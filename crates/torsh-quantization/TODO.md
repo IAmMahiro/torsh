@@ -2147,3 +2147,7 @@ The torsh-quantization framework is confirmed to be in exceptional production-re
 **Status**: 🏆 **ENHANCED PRODUCTION-READY FRAMEWORK** - All placeholder implementations replaced with fully functional, production-quality code
 
 **Status**: 🏆 **VERIFIED PRODUCTION-READY FRAMEWORK** - Comprehensive maintenance confirms continued excellence with cutting-edge features and exceptional code quality
+
+## Proposed follow-ups
+
+- **Unblock the experimental PTQ/QAT surface (surfaced 2026-07-03 by /nagare Phase 1 iteration 1, not actioned this run):** `quantize_auto`, `ptq_pipeline`, `calibrate_model`, `prepare_qat`, `quantize_post_training`, `quantize_dynamic` (in `quantize.rs`/`post_training.rs`/`qat.rs`) are gated behind an `experimental` feature that is declared empty (`experimental = []`) and enabled nowhere in the workspace, AND require a local placeholder `Module` trait (defined separately in `post_training.rs:11` and `qat.rs:13`, NOT `torsh_nn::Module`) with no concrete implementor — pipeline bodies are partly simulated (e.g. `simulate_observer_updates`). Recommend either: (a) provide a real `Module` adapter once torsh-nn/autograd stabilizes, or (b) promote the per-tensor API (`quantize_with_config`, `dequantize`, `calculate_quantization_metrics` in `algorithms.rs`/`metrics.rs`, already non-experimental and default-feature) as the primary supported surface for callers like torsh-cli.

@@ -2611,3 +2611,7 @@ The torsh-ffi crate now provides **production-ready, enterprise-grade FFI capabi
 - [x] ✅ **COMPLETED**: Investigate GraalVM support → Implemented in graalvm.rs (563 lines)
 - [x] ✅ **COMPLETED**: Research .NET 6+ integration → Implemented in dotnet6.rs (840 lines)
 - [x] ✅ **COMPLETED**: Study mobile bindings → iOS in ios.rs (944 lines), Android in android.rs (1046 lines)
+
+## Proposed follow-ups
+
+- **Recommend closing the 3 duplicate "Arc<RefCell>" items as done/won't-do (surfaced 2026-07-03 by /nagare Phase 1 iteration 1, not actioned this run):** The same "optimize Arc<RefCell> ownership patterns" item is duplicated 3x across session logs (see the three open checkboxes above). There is no literal `Arc<RefCell>` anywhere in `src/` — actual shared-ownership code uses `Arc<RwLock<...>>` and `Arc<Mutex<...>>` (in `conversions.rs`, `tensor/storage.rs`, `wasm.rs`, `performance.rs`, `numpy_compatibility.rs`). The file itself already records elsewhere that these patterns were confirmed thread-safe (`Send + Sync`). Recommend a human reviewer close all 3 as done/won't-do rather than treating this as open work; if a genuine optimization is still wanted, rescope it against the actual `Arc<RwLock>`/`Arc<Mutex>` call sites.

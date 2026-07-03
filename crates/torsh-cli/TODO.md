@@ -372,3 +372,7 @@ This roadmap prioritizes **real functionality over mock implementations** while 
 - [ ] Comprehensive test coverage (>80%)
 - [ ] Performance comparable to PyTorch CLI tools
 - [ ] Production deployment examples
+
+## Proposed follow-ups
+
+- **Real model-I/O foundation needed before `quantize`/`convert`/`benchmark` wiring (surfaced 2026-07-03 by /nagare Phase 1 iteration 1, not actioned this run):** `commands/model/serialization.rs::serialize_tensor_data` currently fabricates random tensor data on save (`rng.gen_range`) instead of serializing real values, and `load_model` reconstructs metadata only — `TensorInfo` carries no data buffer. `commands/model/optimization.rs::load_torsh_model` similarly fabricates a random `Array2<f32>`. Any "wire quantize to torsh-quantization" work is blocked on building real tensor-data serialization first (add data buffers to `TensorInfo`/`SerializedTensor`, real save/load), then wiring to `torsh_quantization::{quantize_with_config, dequantize, calculate_quantization_metrics}` (the non-experimental, default-feature API — NOT `quantize_auto`/`ptq_pipeline`, which are gated behind an unused `experimental` feature and require a `Module` trait with no implementor). Recommend a dedicated future `/ultra` pass scoped to this foundation.

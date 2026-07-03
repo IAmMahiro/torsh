@@ -63,8 +63,13 @@
 - [ ] Add gradient clipping
 
 #### 5.3 Optimization
-- [ ] Add learning rate schedulers
-- [ ] Add optimizer state serialization
+- [x] Add learning-rate schedulers + optimizer state serialization (planned 2026-07-03)
+  - **Goal:** Every Python optimizer (SGD, Adam, AdamW, AdaGrad, RMSprop) round-trips its real state through `state_dict()`/`load_state_dict()` (checkpoint/resume works), and a PyTorch-shaped `torsh.optim.lr_scheduler` family adjusts LR against the real optimizer.
+  - **Design:** Real `state_dict()`/`load_state_dict()` on each optimizer subclass (currently stubs returning an empty HashMap) — serialize per-parameter momentum/velocity/squared-grad buffers (real Tensor<f32> data), step counts, lr, and hyperparameters, matching PyTorch's `{"state": {...}, "param_groups": [...]}` shape. New `PyLRScheduler` family in `crates/torsh-python/src/optim/lr_scheduler.rs`: since the Rust `torsh_optim` scheduler owns its optimizer by value and Python optimizers don't implement the Rust `Optimizer` trait, each `PyLRScheduler` holds a `Py<PyAny>` handle to the Python optimizer and drives LR via the existing `set_lr(f32)`/`lr` getter, computing the schedule in the binding. Implement StepLR, MultiStepLR, ExponentialLR, CosineAnnealingLR, LinearLR, ReduceLROnPlateau matching `torch.optim.lr_scheduler` formulas exactly. pyo3 0.29 house style throughout (`PyClassInitializer`, `Python::attach`, matching `optim/sgd.rs`).
+  - **Files:** new `crates/torsh-python/src/optim/lr_scheduler.rs`; edit `crates/torsh-python/src/optim/mod.rs` (registration) and `crates/torsh-python/src/optim/{sgd,adam,adamw,adagrad,rmsprop}.rs` (real state_dict/load_state_dict) — these 4 files carry in-flight pyo3-0.29 migration edits, extend them, do not revert.
+  - **Prerequisites:** none external — torsh_optim schedule semantics and Python optimizer lr/set_lr already exist.
+  - **Tests:** state_dict round-trip per optimizer (snapshot → fresh optimizer → load → assert buffers/step/lr match); scheduler trajectories (StepLR/ExponentialLR/CosineAnnealingLR/MultiStepLR/LinearLR) asserted against closed-form PyTorch values per epoch; ReduceLROnPlateau LR-drop-after-patience; scheduler load_state_dict resumes epoch/LR correctly.
+  - **Risk:** schedule-formula drift vs PyTorch (mitigated by closed-form assertions); overlap with in-flight pyo3-0.29 edits (mitigated by extending, not reverting); Tensor<f32> Python serialization shape kept as plain nested list/dict symmetric with load.
 - [ ] Add gradient checkpointing
 
 #### 5.4 Data Loading
@@ -583,3 +588,7 @@ The torsh-python crate is now **production-quality** with:
 - ✅ **Security policy and vulnerability reporting (Session 4)**
 - ✅ **Developer guides for contributors (Session 4)**
 - ✅ **Zero clippy warnings - production quality code (Session 6)**
+
+## Proposed follow-ups
+
+- **Stale re-enable markers (was L14-16):** TODO items said "Re-enable torsh-autograd/data/distributed" but `src/lib.rs` already enables and registers all three modules today — only `functional` is genuinely disabled. Recommend verifying and checking these off, and re-scoping the `functional` item to "re-enable once tensor ops land." (Surfaced 2026-07-03 by /nagare Phase 1 iteration 1, not actioned this run.)
