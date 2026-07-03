@@ -176,7 +176,7 @@ anyhow = "1.0"
 cust = "0.3"
 cuda-sys = "0.2"
 cudnn-sys = "0.0.3"
-wgpu = "29.0.3"
+wgpu = "30.0.0"
 metal = "0.33"
 bytemuck = "1.25"
 
@@ -206,8 +206,8 @@ indexmap = { version = "2.14", features = ["serde"] }
 
 # FFI
 # libc = "0.2"  # REMOVED: Pure Rust (SciRS2 ecosystem) - replaced with sysinfo
-pyo3 = { version = "0.28.3" }
-numpy = "0.28"
+pyo3 = { version = "0.29.0" }
+numpy = "0.29"
 scirs2-numpy = { version = "0.6.0", default-features = false }  # SciRS2-compatible numpy bindings
 
 # Additional utilities
@@ -262,7 +262,7 @@ dashmap = "6.2"
 # rand_chacha = "0.9.0"  # REMOVED: Use scirs2_core::random instead (SciRS2 POLICY)
 # ✅ SciRS2 Policy: All random number generation handled by scirs2_core::random
 # EXCEPTION: rand is needed for security features (cryptographic randomness)
-rand = "0.10.1"  # Used only for security module (ed25519-dalek requirement)
+rand = "0.10.2"  # Used only for security module (ed25519-dalek requirement)
 half = "2.7"
 lazy_static = "1.5"
 md5 = "0.8"

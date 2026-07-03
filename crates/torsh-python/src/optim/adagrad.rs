@@ -29,7 +29,7 @@ impl PyAdaGrad {
         lr_decay: Option<f32>,
         weight_decay: Option<f32>,
         eps: Option<f32>,
-    ) -> (Self, PyOptimizer) {
+    ) -> PyClassInitializer<Self> {
         let lr = lr.unwrap_or(0.01);
         let lr_decay = lr_decay.unwrap_or(0.0);
         let weight_decay = weight_decay.unwrap_or(0.0);
@@ -93,6 +93,7 @@ impl PyAdaGrad {
             },
             PyOptimizer {},
         )
+            .into()
     }
 
     /// Perform a single optimization step

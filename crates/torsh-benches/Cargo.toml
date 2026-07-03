@@ -115,7 +115,7 @@ tempfile = { workspace = true }
 [build-dependencies]
 # COOLJAPAN Pure Rust Policy: Build dependencies for optional Python features
 # Only used when Python comparison features are enabled
-pyo3-build-config = { version = "0.28", features = ["resolve-config"] }
+pyo3-build-config = { version = "0.29", features = ["resolve-config"] }
 
 [features]
 default = ["std"]

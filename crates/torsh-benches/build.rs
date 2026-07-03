@@ -28,10 +28,10 @@ fn main() {
         // Without these link args, `cargo nextest --all-features` fails with a
         // dyld "symbol not found in flat namespace" error on macOS.
         let config = pyo3_build_config::get();
-        if let Some(lib_dir) = &config.lib_dir {
+        if let Some(lib_dir) = config.lib_dir() {
             println!("cargo:rustc-link-search=native={lib_dir}");
         }
-        if let Some(lib_name) = &config.lib_name {
+        if let Some(lib_name) = config.lib_name() {
             println!("cargo:rustc-link-lib={lib_name}");
         }
     }

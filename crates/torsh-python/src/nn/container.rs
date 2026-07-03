@@ -16,7 +16,7 @@ pub struct PySequential {
 #[pymethods]
 impl PySequential {
     #[new]
-    fn new(modules: Option<Vec<Py<PyAny>>>) -> (Self, PyModule) {
+    fn new(modules: Option<Vec<Py<PyAny>>>) -> PyClassInitializer<Self> {
         let modules = modules.unwrap_or_default();
         (
             Self {
@@ -25,6 +25,7 @@ impl PySequential {
             },
             PyModule::new(),
         )
+            .into()
     }
 
     /// Add a module to the sequential container
@@ -173,7 +174,7 @@ pub struct PyModuleList {
 #[pymethods]
 impl PyModuleList {
     #[new]
-    fn new(modules: Option<Vec<Py<PyAny>>>) -> (Self, PyModule) {
+    fn new(modules: Option<Vec<Py<PyAny>>>) -> PyClassInitializer<Self> {
         let modules = modules.unwrap_or_default();
         (
             Self {
@@ -182,6 +183,7 @@ impl PyModuleList {
             },
             PyModule::new(),
         )
+            .into()
     }
 
     /// Append a module to the list

@@ -24,7 +24,7 @@ impl PyLinear {
         in_features: usize,
         out_features: usize,
         bias: Option<bool>,
-    ) -> PyResult<(Self, PyModule)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let has_bias = bias.unwrap_or(true);
 
         // Initialize weight with Xavier/Glorot uniform initialization
@@ -49,7 +49,8 @@ impl PyLinear {
                 training: true,
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through the linear layer

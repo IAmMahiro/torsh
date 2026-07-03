@@ -92,7 +92,7 @@ tempfile = { workspace = true }
 [build-dependencies]
 # pyo3-build-config is always compiled (it's a build dep) but only emits Python
 # link args when the "python" feature is active (controlled via build.rs).
-pyo3-build-config = { version = "0.28", features = ["resolve-config"] }
+pyo3-build-config = { version = "0.29", features = ["resolve-config"] }
 
 # Examples temporarily disabled - need API updates after refactoring
 # [[example]]

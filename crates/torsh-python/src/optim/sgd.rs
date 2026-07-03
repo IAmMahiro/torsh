@@ -30,7 +30,7 @@ impl PySGD {
         dampening: Option<f32>,
         weight_decay: Option<f32>,
         nesterov: Option<bool>,
-    ) -> PyResult<(Self, PyOptimizer)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let momentum = momentum.unwrap_or(0.0);
         let dampening = dampening.unwrap_or(0.0);
         let weight_decay = weight_decay.unwrap_or(0.0);
@@ -87,7 +87,8 @@ impl PySGD {
                 nesterov,
             },
             PyOptimizer {},
-        ))
+        )
+            .into())
     }
 
     /// Perform a single optimization step

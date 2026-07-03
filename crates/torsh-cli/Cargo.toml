@@ -64,7 +64,7 @@ thiserror = { workspace = true }
 
 # Utilities
 chrono = { workspace = true }
-humantime = "2.3"
+humantime = "2.4"
 byte-unit = "5.2"
 uuid = { workspace = true }
 fastrand = "2.4"

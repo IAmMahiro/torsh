@@ -33,7 +33,7 @@ impl PyRMSprop {
         weight_decay: Option<f32>,
         momentum: Option<f32>,
         centered: Option<bool>,
-    ) -> (Self, PyOptimizer) {
+    ) -> PyClassInitializer<Self> {
         let lr = lr.unwrap_or(0.01);
         let alpha = alpha.unwrap_or(0.99);
         let eps = eps.unwrap_or(1e-8);
@@ -114,6 +114,7 @@ impl PyRMSprop {
             },
             PyOptimizer {},
         )
+            .into()
     }
 
     /// Perform a single optimization step

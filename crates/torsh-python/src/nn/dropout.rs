@@ -16,7 +16,7 @@ pub struct PyDropout {
 #[pymethods]
 impl PyDropout {
     #[new]
-    fn new(p: Option<f32>, inplace: Option<bool>) -> PyResult<(Self, PyModule)> {
+    fn new(p: Option<f32>, inplace: Option<bool>) -> PyResult<PyClassInitializer<Self>> {
         let p = p.unwrap_or(0.5);
         let inplace = inplace.unwrap_or(false);
 
@@ -33,7 +33,8 @@ impl PyDropout {
                 training: true,
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through dropout
@@ -124,7 +125,7 @@ pub struct PyDropout2d {
 #[pymethods]
 impl PyDropout2d {
     #[new]
-    fn new(p: Option<f32>, inplace: Option<bool>) -> PyResult<(Self, PyModule)> {
+    fn new(p: Option<f32>, inplace: Option<bool>) -> PyResult<PyClassInitializer<Self>> {
         let p = p.unwrap_or(0.5);
         let inplace = inplace.unwrap_or(false);
 
@@ -141,7 +142,8 @@ impl PyDropout2d {
                 training: true,
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through 2D dropout
@@ -253,7 +255,7 @@ pub struct PyDropout3d {
 #[pymethods]
 impl PyDropout3d {
     #[new]
-    fn new(p: Option<f32>, inplace: Option<bool>) -> PyResult<(Self, PyModule)> {
+    fn new(p: Option<f32>, inplace: Option<bool>) -> PyResult<PyClassInitializer<Self>> {
         let p = p.unwrap_or(0.5);
         let inplace = inplace.unwrap_or(false);
 
@@ -270,7 +272,8 @@ impl PyDropout3d {
                 training: true,
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through 3D dropout
@@ -382,7 +385,7 @@ pub struct PyAlphaDropout {
 #[pymethods]
 impl PyAlphaDropout {
     #[new]
-    fn new(p: Option<f32>, inplace: Option<bool>) -> PyResult<(Self, PyModule)> {
+    fn new(p: Option<f32>, inplace: Option<bool>) -> PyResult<PyClassInitializer<Self>> {
         let p = p.unwrap_or(0.5);
         let inplace = inplace.unwrap_or(false);
 
@@ -399,7 +402,8 @@ impl PyAlphaDropout {
                 training: true,
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through alpha dropout

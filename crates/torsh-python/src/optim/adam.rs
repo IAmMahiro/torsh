@@ -31,7 +31,7 @@ impl PyAdam {
         eps: Option<f32>,
         weight_decay: Option<f32>,
         amsgrad: Option<bool>,
-    ) -> (Self, PyOptimizer) {
+    ) -> PyClassInitializer<Self> {
         let lr = lr.unwrap_or(0.001);
         let betas = betas.unwrap_or((0.9, 0.999));
         let eps = eps.unwrap_or(1e-8);
@@ -101,6 +101,7 @@ impl PyAdam {
             },
             PyOptimizer {},
         )
+            .into()
     }
 
     /// Perform a single optimization step
@@ -298,7 +299,7 @@ impl PyAdamW {
         eps: Option<f32>,
         weight_decay: Option<f32>,
         amsgrad: Option<bool>,
-    ) -> (Self, PyOptimizer) {
+    ) -> PyClassInitializer<Self> {
         let lr = lr.unwrap_or(0.001);
         let betas = betas.unwrap_or((0.9, 0.999));
         let eps = eps.unwrap_or(1e-8);
@@ -368,6 +369,7 @@ impl PyAdamW {
             },
             PyOptimizer {},
         )
+            .into()
     }
 
     /// Perform a single optimization step

@@ -14,7 +14,7 @@ pub struct PyReLU {
 #[pymethods]
 impl PyReLU {
     #[new]
-    fn new(inplace: Option<bool>) -> (Self, PyModule) {
+    fn new(inplace: Option<bool>) -> PyClassInitializer<Self> {
         (
             Self {
                 inplace: inplace.unwrap_or(false),
@@ -22,6 +22,7 @@ impl PyReLU {
             },
             PyModule::new(),
         )
+            .into()
     }
 
     /// Forward pass through ReLU
@@ -64,8 +65,8 @@ pub struct PySigmoid {
 #[pymethods]
 impl PySigmoid {
     #[new]
-    fn new() -> (Self, PyModule) {
-        (Self { training: true }, PyModule::new())
+    fn new() -> PyClassInitializer<Self> {
+        (Self { training: true }, PyModule::new()).into()
     }
 
     /// Forward pass through Sigmoid
@@ -104,8 +105,8 @@ pub struct PyTanh {
 #[pymethods]
 impl PyTanh {
     #[new]
-    fn new() -> (Self, PyModule) {
-        (Self { training: true }, PyModule::new())
+    fn new() -> PyClassInitializer<Self> {
+        (Self { training: true }, PyModule::new()).into()
     }
 
     /// Forward pass through Tanh

@@ -70,6 +70,7 @@ impl Default for ModernWebGpuConfig {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             },
             max_buffer_size: 256 * 1024 * 1024, // 256MB default
             enable_validation: true,
@@ -439,7 +440,9 @@ impl ModernWebGpuBuffer {
         });
         rx.await.expect("buffer mapping channel should not be dropped").map_err(|e| WebGpuError::RuntimeError(format!("Buffer mapping failed: {:?}", e)))?;
 
-        let data = buffer_slice.get_mapped_range();
+        let data = buffer_slice
+            .get_mapped_range()
+            .map_err(|e| WebGpuError::BufferMapping(e.to_string()))?;
         let result: Vec<T> = bytemuck::cast_slice(&data).to_vec();
 
         drop(data);

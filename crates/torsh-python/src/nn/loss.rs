@@ -14,7 +14,7 @@ pub struct PyMSELoss {
 #[pymethods]
 impl PyMSELoss {
     #[new]
-    fn new(reduction: Option<String>) -> (Self, PyModule) {
+    fn new(reduction: Option<String>) -> PyClassInitializer<Self> {
         let reduction = reduction.unwrap_or_else(|| "mean".to_string());
         (
             Self {
@@ -23,6 +23,7 @@ impl PyMSELoss {
             },
             PyModule::new(),
         )
+            .into()
     }
 
     /// Forward pass through MSE Loss
@@ -65,7 +66,7 @@ pub struct PyCrossEntropyLoss {
 #[pymethods]
 impl PyCrossEntropyLoss {
     #[new]
-    fn new(reduction: Option<String>) -> (Self, PyModule) {
+    fn new(reduction: Option<String>) -> PyClassInitializer<Self> {
         let reduction = reduction.unwrap_or_else(|| "mean".to_string());
         (
             Self {
@@ -74,6 +75,7 @@ impl PyCrossEntropyLoss {
             },
             PyModule::new(),
         )
+            .into()
     }
 
     /// Forward pass through Cross Entropy Loss
@@ -114,7 +116,7 @@ pub struct PyBCELoss {
 #[pymethods]
 impl PyBCELoss {
     #[new]
-    fn new(reduction: Option<String>) -> (Self, PyModule) {
+    fn new(reduction: Option<String>) -> PyClassInitializer<Self> {
         let reduction = reduction.unwrap_or_else(|| "mean".to_string());
         (
             Self {
@@ -123,6 +125,7 @@ impl PyBCELoss {
             },
             PyModule::new(),
         )
+            .into()
     }
 
     /// Forward pass through BCE Loss
