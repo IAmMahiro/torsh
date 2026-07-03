@@ -2102,3 +2102,11 @@ The torsh-jit codebase now has significantly improved compilation status with ma
 **Status**: Active Compilation Error Resolution ✅ MAJOR PROGRESS  
 **Next**: Continue systematic error resolution to achieve full compilation success  
 **Achievement**: **Substantial infrastructure improvements and error reduction**
+
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+- [ ] torsh-jit: codegen.rs:414 — TODO: Implement actual Cranelift code generation
+  - **Approach:** Confirmed this exact code path is DEAD in the shipped pipeline. torsh-jit has TWO Cranelift implementations: this one (codegen.rs's private CraneliftBackend, embedded in CodeGenerator) and a separate, FULLY-IMPLEMENTED one in cranelift_backend.rs (CraneliftCodeGen, real instruction-level codegen incl. intrinsics/fmax handling). Traced lib.rs::generate_code() (the real compile() entry point): Cpu+cranelift-backend-feature routes to cranelift_backend::CraneliftCodeGen (the real one); non-CPU/no-feature paths route elsewhere, never touching codegen.rs's CraneliftBackend either. codegen.rs's own #[cfg(test)] module only exercises CodeGenerator::new() and compute_strides(), never .generate(&graph) — unreached by both production pipeline and test suite. Recommend: delete codegen.rs's redundant CraneliftBackend/generate_kernel entirely and have generate_cpu() delegate to cranelift_backend::CraneliftCodeGen directly (removes duplicate maintenance burden) — OR backfill for parity if there's an unstated reason to keep two independent paths.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** Low in practice (unreachable via the public JitCompiler API), but a latent trap — any future code calling CodeGenerator::generate(&graph) directly (bypassing JitCompiler) on Cpu with cranelift-backend enabled would silently get empty-bytecode kernels (code: vec![]) with no error. Recommend deletion over backfill given the duplicate already works.

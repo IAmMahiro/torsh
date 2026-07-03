@@ -909,3 +909,263 @@ For production use, rely on the standard feature set which has been thoroughly t
   - **Design:** default = ["std", "simd", "parallel"]; simd feature += scirs2-core/simd; verify --no-default-features --features std still builds.
   - **Files:** crates/torsh-tensor/Cargo.toml, possibly .github/workflows/
   - **Tests:** cargo build default; cargo build --no-default-features --features std
+
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+- [ ] torsh-tensor: advanced_simd_ops.rs:207 — "TODO: Pass chunk_config to parallel_map_collect_with_config when available"
+  - **Approach:** scirs2_core::chunking::ChunkingUtils::chunked_map(data,&ChunkConfig,map_fn) already accepts &ChunkConfig directly (pre-existing API, not from the recent bump) — build indices 0..rows_a and call chunked_map, dropping the current dead-parameter workaround.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Low, behavior-preserving; chunk sizing changes so a quick perf check is warranted.
+
+- [ ] torsh-tensor: advanced_simd_ops.rs:387 — "TODO: Pass chunk_config when parallel_map_reduce supports it"
+  - **Approach:** scirs2_core::chunking::ChunkingUtils::chunked_reduce(data,&ChunkConfig,identity,reduce_fn) exists and operates directly on the slice; replace call and drop the redundant local CHUNK_SIZE constant.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Low.
+
+- [ ] torsh-tensor: hardware_accelerators.rs:1189 — "TODO: Implement when CPU accelerator APIs are expanded for each vendor"
+  - **Approach:** CpuDetectionResult is torsh-tensor's own macro-placeholder type, not external. Branch on real CPU features via is_x86_feature_detected! (precedent in type_conversions.rs, ops/simd/f32_ops.rs) and populate fields directly — no external dep needed.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** Capped usefulness until sibling detect_cpu_architecture() also populates real vendor data; Default impl uses unsafe{mem::zeroed()} — pre-existing UB landmine adjacent to any fix.
+
+- [ ] torsh-tensor: hardware_accelerators.rs:1221 — "TODO: Implement when GPU accelerator APIs are expanded for each vendor"
+  - **Approach:** same placeholder pattern as :1189 (GpuDetectionResult). Real vendor signal already obtainable via torsh-backend's wgpu AdapterInfo{vendor,device_type} (webgpu/device.rs) rather than inventing new detection.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** More cross-crate coordination than the CPU case; still gated on sibling detect_gpu_hardware() stub.
+
+- [ ] torsh-tensor: hardware_accelerators.rs:1253 — "TODO: Implement when MemoryDetectionResult and optimizer APIs are expanded"
+  - **Approach:** unlike CPU/GPU, no existing detection utility in-workspace to build on; needs real OS-level NUMA/cache-topology queries (e.g. /sys/devices/system/node parsing on Linux).
+  - **Scope:** large
+  - **Prerequisites:** none
+  - **Risk:** Platform-specific, may need a new pure-Rust systems dependency, subject to Pure-Rust policy review.
+
+- [ ] torsh-tensor: scirs2_stats_integration.rs:93 — "TODO: Use actual scirs2-stats descriptive statistics when API stabilizes"
+  - **Approach:** scirs2-stats 0.6.0 exports mean/var/std/skew/kurtosis/moment/percentile/quartiles directly — call instead of manual loops.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Current skew/kurtosis use a nonstandard hybrid convention — switching changes numeric output (correctness fix); pinned-value tests need updating.
+
+- [ ] torsh-tensor: scirs2_stats_integration.rs:180 — "TODO: Use actual scirs2-stats correlation analysis when API stabilizes"
+  - **Approach:** scirs2_stats::corrcoef(view,"pearson"|"spearman"|"kendall") computes the whole matrix in one call; pearsonr/spearmanr/kendalltau give (r,p_value) for significant_pairs.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Spearman/Kendall enum variants exist but are never produced today — new behavior, not just refactor.
+
+- [ ] torsh-tensor: scirs2_stats_integration.rs:225 — "TODO: Use actual scirs2-stats t-test when API stabilizes"
+  - **Approach:** scirs2_stats::ttest_1samp replaces hand-computed stats and crude tanh p-value approximation.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Name collision between scirs2-stats's TTestResult and torsh's own (extra fields) needs field mapping; p-values change (become accurate).
+
+- [ ] torsh-tensor: scirs2_stats_integration.rs:274 — "TODO: Use actual scirs2-stats two-sample t-test when available"
+  - **Approach:** scirs2_stats::ttest_ind implements both pooled-variance and Welch's-t, matching torsh's equal_variance param 1:1.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Same TTestResult field-mapping issue; p-values change.
+
+- [ ] torsh-tensor: scirs2_stats_integration.rs:357 — "TODO: Use actual scirs2-stats regression when available"
+  - **Approach:** scirs2_stats::linear_regression returns a superset of torsh's result struct; build [1,x] design matrix and map fields.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** Uses lstsq internally, no new dep; current hand-rolled SE/F-stat are approximations, library's OLS inference will differ slightly; design-matrix column order (intercept first) must be correct.
+
+- [ ] torsh-tensor: scirs2_stats_integration.rs:437 — "TODO: Use actual scirs2-stats distribution fitting when available"
+  - **Approach:** the literal Fittable trait has zero concrete impls upstream, but composable pieces exist: mean/var(ddof=0) for MLE params, kstest+real Normal for goodness-of-fit, information::{aic,bic} as risk-free drop-ins.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Current code uses ddof=1 for MLE std_dev but true normal MLE variance is ddof=0 — latent pre-existing bug independent of scirs2-stats.
+
+- [ ] torsh-tensor: scirs2_stats_integration.rs:559 — "TODO: Use actual scirs2-stats implementation"
+  - **Approach:** private t_cdf(t,df) helper — replace tanh-heuristic body with scirs2_stats::distributions::student_t::StudentT::cdf.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** Changes p-values at both t-test call sites; if lines 225/274 migrate to ttest_1samp/ttest_ind wholesale this helper becomes dead code — coordinate to avoid duplicate work.
+
+- [ ] torsh-tensor: core_ops/types.rs:587 — "TODO: Temporarily disabled - backend types not yet available in scirs2_core"
+  - **Approach:** is_backend_available hardcodes false, breaking zeros_gpu/ones_gpu. Real detection available in-house: oxicuda-driver::multi_gpu::device_count() for Cuda, torsh_backend::webgpu::is_available() for WebGpu/Metal.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Both detection calls are relatively expensive (live handle / async probe) — should be cached, not called per-invocation on the backend-selection hot path.
+
+- [ ] torsh-tensor: memory_pool.rs:72 — "TODO: profile_section macro not available in scirs2_core yet"
+  - **Approach:** scirs2-core 0.6.0 ships pub mod profiling with struct Timer (Drop-based RAII) — exact drop-in replacement at ~7 call sites. Needs "profiling" added to this crate's scirs2-core feature forwarding in Cargo.toml.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Timer::start() takes a global Mutex-guarded Profiler lock each call — could add contention on hot allocation paths; benchmark before wiring broadly.
+
+- [ ] torsh-tensor: memory_pool.rs:927 — "TODO: When mmap-support feature is enabled, use memory-mapped file at backing_path"
+  - **Approach:** no "mmap-support" feature exists anywhere (the name is aspirational). torsh-tensor already declares memory_efficient=["scirs2-core/memory_efficient"], which activates scirs2-core's in-house mmap layer (MmapArray, create_mmap, MemoryMappedArray). Rewire disk_backed() onto that (COOLJAPAN in-house-over-third-party preference) rather than raw memmap2 or inventing a new feature flag — needs a maintainer design call.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** disk_backed() currently silently allocates full in-memory storage regardless of file_path — a real functional gap for large-tensor/memory-constrained use, not cosmetic. NEEDS_CLARIFICATION on which mmap path to standardize on.
+
+- [ ] torsh-tensor: hardware_accelerators_specialized.rs:63 — "TODO: Implement when PlatformDetectionResult and optimizer APIs are expanded"
+  - **Approach:** NetworkAcceleratorEngine needs real interconnect/RDMA/topology detection (Ethernet vs InfiniBand, bandwidth probing) — no existing code path to extend anywhere in the workspace.
+  - **Scope:** large
+  - **Prerequisites:** none
+  - **Risk:** Hardware-dependent subsystem needing OS-level syscalls not yet available in this pure-Rust workspace; reasonable to leave as documented no-op.
+
+- [ ] torsh-tensor: hardware_accelerators_specialized.rs:239 — "TODO: Implement when SpecializedDetectionResult and accelerator APIs are expanded"
+  - **Approach:** SpecializedAcceleratorEngine covers TPU/FPGA/NPU/quantum placeholders (20 leaf types) — genuine implementation means integrating proprietary non-Rust vendor SDKs, none referenced anywhere in this codebase.
+  - **Scope:** oversized
+  - **Prerequisites:** none
+  - **Risk:** Essentially unbounded scope tied to proprietary vendor SDKs outside Pure-Rust policy; recommend keeping as explicit no-op indefinitely.
+
+- [ ] torsh-tensor: tests/tensor_tests.rs:202 — "TODO: Implement normal_ in-place function"
+  - **Approach:** fn normal_ doesn't exist in the active src tree (only in uncompiled ops.rs.backup). Needs a new in-place .normal_(mean,std) method on Tensor using scirs2-core::random (already a hard dep). Test body is block-commented, ready to uncomment once implemented.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Low — self-contained; watch RNG-source consistency with rest of crate.
+
+- [ ] torsh-tensor: tests/tensor_tests.rs:232 — "TODO: Implement multinomial sampling function"
+  - **Approach:** fn multinomial doesn't exist in active src (only ops.rs.backup). Needs Tensor::multinomial(&weights,num_samples,replacement) via cumulative-distribution sampling on scirs2-core::random, with explicit error cases (over-sampling without replacement, all-zero weights) per the commented test.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Low-medium — correctness-sensitive edge cases are explicitly tested but self-contained.
+
+- [ ] torsh-tensor: math_ops.rs:55 — "TODO: scirs2_core::profiling module not available yet"
+  - **Approach:** same finding as memory_pool.rs:72 — module now exists upstream but isn't reachable until the profiling feature is forwarded in Cargo.toml.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** Same Cargo.toml fix as memory_pool.rs:72 unlocks this too.
+
+- [ ] torsh-tensor: math_ops.rs:59 — "TODO: profile_section macro not available in scirs2_core yet"
+  - **Approach:** swap commented profile_section! for scirs2_core::profiling::Timer::start(...) at the one guarded call site.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Same lock-contention caveat as memory_pool.rs; low blast radius (one call site).
+
+- [ ] torsh-tensor: math_ops.rs:1220 — "TODO: Integrate with actual SciRS2 backend" (add_scirs2)
+  - **Approach:** currently delegates to self.add(other) whose "SIMD" fallback is dead code. scirs2_core::simd_ops::SimdUnifiedOps::simd_add(a,b) exists for f32/f64 — dispatch generically, closing the f64 SIMD gap.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Marginal gain for f32 (already fast); main win is f64/other-float coverage. Must preserve requires_grad/Operation::Add autograd bookkeeping.
+
+- [ ] torsh-tensor: math_ops.rs:1230 — "TODO: Integrate with actual SciRS2 backend" (mul_scirs2)
+  - **Approach:** SimdUnifiedOps::simd_mul(a,b) exists for f32/f64.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** mul()'s f32 fast path returns via from_data WITHOUT setting requires_grad/operation (unlike add/sub) — pre-existing autograd-tracking gap worth fixing alongside.
+
+- [ ] torsh-tensor: math_ops.rs:1240 — "TODO: Integrate with actual SciRS2 backend" (sub_scirs2)
+  - **Approach:** SimdUnifiedOps::simd_sub(a,b) exists for f32/f64.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** sub()'s fast path DOES correctly set requires_grad/Operation::Sub already — lower regression risk than mul.
+
+- [ ] torsh-tensor: math_ops.rs:1250 — "TODO: Integrate with actual SciRS2 backend" (div_scirs2)
+  - **Approach:** SimdUnifiedOps::simd_div(a,b) exists for f32/f64.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** div()'s fast path also skips requires_grad/operation bookkeeping on early return (same gap as mul) — be careful not to bake this into any rewrite.
+
+- [ ] torsh-tensor: cuda_backend/mod.rs:146 — "TODO(torsh-cuda-gemm): wire oxicuda-blas here"
+  - **Approach:** oxicuda-blas is mature and published (0.4.0 resolved, matching sibling oxicuda-driver/launch/ptx already pinned) but CONFIRMED never referenced in root Cargo.toml. Add as optional workspace dep, wire into torsh-tensor's cuda feature, replace gemm()'s Err(Unsupported) with MatrixDesc/BlasHandle calls from existing raw u64 device pointers.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** Pointer-marshaling across the raw-u64 ComputeBackend ABI into oxicuda-blas's typed descriptors is real glue work needing GPU hardware to validate.
+
+- [ ] torsh-tensor: cuda_backend/mod.rs:165 — "TODO(torsh-cuda-dnn): wire oxicuda-dnn if GPU conv is ever needed"
+  - **Approach:** oxicuda-dnn exists, published, unwired (same pattern as oxicuda-blas). Implement conv2d_forward() by constructing oxicuda-dnn's conv descriptors from existing raw pointer/shape/stride/padding args.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** Same pointer-marshaling + hardware-validation caveat; conv descriptor setup (padding/stride/layout) is fiddly to get bit-exact.
+
+- [ ] torsh-tensor: advanced_ops.rs:927 — "TODO: Integrate with actual SciRS2 backend" (matmul_scirs2)
+  - **Approach:** currently naive triple-nested-loop O(m·n·k), no blocking/SIMD/BLAS. scirs2_core::simd_ops::matmul::simd_matrix_multiply_f32/f64 usable with zero new dependency.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** Real perf-relevant gap; requires ArrayView2 conversion + correct fallback for non-contiguous/broadcast shapes.
+
+- [ ] torsh-tensor: advanced_ops.rs:937 — "TODO: Integrate with actual SciRS2 backend" (sum_scirs2)
+  - **Approach:** scirs2_core::simd_ops::SimdUnifiedOps::simd_sum(a) exists for f32/f64 — one-line swap after viewing as ArrayView1.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** SIMD reduction order differs from sequential fold — last-ULP differences possible, acceptable except for strict bit-reproducibility tests.
+
+- [ ] torsh-tensor: advanced_ops.rs:954 — "TODO: Integrate with actual SciRS2 backend" (mean_scirs2)
+  - **Approach:** scirs2-stats::mean already used elsewhere in this crate (no new dep) — cleanest fix in this batch.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** Narrower trait bounds (F: Float+Sum+Div+Display+SimdUnifiedOps) than current generic T — needs bound adjustment or TypeId dispatch shim; returns StatsResult needing mapping to TorshError.
+
+- [ ] torsh-tensor: advanced_ops.rs:973 — "TODO: Integrate with actual SciRS2 backend" (relu_scirs2)
+  - **Approach:** Tensor::map is plain single-threaded collect with ZERO acceleration today. scirs2_core::ndarray_ext::elementwise::relu_simd is a direct match.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** Real, uncontested gap; ReLU semantics unambiguous so low correctness risk.
+
+- [ ] torsh-tensor: advanced_ops.rs:983 — "TODO: Integrate with actual SciRS2 backend" (sigmoid_scirs2)
+  - **Approach:** scirs2_core::ndarray_ext::elementwise::sigmoid_simd exists, claims better numerical stability for large |x| than the naive formula used today.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** Low; watch tie-breaking/rounding differences in golden-value tests.
+
+- [ ] torsh-tensor: advanced_ops.rs:995 — "TODO: Integrate with actual SciRS2 backend" (tanh_scirs2)
+  - **Approach:** scirs2_core offers tanh_simd; current formula already correct, purely a perf upgrade.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** Essentially none; lowest priority of the activation-function TODOs.
+
+- [ ] torsh-tensor: algorithmic_optimizations.rs:757 — "TODO: Re-enable when tracing is added to dependencies"
+  - **Approach:** tracing/tracing-subscriber already in root workspace Cargo.toml but not in torsh-tensor's own Cargo.toml; profiling=[] feature is unwired. Add tracing={workspace=true,optional=true}, change feature to profiling=["dep:tracing"], uncomment the trace! block.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** Low — purely additive observability.
+
+- [ ] torsh-tensor: serialize/data_science.rs:39 — "TODO: Implement Arrow serialization using arrow-rs crate"
+  - **Approach:** arrow (59.0.0 resolved) already a feature-gated (serialize-arrow) dependency with everything needed (RecordBatch, FileWriter/StreamWriter). Map T:TensorElement to matching Arrow primitive array, flatten tensor.data(), build single-column RecordBatch with shape/dtype/requires_grad/version as Schema::metadata. Reachable code (dispatched from serialize/core.rs), not dead.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** Mainly a schema-design risk (arbitrary tensor shapes/dtypes round-tripping, ideally pandas/pyarrow-interoperable) — API itself is present and stable.
+
+- [ ] torsh-tensor: serialize/data_science.rs:89 — "TODO: Implement Parquet serialization using parquet-rs crate"
+  - **Approach:** parquet (59.0.0) already a feature-gated dependency; ArrowWriter<W> with RecordBatchWriter impl. Same RecordBatch construction as the Arrow case, then ArrowWriter::try_new + write + close.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** Shares schema-design risk with Arrow case; adds compression/encoding choices needing reasonable defaults.
+
+- [ ] torsh-tensor: serialize/scientific.rs:94 — "TODO: Implement proper string metadata storage when HDF5 API is updated"
+  - **Approach:** hdf5-types 0.8.1's VarLenUnicode (impl FromStr) already used successfully for READING elsewhere in this same file — write side is symmetric: new_attr::<VarLenUnicode>().create(key)?.write_scalar(&value.parse()?)?, matching the requires_grad/timestamp pattern already in this function.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Attribute names must be valid identifiers; otherwise low risk.
+
+- [ ] torsh-tensor: serialize/scientific.rs:210 — "TODO: Implement proper device storage when HDF5 string API is updated"
+  - **Approach:** write-side mirror of read_device_from_attributes in the same file, which already reads via VarLenUnicode.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** Debug format for DeviceType must keep matching the hand-rolled parser in read_device_from_attributes — a coupling to watch, not a blocker.
+
+- [ ] torsh-tensor: serialize/scientific.rs:232 — "TODO: Implement proper dtype storage when HDF5 string API is updated"
+  - **Approach:** same pattern as :210, write-side mirror of the existing dtype read.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** None beyond attribute-name validity.
+
+- [ ] torsh-tensor: serialize/scientific.rs:236 — "TODO: Implement proper version storage when HDF5 string API is updated"
+  - **Approach:** same pattern again, write-side mirror of existing version read.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** None beyond attribute-name validity.
+
+- [ ] torsh-tensor: serialize/ml_formats.rs:38 — "TODO: Implement ONNX serialization using onnx-rs crate"
+  - **Approach:** PERMANENTLY blocked by explicit security policy — Cargo.toml has the onnx dep commented out with note "REMOVED: Unmaintained with security vulnerabilities (RUSTSEC-2024-0437, RUSTSEC-2023-0018)"; serialize-onnx is now a permanent no-op stub feature. Real fix requires either a from-scratch pure-Rust ONNX protobuf writer or a freshly-vetted replacement crate.
+  - **Scope:** oversized (Status: tracked_external, permanent)
+  - **Prerequisites:** none
+  - **Risk:** Reintroducing the old onnx crate reopens the RUSTSEC vulnerabilities; any future work needs a dependency security audit first, not a routine unblock.
+
+- [ ] torsh-tensor: lib.rs:235 — "TODO: Conditional AutogradTensor trait implementation - torsh-autograd not yet available"
+  - **Approach:** NEEDS_CLARIFICATION — torsh-autograd IS now a real workspace member and already depends on torsh-tensor, so implementing AutogradTensor FOR Tensor inside torsh-tensor would create a cyclic package dependency (Cargo will reject it). The correct fix is `impl AutogradTensor<T> for torsh_tensor::Tensor<T>` INSIDE torsh-autograd instead (orphan rule permits this, confirmed torsh-autograd doesn't implement it yet, only for its own Mock/OwnedTensor test types). This is a placement/design decision belonging to a different crate than this TODO names.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** A literal in-place fix (uncomment + add dep) fails to compile with a cyclic-dependency error — do not attempt the literal fix as written.
+
+- [ ] torsh-tensor: hardware_accelerators.rs / hardware_accelerators_specialized.rs — cross-cutting note
+  - **Approach:** several of the above (esp. items 3-5, 16-17) share the same `impl_placeholder_accelerator!`/`impl_detector_component!` macro-generated scaffolding pattern — worth tackling as one coordinated pass rather than piecemeal, since they share design questions (how much real hardware detection this crate wants to own vs. delegate to torsh-backend).
+  - **Scope:** cross-cutting (spans items 3-5, 16-17)
+  - **Prerequisites:** none
+  - **Risk:** N/A — coordination note, not a standalone implementation task.

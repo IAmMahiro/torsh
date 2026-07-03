@@ -1913,3 +1913,35 @@ The core crate is well-structured with comprehensive error handling, device abst
 - [x] **COMPLETED**: Implement standard error codes for interoperability - error_codes.rs with StandardErrorCode, ErrorCodeMapper, POSIX-compatible codes (625 lines, 11 tests)
 - [x] **COMPLETED**: Follow Rust API guidelines consistently - Comprehensive API following Rust conventions with builder patterns, trait implementations, proper error handling
 - [x] **COMPLETED**: Add compliance tests for relevant standards - IEEE 754 compliance testing fully implemented with comprehensive edge case coverage
+
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+- [ ] torsh-core: simd_arm.rs:248 — "TODO: Re-enable vdotq_s32 when it becomes stable"
+  - **Approach:** CONFIRMED by test-compiling for aarch64-apple-darwin: fails E0658 "unstable library feature stdarch_neon_dotprod" (rust-lang/rust#117224). Current manual 4-lane vmlaq_s32 fallback is already functionally correct, just not using the single hardware SDOT instruction.
+  - **Scope:** trivial
+  - **Prerequisites:** Rust stdlib stabilization of stdarch_neon_dotprod (rustc issue #117224)
+  - **Risk:** none if left as-is; correct today, just not maximally fast. Status: tracked_external.
+
+- [ ] torsh-core: backend_detection.rs:567 — "TODO: Integrate with scirs2-core::gpu::opencl when available"
+  - **Approach:** scirs2-core's "opencl" Cargo feature (dep:opencl3, non-default) exists upstream but isn't enabled by torsh's scirs2-core feature list. Add opencl=["scirs2-core/opencl"] to torsh-core/Cargo.toml, gate detect_opencl_version behind #[cfg(feature="opencl")], call opencl3::platform::get_platforms() for CL_PLATFORM_VERSION. Function is already wired into the live detection flow (called at :401), not dead code.
+  - **Scope:** medium
+  - **Prerequisites:** none (feature-gate addition)
+  - **Risk:** must stay non-default/feature-gated (opencl3 is FFI, though needs no C compiler to build) per Pure-Rust policy; must handle machines with no OpenCL runtime gracefully.
+
+- [ ] torsh-core: backend_detection.rs:574 — "TODO: Integrate with scirs2-core::gpu::vulkan when available"
+  - **Approach:** TODO's literal target doesn't and shouldn't exist — scirs2-core (0.6.0 and newer 0.6.1 checked) has no gpu::vulkan module; Vulkan is only reachable via wgpu::Backend::Vulkan. Implement via wgpu: enumerate wgpu::Instance adapters filtered to Backends::VULKAN, surface AdapterInfo.driver_info. Should be done together with the neighboring detect_webgpu_support, which is itself a hardcoded "true // Placeholder" behind an inert wgpu=[] feature.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** moderate scope creep (requires actually wiring real wgpu, currently just an empty placeholder feature); wgpu's Vulkan backend links the system Vulkan loader at runtime — keep behind non-default feature, same FFI-boundary risk class as opencl3.
+
+- [ ] torsh-core: storage/numa.rs:262 — "TODO: Implement Windows NUMA detection using GetNumaNodeProcessorMask"
+  - **Approach:** no windows/windows-sys/hwloc/core_affinity is a direct dep today (libc was explicitly removed project-wide for Pure Rust), BUT windows-sys v0.52/0.60/0.61 and windows v0.62 are already transitively resolved in Cargo.lock, and the needed WinAPI functions (GetNumaHighestNodeNumber, GetNumaNodeProcessorMask/Ex) were confirmed present in cached windows-sys-0.61.2 source. Add a target.'cfg(windows)'.dependencies windows-sys entry (mirrors existing cudnn-sys cfg-target pattern), implement detect_windows() using those functions, fallback distance_matrix style matching detect_linux().
+  - **Scope:** small
+  - **Prerequisites:** add windows-sys as a cfg(windows)-gated dependency
+  - **Risk:** windows-sys is pure-Rust FFI declarations (no C toolchain, just links kernel32.dll) — lower risk than a true C dep, but scope strictly to cfg(windows); raw unsafe FFI needs careful Result propagation, no unwrap, fallback to single_node() on API error.
+
+- [ ] torsh-core: storage/numa.rs:281 — "TODO: Implement CPU affinity detection"
+  - **Approach:** function currently has no #[cfg(target_os)] gating and ignores its _thread_id parameter entirely. Branch per-OS: Linux parses Cpus_allowed_list from procfs (same style already used in this file, no new dep); Windows uses GetCurrentThread+GetThreadGroupAffinity mapped via GetNumaProcessorNodeEx (same dep as item 4); macOS has no usable OS API (detect_macos() stays single-node, cannot be meaningfully improved).
+  - **Scope:** medium
+  - **Prerequisites:** item 4 for the Windows branch
+  - **Risk:** medium — real obstacle is std::thread::ThreadId being an opaque handle with no public accessor to the OS-level TID for a non-current thread's affinity syscall; realistically only the current-thread path (optimal_node()) can be made fully real without an API break. NEEDS_CLARIFICATION on scope (current-thread-only vs full API).

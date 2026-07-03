@@ -3089,3 +3089,122 @@ The advanced monitoring system is ready for production use. Future enhancements 
 - Performance prediction and capacity planning
 
 ---
+
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+**Correction to this file's own history:** the "~300 compile errors remaining" narrative recorded in earlier
+session entries above is STALE. Verified 2026-07-03: `cargo build -p torsh-distributed`, `cargo check -p
+torsh-distributed --tests`, and `cargo check -p torsh-distributed --all-features` (including the mpi feature)
+all succeed with 0 errors, 0 warnings. The crate compiles cleanly; it is simply not yet re-enabled in the
+workspace root `Cargo.toml`'s `default-members` list. The TODO items below are independently actionable, not
+blocked on a crate-wide compile fix.
+
+- [ ] torsh-distributed: tensor_parallel.rs:23 — "TODO: These features are not yet available in scirs2_core"
+  - **Approach:** scirs2-core 0.6.0 (pinned) exports memory/memory_efficient/parallel_ops/simd_ops; par_join/par_scope specifically not found, simd_dot_product/simd_matrix_multiply exist only as _f32/_f64-suffixed. Uncomment the 6-line import block, adjust the two API-name mismatches, wire into the 6 downstream TODOs this block gates.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** low
+
+- [ ] torsh-distributed: tensor_parallel.rs:467 — "TODO: Implement proper memory-mapped tensor support"
+  - **Approach:** scirs2_core::memory_efficient::{MemoryMappedArray, create_mmap} confirmed present in 0.6.0. The _use_mapping flag is already computed (numel > 1M) but discarded — route that branch through create_mmap/MemoryMappedArray instead of always delegating to create_chunked_shard.
+  - **Scope:** small
+  - **Prerequisites:** item 1
+  - **Risk:** low
+
+- [ ] torsh-distributed: tensor_parallel.rs:482 — "TODO: Implement proper chunked array support with AdaptiveChunking"
+  - **Approach:** scirs2_core::memory_efficient::{AdaptiveChunking, AdaptiveChunkingBuilder, AdaptiveChunkingParams} confirmed present. Current tensor.narrow()-based fallback is functionally correct for equal shards, just not adaptive — swap in AdaptiveChunkingBuilder for memory-pressure-aware sizing.
+  - **Scope:** small
+  - **Prerequisites:** item 1
+  - **Risk:** low
+
+- [ ] torsh-distributed: tensor_parallel.rs:598 — "TODO: Initialize global buffer pool when available in scirs2_core"
+  - **Approach:** scirs2_core::memory::GlobalBufferPool confirmed present in 0.6.0. Function currently logs "initialized successfully" while doing nothing (misleading) — verify GlobalBufferPool's actual initialize()/pre_allocate_buffer() signatures before wiring in.
+  - **Scope:** small
+  - **Prerequisites:** item 1
+  - **Risk:** low, but currently actively misleading (false success log).
+
+- [ ] torsh-distributed: tensor_parallel.rs:623 — "TODO: Re-enable buffer pool stats when GlobalBufferPool is properly available"
+  - **Approach:** pairs with item 4 — once wired, populate utilization/fragmentation/cache-hit stats from the same GlobalBufferPool instance.
+  - **Scope:** small
+  - **Prerequisites:** item 4
+  - **Risk:** low
+
+- [ ] torsh-distributed: metrics.rs:19 — "TODO: These features are not yet available in scirs2_core"
+  - **Approach:** scirs2-core 0.6.0 has benchmarking/, metrics.rs, observability/{audit,tracing}, profiling/{Profiler, profiling_memory_tracker} all present. Uncomment and gate the 10 downstream TODOs in this file on real calls.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** low
+
+- [ ] torsh-distributed: metrics.rs:928 — "TODO: profiling module not yet available in scirs2_core"
+  - **Approach:** module exists; MemoryTracker method names (peak_usage_bytes/current_allocations/total_allocations/fragmentation_ratio) need signature verification before implementing. Function already returns valid base metrics via MetricsCollector::collect_system_metrics — this only gates the enhancement overlay.
+  - **Scope:** medium
+  - **Prerequisites:** item 6
+  - **Risk:** low
+
+- [ ] torsh-distributed: metrics.rs:934 — "TODO: Enhanced memory profiling using SciRS2 - disabled until profiling module is available"
+  - **Approach:** subset of item 7 — wire profiling_memory_tracker() into metrics.memory_profile per the commented sketch, after confirming its return type.
+  - **Scope:** small
+  - **Prerequisites:** item 7
+  - **Risk:** low
+
+- [ ] torsh-distributed: metrics.rs:960 — "TODO: CPU profiling with enhanced precision - disabled until profiling module is available"
+  - **Approach:** profiling::Profiler confirmed present; Profiler::global() and cpu_efficiency_ratio()/cache_hit_ratio()/simd_utilization_ratio()/vectorization_efficiency() method names not individually verified — verify then populate scirs2_profile as sketched.
+  - **Scope:** small
+  - **Prerequisites:** item 6
+  - **Risk:** low
+
+- [ ] torsh-distributed: metrics.rs:993 — "TODO: Disabled until benchmarking module is available in scirs2_core"
+  - **Approach:** scirs2_core::benchmarking::{BenchmarkRunner, BenchmarkSuite} confirmed present in 0.6.0. run_performance_benchmarks() always returns an empty HashMap today (silent no-op) — needs a real benchmark-suite design (which ops to benchmark) plus mapping the actual API.
+  - **Scope:** medium
+  - **Prerequisites:** item 6
+  - **Risk:** low, but currently silently returns empty results.
+
+- [ ] torsh-distributed: metrics.rs:996 — "TODO: benchmarking module not yet available in scirs2_core"
+  - **Approach:** duplicate blocker statement to item 10; resolve together.
+  - **Scope:** small
+  - **Prerequisites:** item 10
+  - **Risk:** low
+
+- [ ] torsh-distributed: metrics.rs:1002 — "TODO: Implement when scirs2_core benchmarking module is available"
+  - **Approach:** same fix as item 10 — the commented-out BenchmarkSuite::new(...) sketch to uncomment/adapt.
+  - **Scope:** small
+  - **Prerequisites:** item 10
+  - **Risk:** low
+
+- [ ] torsh-distributed: metrics.rs:1010 — "TODO: Disabled until observability module is available in scirs2_core"
+  - **Approach:** observability::{audit, tracing} confirmed present. collect_enhanced_metrics() already returns a fully-populated, correct PerformanceMetrics today (calls three real collector methods) — only the tracing span + audit log side-effects are missing. Lowest-impact item in this file.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** very low
+
+- [ ] torsh-distributed: metrics.rs:1013 — "TODO: observability module not yet available in scirs2_core"
+  - **Approach:** subset of item 13.
+  - **Scope:** small
+  - **Prerequisites:** item 13
+  - **Risk:** very low
+
+- [ ] torsh-distributed: metrics.rs:1016 — "TODO: Start enhanced tracing when available"
+  - **Approach:** observability::tracing module exists — add tracing::span!(...) wrap once its API shape is confirmed.
+  - **Scope:** trivial
+  - **Prerequisites:** item 13
+  - **Risk:** very low
+
+- [ ] torsh-distributed: metrics.rs:1023 — "TODO: Create audit trail when observability module is available"
+  - **Approach:** observability::audit module exists — call audit::log_event(...) as sketched, after confirming signature.
+  - **Scope:** small
+  - **Prerequisites:** item 13
+  - **Risk:** very low
+
+- [ ] torsh-distributed: backend.rs:947 — "TODO: Add actual NCCL communicator when bindings are available"
+  - **Approach:** NO real NVIDIA NCCL Rust bindings exist on crates.io (confirmed by the surrounding module's own doc comment). oxicuda-driver has related primitives (multi_gpu.rs, cooperative_launch.rs, nvlink_topology.rs) but no ready-made allreduce/allgather/broadcast collective-comms API. Needs either a new oxicuda collective-comms crate/module (ecosystem cross-project work) or accepting the mock as intentional scope-for-now — whole NcclBackend module is explicitly documented as "Currently uses mock implementations" by design.
+  - **Scope:** oversized
+  - **Prerequisites:** new NCCL-equivalent Rust bindings (don't exist)
+  - **Risk:** n/a — intentionally mocked today. Status: tracked_external.
+
+- [ ] torsh-distributed: backend.rs:955 — "TODO: Validate CUDA device exists and is accessible"
+  - **Approach:** smaller than item 17 but still cross-crate — torsh-distributed currently has ZERO CUDA/oxicuda dependency in Cargo.toml at all; the nccl feature is deliberately dependency-free today. Fix means adding oxicuda-driver as a new optional dependency gated behind nccl (or a new cuda feature) and calling its device-count/device-info query to bounds-check device_id in NcclBackend::new().
+  - **Scope:** medium
+  - **Prerequisites:** add oxicuda-driver dependency (architecture decision, not just a code fix)
+  - **Risk:** n/a. Status: tracked_external.
+
+**Side observation (not an actionable item, just noted):** both tensor_parallel.rs and metrics.rs carry a file-level `#![allow(dead_code)]` ("Framework infrastructure - components designed for future use"), which is why half-wired branches like the discarded `_use_mapping` flag don't trip the no-warnings policy on their own — worth knowing since dead-code lint won't surface these organically.

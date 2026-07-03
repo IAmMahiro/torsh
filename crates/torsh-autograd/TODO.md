@@ -469,3 +469,47 @@ The autograd crate provides a comprehensive automatic differentiation system wit
 - [ ] Document autograd numerical accuracy and stability properties
 - [ ] Add certification for safety-critical autograd applications
 - [ ] Implement autograd reproducibility standards
+
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+- [ ] torsh-autograd: grad_mode.rs:668 — "TODO: Implement proper gradient clipping when scirs2 integration is ready"
+  - **Approach:** STALE self-referential blocker — whole clip module is wrapped in a disabled block; both claimed blockers (torsh_tensor::Tensor, crate::AutogradTensor) are pervasively used elsewhere in this same crate today. A parallel clip_grad_norm/clip_grad_value already lives at lib.rs:632-710 using plain arithmetic, proving no scirs2 API was ever required. Port grad_mode.rs's Tensor-slice signature using existing Tensor arithmetic — note even the lib.rs analog never applies the computed scale, so this needs finishing properly, not just porting.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** low — pure numeric function; watch for API duplication/confusion with the lib.rs version.
+
+- [ ] torsh-autograd: grad_mode.rs:678 — "TODO: Implement proper gradient clipping when scirs2 integration is ready"
+  - **Approach:** same disabled block, clip_grad_value case — trivial elementwise clamp over Tensor data using existing arithmetic.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** low.
+
+- [ ] torsh-autograd: blas_integration.rs:704 — "TODO: Register other BLAS providers when available"
+  - **Approach:** register_providers() only inserts PureRustBlasProvider today; BlasImplementation enum + BlasProvider trait scaffolding already support more variants. Add an OxiBLAS-backed provider (routing through already-integrated scirs2-core) rather than the comment's literal MKL/OpenBLAS suggestion, which CONFLICTS with the no-OpenBLAS policy — reword/reinterpret this TODO, don't implement it literally.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** medium — must not violate no-OpenBLAS policy; wrong provider selection could silently change numerics/perf. POLICY NOTE: do not add MKL/OpenBLAS providers under any circumstances.
+
+- [ ] torsh-autograd: hyperparameter_optimization.rs:284 — "TODO: Implement second-order gradient computation when autograd API is available"
+  - **Approach:** first-order autograd is now genuinely available (see the already-fixed items 250/273 in this file). higher_order_gradients.rs has the right API surface (compute_hessian, hessian_vector_product) but every method is itself an explicit zero-filled placeholder — needs real double-backward/forward-over-reverse work, not just a wiring change.
+  - **Scope:** large
+  - **Prerequisites:** real Hessian-vector-product implementation in higher_order_gradients.rs
+  - **Risk:** HIGH — Hessian-vector-product correctness is subtle; second_order:true is the DEFAULT config, so this stub is on the default path even after the first-order fix lands. Recommend a dedicated future pass.
+
+- [ ] torsh-autograd: context/gradient_functions.rs:9 — "TODO(oxicuda-backward-ops) — planned upstream addition"
+  - **Approach:** positively verified still missing in oxicuda-backend 0.4.0 (pinned): UnaryOp only has {Relu,Sigmoid,Tanh,Exp,Log,Sqrt,Abs,Neg}; ComputeBackend has forward unary() only, no generic backward dispatch, no Gelu/Silu/parameterized LeakyRelu variants. Root TODO.md already tracks this under "DEFERRED / follow-up" pending upstream oxicuda work.
+  - **Scope:** medium
+  - **Prerequisites:** oxicuda-backend generic elementwise/activation backward dispatch (upstream, not yet available)
+  - **Risk:** low — GPU-offload perf gap only; CPU fallback path is complete and correct meanwhile. Status: tracked_external.
+
+- [ ] torsh-autograd: context/gradient_functions.rs:85 — "TODO(oxicuda-backward-ops)"
+  - **Approach:** cross-reference to item 5. The surrounding ReLUGradient::backward CPU implementation is complete and correct; only optional GPU dispatch is deferred.
+  - **Scope:** trivial
+  - **Prerequisites:** same as item 5
+  - **Risk:** low. Status: tracked_external.
+
+- [ ] torsh-autograd: scirs2_integration.rs:142 — "TODO: Re-enable when SciRS2 API is stabilized"
+  - **Approach:** STALE — this file already imports/uses a newer working API (scirs2_autograd::{SafeVariable, SafeVariableEnvironment}, high_performance::{simd_backward_pass, ultra_backward_pass}) 120 lines above, with an explicit "RESOLVED" comment, and SciRS2AutogradAdapter already holds a populated variable_env. The stale TODO'd code instead references a dead import path (scirs2::autograd::VariableEnvironment — the crate is actually named scirs2_autograd). Implement create_scirs2_tensor using the already-wired self.variable_env/SafeVariable instead of falling to create_fallback_tensor.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** low-medium — needs care around interior mutability/thread-safety reusing the shared Arc<SafeVariableEnvironment> across calls. Adjacent non-blocking finding: verify_api_compatibility() hardcodes a fake version string, worth a separate cleanup note.

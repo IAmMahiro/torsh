@@ -259,11 +259,13 @@ impl TensorElement for f16 {
     }
 }
 
-// TODO: f16 FloatElement implementation requires scirs2_core::Float trait implementation for half::f16
-// This will be available when scirs2-core adds Float trait support for f16/bf16 types
-// For now, f16 tensors can be created but may have limited Float-based operations
-// Uncomment when scirs2-core 0.1.1+ provides Float impl for f16
-/*
+/// `FloatElement` implementation for f16 (half precision)
+///
+/// `scirs2_core::numeric::Float` is a re-export of `num_traits::float::Float`,
+/// which `half::f16` implements when the `half` crate's `num-traits` feature is
+/// enabled (see the `half` dependency in this crate's Cargo.toml). That satisfies
+/// the `FloatElement: TensorElement + Float` supertrait bound; the methods below
+/// otherwise just forward to f16's own unconditional inherent consts/methods.
 impl FloatElement for f16 {
     fn epsilon() -> Self {
         f16::EPSILON
@@ -293,7 +295,6 @@ impl FloatElement for f16 {
         f16::NAN
     }
 }
-*/
 
 /// Custom implementation for bf16 (brain floating point)
 impl TensorElement for bf16 {
@@ -326,11 +327,13 @@ impl TensorElement for bf16 {
     }
 }
 
-// TODO: bf16 FloatElement implementation requires scirs2_core::Float trait implementation for half::bf16
-// This will be available when scirs2-core adds Float trait support for f16/bf16 types
-// For now, bf16 tensors can be created but may have limited Float-based operations
-// Uncomment when scirs2-core 0.1.1+ provides Float impl for bf16
-/*
+/// `FloatElement` implementation for bf16 (brain floating point)
+///
+/// `scirs2_core::numeric::Float` is a re-export of `num_traits::float::Float`,
+/// which `half::bf16` implements when the `half` crate's `num-traits` feature is
+/// enabled (see the `half` dependency in this crate's Cargo.toml). That satisfies
+/// the `FloatElement: TensorElement + Float` supertrait bound; the methods below
+/// otherwise just forward to bf16's own unconditional inherent consts/methods.
 impl FloatElement for bf16 {
     fn epsilon() -> Self {
         bf16::EPSILON
@@ -360,7 +363,6 @@ impl FloatElement for bf16 {
         bf16::NAN
     }
 }
-*/
 
 /// Type aliases for complex numbers
 pub type Complex32 = Complex<f32>;

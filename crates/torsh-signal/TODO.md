@@ -312,3 +312,11 @@
 - Complete wavelet families
 - Professional filtering and resampling
 - **118/118 tests passing** (100% pass rate)
+
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+- [ ] torsh-signal: performance.rs:14 — "TODO: Enable when scirs2-core parallel ops API is stable"
+  - **Approach:** commented-out imports only; module currently does no SIMD/parallel work at all. Re-check scirs2-core::simd_ops::SimdUnifiedOps / parallel_ops API surface (now at 0.6.0, likely stable), then uncomment and wire into SIMDSignalProcessor.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** low — purely a missed-optimization stub, not a correctness gap. Struct/enum scaffolding (SIMDSignalProcessor, OptimizationLevel) already exists unused.

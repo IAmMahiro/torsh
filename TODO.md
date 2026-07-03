@@ -1502,3 +1502,41 @@ These are gated on unbuilt/unstable upstream APIs (chiefly `scirs2-core` GPU / p
 - crates/torsh-nn/src/hardware_opts.rs:354,372,376,406,410,440,444 — AVX-512/AVX2/NEON tiled matmul via scirs2_core::simd_ops not exposed.
 - crates/torsh-functional/src/profiling/{core.rs:203,regression.rs:149} — CPU-utilization / memory detection need scirs2 profiling.
 - crates/torsh-python/src/tensor/core.rs:998 — full norm_lp blocked on ops module exposure (p/dim/keepdim currently ignored).
+
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+- [ ] crates/torsh/src/lib.rs: crates/torsh/src/lib.rs:176 — TODO: Implement ShapeBuilder when available
+  - **Approach:** torsh_core::shape::ShapeBuilder does NOT exist anywhere in torsh-core/src (confirmed via direct grep and git log -S search across history — no hits). It genuinely needs to be implemented, not just re-exported. BONUS finding: crates/torsh-core/fuzz/fuzz_targets/fuzz_shape_creation.rs ALREADY references torsh_core::shape::{Shape, ShapeBuilder} and calls ShapeBuilder::new() — this fuzz target would fail `cargo fuzz build` today. Implementing ShapeBuilder in torsh-core fixes both this TODO and that fuzz target simultaneously.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** Low — currently just an inert comment; risk is the fuzz target silently bit-rotting since fuzz crates are typically excluded from normal workspace builds/CI.
+
+- [ ] crates/torsh/src/lib.rs: crates/torsh/src/lib.rs:552 — TODO: Re-enable when tensor ops module is available
+  - **Approach:** NEEDS_CLARIFICATION — stated reason is stale (torsh_tensor::ops confirmed to exist now: real module directory ops/manipulation/{dim_ops,core_ops}.rs, ops/simd/f32_ops.rs, plus an ops.rs.backup showing it was refactored from a single file). The LIKELY REAL blocker (unstated in the comment) is glob-import ambiguity: the very next block re-exports crate::nn::functional::* under #[cfg(feature="nn")], and an adjacent comment explicitly says explicit PascalCase aliases were added "to avoid ambiguous glob imports" with nn::functional's lowercase names (relu, sigmoid, etc.) — re-enabling `pub use crate::tensor::ops::*;` as a second unscoped glob would likely reintroduce that collision. Needs a maintainer decision: re-export tensor::ops with an explicit/aliased list (not a glob) to dodge the collision, or update the comment to state the real (collision) reason and leave permanently disabled by design.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** Low — inert comment today; main risk is that "when tensor ops module is available" reads as an open blocker to future contributors when the module has in fact been available for a while.
+
+- [ ] examples/distributed_gradient_sync.rs: examples/distributed_gradient_sync.rs:187 — TODO: Backward pass would go here when autograd is fully integrated
+  - **Approach:** LIKELY STALE — Tensor::backward() is confirmed fully implemented and documented (torsh-tensor core_ops/types.rs:1448). DDP-specific autograd wiring (whether ddp.forward()'s output stays on the tracked graph through to loss.mean()) was NOT independently re-verified — needs a quick re-test rather than being assumed still-blocked. Example currently fabricates fake gradients via randn() instead of calling the commented-out loss.backward()?. Try re-enabling now that Tensor::backward() exists; if it works, delete the fake-gradient workaround.
+  - **Scope:** small
+  - **Prerequisites:** none (verify DDP autograd wiring first)
+  - **Risk:** Low — example-only code, no library impact. Misleading to readers if left stale.
+
+- [ ] examples/gradient_checkpointing.rs: examples/gradient_checkpointing.rs:6 — TODO: Re-enable when checkpoint functions are properly exported
+  - **Approach:** STALE reasoning, but not simply an "export" fix — confirmed NONE of the referenced free functions (auto_checkpoint_sequence, checkpoint, checkpoint_sequential, configure_checkpointing_with_strategy, get_checkpoint_memory_stats) exist anywhere in torsh-autograd under those names. The module was redesigned: torsh-autograd/src/checkpoint_scheduler.rs now provides a struct-based API (CheckpointScheduler, IntegratedCheckpointScheduler, CheckpointConfig, and a CheckpointStrategy enum that does still exist) with methods like record_operation/force_checkpoint/get_stats/process_operation instead of free functions. This isn't a missing pub-use — the whole example needs PORTING to the new API shape.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** Low (example-only), but misleading to a future maintainer who might just try uncommenting the use block and find it doesn't compile.
+
+- [ ] examples/gradient_checkpointing.rs: examples/gradient_checkpointing.rs:22 — TODO: Re-enable when checkpoint functions are properly exported
+  - **Approach:** Duplicate marker for the same large commented-out block as the item above (examples 1-4 in that file, lines ~24-39) — not a separate piece of work, resolve together.
+  - **Scope:** medium
+  - **Prerequisites:** examples/gradient_checkpointing.rs:6 (same commented-out block)
+  - **Risk:** Low — example-only.
+
+- [ ] examples/gradient_checkpointing.rs: examples/gradient_checkpointing.rs:170 — // let stats = get_checkpoint_memory_stats();
+  - **Approach:** Same root cause as examples/gradient_checkpointing.rs:6 — get_checkpoint_memory_stats() doesn't exist; nearest equivalent is CheckpointScheduler::get_stats()/IntegratedCheckpointScheduler::stats(). memory_statistics_example() currently hardcodes all-zero output (0,0,0,0.0) instead of calling any real stats API. Part of the same example-porting task.
+  - **Scope:** medium
+  - **Prerequisites:** examples/gradient_checkpointing.rs:6 (same commented-out block)
+  - **Risk:** Low — example-only; prints fake zeros which could mislead a reader into thinking checkpointing has no measurable effect.

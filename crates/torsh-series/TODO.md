@@ -338,3 +338,29 @@
 - ✅ scirs2-signal: Complete wavelet analysis
 - ✅ scirs2-core: Linear algebra, interpolation, random generation
 - ✅ Module structure: Clean exports and comprehensive documentation
+
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+- [ ] torsh-series: frequency/mod.rs:122 — "TODO: Use scirs2-signal FFT when available"
+  - **Approach:** STALE — scirs2-fft (a dependency of scirs2-signal itself, built on the COOLJAPAN oxifft backend) already exports a full fft/ifft/fft2/fftn/rfft/dct/dst API at its crate root. torsh-series depends on scirs2-signal but not directly on scirs2-fft. fft() currently calls self.naive_dft() — an O(n^2) nested-loop DFT (correctness-wise fine, perf-wise slow). Swap in scirs2-fft (add direct dep or use scirs2-signal's re-export if present) for O(n log n).
+  - **Scope:** medium
+  - **Prerequisites:** possibly add scirs2-fft as a direct dependency
+  - **Risk:** low correctness risk, real performance risk for large series; blocks fixing items 2 and 3 which reuse this path.
+
+- [ ] torsh-series: frequency/mod.rs:141 — "TODO: Use scirs2-signal IFFT when available"
+  - **Approach:** STALE, same as item 1 — scirs2-fft exports ifft/ifft2/ifftn directly. ifft() implements its own O(n^2) inverse DFT loop.
+  - **Scope:** medium
+  - **Prerequisites:** item 1
+  - **Risk:** low correctness / real performance risk, same as item 1.
+
+- [ ] torsh-series: frequency/mod.rs:434 — "TODO: Use scirs2-signal cross-spectral density when available"
+  - **Approach:** STALE — scirs2-signal::parallel_spectral::cross_spectral_density_matrix confirmed to exist and could be called directly instead of hand-rolling coherence from two independent FFT calls. coherence() currently calls the naive FFTAnalyzer twice and computes magnitude-squared coherence manually.
+  - **Scope:** small
+  - **Prerequisites:** items 1-2, or could call cross_spectral_density_matrix directly for a bigger win
+  - **Risk:** low — functionally correct today, just slow and duplicative.
+
+- [ ] torsh-series: forecast/deep.rs:124 — "TODO: Implement training loop when full autograd system is available"
+  - **Approach:** PARTIALLY STALE — Tensor::backward() is confirmed fully implemented (torsh-tensor core_ops/types.rs:1448) with working doctests. The autograd PRIMITIVE the comment blames is ready; what's actually missing is the application-level training loop itself (sequence batching, MSE loss, optimizer step, epoch iteration) — real substantial code never written. fit() is a completely empty function body (all params underscore-prefixed/unused) with a comment listing the 5 steps it should perform.
+  - **Scope:** oversized
+  - **Prerequisites:** none (Tensor::backward() already available) — this is pure application-level work, not blocked
+  - **Risk:** HIGH-VISIBILITY GAP — DeepForecast-style models are unusable for training (only forecast() with pre-set/untrained weights works); silent no-op (doesn't error) could mislead a caller into thinking training happened. Recommend flagging prominently in any user-facing docs until implemented.

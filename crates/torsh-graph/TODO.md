@@ -690,3 +690,11 @@
 5. **Continuous-Time Networks** for dynamic graph modeling
 
 Ready for deployment in production and research with **world-class** capabilities across ALL graph neural network domains including classical GNNs, foundation models, quantum computing, neuromorphic processing, geometric deep learning, spectral methods, generative modeling, optimal transport, network pruning, and temporal dynamics.
+
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+- [ ] torsh-graph: data.rs:67 — TODO: Implement when scirs2_graph API is stable
+  - **Approach:** STALE — scirs2-graph's own lib.rs explicitly comments "Core graph types - stable for 1.0" immediately above `pub use base::{..., Graph, ...}`. torsh-graph already has two dedicated integration files (scirs2_integration.rs, enhanced_scirs2_integration.rs) proving scirs2-graph integration is already happening elsewhere in this crate. from_scirs2_graph() is fully commented out (not even compiled) inside `pub mod converters`. Should be straightforward now, following the pattern already established in the crate's own scirs2_integration.rs/enhanced_scirs2_integration.rs files.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** Low — dead comment currently, not reachable code; only risk is the module looking incomplete/lower parity vs. from_edge_list() which is fully implemented right below it.

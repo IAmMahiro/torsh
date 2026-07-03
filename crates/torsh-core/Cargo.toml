@@ -33,7 +33,7 @@ num-complex = { workspace = true } # INTERNAL dtype implementation only
 num_cpus = ">=1.15.0, <2.0.0"  # Constrained version for stability
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
-half = { workspace = true }
+half = { workspace = true, features = ["num-traits"] }
 memmap2 = { workspace = true }
 
 # Serialization (optional)

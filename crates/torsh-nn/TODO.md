@@ -1976,3 +1976,71 @@ The torsh-nn crate has achieved **full production-ready status** with:
 - **Advanced Features**: All advanced features (quantization, research components, export systems) working correctly
 
 This session represents the **successful completion** of the torsh-nn neural network framework with a fully functional, production-ready implementation validated through comprehensive testing.
+
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+- [ ] torsh-nn: hardware_opts.rs:354 — "TODO: Use actual GPU kernel through scirs2_core::gpu"
+  - **Approach:** comment's literal target is stale/abandoned workspace-wide; real blocker is torsh-tensor's CudaBackend::gemm hard-returning Unsupported. Once that lands (see torsh-tensor TODO), forward_gpu just calls the same functional::linear() the generic path uses.
+  - **Scope:** large
+  - **Prerequisites:** torsh-tensor CudaBackend::gemm real implementation
+  - **Risk:** low to leave as-is (fallback correct, just unaccelerated). Status: tracked_external.
+
+- [ ] torsh-nn: hardware_opts.rs:372 — "TODO: Use scirs2_core::simd_ops::SimdUnifiedOps for AVX-512 intrinsics"
+  - **Approach:** SimdUnifiedOps already proven elsewhere in torsh-tensor (simd_ops_f32.rs). forward_avx512 currently just calls input.matmul(&weight) identically to forward_generic — pure no-op branch. Implement 16-lane tiled matmul via simd_dot/simd_mul_into/simd_add_into.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** moderate — numeric-parity vs generic path, remainder handling; branch is dead by default (simd feature off).
+
+- [ ] torsh-nn: hardware_opts.rs:376 — "TODO: Implement tiled matmul with AVX-512 intrinsics through scirs2"
+  - **Approach:** same stub block as item 2 (forward_avx512); resolve together as one function-level change.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** same as item 2.
+
+- [ ] torsh-nn: hardware_opts.rs:406 — "TODO: Use scirs2_core::simd_ops::SimdUnifiedOps for AVX2 intrinsics"
+  - **Approach:** forward_avx2 falls through to input.matmul(&weight), same as generic. Implement 8-lane tiled matmul via SimdUnifiedOps.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** moderate — same caveats as AVX-512 case; dead by default.
+
+- [ ] torsh-nn: hardware_opts.rs:410 — "TODO: Implement tiled matmul with AVX2 intrinsics through scirs2"
+  - **Approach:** same stub block as item 4; resolve together.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** same as item 4.
+
+- [ ] torsh-nn: hardware_opts.rs:440 — "TODO: Use scirs2_core::simd_ops::SimdUnifiedOps for NEON intrinsics"
+  - **Approach:** forward_neon falls through to input.matmul(&weight), same as generic. Implement 4-lane tiled matmul via SimdUnifiedOps.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** moderate; dead by default.
+
+- [ ] torsh-nn: hardware_opts.rs:444 — "TODO: Implement tiled matmul with NEON intrinsics through scirs2"
+  - **Approach:** same stub block as item 6; resolve together.
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** same as item 6.
+
+- [ ] torsh-nn: tests/integration_tests.rs:175 — "TODO: TransformerDecoderLayer is not yet implemented"
+  - **Approach:** confirmed genuinely absent from torsh-nn's transformer.rs (only task-specific decoders exist elsewhere). All primitives (MHA, FFN, LayerNorm, residual wiring) proven via the fully-implemented TransformerEncoderLayer in the same file — build masked self-attn + cross-attn + FFN following that pattern.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** medium — causal-mask/cross-attention wiring easy to get subtly wrong; the containing test is already #[ignore] for an unrelated reason so this alone won't un-ignore it.
+
+- [ ] torsh-nn: tests/integration_tests.rs:489 — "TODO: Add mixed precision tests when AutocastModel is available"
+  - **Approach:** STALE blocker — AutocastModel already fully implemented (mixed_precision.rs:180) and unit-tested. Wrap linear in AutocastModel::with_default_config and assert shape parity.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** low — functionality already covered by its own unit test, this just closes an integration-coverage gap.
+
+- [ ] torsh-nn: tests/integration_tests.rs:490 — "TODO: Add quantization tests when QAT layers are available"
+  - **Approach:** STALE blocker — QAT layers (FakeQuantize, QuantizedInferenceModel, QuantizationAwareTraining) already exist with 9 passing unit tests in quantization/qat.rs. Add an integration test mirroring those.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** low.
+
+- [ ] torsh-nn: tests/integration_tests.rs:521 — "TODO: Add backward pass testing when autograd is fully integrated"
+  - **Approach:** NOT stale — verified via gradcheck.rs's own test which documents that module-parameter gradcheck currently fails with an explicit "autograd not wired" error. Raw tensor-level backward() works, but Parameter objects aren't confirmed hooked into the same graph. Needs wiring Parameter's underlying Tensor into the autograd context before this test can add loss.backward()+assert grads.
+  - **Scope:** medium
+  - **Prerequisites:** Parameter<->autograd-graph wiring (internal gap)
+  - **Risk:** medium-high — crate-wide autograd-correctness surface; cross-check against the fully-#[ignore]'d gradient_tests.rs suite (9 tests). Status: tracked_external (internal gap, not upstream-blocked).

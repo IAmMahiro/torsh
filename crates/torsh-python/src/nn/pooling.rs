@@ -512,7 +512,10 @@ pub struct PyAdaptiveMaxPool2d {
 #[pymethods]
 impl PyAdaptiveMaxPool2d {
     #[new]
-    fn new(output_size: Py<PyAny>, return_indices: Option<bool>) -> PyResult<PyClassInitializer<Self>> {
+    fn new(
+        output_size: Py<PyAny>,
+        return_indices: Option<bool>,
+    ) -> PyResult<PyClassInitializer<Self>> {
         // Parse output size
         let output_size = Python::attach(|py| -> PyResult<(usize, usize)> {
             if let Ok(size) = output_size.extract::<usize>(py) {
