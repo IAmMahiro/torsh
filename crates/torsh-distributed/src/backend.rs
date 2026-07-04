@@ -624,6 +624,7 @@ impl BackendFactory for MockBackendFactory {
 mod mpi_backend {
     use super::*;
     use mpi::topology::Communicator;
+    use mpi::traits::CommunicatorCollectives;
     use tracing::info;
 
     pub struct MpiBackend {
@@ -715,9 +716,8 @@ mod mpi_backend {
                 ));
             }
 
-            // TODO: MPI barrier - method not available in current mpi crate version
-            // self.world.barrier();
-            info!("MPI barrier (mock - not implemented)");
+            self.world.barrier();
+            info!("MPI barrier completed (rank {})", self.rank());
             Ok(())
         }
 
@@ -918,6 +918,23 @@ mod mpi_backend {
 
         fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
             self
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // NOTE: `mpi::initialize()` can only succeed once per OS process, so
+        // this crate must contain exactly one test that constructs an
+        // `MpiBackend`. MPICH's singleton init means this works even when
+        // run directly (without `mpirun`), creating a size-1 world.
+        #[tokio::test]
+        async fn test_mpi_barrier_returns_ok() -> TorshResult<()> {
+            let mut backend = MpiBackend::new()?;
+            backend.init(BackendConfig::default()).await?;
+            backend.barrier().await?;
+            Ok(())
         }
     }
 }

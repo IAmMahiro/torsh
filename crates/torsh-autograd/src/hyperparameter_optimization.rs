@@ -161,7 +161,8 @@ impl HyperparameterOptimizer {
         let objective_value = objective.item()? as f64;
 
         // Compute gradients with respect to hyperparameters
-        let gradients = self.compute_hyperparameter_gradients(&objective)?;
+        let gradients =
+            self.compute_hyperparameter_gradients(&objective, &objective_fn, &current_values)?;
 
         // Update hyperparameters using gradients
         self.update_hyperparameters(&gradients)?;
@@ -238,24 +239,27 @@ impl HyperparameterOptimizer {
     }
 
     /// Compute gradients with respect to hyperparameters
-    fn compute_hyperparameter_gradients(
+    fn compute_hyperparameter_gradients<F>(
         &self,
         objective: &Tensor,
-    ) -> Result<HashMap<String, Tensor>> {
+        objective_fn: &F,
+        current_values: &HashMap<String, f64>,
+    ) -> Result<HashMap<String, Tensor>>
+    where
+        F: Fn(&HashMap<String, f64>) -> Result<Tensor>,
+    {
         let mut gradients = HashMap::new();
 
         for (name, hyperparam) in &self.hyperparameters {
-            // Create computation graph for this hyperparameter
-            let param_with_grad = hyperparam.value.clone();
-            // TODO: Implement gradient computation when autograd API is available
-
-            // Compute gradient using automatic differentiation
             let grad = if self.config.second_order {
-                // Second-order gradient computation
+                // Second-order gradient computation (Hessian-vector product).
+                // Not yet implemented; tracked separately from this fix (see
+                // `compute_second_order_gradient` and `higher_order_gradients.rs`).
+                let param_with_grad = hyperparam.value.clone();
                 self.compute_second_order_gradient(objective, &param_with_grad)?
             } else {
-                // First-order gradient computation
-                self.compute_first_order_gradient(objective, &param_with_grad)?
+                // First-order gradient via central finite differences.
+                self.compute_first_order_gradient(objective_fn, current_values, name, hyperparam)?
             };
 
             gradients.insert(name.clone(), grad);
@@ -264,15 +268,66 @@ impl HyperparameterOptimizer {
         Ok(gradients)
     }
 
-    /// Compute first-order gradient
-    fn compute_first_order_gradient(
+    /// Compute the first-order gradient of the objective with respect to a
+    /// single hyperparameter using central finite differences.
+    ///
+    /// `objective_fn` only exposes the objective as a black-box function of
+    /// concrete hyperparameter values (`&HashMap<String, f64> -> Tensor`): the
+    /// values it receives are plain `f64`s extracted via
+    /// `OptimizableHyperparameter::get_value`, fully detached from any
+    /// computation graph. That means there is no recorded tape for
+    /// `self.context` (`AutogradContext`) -- or for the tensor's own
+    /// `requires_grad` tape -- to run reverse-mode differentiation through, no
+    /// matter how the objective is invoked. Central finite differences is the
+    /// principled technique for differentiating exactly this kind of
+    /// black-box scalar objective; it is not a placeholder, it is the same
+    /// numerical method this crate already trusts as a reference oracle for
+    /// gradient checking elsewhere (see `gradient_checking.rs`).
+    ///
+    /// The difference is taken on the *raw* hyperparameter tensor value
+    /// (`hyperparam.value`, pre-`exp` for log-scale parameters) because that
+    /// is the quantity `update_hyperparameters` actually updates. For
+    /// log-scale hyperparameters we re-apply the same `exp` transform used by
+    /// `OptimizableHyperparameter::get_value` before invoking `objective_fn`,
+    /// so the chain rule through the log transform falls out automatically.
+    fn compute_first_order_gradient<F>(
         &self,
-        _objective: &Tensor,
-        parameter: &Tensor,
-    ) -> Result<Tensor> {
-        // TODO: Use automatic differentiation to compute gradient when backward_single is available
-        // For now, return zeros as placeholder
-        Ok(Tensor::zeros_like(parameter)?)
+        objective_fn: &F,
+        current_values: &HashMap<String, f64>,
+        name: &str,
+        hyperparam: &OptimizableHyperparameter,
+    ) -> Result<Tensor>
+    where
+        F: Fn(&HashMap<String, f64>) -> Result<Tensor>,
+    {
+        let raw_value = hyperparam.value.item()? as f64;
+        let step = Self::finite_difference_step(raw_value);
+
+        let evaluate_at = |raw: f64| -> Result<f64> {
+            let actual_value = if hyperparam.log_scale { raw.exp() } else { raw };
+            let mut perturbed = current_values.clone();
+            perturbed.insert(name.to_string(), actual_value);
+            Ok(objective_fn(&perturbed)?.item()? as f64)
+        };
+
+        let objective_plus = evaluate_at(raw_value + step)?;
+        let objective_minus = evaluate_at(raw_value - step)?;
+        let gradient = (objective_plus - objective_minus) / (2.0 * step);
+
+        Tensor::scalar(gradient as f32)
+    }
+
+    /// Adaptive step size for central-difference numerical differentiation.
+    ///
+    /// Uses a relative step (scaled by the magnitude of the evaluation point,
+    /// floored at `1.0` so the step stays well-defined near zero) sized to
+    /// `f32::EPSILON.cbrt()`. Hyperparameter values round-trip through
+    /// `f32`-backed `Tensor`s here, so a step much smaller than that would be
+    /// swallowed by `f32` rounding noise when `objective_fn` casts its result
+    /// down to `f32`, while a much larger step would introduce unnecessary
+    /// truncation error for non-quadratic objectives.
+    fn finite_difference_step(x: f64) -> f64 {
+        (f32::EPSILON as f64).cbrt() * x.abs().max(1.0)
     }
 
     /// Compute second-order gradient (for more accurate optimization)
@@ -452,5 +507,90 @@ mod tests {
         let optimizer = HyperparameterOptimizer::for_learning_rate(0.01, None).unwrap();
         let lr = optimizer.get_hyperparameter("learning_rate").unwrap();
         assert!((lr - 0.01).abs() < 1e-6);
+    }
+
+    /// Regression test for the "no-op optimizer" bug: `compute_first_order_gradient`
+    /// used to unconditionally return `Tensor::zeros_like(...)`, so gradient
+    /// descent never moved the hyperparameter no matter how far it was from the
+    /// optimum. This must fail against that stub (the parameter never moves,
+    /// so `x_after == x_before` and neither assertion below can hold) and pass
+    /// once `compute_first_order_gradient` returns a real gradient.
+    #[test]
+    fn test_first_order_gradient_moves_toward_minimum() {
+        // Minimize f(x) = (x - 5)^2, whose unique minimum is x = 5.
+        fn objective(values: &HashMap<String, f64>) -> Result<Tensor> {
+            let x = values["x"];
+            Tensor::scalar(((x - 5.0) * (x - 5.0)) as f32)
+        }
+
+        let config = HyperparameterConfig {
+            meta_learning_rate: 0.1,
+            max_steps: 1,
+            tolerance: 1e-6,
+            second_order: false,
+            validation_frequency: 1,
+            early_stopping_patience: 50,
+        };
+
+        let mut optimizer = HyperparameterOptimizer::new(config);
+        optimizer.add_hyperparameter(
+            OptimizableHyperparameter::new("x".to_string(), 0.0, None, None, false).unwrap(),
+        );
+
+        let x_before = optimizer.get_hyperparameter("x").unwrap();
+        assert!((x_before - 0.0).abs() < 1e-6);
+
+        for _ in 0..20 {
+            optimizer.step(objective).unwrap();
+        }
+
+        let x_after = optimizer.get_hyperparameter("x").unwrap();
+
+        // The parameter must have moved strictly closer to the true minimum.
+        assert!(
+            (x_after - 5.0).abs() < (x_before - 5.0).abs(),
+            "expected x to move toward the minimum at 5.0 (from {x_before}), got {x_after}"
+        );
+        // 20 gradient-descent steps on a well-conditioned convex quadratic
+        // should land close to the minimum, not just move a little.
+        assert!(
+            (x_after - 5.0).abs() < 0.5,
+            "expected x to converge near the minimum 5.0 after 20 steps, got {x_after}"
+        );
+    }
+
+    /// `compute_first_order_gradient` is central-difference exact for a
+    /// quadratic objective, so its output should closely match the true
+    /// analytic gradient df/dx = 2(x - 5), not just be "non-zero".
+    #[test]
+    fn test_first_order_gradient_matches_analytic_gradient() {
+        fn objective(values: &HashMap<String, f64>) -> Result<Tensor> {
+            let x = values["x"];
+            Tensor::scalar(((x - 5.0) * (x - 5.0)) as f32)
+        }
+
+        let config = HyperparameterConfig {
+            second_order: false,
+            ..HyperparameterConfig::default()
+        };
+        let mut optimizer = HyperparameterOptimizer::new(config);
+        optimizer.add_hyperparameter(
+            OptimizableHyperparameter::new("x".to_string(), 0.0, None, None, false).unwrap(),
+        );
+
+        let current_values = optimizer.get_current_values().unwrap();
+        let objective_tensor = objective(&current_values).unwrap();
+        let gradients = optimizer
+            .compute_hyperparameter_gradients(&objective_tensor, &objective, &current_values)
+            .unwrap();
+
+        let grad_x = gradients["x"].item().unwrap() as f64;
+
+        // Analytic gradient at x = 0 is 2 * (0 - 5) = -10.
+        assert!(
+            (grad_x - (-10.0)).abs() < 1e-2,
+            "expected gradient close to -10.0, got {grad_x}"
+        );
+        assert!(grad_x.abs() > 1e-6, "gradient must not be (near-)zero");
     }
 }

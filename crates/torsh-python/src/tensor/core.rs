@@ -987,16 +987,42 @@ impl PyTensor {
     }
 
     /// Norm calculation
+    ///
+    /// Computes the p-norm of the tensor. `p` defaults to `2.0` (Euclidean
+    /// norm), matching PyTorch's `Tensor.norm()`. When `dim` is given, the
+    /// norm is computed along those dimensions instead of over the whole
+    /// tensor; negative dimensions are supported. `keepdim` controls whether
+    /// the reduced dimensions are kept (with size 1) or removed.
+    #[pyo3(signature = (p=None, dim=None, keepdim=None))]
     fn norm(
         &self,
         p: Option<f32>,
-        _dim: Option<Vec<i64>>,
-        _keepdim: Option<bool>,
+        dim: Option<Vec<i64>>,
+        keepdim: Option<bool>,
     ) -> PyResult<PyTensor> {
-        let _p = p.unwrap_or(2.0);
-        // For now, use simple L2 norm regardless of parameters
-        // TODO: Implement full norm_lp functionality when ops module is exposed
-        let result = py_result!(self.tensor.norm())?;
+        let p = f64::from(p.unwrap_or(2.0));
+        let keepdim = keepdim.unwrap_or(false);
+        let ndim = self.tensor.shape().dims().len() as i64;
+
+        let dims: Option<Vec<usize>> = match dim {
+            Some(requested) => {
+                let mut normalized = Vec::with_capacity(requested.len());
+                for d in requested {
+                    let nd = if d < 0 { d + ndim } else { d };
+                    if !(0..ndim).contains(&nd) {
+                        return Err(PyErr::new::<pyo3::exceptions::PyIndexError, _>(format!(
+                            "Dimension {} out of range for tensor with {} dimensions",
+                            d, ndim
+                        )));
+                    }
+                    normalized.push(nd as usize);
+                }
+                Some(normalized)
+            }
+            None => None,
+        };
+
+        let result = py_result!(self.tensor.norm_lp(p, dims.as_deref(), keepdim))?;
         Ok(PyTensor { tensor: result })
     }
 

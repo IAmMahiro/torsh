@@ -403,6 +403,14 @@ impl WebGpuBuffer {
     pub fn descriptor(&self) -> &BufferDescriptor {
         &self.descriptor
     }
+
+    /// Get this buffer as `&dyn Any` for downcasting from trait-object
+    /// contexts. Mirrors the `as_any` convention used elsewhere in this
+    /// crate (e.g. `WebGpuKernel::as_any` in `webgpu::kernels`, and
+    /// `cuda::unified_buffer::BufferTrait::as_any`).
+    pub fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl Drop for WebGpuBuffer {

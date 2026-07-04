@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use numpy::PyArrayDyn;
+use numpy::{IxDyn as NpIxDyn, PyArray1, PyArrayDyn, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 
 /// NumPy data type mapping
@@ -500,104 +500,49 @@ impl NumpyCompat {
     }
 
     /// Convert NumPy array to ToRSh tensor (Python integration)
-    pub fn from_numpy_array(&self, _py_array: &PyArrayDyn<f32>) -> Result<Vec<f32>, String> {
-        // TODO: Fix PyArray compatibility issues
-        // Get array info
-        // let shape = py_array.shape().to_vec();
-        // let strides = py_array.strides().to_vec();
-
-        // Temporary placeholder implementation
-        Ok(vec![])
-
-        // Check if array is contiguous
-        // let is_contiguous = self.is_c_contiguous(&shape, &strides, &NumpyDType::Float32);
-
-        // if is_contiguous {
-        //     // Zero-copy conversion for contiguous arrays
-        //     let data = unsafe { py_array.as_slice() }
-        //         .map_err(|e| format!("Array conversion error: {}", e))?;
-        //     Ok(data.to_vec())
-        // } else {
-        //     // Copy with stride handling for non-contiguous arrays
-        //     let total_elements: usize = shape.iter().product();
-        //     let mut result = Vec::with_capacity(total_elements);
-
-        //     // Implement proper strided copying
-        //     self.copy_strided_array_to_contiguous(py_array, &shape, &strides, &mut result)?;
-
-        //     Ok(result)
-        // }
+    ///
+    /// Mirrors the zero-copy-when-possible strategy used by
+    /// [`crate::tensor::PyTensor::new`]: contiguous arrays are read out via a
+    /// single slice copy, while non-contiguous arrays fall back to iterating
+    /// the stride-aware `ArrayView` (which transparently handles arbitrary
+    /// strides, including negative ones, without any hand-rolled offset
+    /// arithmetic).
+    pub fn from_numpy_array(
+        &self,
+        py_array: &Bound<'_, PyArrayDyn<f32>>,
+    ) -> Result<Vec<f32>, String> {
+        let readonly = py_array.readonly();
+        if readonly.is_c_contiguous() {
+            // Zero-copy path for contiguous arrays
+            readonly
+                .as_slice()
+                .map(|slice| slice.to_vec())
+                .map_err(|e| format!("Array conversion error: {}", e))
+        } else {
+            // Fallback for non-contiguous arrays: ArrayView iteration handles
+            // arbitrary strides for free.
+            Ok(readonly.as_array().iter().copied().collect())
+        }
     }
 
     /// Convert ToRSh tensor to NumPy array (Python integration)
+    ///
+    /// Mirrors [`crate::tensor::PyTensor::to_numpy`]: build a flat 1-D array
+    /// and reshape it to the target dimensionality, which sidesteps the
+    /// `ndarray` version mismatch between this crate and the `numpy` crate's
+    /// vendored version.
     pub fn to_numpy_array(
         &self,
-        _data: &[f32],
-        _shape: &[usize],
+        data: &[f32],
+        shape: &[usize],
     ) -> Result<Py<PyArrayDyn<f32>>, String> {
-        // TODO: Fix PyArray compatibility issues
-        Err("PyArray compatibility not implemented".to_string())
-
-        // Python::attach(|py| {
-        //     let array = PyArrayDyn::from_vec(py, data.to_vec())
-        //         .reshape(shape)
-        //         .map_err(|e| format!("Array creation error: {}", e))?;
-        //     Ok(array.to_owned())
-        // })
-    }
-
-    #[allow(dead_code)]
-    /// Copy strided array data to contiguous layout
-    fn copy_strided_array_to_contiguous(
-        &self,
-        _py_array: &PyArrayDyn<f32>,
-        _shape: &[usize],
-        _strides: &[isize],
-        _result: &mut Vec<f32>,
-    ) -> Result<(), String> {
-        // Get the raw data pointer
-        // let data_ptr = py_array.as_ptr();
-        return Err("PyArray compatibility not implemented".to_string());
-
-        // TODO: Fix PyArray compatibility issues
-        // Calculate total elements
-        // let total_elements: usize = shape.iter().product();
-        // result.reserve(total_elements);
-
-        // Create multi-dimensional index iterator
-        // let mut indices = vec![0usize; shape.len()];
-
-        // for _ in 0..total_elements {
-        //     // Calculate offset in strided layout
-        //     let mut offset = 0isize;
-        //     for (dim_idx, &index) in indices.iter().enumerate() {
-        //         offset += (index as isize) * strides[dim_idx];
-        //     }
-
-        //     // Safely read the element
-        //     let element = unsafe {
-        //         if offset < 0 {
-        //             return Err("Negative stride offset encountered".to_string());
-        //         }
-        //         *data_ptr.offset(offset / std::mem::size_of::<f32>() as isize)
-        //     };
-
-        //     result.push(element);
-
-        //     // Increment indices (like odometer)
-        //     let mut carry = 1;
-        //     for dim in (0..shape.len()).rev() {
-        //         indices[dim] += carry;
-        //         if indices[dim] < shape[dim] {
-        //             carry = 0;
-        //             break;
-        //         } else {
-        //             indices[dim] = 0;
-        //         }
-        //     }
-        // }
-
-        // Ok(())
+        Python::attach(|py| {
+            let array_1d = PyArray1::from_vec(py, data.to_vec());
+            let array_nd = array_1d
+                .reshape(NpIxDyn(shape))
+                .map_err(|e| format!("Array creation error: {}", e))?;
+            Ok(array_nd.unbind())
+        })
     }
 }
 
@@ -873,5 +818,87 @@ mod tests {
             mapping.get("np.reshape"),
             Some(&"tensor.reshape".to_string())
         );
+    }
+
+    /// Compare two `f32` slices elementwise within a small tolerance, rather
+    /// than via `assert_eq!` -- avoids relying on bit-exact float equality
+    /// after a round trip through Python/NumPy.
+    fn assert_f32_slice_approx_eq(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len(), "length mismatch");
+        for (a, e) in actual.iter().zip(expected.iter()) {
+            assert!((a - e).abs() < 1e-5, "{:?} vs {:?}", actual, expected);
+        }
+    }
+
+    #[test]
+    fn test_numpy_array_round_trip_contiguous() {
+        Python::initialize();
+        let compat = NumpyCompat::new();
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let shape = vec![2usize, 3usize];
+
+        let py_array = compat
+            .to_numpy_array(&data, &shape)
+            .expect("to_numpy_array should succeed for a real, non-empty tensor");
+
+        Python::attach(|py| {
+            let bound = py_array.bind(py);
+            assert_eq!(bound.readonly().shape(), shape.as_slice());
+
+            let round_tripped = compat
+                .from_numpy_array(bound)
+                .expect("from_numpy_array should succeed on a contiguous array");
+            assert_f32_slice_approx_eq(&round_tripped, &data);
+        });
+    }
+
+    #[test]
+    fn test_numpy_array_round_trip_non_contiguous() {
+        Python::initialize();
+        let compat = NumpyCompat::new();
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let shape = vec![2usize, 3usize];
+
+        let py_array = compat
+            .to_numpy_array(&data, &shape)
+            .expect("to_numpy_array should succeed for a real, non-empty tensor");
+
+        Python::attach(|py| {
+            let bound = py_array.bind(py);
+
+            // `.T` yields a non-contiguous view over the same underlying
+            // buffer (Fortran-ordered relative to the original), exercising
+            // the strided `ArrayView` fallback path in `from_numpy_array`.
+            let transposed = bound
+                .getattr("T")
+                .expect("transpose attribute access should succeed");
+            let transposed = transposed
+                .cast::<PyArrayDyn<f32>>()
+                .expect("transposed view should still be a float32 array");
+            assert!(!transposed.readonly().is_c_contiguous());
+
+            let round_tripped = compat
+                .from_numpy_array(transposed)
+                .expect("from_numpy_array should succeed on non-contiguous input");
+            // Logical (C-order) traversal of the transpose of
+            // [[1, 2, 3], [4, 5, 6]] is [1, 4, 2, 5, 3, 6].
+            assert_f32_slice_approx_eq(&round_tripped, &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        });
+    }
+
+    #[test]
+    fn test_numpy_array_round_trip_empty_data_still_errors_cleanly() {
+        // A dtype mismatch (e.g. handing in a non-float32 array) must not
+        // silently succeed with wrong/empty data the way the old stub did;
+        // it should fail the `.cast::<PyArrayDyn<f32>>()` step instead.
+        Python::initialize();
+        Python::attach(|py| {
+            let int_array = PyArray1::<i64>::from_vec(py, vec![1, 2, 3]);
+            let cast_result = int_array.cast::<PyArrayDyn<f32>>();
+            assert!(
+                cast_result.is_err(),
+                "an int64 array must not be castable to a float32 array view"
+            );
+        });
     }
 }

@@ -915,6 +915,190 @@ where
         // Return scalar tensor (1-element tensor with shape [])
         Tensor::from_data(vec![norm_value], vec![], self.device())
     }
+
+    /// Computes the p-norm (Lp norm) of the tensor, optionally reduced along
+    /// specific dimensions.
+    ///
+    /// Mirrors PyTorch's `torch.norm(p, dim, keepdim)` semantics:
+    /// - `p == 1.0` -> L1 ("Manhattan") norm: `sum(|x|)`
+    /// - `p == 2.0` -> L2 (Euclidean) norm: `sqrt(sum(x^2))`, matching [`Tensor::norm`]
+    /// - `p == 0.0` -> count of non-zero elements
+    /// - `p == f64::INFINITY` -> maximum absolute value
+    /// - `p == f64::NEG_INFINITY` -> minimum absolute value
+    /// - any other finite `p` -> general Lp norm: `(sum(|x|^p))^(1/p)`
+    ///
+    /// `dims == None` reduces over every element, producing a scalar tensor
+    /// (or an all-ones-shaped tensor when `keepdim` is true). `dims ==
+    /// Some(&[...])` reduces only the given dimensions, which must already be
+    /// normalized (non-negative and in range); duplicates are ignored.
+    pub fn norm_lp(&self, p: f64, dims: Option<&[usize]>, keepdim: bool) -> Result<Self>
+    where
+        T: num_traits::FromPrimitive,
+    {
+        let shape_binding = self.shape();
+        let input_shape = shape_binding.dims().to_vec();
+        let ndim = input_shape.len();
+
+        let reduce_dims: Vec<usize> = match dims {
+            Some(requested) => {
+                for &dim in requested {
+                    if dim >= ndim {
+                        return Err(TorshError::InvalidOperation(format!(
+                            "Dimension {} out of range for {}-dimensional tensor",
+                            dim, ndim
+                        )));
+                    }
+                }
+                let mut normalized = requested.to_vec();
+                normalized.sort_unstable();
+                normalized.dedup();
+                normalized
+            }
+            None => (0..ndim).collect(),
+        };
+
+        let convert = |value: f64| -> Result<T> {
+            <T as num_traits::FromPrimitive>::from_f64(value).ok_or_else(|| {
+                TorshError::InvalidOperation(format!(
+                    "norm: p={} cannot be represented in this tensor's element type",
+                    p
+                ))
+            })
+        };
+
+        let zero = <T as num_traits::Zero>::zero();
+        let one = <T as num_traits::One>::one();
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum NormKind {
+            L0,
+            L1,
+            L2,
+            MaxAbs,
+            MinAbs,
+            General,
+        }
+
+        let kind = if p == 1.0 {
+            NormKind::L1
+        } else if p == 2.0 {
+            NormKind::L2
+        } else if p == 0.0 {
+            NormKind::L0
+        } else if p == f64::INFINITY {
+            NormKind::MaxAbs
+        } else if p == f64::NEG_INFINITY {
+            NormKind::MinAbs
+        } else {
+            NormKind::General
+        };
+
+        let (p_t, inv_p_t) = if kind == NormKind::General {
+            (convert(p)?, convert(1.0 / p)?)
+        } else {
+            (zero, zero)
+        };
+
+        // Identity element for the combining operation (sum -> 0, min -> +inf).
+        let init: T = if kind == NormKind::MinAbs {
+            <T as num_traits::Float>::infinity()
+        } else {
+            zero
+        };
+
+        let elem = |x: T| -> T {
+            match kind {
+                NormKind::L1 | NormKind::MaxAbs | NormKind::MinAbs => x.abs(),
+                NormKind::L2 => x * x,
+                NormKind::L0 => {
+                    if x == zero {
+                        zero
+                    } else {
+                        one
+                    }
+                }
+                NormKind::General => x.abs().powf(p_t),
+            }
+        };
+
+        let combine = |a: T, b: T| -> T {
+            match kind {
+                NormKind::MaxAbs => a.max(b),
+                NormKind::MinAbs => a.min(b),
+                _ => a + b,
+            }
+        };
+
+        let finalize = |s: T| -> T {
+            match kind {
+                NormKind::L2 => s.sqrt(),
+                NormKind::General => s.powf(inv_p_t),
+                _ => s,
+            }
+        };
+
+        let data = self.data()?;
+
+        // Fully reduced (global norm) fast path: every dimension collapses to a scalar.
+        if ndim == 0 || reduce_dims.len() == ndim {
+            let acc = data.iter().fold(init, |acc, &x| combine(acc, elem(x)));
+            let value = finalize(acc);
+            let out_shape = if keepdim { vec![1; ndim] } else { vec![] };
+            return Self::from_data(vec![value], out_shape, self.device());
+        }
+
+        // Partial reduction over an arbitrary subset of dimensions: walk every
+        // element once, mapping its flat input index to the flat index of the
+        // (keepdim-shaped) output it accumulates into.
+        let mut is_reduced = vec![false; ndim];
+        for &d in &reduce_dims {
+            is_reduced[d] = true;
+        }
+
+        let mut input_strides = vec![1usize; ndim];
+        for i in (0..ndim - 1).rev() {
+            input_strides[i] = input_strides[i + 1] * input_shape[i + 1];
+        }
+
+        let mut output_shape_keepdim = input_shape.clone();
+        for &d in &reduce_dims {
+            output_shape_keepdim[d] = 1;
+        }
+        let mut output_strides = vec![1usize; ndim];
+        for i in (0..ndim - 1).rev() {
+            output_strides[i] = output_strides[i + 1] * output_shape_keepdim[i + 1];
+        }
+        let output_size: usize = output_shape_keepdim.iter().product();
+
+        let mut acc = vec![init; output_size];
+        for (flat_idx, &x) in data.iter().enumerate() {
+            let mut remaining = flat_idx;
+            let mut out_flat = 0usize;
+            for (dim, &reduced) in is_reduced.iter().enumerate() {
+                let coord = remaining / input_strides[dim];
+                remaining %= input_strides[dim];
+                if !reduced {
+                    out_flat += coord * output_strides[dim];
+                }
+            }
+            acc[out_flat] = combine(acc[out_flat], elem(x));
+        }
+
+        let result_data: Vec<T> = acc.into_iter().map(finalize).collect();
+
+        let final_shape = if keepdim {
+            output_shape_keepdim
+        } else {
+            input_shape
+                .into_iter()
+                .zip(is_reduced.iter())
+                .filter(|(_, &reduced)| !reduced)
+                .map(|(size, _)| size)
+                .collect::<Vec<_>>()
+        };
+
+        Self::from_data(result_data, final_shape, self.device())
+    }
 }
 
 // SciRS2 backend integration (placeholder implementations)

@@ -551,12 +551,18 @@ impl TensorParallel {
         }
     }
 
-    /// Parallel all-gather operation using SciRS2 parallel processing
+    /// Parallel all-gather operation using SciRS2 parallel processing.
+    ///
+    /// Gathers `tensor` from every rank in the tensor-parallel group and
+    /// concatenates the shards along `shard_dim`, reconstructing the full,
+    /// unsharded tensor.
     #[cfg(feature = "scirs2-memory")]
-    pub async fn parallel_all_gather(&self, tensor: &Tensor) -> TorshResult<Tensor> {
-        // TODO: Implement proper parallel all-gather with SciRS2 optimizations
-        // For now, use a simplified approach
-        debug!("Performing parallel all-gather (simplified implementation)");
+    pub async fn parallel_all_gather(
+        &self,
+        tensor: &Tensor,
+        shard_dim: usize,
+    ) -> TorshResult<Tensor> {
+        debug!("Performing parallel all-gather with concatenation along dim {shard_dim}");
 
         // Create output buffer for gathered tensors
         let mut output: Vec<Tensor> = Vec::with_capacity(self.config.tp_size);
@@ -564,16 +570,22 @@ impl TensorParallel {
         // Call all_gather with proper signature
         all_gather(&mut output, tensor, &self.tp_group).await?;
 
-        // Concatenate the gathered tensors
-        // For simplicity, just return the first tensor (this rank's data)
-        // In a real implementation, we'd concatenate all gathered tensors
-        let result = if !output.is_empty() {
+        // Concatenate the gathered shards back into the full, unsharded tensor.
+        let result = if output.is_empty() {
+            tensor.clone()
+        } else if output.len() == 1 {
             output
                 .into_iter()
                 .next()
                 .expect("output should not be empty")
         } else {
-            tensor.clone()
+            let shard_refs: Vec<&Tensor> = output.iter().collect();
+            Tensor::cat(&shard_refs, shard_dim as i32).map_err(|e| {
+                TorshDistributedError::InternalError(format!(
+                    "failed to concatenate {} all-gathered shards along dim {shard_dim}: {e}",
+                    shard_refs.len()
+                ))
+            })?
         };
 
         info!(
@@ -630,7 +642,6 @@ impl TensorParallel {
         }
 
         // Add tensor parallelism specific stats
-        // TODO: Implement get_stats() method or remove this call
         stats.insert(
             "memory_reduction_ratio".to_string(),
             1.0 / self.config.tp_size as f64, // Estimated reduction ratio
@@ -1011,6 +1022,51 @@ mod tests {
 
         let shard = utils::split_tensor_for_tp(&tensor, 1, 0, 2)?;
         assert_eq!(shard.shape().dims(), &[8, 8]);
+
+        Ok(())
+    }
+
+    /// Regression test for the all-gather data-loss bug: `parallel_all_gather`
+    /// used to discard every shard except `output[0]`. Uses `tp_size == 3`
+    /// (not 1 or 2) so that the old buggy behavior (shape/data unchanged from
+    /// the input) is clearly distinguishable from the fixed behavior (shape
+    /// and data reflect all `tp_size` gathered shards concatenated together).
+    #[cfg(feature = "scirs2-memory")]
+    #[tokio::test]
+    async fn test_parallel_all_gather_concatenates_all_shards() -> TorshResult<()> {
+        let process_group =
+            Arc::new(init_process_group(BackendType::Gloo, 0, 3, "127.0.0.1", 12348).await?);
+
+        let config = TensorParallelConfig {
+            tp_size: 3,
+            ..Default::default()
+        };
+
+        let tp_layer =
+            utils::create_row_parallel_linear(128, 256, true, false, process_group, Some(config))?;
+
+        // A small, recognizable [2, 3] tensor so both shape and data can be
+        // meaningfully checked after the gather.
+        let input = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3])?;
+        let shard_dim = 0usize;
+
+        let gathered = tp_layer.parallel_all_gather(&input, shard_dim).await?;
+
+        // Shape must grow tp_size-fold along shard_dim: [2, 3] -> [6, 3].
+        // The old buggy implementation would leave the shape at [2, 3].
+        assert_eq!(gathered.shape().dims(), &[6, 3]);
+
+        // `collectives::all_gather` is a mock that clones the local input once
+        // per rank, so the expected data is the input tiled tp_size times
+        // (concatenation of 3 identical [2, 3] blocks along dim 0).
+        let input_data = input.to_vec()?;
+        let mut expected = Vec::with_capacity(input_data.len() * 3);
+        for _ in 0..3 {
+            expected.extend_from_slice(&input_data);
+        }
+
+        let gathered_data = gathered.to_vec()?;
+        assert_eq!(gathered_data, expected);
 
         Ok(())
     }
