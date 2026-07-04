@@ -74,8 +74,7 @@ expected = [[5.0, 0.0, 5.0]]
 assert_close(result.tolist(), expected, tol=1e-5)
 "#;
 
-        run_script(py, &locals, script)
-            .expect("dim=[0], keepdim=True norm script should succeed");
+        run_script(py, &locals, script).expect("dim=[0], keepdim=True norm script should succeed");
     });
 }
 
@@ -101,7 +100,6 @@ expected = [5.0, 0.0, 5.0]
 assert_close(result.tolist(), expected, tol=1e-5)
 "#;
 
-        run_script(py, &locals, script)
-            .expect("dim=[0], keepdim=False norm script should succeed");
+        run_script(py, &locals, script).expect("dim=[0], keepdim=False norm script should succeed");
     });
 }

@@ -2,14 +2,13 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
-use torsh_core::{device::DeviceType, error::{Result, TorshError}};
-use torsh_tensor::{
-    creation::from_vec,
-    Tensor,
+use torsh_core::{
+    device::DeviceType,
+    error::{Result, TorshError},
 };
+use torsh_tensor::{creation::from_vec, Tensor};
 
-use super::core::{WaveletType, get_wavelet_filters};
-
+use super::core::{get_wavelet_filters, WaveletType};
 
 /// Lifting Scheme processor
 pub struct LiftingSchemeProcessor {
@@ -44,32 +43,23 @@ impl LiftingSchemeProcessor {
     /// information at the edges, and -- since lifting is invertible for
     /// *any* boundary rule as long as the inverse mirrors it -- does not
     /// compromise exact invertibility.
-    pub fn lifting_dwt(
-        &self,
-        signal: &Tensor<f32>,
-    ) -> Result<(Tensor<f32>, Tensor<f32>)> {
+    pub fn lifting_dwt(&self, signal: &Tensor<f32>) -> Result<(Tensor<f32>, Tensor<f32>)> {
         let signal_shape = signal.shape();
         if signal_shape.ndim() != 1 {
-            return Err(
-                TorshError::InvalidArgument("Lifting DWT requires 1D tensor".to_string()),
-            );
+            return Err(TorshError::InvalidArgument(
+                "Lifting DWT requires 1D tensor".to_string(),
+            ));
         }
         let signal_length = signal_shape.dims()[0];
         if signal_length == 0 || signal_length % 2 != 0 {
-            return Err(
-                TorshError::InvalidArgument(
-                    format!(
-                        "Lifting DWT requires a non-empty, even-length signal, got length {signal_length}"
-                    ),
-                ),
-            );
+            return Err(TorshError::InvalidArgument(format!(
+                "Lifting DWT requires a non-empty, even-length signal, got length {signal_length}"
+            )));
         }
         let half_length = signal_length / 2;
         let data = signal.to_vec()?;
         let mut even: Vec<f64> = (0..half_length).map(|i| data[2 * i] as f64).collect();
-        let mut odd: Vec<f64> = (0..half_length)
-            .map(|i| data[2 * i + 1] as f64)
-            .collect();
+        let mut odd: Vec<f64> = (0..half_length).map(|i| data[2 * i + 1] as f64).collect();
         match self.wavelet {
             WaveletType::Daubechies(4) => lifting_forward_d4(&mut even, &mut odd),
             _ => lifting_forward_haar(&mut even, &mut odd),
@@ -98,37 +88,24 @@ impl LiftingSchemeProcessor {
         let approx_shape = approximation.shape();
         let detail_shape = detail.shape();
         if approx_shape.ndim() != 1 || detail_shape.ndim() != 1 {
-            return Err(
-                TorshError::InvalidArgument(
-                    "Lifting IDWT requires 1D tensors".to_string(),
-                ),
-            );
+            return Err(TorshError::InvalidArgument(
+                "Lifting IDWT requires 1D tensors".to_string(),
+            ));
         }
         let approx_len = approx_shape.dims()[0];
         let detail_len = detail_shape.dims()[0];
         if approx_len != detail_len {
-            return Err(
-                TorshError::InvalidArgument(
-                    format!(
-                        "Lifting IDWT requires matching approximation/detail lengths, got \
+            return Err(TorshError::InvalidArgument(format!(
+                "Lifting IDWT requires matching approximation/detail lengths, got \
                  {approx_len} and {detail_len}"
-                    ),
-                ),
-            );
+            )));
         }
         if approx_len == 0 {
-            return Err(
-                TorshError::InvalidArgument(
-                    "Lifting IDWT requires non-empty approximation/detail tensors"
-                        .to_string(),
-                ),
-            );
+            return Err(TorshError::InvalidArgument(
+                "Lifting IDWT requires non-empty approximation/detail tensors".to_string(),
+            ));
         }
-        let mut even: Vec<f64> = approximation
-            .to_vec()?
-            .iter()
-            .map(|&v| v as f64)
-            .collect();
+        let mut even: Vec<f64> = approximation.to_vec()?.iter().map(|&v| v as f64).collect();
         let mut odd: Vec<f64> = detail.to_vec()?.iter().map(|&v| v as f64).collect();
         match self.wavelet {
             WaveletType::Daubechies(4) => lifting_inverse_d4(&mut even, &mut odd),
@@ -177,17 +154,15 @@ impl WaveletPacketProcessor {
     pub fn wpt(&self, signal: &Tensor<f32>) -> Result<Vec<Tensor<f32>>> {
         let signal_shape = signal.shape();
         if signal_shape.ndim() != 1 {
-            return Err(
-                TorshError::InvalidArgument("WPT requires 1D tensor".to_string()),
-            );
+            return Err(TorshError::InvalidArgument(
+                "WPT requires 1D tensor".to_string(),
+            ));
         }
         let signal_length = signal_shape.dims()[0];
         if signal_length == 0 {
-            return Err(
-                TorshError::InvalidArgument(
-                    "WPT requires a non-empty signal".to_string(),
-                ),
-            );
+            return Err(TorshError::InvalidArgument(
+                "WPT requires a non-empty signal".to_string(),
+            ));
         }
         let max_level = self.max_level;
         let (lo_d, hi_d, _lo_r, _hi_r) = get_wavelet_filters(&self.wavelet)?;
@@ -195,16 +170,12 @@ impl WaveletPacketProcessor {
         let mut projected_len = signal_length;
         for _ in 0..max_level {
             if projected_len < filter_len || projected_len % 2 != 0 {
-                return Err(
-                    TorshError::InvalidArgument(
-                        format!(
-                            "signal length {signal_length} cannot be decomposed to WPT level \
+                return Err(TorshError::InvalidArgument(format!(
+                    "signal length {signal_length} cannot be decomposed to WPT level \
                      {max_level} with a {filter_len}-tap filter (node length \
                      {projected_len} became too short or odd); use a longer signal or \
                      a shallower level"
-                        ),
-                    ),
-                );
+                )));
             }
             projected_len /= 2;
         }
@@ -243,28 +214,20 @@ impl WaveletPacketProcessor {
     pub fn iwpt(&self, packets: &[Tensor<f32>]) -> Result<Tensor<f32>> {
         let n_packets = packets.len();
         if n_packets == 0 {
-            return Err(
-                TorshError::InvalidArgument(
-                    "iwpt requires at least one packet".to_string(),
-                ),
-            );
+            return Err(TorshError::InvalidArgument(
+                "iwpt requires at least one packet".to_string(),
+            ));
         }
         if !n_packets.is_power_of_two() {
-            return Err(
-                TorshError::InvalidArgument(
-                    format!(
-                        "iwpt requires a power-of-two number of packets, got {n_packets}"
-                    ),
-                ),
-            );
+            return Err(TorshError::InvalidArgument(format!(
+                "iwpt requires a power-of-two number of packets, got {n_packets}"
+            )));
         }
         for packet in packets {
             if packet.shape().ndim() != 1 {
-                return Err(
-                    TorshError::InvalidArgument(
-                        "iwpt requires 1D packet tensors".to_string(),
-                    ),
-                );
+                return Err(TorshError::InvalidArgument(
+                    "iwpt requires 1D packet tensors".to_string(),
+                ));
             }
         }
         let (lo_d, hi_d, _lo_r, _hi_r) = get_wavelet_filters(&self.wavelet)?;
@@ -283,18 +246,10 @@ impl WaveletPacketProcessor {
             }
             nodes = parents;
         }
-        let reconstructed = nodes
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                TorshError::ComputeError(
-                    "iwpt: reconstruction produced no output".to_string(),
-                )
-            })?;
-        let reconstructed_f32: Vec<f32> = reconstructed
-            .iter()
-            .map(|&v| v as f32)
-            .collect();
+        let reconstructed = nodes.into_iter().next().ok_or_else(|| {
+            TorshError::ComputeError("iwpt: reconstruction produced no output".to_string())
+        })?;
+        let reconstructed_f32: Vec<f32> = reconstructed.iter().map(|&v| v as f32).collect();
         let len = reconstructed_f32.len();
         from_vec(reconstructed_f32, &[len], DeviceType::Cpu)
     }
@@ -338,12 +293,7 @@ fn circular_analyze(signal: &[f64], lo: &[f64], hi: &[f64]) -> (Vec<f64>, Vec<f6
 /// whenever `lo`/`hi` form an orthonormal analysis pair -- true for the
 /// Haar/Daubechies/Symlet/Coiflet families used elsewhere in this module.
 /// Used by [`WaveletPacketProcessor::iwpt`].
-fn circular_synthesize(
-    approx: &[f64],
-    detail: &[f64],
-    lo: &[f64],
-    hi: &[f64],
-) -> Vec<f64> {
+fn circular_synthesize(approx: &[f64], detail: &[f64], lo: &[f64], hi: &[f64]) -> Vec<f64> {
     let out_len = approx.len() * 2;
     let mut output = vec![0.0f64; out_len];
     for (i, &a) in approx.iter().enumerate() {

@@ -454,11 +454,9 @@ impl SciPyIntegration {
 
         // Design filter
         let filter_result = match filter_type {
-            "lowpass" | "highpass" | "bandpass" | "bandstop" => scipy_signal.call_method1(
-                py,
-                "butter",
-                (order, normalized_cutoff, filter_type),
-            )?,
+            "lowpass" | "highpass" | "bandpass" | "bandstop" => {
+                scipy_signal.call_method1(py, "butter", (order, normalized_cutoff, filter_type))?
+            }
             _ => {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                     "Unknown filter type: {}",
@@ -806,14 +804,12 @@ impl SciPyIntegration {
         };
 
         let float32_array = real_array.call_method1("astype", ("float32",))?;
-        let py_array = float32_array
-            .cast::<PyArrayDyn<f32>>()
-            .map_err(|e| {
-                PyErr::new::<PyRuntimeError, _>(format!(
-                    "Failed to interpret {} as a NumPy array: {}",
-                    label, e
-                ))
-            })?;
+        let py_array = float32_array.cast::<PyArrayDyn<f32>>().map_err(|e| {
+            PyErr::new::<PyRuntimeError, _>(format!(
+                "Failed to interpret {} as a NumPy array: {}",
+                label, e
+            ))
+        })?;
 
         self.numpy_compat
             .from_numpy_array(py_array)
@@ -948,7 +944,9 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             if !require_scipy(py) {
-                eprintln!("skipping test_eigendecomposition_rejects_non_square: scipy not installed");
+                eprintln!(
+                    "skipping test_eigendecomposition_rejects_non_square: scipy not installed"
+                );
                 return;
             }
             let integration = SciPyIntegration::new().expect("SciPyIntegration::new");
@@ -1063,7 +1061,9 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             if !require_scipy(py) {
-                eprintln!("skipping test_filter_signal_lowpass_preserves_shape: scipy not installed");
+                eprintln!(
+                    "skipping test_filter_signal_lowpass_preserves_shape: scipy not installed"
+                );
                 return;
             }
             let integration = SciPyIntegration::new().expect("SciPyIntegration::new");
@@ -1122,7 +1122,9 @@ mod tests {
                 .expect("benchmark_operations should succeed end-to-end");
 
             for key in ["eigenvalues", "optimization", "fft"] {
-                let elapsed = results.get(key).unwrap_or_else(|| panic!("missing '{key}' result"));
+                let elapsed = results
+                    .get(key)
+                    .unwrap_or_else(|| panic!("missing '{key}' result"));
                 assert!(*elapsed >= 0.0);
             }
         });

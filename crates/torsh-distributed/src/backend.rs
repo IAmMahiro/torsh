@@ -628,6 +628,14 @@ mod mpi_backend {
     use tracing::info;
 
     pub struct MpiBackend {
+        // Must be kept alive for as long as `world` is used: `Universe`'s
+        // `Drop` impl calls `MPI_Finalize()`, so if this were dropped at the
+        // end of `new()` (e.g. by not storing it here), every subsequent MPI
+        // call on `world` would fail with "Attempting to use an MPI routine
+        // ... before initializing or after finalizing MPICH". The leading
+        // underscore is intentional: this field is held only for its `Drop`
+        // side effect and is never otherwise read.
+        _universe: mpi::environment::Universe,
         world: mpi::topology::SimpleCommunicator,
         initialized: bool,
     }
@@ -646,8 +654,11 @@ mod mpi_backend {
                 TorshDistributedError::backend_error("MPI", "Failed to initialize MPI".to_string())
             })?;
 
+            let world = universe.world();
+
             Ok(Self {
-                world: universe.world(),
+                _universe: universe,
+                world,
                 initialized: false,
             })
         }

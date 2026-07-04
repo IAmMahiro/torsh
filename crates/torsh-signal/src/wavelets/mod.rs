@@ -7,12 +7,12 @@
 //! Coiflet and Biorthogonal filter banks are hard-coded below) and do not
 //! depend on scirs2-signal.
 
-pub mod packet_lifting;
 pub mod core;
+pub mod packet_lifting;
 
 // Re-export all types
-pub use packet_lifting::*;
 pub use core::*;
+pub use packet_lifting::*;
 
 #[cfg(test)]
 mod tests;

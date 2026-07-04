@@ -668,11 +668,12 @@ impl PandasSupport {
     /// output.
     fn extract_f32_array(&self, array: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
         let float32_array = array.call_method1("astype", ("float32",))?;
-        let py_array = float32_array
-            .cast::<PyArrayDyn<f32>>()
-            .map_err(|e| FfiError::InvalidConversion {
-                message: format!("Expected a NumPy-array-convertible value: {}", e),
-            })?;
+        let py_array =
+            float32_array
+                .cast::<PyArrayDyn<f32>>()
+                .map_err(|e| FfiError::InvalidConversion {
+                    message: format!("Expected a NumPy-array-convertible value: {}", e),
+                })?;
         self.numpy_compat
             .from_numpy_array(py_array)
             .map_err(|e| FfiError::InvalidConversion { message: e }.into())
@@ -759,7 +760,10 @@ mod tests {
             assert_eq!(torsh_df.data.shape, vec![3, 2]);
             // `_values` is row-major: row i is [a[i], b[i]].
             assert_f32_slice_approx_eq(&torsh_df.data.data, &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
-            assert_eq!(torsh_df.dtypes.get("a").map(String::as_str), Some("float64"));
+            assert_eq!(
+                torsh_df.dtypes.get("a").map(String::as_str),
+                Some("float64")
+            );
         });
     }
 
@@ -864,7 +868,10 @@ mod tests {
             let pivoted = pivoted.bind(py);
 
             // Two distinct categories ('x', 'y') become two index rows.
-            assert_eq!(pivoted.len().expect("pivoted result should have a length"), 2);
+            assert_eq!(
+                pivoted.len().expect("pivoted result should have a length"),
+                2
+            );
         });
     }
 
@@ -889,7 +896,10 @@ mod tests {
                 .time_series_analysis(py, series, None, Some(2))
                 .expect("time_series_analysis with a rolling window should succeed");
 
-            assert_eq!(result.metadata.get("operation").map(String::as_str), Some("rolling"));
+            assert_eq!(
+                result.metadata.get("operation").map(String::as_str),
+                Some("rolling")
+            );
             assert_eq!(result.data.data.len(), 5);
             // First rolling(2).mean() observation is NaN (not enough history).
             assert!(result.data.data[0].is_nan());
@@ -914,7 +924,10 @@ mod tests {
                 .expect("failed to build test series");
 
             let result = support.time_series_analysis(py, series, None, None);
-            assert!(result.is_err(), "expected an error when neither freq nor window is given");
+            assert!(
+                result.is_err(),
+                "expected an error when neither freq nor window is given"
+            );
         });
     }
 }

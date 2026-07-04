@@ -1272,7 +1272,9 @@ mod tests {
         // Distinguishable, non-zero, non-constant payload so a silent no-op
         // (old buggy behavior) is unambiguously distinguishable from a real
         // transfer: a zero-filled or unmodified `readback` cannot match it.
-        let payload: Vec<u8> = (0..LEN as u32).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        let payload: Vec<u8> = (0..LEN as u32)
+            .map(|i| ((i * 37 + 11) % 256) as u8)
+            .collect();
         assert!(
             payload.iter().any(|&b| b != 0),
             "test payload must contain non-zero bytes"

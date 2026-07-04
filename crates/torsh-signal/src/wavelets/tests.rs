@@ -13,14 +13,11 @@ mod tests_2 {
     #[test]
     fn test_cwt_processor() -> Result<()> {
         let scales = vec![1.0, 2.0, 4.0, 8.0];
-        let processor = ContinuousWaveletProcessor::new(
-            WaveletType::Morlet,
-            scales.clone(),
-            1000.0,
-        );
+        let processor =
+            ContinuousWaveletProcessor::new(WaveletType::Morlet, scales.clone(), 1000.0);
         let signal = ones(&[256])?;
         let cwt_result = processor.cwt(&signal)?;
-        assert_eq!(cwt_result.shape().dims(), & [4, 256]);
+        assert_eq!(cwt_result.shape().dims(), &[4, 256]);
         Ok(())
     }
     #[test]
@@ -28,7 +25,7 @@ mod tests_2 {
         let processor = DiscreteWaveletProcessor::new(WaveletType::Daubechies(4), 3);
         let signal = ones(&[256])?;
         let (approximation, details) = processor.dwt(&signal)?;
-        assert_eq!(approximation.shape().dims() [0], 32);
+        assert_eq!(approximation.shape().dims()[0], 32);
         assert_eq!(details.len(), 3);
         Ok(())
     }
@@ -39,7 +36,7 @@ mod tests_2 {
         let packets = processor.wpt(&signal)?;
         assert_eq!(packets.len(), 4);
         for packet in &packets {
-            assert_eq!(packet.shape().dims() [0], 64);
+            assert_eq!(packet.shape().dims()[0], 64);
         }
         Ok(())
     }
@@ -48,7 +45,11 @@ mod tests_2 {
     fn relative_l2_error(a: &[f32], b: &[f32]) -> f32 {
         let diff_sq: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum();
         let norm_sq: f32 = a.iter().map(|&x| x * x).sum();
-        if norm_sq <= 0.0 { diff_sq.sqrt() } else { (diff_sq / norm_sq).sqrt() }
+        if norm_sq <= 0.0 {
+            diff_sq.sqrt()
+        } else {
+            (diff_sq / norm_sq).sqrt()
+        }
     }
     /// A sum-of-sinusoids test signal with `n` samples, mixing a couple of
     /// frequencies and amplitudes so it exercises both the approximation
@@ -59,9 +60,7 @@ mod tests_2 {
                 let t = i as f32 / n as f32;
                 freqs_and_amps
                     .iter()
-                    .map(|&(freq, amp)| {
-                        amp * (2.0 * std::f32::consts::PI * freq * t).sin()
-                    })
+                    .map(|&(freq, amp)| amp * (2.0 * std::f32::consts::PI * freq * t).sin())
                     .sum()
             })
             .collect()
@@ -75,14 +74,15 @@ mod tests_2 {
         let packets = processor.wpt(&signal)?;
         assert_eq!(packets.len(), 8, "expected 2^3 leaf packets");
         for packet in &packets {
-            assert_eq!(packet.shape().dims() [0], n / 8);
+            assert_eq!(packet.shape().dims()[0], n / 8);
         }
         let reconstructed = processor.iwpt(&packets)?;
         let reconstructed_vec = reconstructed.to_vec()?;
         assert_eq!(reconstructed_vec.len(), n);
         let error = relative_l2_error(&original, &reconstructed_vec);
         assert!(
-            error < 1e-5, "Haar WPT round-trip relative error {error} exceeds tolerance"
+            error < 1e-5,
+            "Haar WPT round-trip relative error {error} exceeds tolerance"
         );
         Ok(())
     }
@@ -128,12 +128,12 @@ mod tests_2 {
         let signal = from_vec(ramp, &[n], DeviceType::Cpu)?;
         let processor = WaveletPacketProcessor::new(WaveletType::Haar, 2);
         let packets = processor.wpt(&signal)?;
-        let all_zero = packets
-            .iter()
-            .all(|p| {
-                p.to_vec().map(|v| v.iter().all(|&x| x.abs() < 1e-9)).unwrap_or(true)
-            });
-        assert!(! all_zero, "wpt() must not silently return all-zero packets");
+        let all_zero = packets.iter().all(|p| {
+            p.to_vec()
+                .map(|v| v.iter().all(|&x| x.abs() < 1e-9))
+                .unwrap_or(true)
+        });
+        assert!(!all_zero, "wpt() must not silently return all-zero packets");
         Ok(())
     }
     #[test]
@@ -150,8 +150,8 @@ mod tests_2 {
         let approx_vec = approx.to_vec()?;
         let detail_vec = detail.to_vec()?;
         assert!(
-            approx_vec.iter().any(|& x | x.abs() > 1e-6) && detail_vec.iter().any(|& x |
-            x.abs() > 1e-6),
+            approx_vec.iter().any(|&x| x.abs() > 1e-6)
+                && detail_vec.iter().any(|&x| x.abs() > 1e-6),
             "lifting_dwt() must not silently return all-zero coefficients"
         );
         let reconstructed = processor.lifting_idwt(&approx, &detail)?;
@@ -174,8 +174,8 @@ mod tests_2 {
         let approx_vec = approx.to_vec()?;
         let detail_vec = detail.to_vec()?;
         assert!(
-            approx_vec.iter().any(|& x | x.abs() > 1e-6) && detail_vec.iter().any(|& x |
-            x.abs() > 1e-6),
+            approx_vec.iter().any(|&x| x.abs() > 1e-6)
+                && detail_vec.iter().any(|&x| x.abs() > 1e-6),
             "lifting_dwt() must not silently return all-zero coefficients"
         );
         let reconstructed = processor.lifting_idwt(&approx, &detail)?;
@@ -190,29 +190,17 @@ mod tests_2 {
     #[test]
     fn test_cone_of_influence_matches_formula() {
         let scales = vec![1.0, 2.0, 4.0, 8.0];
-        let coi_morlet = WaveletUtils::cone_of_influence(
-            &scales,
-            100_000,
-            WaveletType::Morlet,
-        );
+        let coi_morlet = WaveletUtils::cone_of_influence(&scales, 100_000, WaveletType::Morlet);
         for (&s, &c) in scales.iter().zip(coi_morlet.iter()) {
             let expected = std::f32::consts::SQRT_2 * s;
             assert_relative_eq!(c, expected, epsilon = 1e-4);
         }
-        let coi_haar = WaveletUtils::cone_of_influence(
-            &scales,
-            100_000,
-            WaveletType::Haar,
-        );
+        let coi_haar = WaveletUtils::cone_of_influence(&scales, 100_000, WaveletType::Haar);
         for (&s, &c) in scales.iter().zip(coi_haar.iter()) {
             let expected = 0.5 * s;
             assert_relative_eq!(c, expected, epsilon = 1e-4);
         }
-        let coi_db4 = WaveletUtils::cone_of_influence(
-            &scales,
-            100_000,
-            WaveletType::Daubechies(4),
-        );
+        let coi_db4 = WaveletUtils::cone_of_influence(&scales, 100_000, WaveletType::Daubechies(4));
         for (&s, &c) in scales.iter().zip(coi_db4.iter()) {
             let expected = 1.5 * s;
             assert_relative_eq!(c, expected, epsilon = 1e-4);
@@ -221,40 +209,26 @@ mod tests_2 {
     #[test]
     fn test_cone_of_influence_depends_on_wavelet_type() {
         let scales = vec![4.0];
-        let coi_morlet = WaveletUtils::cone_of_influence(
-            &scales,
-            100_000,
-            WaveletType::Morlet,
-        );
-        let coi_db4 = WaveletUtils::cone_of_influence(
-            &scales,
-            100_000,
-            WaveletType::Daubechies(4),
-        );
+        let coi_morlet = WaveletUtils::cone_of_influence(&scales, 100_000, WaveletType::Morlet);
+        let coi_db4 = WaveletUtils::cone_of_influence(&scales, 100_000, WaveletType::Daubechies(4));
         assert!(
             (coi_morlet[0] - coi_db4[0]).abs() > 1e-3,
             "cone_of_influence must depend on wavelet type: morlet={}, db4={}",
-            coi_morlet[0], coi_db4[0]
+            coi_morlet[0],
+            coi_db4[0]
         );
     }
     #[test]
     fn test_cone_of_influence_depends_on_signal_length() {
         let scales = vec![1000.0];
-        let coi_short = WaveletUtils::cone_of_influence(
-            &scales,
-            10,
-            WaveletType::Morlet,
-        );
-        let coi_long = WaveletUtils::cone_of_influence(
-            &scales,
-            1_000_000,
-            WaveletType::Morlet,
-        );
+        let coi_short = WaveletUtils::cone_of_influence(&scales, 10, WaveletType::Morlet);
+        let coi_long = WaveletUtils::cone_of_influence(&scales, 1_000_000, WaveletType::Morlet);
         assert_relative_eq!(coi_short[0], 5.0, epsilon = 1e-4);
         assert!(
             coi_long[0] > coi_short[0] * 100.0,
             "cone_of_influence must depend on signal_length: short={}, long={}",
-            coi_short[0], coi_long[0]
+            coi_short[0],
+            coi_long[0]
         );
     }
     #[test]
@@ -262,10 +236,10 @@ mod tests_2 {
         let processor = LiftingSchemeProcessor::new(WaveletType::Haar);
         let signal = ones(&[256])?;
         let (approx, detail) = processor.lifting_dwt(&signal)?;
-        assert_eq!(approx.shape().dims() [0], 128);
-        assert_eq!(detail.shape().dims() [0], 128);
+        assert_eq!(approx.shape().dims()[0], 128);
+        assert_eq!(detail.shape().dims()[0], 128);
         let reconstructed = processor.lifting_idwt(&approx, &detail)?;
-        assert_eq!(reconstructed.shape().dims() [0], 256);
+        assert_eq!(reconstructed.shape().dims()[0], 256);
         Ok(())
     }
     #[test]
@@ -276,7 +250,8 @@ mod tests_2 {
         let denoised_len = denoised.shape().dims()[0];
         assert!(
             denoised_len >= 64 && denoised_len <= 256,
-            "Denoised signal length {} should be between 64 and 256", denoised_len
+            "Denoised signal length {} should be between 64 and 256",
+            denoised_len
         );
         let noise_level = denoiser.estimate_noise_level(&signal)?;
         assert!(noise_level >= 0.0);
@@ -288,11 +263,7 @@ mod tests_2 {
         let sample_rate = 1000.0;
         let wavelet = WaveletType::Morlet;
         let scale = WaveletUtils::frequency_to_scale(frequency, sample_rate, wavelet);
-        let frequency_back = WaveletUtils::scale_to_frequency(
-            scale,
-            sample_rate,
-            wavelet,
-        );
+        let frequency_back = WaveletUtils::scale_to_frequency(scale, sample_rate, wavelet);
         assert_relative_eq!(frequency, frequency_back, epsilon = 1e-5);
         let scales = vec![1.0, 2.0, 4.0];
         let coi = WaveletUtils::cone_of_influence(&scales, 256, wavelet);
@@ -303,19 +274,19 @@ mod tests_2 {
         let processor_sym2 = DiscreteWaveletProcessor::new(WaveletType::Symlet(2), 2);
         let signal = ones(&[128])?;
         let (approx, details) = processor_sym2.dwt(&signal)?;
-        assert!(approx.shape().dims() [0] > 0);
+        assert!(approx.shape().dims()[0] > 0);
         assert_eq!(details.len(), 2);
         let processor_sym4 = DiscreteWaveletProcessor::new(WaveletType::Symlet(4), 2);
         let (approx, details) = processor_sym4.dwt(&signal)?;
-        assert!(approx.shape().dims() [0] > 0);
+        assert!(approx.shape().dims()[0] > 0);
         assert_eq!(details.len(), 2);
         let processor_sym6 = DiscreteWaveletProcessor::new(WaveletType::Symlet(6), 2);
         let (approx, details) = processor_sym6.dwt(&signal)?;
-        assert!(approx.shape().dims() [0] > 0);
+        assert!(approx.shape().dims()[0] > 0);
         assert_eq!(details.len(), 2);
         let processor_sym8 = DiscreteWaveletProcessor::new(WaveletType::Symlet(8), 2);
         let (approx, details) = processor_sym8.dwt(&signal)?;
-        assert!(approx.shape().dims() [0] > 0);
+        assert!(approx.shape().dims()[0] > 0);
         assert_eq!(details.len(), 2);
         Ok(())
     }
@@ -323,17 +294,18 @@ mod tests_2 {
     fn test_coiflet_wavelets() -> Result<()> {
         let signal = ones(&[128])?;
         for order in 1..=5 {
-            let processor = DiscreteWaveletProcessor::new(
-                WaveletType::Coiflet(order),
-                2,
-            );
+            let processor = DiscreteWaveletProcessor::new(WaveletType::Coiflet(order), 2);
             let (approx, details) = processor.dwt(&signal)?;
             assert!(
-                approx.shape().dims() [0] > 0, "Coiflet {} failed: approx size is 0",
+                approx.shape().dims()[0] > 0,
+                "Coiflet {} failed: approx size is 0",
                 order
             );
             assert_eq!(
-                details.len(), 2, "Coiflet {} failed: expected 2 detail levels", order
+                details.len(),
+                2,
+                "Coiflet {} failed: expected 2 detail levels",
+                order
             );
         }
         Ok(())
@@ -341,40 +313,25 @@ mod tests_2 {
     #[test]
     fn test_biorthogonal_wavelets() -> Result<()> {
         let signal = ones(&[128])?;
-        let processor_bior11 = DiscreteWaveletProcessor::new(
-            WaveletType::Biorthogonal(1, 1),
-            2,
-        );
+        let processor_bior11 = DiscreteWaveletProcessor::new(WaveletType::Biorthogonal(1, 1), 2);
         let (approx, details) = processor_bior11.dwt(&signal)?;
-        assert!(approx.shape().dims() [0] > 0);
+        assert!(approx.shape().dims()[0] > 0);
         assert_eq!(details.len(), 2);
-        let processor_bior13 = DiscreteWaveletProcessor::new(
-            WaveletType::Biorthogonal(1, 3),
-            2,
-        );
+        let processor_bior13 = DiscreteWaveletProcessor::new(WaveletType::Biorthogonal(1, 3), 2);
         let (approx, details) = processor_bior13.dwt(&signal)?;
-        assert!(approx.shape().dims() [0] > 0);
+        assert!(approx.shape().dims()[0] > 0);
         assert_eq!(details.len(), 2);
-        let processor_bior15 = DiscreteWaveletProcessor::new(
-            WaveletType::Biorthogonal(1, 5),
-            2,
-        );
+        let processor_bior15 = DiscreteWaveletProcessor::new(WaveletType::Biorthogonal(1, 5), 2);
         let (approx, details) = processor_bior15.dwt(&signal)?;
-        assert!(approx.shape().dims() [0] > 0);
+        assert!(approx.shape().dims()[0] > 0);
         assert_eq!(details.len(), 2);
-        let processor_bior22 = DiscreteWaveletProcessor::new(
-            WaveletType::Biorthogonal(2, 2),
-            2,
-        );
+        let processor_bior22 = DiscreteWaveletProcessor::new(WaveletType::Biorthogonal(2, 2), 2);
         let (approx, details) = processor_bior22.dwt(&signal)?;
-        assert!(approx.shape().dims() [0] > 0);
+        assert!(approx.shape().dims()[0] > 0);
         assert_eq!(details.len(), 2);
-        let processor_bior24 = DiscreteWaveletProcessor::new(
-            WaveletType::Biorthogonal(2, 4),
-            2,
-        );
+        let processor_bior24 = DiscreteWaveletProcessor::new(WaveletType::Biorthogonal(2, 4), 2);
         let (approx, details) = processor_bior24.dwt(&signal)?;
-        assert!(approx.shape().dims() [0] > 0);
+        assert!(approx.shape().dims()[0] > 0);
         assert_eq!(details.len(), 2);
         Ok(())
     }
@@ -383,18 +340,15 @@ mod tests_2 {
         let signal = ones(&[128])?;
         let processor_db3 = DiscreteWaveletProcessor::new(WaveletType::Daubechies(6), 2);
         let (approx, details) = processor_db3.dwt(&signal)?;
-        assert!(approx.shape().dims() [0] > 0);
+        assert!(approx.shape().dims()[0] > 0);
         assert_eq!(details.len(), 2);
         let processor_db4 = DiscreteWaveletProcessor::new(WaveletType::Daubechies(8), 2);
         let (approx, details) = processor_db4.dwt(&signal)?;
-        assert!(approx.shape().dims() [0] > 0);
+        assert!(approx.shape().dims()[0] > 0);
         assert_eq!(details.len(), 2);
-        let processor_db5 = DiscreteWaveletProcessor::new(
-            WaveletType::Daubechies(10),
-            2,
-        );
+        let processor_db5 = DiscreteWaveletProcessor::new(WaveletType::Daubechies(10), 2);
         let (approx, details) = processor_db5.dwt(&signal)?;
-        assert!(approx.shape().dims() [0] > 0);
+        assert!(approx.shape().dims()[0] > 0);
         assert_eq!(details.len(), 2);
         Ok(())
     }
@@ -402,8 +356,12 @@ mod tests_2 {
     fn test_wavelet_reconstruction_perfect() -> Result<()> {
         use torsh_tensor::creation::randn;
         let wavelets = vec![
-            WaveletType::Haar, WaveletType::Daubechies(4), WaveletType::Daubechies(6),
-            WaveletType::Symlet(4), WaveletType::Symlet(6), WaveletType::Coiflet(1),
+            WaveletType::Haar,
+            WaveletType::Daubechies(4),
+            WaveletType::Daubechies(6),
+            WaveletType::Symlet(4),
+            WaveletType::Symlet(6),
+            WaveletType::Coiflet(1),
             WaveletType::Coiflet(2),
         ];
         for wavelet in wavelets {
@@ -414,9 +372,11 @@ mod tests_2 {
             let original_len = signal.shape().dims()[0];
             let reconstructed_len = reconstructed.shape().dims()[0];
             assert!(
-                reconstructed_len >= original_len / 2 && reconstructed_len <=
-                original_len * 2, "Wavelet {:?}: reconstructed length {} vs original {}",
-                wavelet, reconstructed_len, original_len
+                reconstructed_len >= original_len / 2 && reconstructed_len <= original_len * 2,
+                "Wavelet {:?}: reconstructed length {} vs original {}",
+                wavelet,
+                reconstructed_len,
+                original_len
             );
         }
         Ok(())

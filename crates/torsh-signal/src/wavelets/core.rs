@@ -2,12 +2,12 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
-use torsh_core::{device::DeviceType, dtype::Complex32, error::{Result, TorshError}};
-use torsh_tensor::{
-    creation::zeros,
-    Tensor,
+use torsh_core::{
+    device::DeviceType,
+    dtype::Complex32,
+    error::{Result, TorshError},
 };
-
+use torsh_tensor::{creation::zeros, Tensor};
 
 /// Continuous Wavelet Transform (CWT) processor
 pub struct ContinuousWaveletProcessor {
@@ -27,9 +27,9 @@ impl ContinuousWaveletProcessor {
     pub fn cwt(&self, signal: &Tensor<f32>) -> Result<Tensor<Complex32>> {
         let signal_shape = signal.shape();
         if signal_shape.ndim() != 1 {
-            return Err(
-                TorshError::InvalidArgument("CWT requires 1D tensor".to_string()),
-            );
+            return Err(TorshError::InvalidArgument(
+                "CWT requires 1D tensor".to_string(),
+            ));
         }
         let signal_length = signal_shape.dims()[0];
         let n_scales = self.scales.len();
@@ -58,7 +58,9 @@ impl ContinuousWaveletProcessor {
     /// Compute scalogram (magnitude of CWT)
     pub fn scalogram(&self, signal: &Tensor<f32>) -> Result<Tensor<f32>> {
         let cwt_result = self.cwt(signal)?;
-        cwt_result.abs().map_err(|e| TorshError::ComputeError(e.to_string()))
+        cwt_result
+            .abs()
+            .map_err(|e| TorshError::ComputeError(e.to_string()))
     }
 }
 /// Discrete Wavelet Transform (DWT) processor
@@ -74,9 +76,9 @@ impl DiscreteWaveletProcessor {
     pub fn dwt(&self, signal: &Tensor<f32>) -> Result<(Tensor<f32>, Vec<Tensor<f32>>)> {
         let signal_shape = signal.shape();
         if signal_shape.ndim() != 1 {
-            return Err(
-                TorshError::InvalidArgument("DWT requires 1D tensor".to_string()),
-            );
+            return Err(TorshError::InvalidArgument(
+                "DWT requires 1D tensor".to_string(),
+            ));
         }
         let _signal_length = signal_shape.dims()[0];
         let (lo_d, hi_d, _lo_r, _hi_r) = get_wavelet_filters(&self.wavelet)?;
@@ -106,10 +108,7 @@ impl DiscreteWaveletProcessor {
         for detail in details.iter().rev() {
             let upsampled_approx = upsample_and_convolve(&current_signal, &lo_r)?;
             let upsampled_detail = upsample_and_convolve(detail, &hi_r)?;
-            let len = upsampled_approx
-                .shape()
-                .dims()[0]
-                .min(upsampled_detail.shape().dims()[0]);
+            let len = upsampled_approx.shape().dims()[0].min(upsampled_detail.shape().dims()[0]);
             let mut reconstructed = zeros(&[len])?;
             for i in 0..len {
                 let approx_val: f32 = upsampled_approx.get_1d(i)?;
@@ -127,9 +126,9 @@ impl DiscreteWaveletProcessor {
     ) -> Result<(Tensor<f32>, Tensor<f32>, Tensor<f32>, Tensor<f32>)> {
         let image_shape = image.shape();
         if image_shape.ndim() != 2 {
-            return Err(
-                TorshError::InvalidArgument("2D DWT requires 2D tensor".to_string()),
-            );
+            return Err(TorshError::InvalidArgument(
+                "2D DWT requires 2D tensor".to_string(),
+            ));
         }
         let (rows, cols) = (image_shape.dims()[0], image_shape.dims()[1]);
         let (lo_d, hi_d, _lo_r, _hi_r) = get_wavelet_filters(&self.wavelet)?;
@@ -198,11 +197,7 @@ pub struct WaveletDenoiser {
     pub threshold_method: ThresholdMethod,
 }
 impl WaveletDenoiser {
-    pub fn new(
-        wavelet: WaveletType,
-        levels: usize,
-        threshold_method: ThresholdMethod,
-    ) -> Self {
+    pub fn new(wavelet: WaveletType, levels: usize, threshold_method: ThresholdMethod) -> Self {
         Self {
             wavelet,
             levels,
@@ -213,11 +208,9 @@ impl WaveletDenoiser {
     pub fn denoise(&self, signal: &Tensor<f32>) -> Result<Tensor<f32>> {
         let signal_shape = signal.shape();
         if signal_shape.ndim() != 1 {
-            return Err(
-                TorshError::InvalidArgument(
-                    "Wavelet denoising requires 1D tensor".to_string(),
-                ),
-            );
+            return Err(TorshError::InvalidArgument(
+                "Wavelet denoising requires 1D tensor".to_string(),
+            ));
         }
         let dwt_processor = DiscreteWaveletProcessor::new(self.wavelet, self.levels);
         let (approximation, mut details) = dwt_processor.dwt(signal)?;
@@ -266,19 +259,11 @@ pub enum WaveletType {
 pub struct WaveletUtils;
 impl WaveletUtils {
     /// Convert frequency to wavelet scale (simplified implementation)
-    pub fn frequency_to_scale(
-        frequency: f32,
-        sample_rate: f32,
-        _wavelet: WaveletType,
-    ) -> f32 {
+    pub fn frequency_to_scale(frequency: f32, sample_rate: f32, _wavelet: WaveletType) -> f32 {
         sample_rate / (2.0 * frequency)
     }
     /// Convert wavelet scale to frequency (simplified implementation)
-    pub fn scale_to_frequency(
-        scale: f32,
-        sample_rate: f32,
-        _wavelet: WaveletType,
-    ) -> f32 {
+    pub fn scale_to_frequency(scale: f32, sample_rate: f32, _wavelet: WaveletType) -> f32 {
         sample_rate / (2.0 * scale)
     }
     /// Compute the cone of influence (COI) for each requested scale.
@@ -334,9 +319,9 @@ pub(super) fn get_wavelet_filters(
         }
         _ => {
             let lo_d = vec![1.0 / sqrt2_f32, 1.0 / sqrt2_f32];
-            let hi_d = vec![1.0 / sqrt2_f32, - 1.0 / sqrt2_f32];
+            let hi_d = vec![1.0 / sqrt2_f32, -1.0 / sqrt2_f32];
             let lo_r = lo_d.clone();
-            let hi_r = vec![- 1.0 / sqrt2_f32, 1.0 / sqrt2_f32];
+            let hi_r = vec![-1.0 / sqrt2_f32, 1.0 / sqrt2_f32];
             Ok((lo_d, hi_d, lo_r, hi_r))
         }
     }
@@ -345,9 +330,9 @@ pub(super) fn get_wavelet_filters(
 pub(super) fn get_haar_filters() -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
     let sqrt2_f32 = 2.0_f32.sqrt();
     let lo_d = vec![1.0 / sqrt2_f32, 1.0 / sqrt2_f32];
-    let hi_d = vec![1.0 / sqrt2_f32, - 1.0 / sqrt2_f32];
+    let hi_d = vec![1.0 / sqrt2_f32, -1.0 / sqrt2_f32];
     let lo_r = lo_d.clone();
-    let hi_r = vec![- 1.0 / sqrt2_f32, 1.0 / sqrt2_f32];
+    let hi_r = vec![-1.0 / sqrt2_f32, 1.0 / sqrt2_f32];
     Ok((lo_d, hi_d, lo_r, hi_r))
 }
 /// Get Daubechies wavelet filters
@@ -363,33 +348,48 @@ pub(super) fn get_daubechies_filters(
             let c2 = (3.0 - 3.0_f32.sqrt()) / (4.0 * sqrt2_f32);
             let c3 = (1.0 - 3.0_f32.sqrt()) / (4.0 * sqrt2_f32);
             let lo_d = vec![c0, c1, c2, c3];
-            let hi_d = vec![- c3, c2, - c1, c0];
+            let hi_d = vec![-c3, c2, -c1, c0];
             let lo_r = vec![c3, c2, c1, c0];
-            let hi_r = vec![c0, - c1, c2, - c3];
+            let hi_r = vec![c0, -c1, c2, -c3];
             Ok((lo_d, hi_d, lo_r, hi_r))
         }
         6 => {
             let lo_d = vec![
-                0.035226291882100656, - 0.08544127388224149, - 0.13501102001039084,
-                0.4598775021193313, 0.8068915093133388, 0.3326705529509569,
+                0.035226291882100656,
+                -0.08544127388224149,
+                -0.13501102001039084,
+                0.4598775021193313,
+                0.8068915093133388,
+                0.3326705529509569,
             ];
             let (hi_d, lo_r, hi_r) = construct_qmf_filters(&lo_d);
             Ok((lo_d, hi_d, lo_r, hi_r))
         }
         8 => {
             let lo_d = vec![
-                - 0.010597401784997278, 0.032883011666982945, 0.030841381835986965, -
-                0.18703481171888114, - 0.02798376941698385, 0.6308807679295904,
-                0.7148465705525415, 0.23037781330885523,
+                -0.010597401784997278,
+                0.032883011666982945,
+                0.030841381835986965,
+                -0.18703481171888114,
+                -0.02798376941698385,
+                0.6308807679295904,
+                0.7148465705525415,
+                0.23037781330885523,
             ];
             let (hi_d, lo_r, hi_r) = construct_qmf_filters(&lo_d);
             Ok((lo_d, hi_d, lo_r, hi_r))
         }
         10 => {
             let lo_d = vec![
-                0.003335725285001549, - 0.012580751999015526, - 0.006241490213011705,
-                0.07757149384006515, - 0.03224486958502952, - 0.24229488706619015,
-                0.13842814590110342, 0.7243085284385744, 0.6038292697974729,
+                0.003335725285001549,
+                -0.012580751999015526,
+                -0.006241490213011705,
+                0.07757149384006515,
+                -0.03224486958502952,
+                -0.24229488706619015,
+                0.13842814590110342,
+                0.7243085284385744,
+                0.6038292697974729,
                 0.160102397974125,
             ];
             let (hi_d, lo_r, hi_r) = construct_qmf_filters(&lo_d);
@@ -399,29 +399,42 @@ pub(super) fn get_daubechies_filters(
     }
 }
 /// Get Symlet wavelet filters (nearly symmetric Daubechies wavelets)
-pub(super) fn get_symlet_filters(
-    order: usize,
-) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+pub(super) fn get_symlet_filters(order: usize) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
     match order {
         2 => get_haar_filters(),
         4 => get_daubechies_filters(4),
         6 => {
             let lo_d = vec![
-                0.015404109327027373, 0.0034907120842174702, - 0.11799011114819057, -
-                0.048311742585633, 0.4910559419267466, 0.787641141030194,
-                0.3379294217276218, - 0.07263752278646252,
+                0.015404109327027373,
+                0.0034907120842174702,
+                -0.11799011114819057,
+                -0.048311742585633,
+                0.4910559419267466,
+                0.787641141030194,
+                0.3379294217276218,
+                -0.07263752278646252,
             ];
             let (hi_d, lo_r, hi_r) = construct_qmf_filters(&lo_d);
             Ok((lo_d, hi_d, lo_r, hi_r))
         }
         8 => {
             let lo_d = vec![
-                0.001889950332298416, - 0.0003029205147213668, - 0.014952258337048231,
-                0.003808752013890615, 0.04909074317376672, - 0.02772022594609928, -
-                0.051945838107709035, 0.3645143928736813, 0.7776289489686924,
-                0.4813596512631286, - 0.06179397068252855, - 0.14329423835127267,
-                0.007607487324917605, 0.031695087811492655, - 0.00047315449868008943, -
-                0.0016294920100633956,
+                0.001889950332298416,
+                -0.0003029205147213668,
+                -0.014952258337048231,
+                0.003808752013890615,
+                0.04909074317376672,
+                -0.02772022594609928,
+                -0.051945838107709035,
+                0.3645143928736813,
+                0.7776289489686924,
+                0.4813596512631286,
+                -0.06179397068252855,
+                -0.14329423835127267,
+                0.007607487324917605,
+                0.031695087811492655,
+                -0.00047315449868008943,
+                -0.0016294920100633956,
             ];
             let (hi_d, lo_r, hi_r) = construct_qmf_filters(&lo_d);
             Ok((lo_d, hi_d, lo_r, hi_r))
@@ -436,45 +449,83 @@ pub(super) fn get_coiflet_filters(
     match order {
         1 => {
             let lo_d = vec![
-                - 0.01565572813546454, - 0.07293414550632238, 0.38486484686420286,
-                0.8525720202122554, 0.33789766245780596, - 0.07273261951253116,
+                -0.01565572813546454,
+                -0.07293414550632238,
+                0.38486484686420286,
+                0.8525720202122554,
+                0.33789766245780596,
+                -0.07273261951253116,
             ];
             let (hi_d, lo_r, hi_r) = construct_qmf_filters(&lo_d);
             Ok((lo_d, hi_d, lo_r, hi_r))
         }
         2 => {
             let lo_d = vec![
-                0.0007205494453645122, 0.0018232088707029932, - 0.005611434819393533, -
-                0.015829105256023893, 0.02578644593202368, 0.05594583865804999, -
-                0.0756826109720478, - 0.4134043227251251, 0.7937772226256206,
-                0.4281166946925372, - 0.07173284831320316, - 0.021508690858944406,
+                0.0007205494453645122,
+                0.0018232088707029932,
+                -0.005611434819393533,
+                -0.015829105256023893,
+                0.02578644593202368,
+                0.05594583865804999,
+                -0.0756826109720478,
+                -0.4134043227251251,
+                0.7937772226256206,
+                0.4281166946925372,
+                -0.07173284831320316,
+                -0.021508690858944406,
             ];
             let (hi_d, lo_r, hi_r) = construct_qmf_filters(&lo_d);
             Ok((lo_d, hi_d, lo_r, hi_r))
         }
         3 => {
             let lo_d = vec![
-                - 0.00003397896721109686, - 0.00011413569775206739,
-                0.0005058077716873224, 0.001181568374654004, - 0.0025745176887502236, -
-                0.009007976137738915, 0.015880544863615904, 0.034555027573061885, -
-                0.08230192710688598, - 0.07179382144625129, 0.42848347637761874,
-                0.793777222626048, 0.4051769024096169, - 0.06112339000267287, -
-                0.0657719112818552, 0.023452696141836267, 0.007782596426059586, -
-                0.0037514361572790727,
+                -0.00003397896721109686,
+                -0.00011413569775206739,
+                0.0005058077716873224,
+                0.001181568374654004,
+                -0.0025745176887502236,
+                -0.009007976137738915,
+                0.015880544863615904,
+                0.034555027573061885,
+                -0.08230192710688598,
+                -0.07179382144625129,
+                0.42848347637761874,
+                0.793777222626048,
+                0.4051769024096169,
+                -0.06112339000267287,
+                -0.0657719112818552,
+                0.023452696141836267,
+                0.007782596426059586,
+                -0.0037514361572790727,
             ];
             let (hi_d, lo_r, hi_r) = construct_qmf_filters(&lo_d);
             Ok((lo_d, hi_d, lo_r, hi_r))
         }
         4 => {
             let lo_d = vec![
-                0.000015105430506304422, 0.000034408827162315834, -
-                0.00011424152003843815, - 0.0002631631042436148, 0.0008930838479398685,
-                0.0016421863558399155, - 0.0034387805907822677, - 0.007758048234430904,
-                0.017520932140694426, 0.02293829995602433, - 0.07139414716608896, -
-                0.0340944213933349, 0.2175694314125749, 0.5617666029804175,
-                0.6106918084502669, 0.2699935541918401, - 0.04039378140437074, -
-                0.10780823770381774, 0.025082261844864097, 0.02344870117325853, -
-                0.007462189892638753, - 0.0036630215397745056, 0.0013327900609159953,
+                0.000015105430506304422,
+                0.000034408827162315834,
+                -0.00011424152003843815,
+                -0.0002631631042436148,
+                0.0008930838479398685,
+                0.0016421863558399155,
+                -0.0034387805907822677,
+                -0.007758048234430904,
+                0.017520932140694426,
+                0.02293829995602433,
+                -0.07139414716608896,
+                -0.0340944213933349,
+                0.2175694314125749,
+                0.5617666029804175,
+                0.6106918084502669,
+                0.2699935541918401,
+                -0.04039378140437074,
+                -0.10780823770381774,
+                0.025082261844864097,
+                0.02344870117325853,
+                -0.007462189892638753,
+                -0.0036630215397745056,
+                0.0013327900609159953,
                 0.00025827469103990166,
             ];
             let (hi_d, lo_r, hi_r) = construct_qmf_filters(&lo_d);
@@ -482,17 +533,36 @@ pub(super) fn get_coiflet_filters(
         }
         5 => {
             let lo_d = vec![
-                - 0.000006854857178203816, - 0.000011896625999958528,
-                0.00003430914831335113, 0.00006568714697935131, - 0.00019909271529607042,
-                - 0.0003397872721921428, 0.0007080360092548208, 0.001371009715384228, -
-                0.002870897558832936, - 0.003918522061185497, 0.01082022248055414,
-                0.009613079728823854, - 0.037935842451264195, - 0.018519328045309374,
-                0.14238972086883867, 0.3289218625133212, 0.5608150246832157,
-                0.6273769926117013, 0.3563150525075308, 0.011020671234056303, -
-                0.09316387741097546, - 0.05816378408050992, 0.03722532651320061,
-                0.04199584152932175, - 0.01301757776315761, - 0.010623419271704404,
-                0.004405572698126006, 0.0017677118642428037, - 0.0008970031762850821, -
-                0.00015949242182535965,
+                -0.000006854857178203816,
+                -0.000011896625999958528,
+                0.00003430914831335113,
+                0.00006568714697935131,
+                -0.00019909271529607042,
+                -0.0003397872721921428,
+                0.0007080360092548208,
+                0.001371009715384228,
+                -0.002870897558832936,
+                -0.003918522061185497,
+                0.01082022248055414,
+                0.009613079728823854,
+                -0.037935842451264195,
+                -0.018519328045309374,
+                0.14238972086883867,
+                0.3289218625133212,
+                0.5608150246832157,
+                0.6273769926117013,
+                0.3563150525075308,
+                0.011020671234056303,
+                -0.09316387741097546,
+                -0.05816378408050992,
+                0.03722532651320061,
+                0.04199584152932175,
+                -0.01301757776315761,
+                -0.010623419271704404,
+                0.004405572698126006,
+                0.0017677118642428037,
+                -0.0008970031762850821,
+                -0.00015949242182535965,
             ];
             let (hi_d, lo_r, hi_r) = construct_qmf_filters(&lo_d);
             Ok((lo_d, hi_d, lo_r, hi_r))
@@ -510,80 +580,150 @@ pub(super) fn get_biorthogonal_filters(
         (1, 3) => {
             let sqrt2_f32 = 2.0_f32.sqrt();
             let lo_d = vec![
-                - 0.08838834764831845 / sqrt2_f32, 0.08838834764831845 / sqrt2_f32,
-                0.7071067811865476 / sqrt2_f32, 0.7071067811865476 / sqrt2_f32,
-                0.08838834764831845 / sqrt2_f32, - 0.08838834764831845 / sqrt2_f32,
+                -0.08838834764831845 / sqrt2_f32,
+                0.08838834764831845 / sqrt2_f32,
+                0.7071067811865476 / sqrt2_f32,
+                0.7071067811865476 / sqrt2_f32,
+                0.08838834764831845 / sqrt2_f32,
+                -0.08838834764831845 / sqrt2_f32,
             ];
             let hi_d = vec![
-                0.0, 0.0, - 0.7071067811865476 / sqrt2_f32, 0.7071067811865476 /
-                sqrt2_f32, 0.0, 0.0,
+                0.0,
+                0.0,
+                -0.7071067811865476 / sqrt2_f32,
+                0.7071067811865476 / sqrt2_f32,
+                0.0,
+                0.0,
             ];
             let lo_r = vec![
-                0.7071067811865476 / sqrt2_f32, 0.7071067811865476 / sqrt2_f32,
+                0.7071067811865476 / sqrt2_f32,
+                0.7071067811865476 / sqrt2_f32,
             ];
             let hi_r = vec![
-                - 0.7071067811865476 / sqrt2_f32, 0.7071067811865476 / sqrt2_f32,
+                -0.7071067811865476 / sqrt2_f32,
+                0.7071067811865476 / sqrt2_f32,
             ];
             Ok((lo_d, hi_d, lo_r, hi_r))
         }
         (1, 5) => {
             let sqrt2_f32 = 2.0_f32.sqrt();
             let lo_d = vec![
-                0.01657281251935307 / sqrt2_f32, - 0.01657281251935307 / sqrt2_f32, -
-                0.12153397801643787 / sqrt2_f32, 0.12153397801643787 / sqrt2_f32,
-                0.7071067811865476 / sqrt2_f32, 0.7071067811865476 / sqrt2_f32,
-                0.12153397801643787 / sqrt2_f32, - 0.12153397801643787 / sqrt2_f32, -
-                0.01657281251935307 / sqrt2_f32, 0.01657281251935307 / sqrt2_f32,
+                0.01657281251935307 / sqrt2_f32,
+                -0.01657281251935307 / sqrt2_f32,
+                -0.12153397801643787 / sqrt2_f32,
+                0.12153397801643787 / sqrt2_f32,
+                0.7071067811865476 / sqrt2_f32,
+                0.7071067811865476 / sqrt2_f32,
+                0.12153397801643787 / sqrt2_f32,
+                -0.12153397801643787 / sqrt2_f32,
+                -0.01657281251935307 / sqrt2_f32,
+                0.01657281251935307 / sqrt2_f32,
             ];
             let hi_d = vec![
-                0.0, 0.0, 0.0, 0.0, - 0.7071067811865476 / sqrt2_f32, 0.7071067811865476
-                / sqrt2_f32, 0.0, 0.0, 0.0, 0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -0.7071067811865476 / sqrt2_f32,
+                0.7071067811865476 / sqrt2_f32,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
             ];
             let lo_r = vec![
-                0.7071067811865476 / sqrt2_f32, 0.7071067811865476 / sqrt2_f32,
+                0.7071067811865476 / sqrt2_f32,
+                0.7071067811865476 / sqrt2_f32,
             ];
             let hi_r = vec![
-                - 0.7071067811865476 / sqrt2_f32, 0.7071067811865476 / sqrt2_f32,
+                -0.7071067811865476 / sqrt2_f32,
+                0.7071067811865476 / sqrt2_f32,
             ];
             Ok((lo_d, hi_d, lo_r, hi_r))
         }
         (2, 2) => {
             let lo_d = vec![
-                0.0, - 0.1767766952966369, 0.3535533905932738, 1.0606601717798214,
-                0.3535533905932738, - 0.1767766952966369,
+                0.0,
+                -0.1767766952966369,
+                0.3535533905932738,
+                1.0606601717798214,
+                0.3535533905932738,
+                -0.1767766952966369,
             ];
             let hi_d = vec![
-                0.0, 0.3535533905932738, - 0.7071067811865476, 0.3535533905932738, 0.0,
+                0.0,
+                0.3535533905932738,
+                -0.7071067811865476,
+                0.3535533905932738,
+                0.0,
                 0.0,
             ];
             let lo_r = vec![
-                0.0, 0.3535533905932738, 0.7071067811865476, 0.3535533905932738, 0.0,
+                0.0,
+                0.3535533905932738,
+                0.7071067811865476,
+                0.3535533905932738,
+                0.0,
                 0.0,
             ];
             let hi_r = vec![
-                0.0, - 0.1767766952966369, - 0.3535533905932738, 1.0606601717798214, -
-                0.3535533905932738, - 0.1767766952966369,
+                0.0,
+                -0.1767766952966369,
+                -0.3535533905932738,
+                1.0606601717798214,
+                -0.3535533905932738,
+                -0.1767766952966369,
             ];
             Ok((lo_d, hi_d, lo_r, hi_r))
         }
         (2, 4) => {
             let lo_d = vec![
-                0.0, 0.03314563036811942, - 0.06629126073623884, - 0.1767766952966369,
-                0.4198446513295126, 0.9943689110435825, 0.4198446513295126, -
-                0.1767766952966369, - 0.06629126073623884, 0.03314563036811942,
+                0.0,
+                0.03314563036811942,
+                -0.06629126073623884,
+                -0.1767766952966369,
+                0.4198446513295126,
+                0.9943689110435825,
+                0.4198446513295126,
+                -0.1767766952966369,
+                -0.06629126073623884,
+                0.03314563036811942,
             ];
             let hi_d = vec![
-                0.0, 0.0, 0.0, 0.3535533905932738, - 0.7071067811865476,
-                0.3535533905932738, 0.0, 0.0, 0.0, 0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.3535533905932738,
+                -0.7071067811865476,
+                0.3535533905932738,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
             ];
             let lo_r = vec![
-                0.0, 0.0, 0.0, 0.3535533905932738, 0.7071067811865476,
-                0.3535533905932738, 0.0, 0.0, 0.0, 0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.3535533905932738,
+                0.7071067811865476,
+                0.3535533905932738,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
             ];
             let hi_r = vec![
-                0.0, 0.03314563036811942, 0.06629126073623884, - 0.1767766952966369, -
-                0.4198446513295126, 0.9943689110435825, - 0.4198446513295126, -
-                0.1767766952966369, 0.06629126073623884, 0.03314563036811942,
+                0.0,
+                0.03314563036811942,
+                0.06629126073623884,
+                -0.1767766952966369,
+                -0.4198446513295126,
+                0.9943689110435825,
+                -0.4198446513295126,
+                -0.1767766952966369,
+                0.06629126073623884,
+                0.03314563036811942,
             ];
             Ok((lo_d, hi_d, lo_r, hi_r))
         }
@@ -682,7 +822,11 @@ fn estimate_noise_sigma(coeffs: &Tensor<f32>) -> Result<f32> {
         values.push(val.abs());
     }
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = if values.is_empty() { 0.0 } else { values[values.len() / 2] };
+    let median = if values.is_empty() {
+        0.0
+    } else {
+        values[values.len() / 2]
+    };
     let sigma = median / 0.6745;
     Ok(sigma)
 }
@@ -698,7 +842,11 @@ fn soft_threshold(value: f32, threshold: f32) -> f32 {
 }
 /// Hard thresholding function
 fn hard_threshold(value: f32, threshold: f32) -> f32 {
-    if value.abs() > threshold { value } else { 0.0 }
+    if value.abs() > threshold {
+        value
+    } else {
+        0.0
+    }
 }
 /// Per-wavelet e-folding time constant `k` such that the cone-of-influence
 /// e-folding time is `k * scale`. See [`WaveletUtils::cone_of_influence`].
