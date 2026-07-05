@@ -192,8 +192,8 @@
 - [ ] **Coverage**: Support major time series analysis workflows
 
 ## ⚠️ Known Issues
-- [ ] **Tensor slicing API incompatibility** (High priority)
-- [ ] **Missing neural network layer imports** (Medium priority)
+- [x] **Tensor slicing API incompatibility** (High priority) — `.narrow()`/`.slice()` are used successfully (e.g. `forecast/deep.rs`) with no workaround comments remaining
+- [x] **Missing neural network layer imports** (Medium priority) — `forecast/deep.rs` imports and uses real `torsh_nn` `LSTM`/`GRU`/`Conv1d`/`Linear`/`Dropout` layers with working forward passes
 - [x] **Incomplete state space model implementations** (Medium priority)
 - [ ] **Error handling needs improvement** (Low priority)
 

@@ -4,267 +4,182 @@ Quantization toolkit for ToRSh, enabling efficient model deployment with reduced
 
 ## Overview
 
-This crate provides comprehensive quantization support for deep learning models:
+This crate provides tensor-level quantization support for deep learning workloads:
 
-- **Post-Training Quantization**: Quantize trained models without retraining
-- **Quantization-Aware Training**: Train models with simulated quantization
-- **Dynamic Quantization**: Runtime quantization for specific operations
-- **Backends**: Support for multiple quantization backends (FBGEMM, QNNPACK)
-- **Formats**: INT8, INT4, and custom quantization schemes
+- **Quantization Schemes**: INT8, INT4, binary, ternary, mixed-precision, per-channel and group-wise, exposed as `QuantConfig` presets
+- **Observers/Calibration**: MinMax, moving-average, histogram and percentile observers for computing scale/zero-point
+- **Auto-Configuration**: An ML-assisted `AutoConfigurator` that recommends a `QuantConfig` from tensor statistics and an optimization objective
+- **Quality Analysis**: PSNR/SNR/MAE/cosine-similarity metrics, multi-config comparison, and auto-calibration helpers
+- **Backends**: A `QuantBackend` enum (FBGEMM, QNNPACK, Native, XNNPACK) used to tag configs for downstream kernel selection
+
+The stable, default-feature surface operates on individual `Tensor`s (`quantize_with_config` / `dequantize` / `calculate_quantization_metrics`). A model-level Post-Training/Quantization-Aware-Training pipeline (calibrating and converting a whole `Module`, ONNX/TensorRT export, etc.) also exists in the source tree, but it is gated behind the `experimental` feature and currently has no concrete implementor for the `Module` trait it depends on — see [TODO.md](./TODO.md) for the tracked status. Treat the per-tensor API below as the primary supported surface.
 
 ## Usage
 
-### Post-Training Quantization
+### Per-Tensor Quantization
+
+This is the primary, stable API surface (used directly in `examples/basic_quantization.rs`):
 
 ```rust
-use torsh_quantization::prelude::*;
+use torsh_quantization::{calculate_quantization_metrics, dequantize, quantize_with_config, QuantConfig};
+use torsh_tensor::creation::tensor_1d;
 
-// Static quantization (requires calibration)
-let model = load_model()?;
+let data = vec![-10.5, -5.2, -2.1, 0.0, 1.3, 3.7, 5.9, 8.4, 12.6, 15.8];
+let tensor = tensor_1d(&data)?;
 
-// Prepare model for calibration
-let prepared = prepare_static(
-    model,
-    QuantConfig::default()
-        .backend(Backend::FBGEMM)
-        .observer(MinMaxObserver::default()),
-)?;
+// Quantize using an INT8 preset configuration
+let config = QuantConfig::int8();
+let (quantized, scale, zero_point) = quantize_with_config(&tensor, &config)?;
 
-// Calibrate with representative data
-for batch in calibration_loader {
-    prepared.forward(&batch)?;
-}
+// Dequantize back to floating point
+let dequantized = dequantize(&quantized, scale, zero_point)?;
 
-// Convert to quantized model
-let quantized = convert(prepared)?;
-
-// Dynamic quantization (no calibration needed)
-let dynamic_quantized = quantize_dynamic(
-    model,
-    qconfig_spec={
-        Linear: default_dynamic_qconfig(),
-        LSTM: default_dynamic_qconfig(),
-    },
-    dtype=qint8,
-)?;
+// Calculate quality metrics (bits_before, bits_after)
+let metrics = calculate_quantization_metrics(&tensor, &dequantized, 32, 8)?;
+println!("PSNR: {:.2} dB, compression: {:.2}x, MAE: {:.6}",
+    metrics.psnr, metrics.compression_ratio, metrics.mae);
 ```
+
+Model-level static/dynamic quantization (`prepare_static`/`convert`/`quantize_dynamic` over a whole model) is **not currently available**: the experimental `qat`/`post_training` modules define their own local placeholder `Module` trait (distinct from `torsh_nn::Module`) with no concrete implementor yet.
 
 ### Quantization-Aware Training (QAT)
 
+A `QuantConfig::qat()` preset (fake-quant enabled, moving-average observer) is available today:
+
 ```rust
-use torsh_quantization::qat::*;
+use torsh_quantization::QuantConfig;
 
-// Prepare model for QAT
-let model = create_model();
-let qat_model = prepare_qat(
-    model,
-    QuantConfig::default()
-        .backend(Backend::QNNPACK)
-        .activation(FakeQuantize::default())
-        .weight(FakeQuantize::default()),
-)?;
-
-// Train with fake quantization
-for epoch in 0..num_epochs {
-    for batch in train_loader {
-        let output = qat_model.forward(&batch.input)?;
-        let loss = criterion(&output, &batch.target)?;
-        
-        optimizer.zero_grad();
-        loss.backward()?;
-        optimizer.step();
-    }
-}
-
-// Convert to actual quantized model
-let quantized = convert(qat_model)?;
+let qat_config = QuantConfig::qat();
 ```
+
+The full QAT training pipeline (`prepare_qat` wrapping an arbitrary model, training-loop integration, `convert` back to a quantized model) lives behind the `experimental` feature in `src/qat.rs`, but — like the post-training pipeline above — it operates on a local placeholder `Module` trait with no concrete implementor yet, so it is not usable end-to-end at the model level. Track status in [TODO.md](./TODO.md).
 
 ### Custom Quantization Configuration
 
+Configuration is built with `QuantConfigBuilder` (there is no per-layer-name/per-module-type `QConfigDict`, and no `quantize_fx`):
+
 ```rust
-use torsh_quantization::qconfig::*;
+use torsh_quantization::config::QuantConfigBuilder;
+use torsh_quantization::{ObserverType, QScheme, QuantBackend};
 
-// Per-layer configuration
-let qconfig_dict = QConfigDict::new()
-    .set_global(get_default_qconfig())
-    .set_module_name("features.0", QConfig {
-        activation: HistogramObserver::with_args(bins=1024),
-        weight: PerChannelMinMaxObserver::with_args(ch_axis=0),
-    })
-    .set_module_type::<Conv2d>(QConfig {
-        activation: MovingAverageMinMaxObserver::default(),
-        weight: default_weight_observer(),
-    });
-
-let quantized = quantize_fx(
-    model,
-    qconfig_dict,
-    backend_config,
-)?;
+let config = QuantConfigBuilder::new()
+    .scheme(QScheme::PerChannelSymmetric)
+    .observer(ObserverType::Histogram)
+    .backend(QuantBackend::Fbgemm)
+    .channel_axis(0)
+    .build()?;
 ```
 
 ### Quantization Schemes
 
+`QuantConfig` ships one preset constructor per scheme (see `QScheme` for the full enum: `PerTensorAffine`, `PerChannelAffine`, `PerTensorSymmetric`, `PerChannelSymmetric`, `Int4PerTensor`, `Int4PerChannel`, `MixedPrecision`, `Binary`, `Ternary`, `GroupWise`):
+
 ```rust
-// Symmetric vs Asymmetric quantization
-let symmetric_qconfig = QConfig::new()
-    .activation(MinMaxObserver::symmetric())
-    .weight(MinMaxObserver::symmetric());
+use torsh_quantization::QuantConfig;
 
-let asymmetric_qconfig = QConfig::new()
-    .activation(MinMaxObserver::asymmetric())
-    .weight(PerChannelMinMaxObserver::asymmetric());
+let int8 = QuantConfig::int8();
+let int4 = QuantConfig::int4();
+let binary = QuantConfig::binary();
+let ternary = QuantConfig::ternary();
+let mixed = QuantConfig::mixed_precision();
+let per_channel = QuantConfig::per_channel(0);           // ch_axis
+let group_wise = QuantConfig::group_wise(0, 32);         // ch_axis, group_size
 
-// Custom bit widths
-let int4_qconfig = QConfig::new()
-    .activation(MinMaxObserver::with_bits(4))
-    .weight(MinMaxObserver::with_bits(4));
-
-// Mixed precision
-let mixed_qconfig = QConfigDict::new()
-    .set_module_type::<Linear>(int8_qconfig())
-    .set_module_type::<Conv2d>(int4_qconfig())
-    .set_module_name("classifier", fp16_qconfig());
+// Observers (a single `Observer` type, not per-scheme observer structs)
+use torsh_quantization::observers::Observer;
+let hist_observer = Observer::histogram_with_bins(1024);
+let pct_observer = Observer::percentile_with_value(99.9);
 ```
 
 ### Model Analysis
 
+There is no `compare_models`/`sensitivity_analysis` that takes a live model plus calibration/test data. The real, tensor-level equivalents are `compare_quantization_configs` (used in `examples/advanced_schemes.rs`) and a heuristic, name-pattern-based `quick_sensitivity_analysis`:
+
 ```rust
-use torsh_quantization::analysis::*;
+use torsh_quantization::{compare_quantization_configs, QuantConfig};
 
-// Compare quantized vs original
-let comparison = compare_models(
-    original_model,
-    quantized_model,
-    test_data,
-    metrics=vec!["accuracy", "latency", "model_size"],
-)?;
+let configs = vec![
+    QuantConfig::int8(),
+    QuantConfig::int4(),
+    QuantConfig::binary(),
+    QuantConfig::ternary(),
+];
 
-println!("Accuracy drop: {:.2}%", comparison.accuracy_drop);
-println!("Speedup: {:.2}x", comparison.speedup);
-println!("Compression: {:.2}x", comparison.compression_ratio);
-
-// Sensitivity analysis
-let sensitivity = sensitivity_analysis(
-    model,
-    calibration_data,
-    test_data,
-)?;
-
-// Find layers sensitive to quantization
-for (layer_name, metrics) in sensitivity {
-    if metrics.accuracy_drop > 0.01 {
-        println!("Sensitive layer: {} (drop: {:.2}%)", 
-                 layer_name, metrics.accuracy_drop * 100.0);
-    }
+// Returns Vec<(config, metrics, time_ms)>
+let comparison = compare_quantization_configs(&tensor, &configs)?;
+for (config, metrics, time_ms) in &comparison {
+    println!("{:?}: PSNR {:.2} dB, {:.2}x compression, {:.2} ms",
+        config.scheme, metrics.psnr, metrics.compression_ratio, time_ms);
 }
+
+// Heuristic sensitivity analysis by layer name (no live model/data is used)
+use torsh_quantization::analysis::quick_sensitivity_analysis;
+let layer_names = vec!["conv1".to_string(), "fc1".to_string()];
+let sensitivity = quick_sensitivity_analysis(&layer_names)?;
 ```
 
 ### Export and Deployment
 
+There are no free functions `optimize_for_mobile`/`export_quantized_onnx`/`export_tensorrt`. The `experimental`-gated `export` module instead provides `ExportFormat` (Onnx, TensorRT, Mobile, TFLite, CoreML), an `ExportConfig`, and a `ModelExporter`:
+
 ```rust
-// Export for mobile (QNNPACK backend)
-let mobile_model = optimize_for_mobile(quantized_model)?;
-mobile_model.save("model_mobile.pt")?;
+use torsh_quantization::export::{ExportConfig, ExportFormat, ModelExporter};
 
-// Export to ONNX with quantization
-let onnx_model = export_quantized_onnx(
-    quantized_model,
-    example_input,
-    opset_version=13,
-)?;
-
-// TensorRT export
-let trt_model = export_tensorrt(
-    quantized_model,
-    precision="INT8",
-    calibration_cache="calibration.cache",
-)?;
+let config = ExportConfig {
+    format: ExportFormat::Onnx,
+    optimize_for_inference: true,
+    ..Default::default()
+};
+let exporter = ModelExporter::new(config);
+// exporter.export_model(&quantized_model, output_path)? — requires a `QuantizedModel`,
+// which today must be constructed by hand since the automatic model-conversion
+// pipeline is blocked on the same Module-trait gap noted above.
 ```
 
 ### Debugging and Visualization
 
+`QuantizationDebugger` (`experimental` feature) works per-tensor via `debug_quantization`, not over a model + data loader:
+
 ```rust
-use torsh_quantization::debug::*;
+use torsh_quantization::debugging::QuantizationDebugger;
 
-// Visualize quantization ranges
-let observer_dict = get_observer_dict(prepared_model)?;
-for (name, observer) in observer_dict {
-    let (min_val, max_val) = observer.calculate_qparams();
-    println!("{}: range [{:.3}, {:.3}]", name, min_val, max_val);
-}
-
-// Debug quantization errors
-let debugger = QuantizationDebugger(
-    model,
-    quantized_model,
-    test_loader,
-);
-
-let layer_errors = debugger.calculate_layer_errors()?;
-debugger.plot_error_heatmap("quantization_errors.png")?;
+let mut debugger = QuantizationDebugger::new();
+debugger.debug_quantization("layer1", &input, &dequantized, &config, scale, zero_point)?;
+println!("{}", debugger.generate_report());
 ```
+
+There is no `get_observer_dict`/`plot_error_heatmap`; observer ranges are read directly from an `Observer` via `calculate_qparams(dtype)`.
 
 ### Advanced Features
 
+There is no `LearnableFakeQuantize`, `StochasticQuantize`, or standalone `GroupWiseQuantConfig` (group-wise is a `QuantConfig::group_wise(...)` preset, shown above). A genuinely available advanced feature is constraint-based auto-configuration:
+
 ```rust
-// Learnable quantization parameters
-let learnable_fake_quant = LearnableFakeQuantize::new(
-    observer=MovingAverageMinMaxObserver::default(),
-    quant_min=-128,
-    quant_max=127,
-    scale_lr=0.01,
-    zero_point_lr=0.01,
-);
+use torsh_quantization::auto_config::{AutoConfigurator, ConfigConstraints, ConfigObjective};
 
-// Stochastic quantization
-let stochastic_quant = StochasticQuantize::new(
-    bit_width=8,
-    temperature=1.0,
-);
+let constraints = ConfigConstraints::new()
+    .with_min_bits(4)
+    .with_target_compression(4.0);
 
-// Channel-wise quantization for Conv/Linear
-let per_channel_qconfig = QConfig::new()
-    .weight(PerChannelMinMaxObserver::new(
-        ch_axis=0,
-        qscheme=per_channel_symmetric,
-    ));
-
-// Group-wise quantization
-let group_wise_qconfig = GroupWiseQuantConfig::new(
-    groups=32,
-    bits=4,
-);
+let configurator = AutoConfigurator::new(ConfigObjective::BalancedQuality);
+let config = configurator.recommend(&tensor, Some(constraints))?; // takes ConfigConstraints by value
 ```
 
 ### Quantization Backends
 
+`QuantBackend` is a plain enum tag on the config (there is no platform-conditional compilation tied to it, and no `CustomBackend`):
+
 ```rust
-// FBGEMM (x86 optimized)
-#[cfg(target_arch = "x86_64")]
-let fbgemm_config = QuantConfig::default()
-    .backend(Backend::FBGEMM);
+use torsh_quantization::{QuantBackend, QuantConfig};
 
-// QNNPACK (mobile optimized)
-#[cfg(target_arch = "arm")]
-let qnnpack_config = QuantConfig::default()
-    .backend(Backend::QNNPACK);
-
-// Custom backend
-let custom_backend = CustomBackend::new()
-    .supported_ops(vec!["quantized::linear", "quantized::conv2d"])
-    .kernel_library(my_kernel_lib);
+let fbgemm_config = QuantConfig::default().with_backend(QuantBackend::Fbgemm);
+let qnnpack_config = QuantConfig::default().with_backend(QuantBackend::Qnnpack);
+// QuantBackend also has Native and Xnnpack variants
 ```
 
-## Supported Operations
+## Scope
 
-- **Linear layers**: Linear, Bilinear
-- **Convolutional**: Conv1d, Conv2d, Conv3d, ConvTranspose
-- **Recurrent**: LSTM, GRU (dynamic quantization)
-- **Activations**: ReLU, ReLU6, Hardswish, ELU
-- **Pooling**: MaxPool, AvgPool, AdaptiveAvgPool
-- **Normalization**: BatchNorm (fused with Conv/Linear)
+There are no layer-type-specific quantized kernels (no `QuantizedLinear`/`QuantizedConv2d`/`QuantizedLSTM`, etc.). Quantization operates generically on `Tensor`s regardless of which layer produced them — per-tensor, per-channel, or group-wise, at whatever scheme/bit-width the chosen `QuantConfig` specifies. An operation-fusion pattern matcher (Conv+BN, Conv+ReLU, Linear+ReLU, ...) exists behind the `experimental` feature for graph-level optimization passes, independent of the per-tensor API above.
 
 ## Best Practices
 

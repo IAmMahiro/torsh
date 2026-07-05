@@ -8,7 +8,7 @@ The `torsh-jit` crate provides JIT compilation capabilities for ToRSh, enabling:
 
 - **Kernel Fusion**: Automatically combines compatible operations to reduce memory bandwidth
 - **Graph Optimization**: Applies various optimization passes to improve performance
-- **Multiple Backends**: Supports CPU (via Cranelift), CUDA, and Metal code generation
+- **Multiple Code-Gen Backends**: Cranelift (native CPU), LLVM IR, and MLIR are implemented; CUDA PTX and Metal shader generation are still planned (see Code Generation below)
 - **TorchScript-like API**: Compatible interface for ease of migration from PyTorch
 
 ## Features
@@ -29,7 +29,9 @@ The `torsh-jit` crate provides JIT compilation capabilities for ToRSh, enabling:
 - Memory layout optimization
 
 ### Code Generation
-- Cranelift backend for CPU
+- Cranelift backend for CPU (native code generation)
+- LLVM IR backend
+- MLIR backend (arith/tensor/linalg/func dialects)
 - CUDA PTX generation (planned)
 - Metal shader generation (planned)
 - Interpreter fallback for unsupported operations
@@ -37,7 +39,8 @@ The `torsh-jit` crate provides JIT compilation capabilities for ToRSh, enabling:
 ## Usage
 
 ```rust
-use torsh_jit::{JitCompiler, JitConfig, FusionStrategy};
+use torsh_jit::{FusionStrategy, JitCompiler, JitConfig};
+use torsh_core::DeviceType;
 
 // Configure JIT compilation
 let config = JitConfig {
@@ -45,8 +48,10 @@ let config = JitConfig {
     enable_optimizations: true,
     max_fusion_size: 8,
     enable_profiling: false,
-    target_device: Device::Cpu,
+    target_device: DeviceType::Cpu,
     enable_caching: true,
+    enable_specialization: true,
+    specialization_config: Default::default(),
 };
 
 // Create JIT compiler
@@ -92,8 +97,10 @@ Multiple optimization passes are applied in sequence:
 ### Code Generation
 Backend-specific code generators produce optimized kernels:
 - CPU: Uses Cranelift for native code generation
-- CUDA: Generates PTX for NVIDIA GPUs
-- Metal: Generates Metal shaders for Apple Silicon
+- LLVM: Generates LLVM IR with target-specific optimization
+- MLIR: Generates MLIR across multiple dialects with canonicalization/CSE/DCE passes
+- CUDA: PTX generation planned, not yet implemented
+- Metal: Shader generation planned, not yet implemented
 
 ## Performance
 

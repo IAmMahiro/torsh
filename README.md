@@ -99,12 +99,12 @@ Add ToRSh to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-torsh = "0.1.3"
-torsh-nn = "0.1.3"      # Neural networks
-torsh-graph = "0.1.3"   # Graph neural networks
-torsh-series = "0.1.3"  # Time series analysis
-torsh-vision = "0.1.3"  # Computer vision
-torsh-metrics = "0.1.3" # Evaluation metrics
+torsh = "0.2.0"
+torsh-nn = "0.2.0"      # Neural networks
+torsh-graph = "0.2.0"   # Graph neural networks
+torsh-series = "0.2.0"  # Time series analysis
+torsh-vision = "0.2.0"  # Computer vision
+torsh-metrics = "0.2.0" # Evaluation metrics
 ```
 
 ## 🚀 Quick Start
@@ -340,7 +340,9 @@ not publish fixed per-domain figures that cannot be reproduced from this repo.
 
 ### Roadmap
 
-**v0.1.3 (Current)** - *2026-06-30* — GPU backend migration to oxicuda 0.3: real CUDA execution on A4000 via PTX kernels, MOS (Mathematical Operations Suite) enhancements with expanded special-function coverage, CUDA backend integration for tensor core ops
+**v0.2.0 (Current)** - *2026-07-04* — Python bindings & correctness release: pyo3 0.29 migration with real Tensor operator overloads (`+`/`-`/`*`/`/`/`@` now work directly on `Tensor` objects), 6 new PyTorch-compatible LR schedulers (`StepLR`, `MultiStepLR`, `ExponentialLR`, `CosineAnnealingLR`, `LinearLR`, `ReduceLROnPlateau`), real optimizer `state_dict()`/`load_state_dict()` checkpointing, real WebGPU cross-backend buffer transfers (previously a silent no-op), real autograd hyperparameter-optimization gradients (previously always zero), real Wavelet Packet Transform + lifting DWT/IDWT in torsh-signal (previously returned zeros), a full NumPy/pandas/SciPy interop bridge in torsh-ffi, MPI all-gather/barrier fixes in torsh-distributed, and correctness fixes (tensor alignment UB, mutex-poisoning cascade, CLI memory-unit/log-leak bugs) found via Miri and direct testing
+
+**v0.1.3** - *2026-06-30* — GPU backend migration to oxicuda 0.3: real CUDA execution on A4000 via PTX kernels, MOS (Mathematical Operations Suite) enhancements with expanded special-function coverage, CUDA backend integration for tensor core ops
 
 **v0.1.2** - *2026-04-26* — SIMD performance release: real AVX2/NEON dispatch for f32 arithmetic and activations, true buffer pool reuse (100% alloc reduction proven by dhat benchmark), criterion regression framework, streaming TAR extraction in torsh-hub, simd+parallel enabled by default
 
@@ -351,12 +353,6 @@ not publish fixed per-domain figures that cannot be reproduced from this repo.
 - ✅ CPU backend with SIMD optimizations
 - ✅ Comprehensive SciRS2 integration (18 crates)
 - ✅ 100% Pure Rust (default features)
-
-**v0.2.0** - *Performance & Polish*
-- 🔄 Enhanced CUDA backend with cuDNN integration
-- 🔄 Enhanced distributed training capabilities
-- 🔄 Performance optimization and profiling tools
-- 🔄 Comprehensive documentation and examples
 
 **v1.0 Vision** - *Production Ready*
 - 🎯 95%+ PyTorch API compatibility for common workflows
@@ -538,7 +534,7 @@ make format    # Code formatting
 make audit     # Security audit
 ```
 
-**Test Coverage**: 10,170 tests across all modules.
+**Test Coverage**: 9,966 tests passing across all modules (0 failed, 75 skipped).
 
 ## 📈 Performance Benchmarks
 
@@ -592,7 +588,7 @@ make docs     # Build documentation
 
 ### Getting Started
 
-- ✅ Core functionality is stable and tested (10,170 tests passing)
+- ✅ Core functionality is stable and tested (9,966 tests passing)
 - ✅ APIs are stabilized for core crates
 - ⚠️ Some advanced features are still under active development
 - ✅ Comprehensive documentation available

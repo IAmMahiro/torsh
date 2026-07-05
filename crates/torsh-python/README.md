@@ -50,6 +50,21 @@ print(f"DType: {float32.name}, Size: {float32.itemsize} bytes")
 # Check device availability
 print(f"CUDA available: {rstorch.cuda_is_available()}")
 print(f"MPS available: {rstorch.mps_is_available()}")
+
+# Tensors: creation functions take optional dtype/device/requires_grad
+# arguments with real defaults now, so they no longer all have to be
+# spelled out explicitly
+a = rstorch.zeros([2, 3])
+b = rstorch.ones([2, 3])
+
+# Real operator overloads (previously `a + b` raised a Python TypeError
+# even though the equivalent `a.add(b)` method worked correctly)
+c = a + b        # __add__
+d = a - b        # __sub__
+e = a * b        # __mul__
+f = a / b        # __truediv__
+g = -a           # __neg__
+h = rstorch.randn([2, 3]) @ rstorch.randn([3, 4])  # __matmul__
 ```
 
 See [examples/basic_usage.py](examples/basic_usage.py) for more examples.
@@ -70,10 +85,10 @@ See [examples/basic_usage.py](examples/basic_usage.py) for more examples.
 - **Validation Utilities**: 25+ validation functions for input checking
 - **Type Stubs**: Full `.pyi` type stubs for IDE support
 - **Documentation**: Comprehensive documentation for all public APIs
+- **Tensor Operations**: Creation functions (`zeros`, `ones`, `randn`, `rand`, `full`, `eye`, `arange`, `linspace`, and `_like` variants) plus real operator overloads (`+`, `-`, `*`, `/`, `@`, unary `-`) and reductions (`sum`, `mean`, `std`, `var`, `norm`, `max`, `min`, `argmax`, `argmin`) — all with proper PyO3 defaults, so optional arguments no longer have to be passed explicitly
 
 #### ❌ Currently Disabled (Coming Soon)
 
-- Tensor operations and creation functions
 - Neural network layers (rstorch.nn)
 - Optimization algorithms (rstorch.optim)
 - Automatic differentiation (rstorch.autograd)
@@ -184,7 +199,7 @@ torsh-python/
 │   ├── device.rs           # Device management
 │   ├── dtype.rs            # Data type handling
 │   ├── error.rs            # Error handling
-│   ├── tensor/             # Tensor operations (disabled)
+│   ├── tensor/             # Tensor operations and creation functions
 │   ├── nn/                 # Neural network layers (disabled)
 │   ├── optim/              # Optimizers (disabled)
 │   └── utils/              # Validation and utilities
@@ -221,6 +236,8 @@ python examples/basic_usage.py
 - ✅ **DType Module**: 40+ tests for all data types and properties
 - ✅ **Error Module**: Error creation and conversion tests
 - ✅ **Validation Module**: 70+ tests for all validation functions
+
+**Current `cargo test -p torsh-python --all-features` results**: 17 of the crate's own tests pass (`test_lr_scheduler.rs`: 9, `test_optim_state_dict.rs`: 5, `test_tensor_norm.rs`: 3). The 3 older integration-test files above (`test_device.rs`: 30, `test_dtype.rs`: 52, `test_error.rs`: 7 — 89 tests total) fail with `ModuleNotFoundError: No module named 'rstorch_python'`, because they `import rstorch_python` directly and need `maturin develop` run first to build the importable extension; plain `cargo test` never invokes maturin. This is a known, pre-existing infra gap — see [TODO.md](TODO.md) — not a regression.
 
 ## 🛠️ Development
 

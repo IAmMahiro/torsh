@@ -846,7 +846,7 @@ This represents the **most comprehensive deep learning framework implementation*
 ### Ecosystem
 - [ ] Create torsh-contrib
 - [x] **COMPLETED**: Add model zoo (model_zoo.rs with comprehensive model support)
-- [ ] Implement hub integration
+- [x] **COMPLETED**: Implement hub integration (`torsh-hub` re-exported as `torsh::hub` behind the `hub` feature, incl. prelude re-export and version tracking)
 - [ ] Create plugin system
 - [ ] Add extension mechanism
 
@@ -855,7 +855,7 @@ This represents the **most comprehensive deep learning framework implementation*
 - [ ] Add model converter
 - [ ] Implement visualization
 - [ ] Create debugging tools
-- [ ] Add profiling utilities
+- [x] **COMPLETED**: Add profiling utilities (`torsh-profiler` re-exported as `torsh::profiler` behind the `profiler` feature, incl. prelude re-export)
 
 ### Compatibility
 - [ ] Ensure PyTorch compatibility

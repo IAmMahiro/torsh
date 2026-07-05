@@ -16,145 +16,176 @@ This crate provides comprehensive linear algebra functionality by wrapping scirs
 
 ### Basic Matrix Operations
 
+There is no `linalg` module/namespace in this crate — `use torsh_linalg::prelude::*;` brings these
+functions directly into scope (no `linalg::` prefix). The matrix-vector product function is named
+`matvec`, not `mv`:
+
 ```rust
 use torsh_linalg::prelude::*;
 use torsh_tensor::prelude::*;
 
-// Matrix multiplication
-let a = randn(&[10, 20]);
-let b = randn(&[20, 30]);
-let c = linalg::matmul(&a, &b)?;
+// Matrix multiplication (2D only today — see note below on batching)
+let a = randn(&[10, 20])?;
+let b = randn(&[20, 30])?;
+let c = matmul(&a, &b)?;
 
-// Batch matrix multiplication
-let batch_a = randn(&[32, 10, 20]);
-let batch_b = randn(&[32, 20, 30]);
-let batch_c = linalg::bmm(&batch_a, &batch_b)?;
+// Batch matrix multiplication (dedicated batched entry point)
+let batch_a = randn(&[32, 10, 20])?;
+let batch_b = randn(&[32, 20, 30])?;
+let batch_c = bmm(&batch_a, &batch_b)?;
 
-// Matrix-vector multiplication
-let matrix = randn(&[10, 20]);
-let vector = randn(&[20]);
-let result = linalg::mv(&matrix, &vector)?;
+// Matrix-vector multiplication (function name is `matvec`, not `mv`)
+let matrix = randn(&[10, 20])?;
+let vector = randn(&[20])?;
+let result = matvec(&matrix, &vector)?;
 ```
+
+Note: `matmul`'s own doc comment states it currently delegates straight to `Tensor::matmul` for
+plain 2D inputs — general N-D broadcasting/batching through `matmul` itself is called out in the
+source as a future enhancement; use `bmm` for the batched case shown above.
 
 ### Decompositions
 
+There is no separate `lu_factor` function — `lu` alone returns the full `(P, L, U)` factorization
+(such that `P @ A = L @ U`), and `cholesky`/`svd` take a required `bool` argument (there is no
+1-argument overload):
+
 ```rust
-// LU decomposition
-let (lu, pivots) = linalg::lu(&matrix)?;
-let (p, l, u) = linalg::lu_factor(&matrix)?;
+// LU decomposition with partial pivoting: returns (P, L, U) where P @ A = L @ U
+let (p, l, u) = lu(&matrix)?;
 
 // QR decomposition
-let (q, r) = linalg::qr(&matrix)?;
+let (q, r) = qr(&matrix)?;
 
-// Cholesky decomposition (for positive definite matrices)
-let l = linalg::cholesky(&pos_def_matrix)?;
+// Cholesky decomposition (for positive definite matrices); `upper` selects
+// upper- vs. lower-triangular factor — there is no argument-less overload
+let l = cholesky(&pos_def_matrix, false)?;
 
 // Eigenvalue decomposition
-let (eigenvalues, eigenvectors) = linalg::eig(&square_matrix)?;
+let (eigenvalues, eigenvectors) = eig(&square_matrix)?;
 
-// Singular Value Decomposition (SVD)
-let (u, s, v) = linalg::svd(&matrix)?;
-let (u_reduced, s_reduced, v_reduced) = linalg::svd(&matrix, false)?; // reduced SVD
+// Singular Value Decomposition (SVD); `full_matrices` is required, not optional
+let (u, s, v) = svd(&matrix, true)?;
+let (u_reduced, s_reduced, v_reduced) = svd(&matrix, false)?; // reduced SVD
 ```
 
 ### Solving Linear Systems
 
+There is no `tril`/`cholesky_solve` function in this crate, and `solve_triangular`/`lstsq` take
+different argument lists than shown previously (no separate "solve with Cholesky" helper — use
+`cholesky` to factor, then `solve_triangular` against the factor):
+
 ```rust
 // Solve Ax = b
-let a = randn(&[10, 10]);
-let b = randn(&[10, 5]);
-let x = linalg::solve(&a, &b)?;
+let a = randn(&[10, 10])?;
+let b = randn(&[10, 5])?;
+let x = solve(&a, &b)?;
 
-// Solve triangular system
-let lower = linalg::tril(&a);
-let x = linalg::solve_triangular(&lower, &b, true, false)?;
+// Solve a triangular system (`upper` selects which triangle `lower` is read
+// from — there is no standalone `tril()` extraction helper in this crate)
+let lower = cholesky(&pos_def_matrix, false)?;
+let x = solve_triangular(&lower, &b, false)?; // 3 args: (matrix, rhs, upper)
 
-// Least squares solution
-let a = randn(&[20, 10]); // overdetermined
-let b = randn(&[20]);
-let x = linalg::lstsq(&a, &b)?;
-
-// Solve with Cholesky (for positive definite systems)
-let x = linalg::cholesky_solve(&pos_def_matrix, &b)?;
+// Least squares solution: returns (solution, residuals, rank, singular_values),
+// not just `x`, and `rcond` is a required (if Option-typed) third argument
+let a = randn(&[20, 10])?; // overdetermined
+let b = randn(&[20, 1])?;
+let (x, _residuals, _rank, _singular_values) = lstsq(&a, &b, None)?;
 ```
 
 ### Matrix Properties
 
+The matrix-norm function is named `matrix_norm` (not `norm`), takes `Option<&str>` (there is no
+numeric-typed overload — spectral norm is requested via the string `"2"`), and `pinv` requires an
+explicit `rcond` argument:
+
 ```rust
 // Determinant
-let det = linalg::det(&square_matrix)?;
+let det = det(&square_matrix)?;
 
 // Inverse
-let inv = linalg::inv(&square_matrix)?;
-let pinv = linalg::pinv(&matrix)?; // pseudo-inverse
+let inv = inv(&square_matrix)?;
+let pinv_result = pinv(&matrix, None)?; // pseudo-inverse; rcond: Option<f32>
 
-// Matrix norms
-let frobenius = linalg::norm(&matrix, "fro")?;
-let nuclear = linalg::norm(&matrix, "nuc")?;
-let spectral = linalg::norm(&matrix, 2)?;
+// Matrix norms (function is `matrix_norm`, ord is `Option<&str>`)
+let frobenius = matrix_norm(&matrix, Some("fro"))?;
+let nuclear = matrix_norm(&matrix, Some("nuc"))?;
+let spectral = matrix_norm(&matrix, Some("2"))?;
 
 // Condition number
-let cond = linalg::cond(&matrix, None)?;
+let cond = cond(&matrix, None)?;
 
 // Rank
-let rank = linalg::matrix_rank(&matrix, None)?;
+let rank = matrix_rank(&matrix, None)?;
 
 // Trace
-let trace = linalg::trace(&square_matrix)?;
+let trace = trace(&square_matrix)?;
 ```
 
 ### Advanced Operations
 
+The Kronecker product function is named `kronecker`, not `kron`, and `matrix_power`'s exponent is a
+plain `i32` — there is no fractional-power / matrix-square-root overload (`0.5` below would not
+type-check):
+
 ```rust
 // Einstein summation
-let result = linalg::einsum("ij,jk->ik", &[&a, &b])?;
-let batch_result = linalg::einsum("bij,bjk->bik", &[&batch_a, &batch_b])?;
+let result = einsum("ij,jk->ik", &[&a, &b])?;
+let batch_result = einsum("bij,bjk->bik", &[&batch_a, &batch_b])?;
 
-// Kronecker product
-let kron = linalg::kron(&a, &b)?;
+// Kronecker product (function is `kronecker`; both inputs must be 2D)
+let kron_result = kronecker(&a, &b)?;
 
 // Matrix exponential
-let exp_matrix = linalg::matrix_exp(&square_matrix)?;
+let exp_matrix = matrix_exp(&square_matrix)?;
 
-// Matrix power
-let matrix_squared = linalg::matrix_power(&square_matrix, 2)?;
-let matrix_sqrt = linalg::matrix_power(&pos_def_matrix, 0.5)?;
+// Matrix power (integer exponents only)
+let matrix_squared = matrix_power(&square_matrix, 2)?;
 ```
 
 ### Special Matrix Constructors
 
+`eye` takes two arguments (`n`, `m`), not three, and `diag` always requires a `diagonal: i32` offset
+argument (for both constructing a diagonal matrix from a vector and extracting a diagonal from a
+matrix — the same function dispatches on the input's rank). Note also that `torsh_tensor::prelude`
+exports its own `eye` (a tensor-creation helper, different signature) — glob-importing both preludes
+together makes bare `eye(...)` ambiguous; qualify as `torsh_linalg::eye(...)` if you hit that:
+
 ```rust
 // Identity matrix
-let eye = linalg::eye(10, None, None)?;
+let eye_matrix = eye(10, None)?;
 
-// Diagonal matrix
+// Diagonal matrix (offset 0 = main diagonal)
 let diag_vals = tensor![1.0, 2.0, 3.0, 4.0];
-let diag_matrix = linalg::diag(&diag_vals)?;
+let diag_matrix = diag(&diag_vals, 0)?;
 
 // Extract diagonal
-let diagonal = linalg::diag(&matrix)?;
+let diagonal = diag(&matrix, 0)?;
 
 // Vandermonde matrix
 let x = tensor![1.0, 2.0, 3.0, 4.0];
-let vander = linalg::vander(&x, None, true)?;
+let vander_matrix = vander(&x, None, true)?;
 ```
 
 ### Batch Operations
 
-All operations support batched inputs:
+Dedicated batched entry points exist for some operations (e.g. `bmm` above); whether every function
+below actually loops over leading batch dimensions internally has not been verified against the
+implementation, so treat this section as indicative rather than guaranteed:
 
 ```rust
 // Batch inverse
-let batch_matrices = randn(&[32, 10, 10]);
-let batch_inv = linalg::inv(&batch_matrices)?;
+let batch_matrices = randn(&[32, 10, 10])?;
+let batch_inv = inv(&batch_matrices)?;
 
 // Batch solve
-let batch_a = randn(&[32, 10, 10]);
-let batch_b = randn(&[32, 10, 5]);
-let batch_x = linalg::solve(&batch_a, &batch_b)?;
+let batch_a = randn(&[32, 10, 10])?;
+let batch_b = randn(&[32, 10, 5])?;
+let batch_x = solve(&batch_a, &batch_b)?;
 
-// Batch eigenvalues
-let batch_eigenvalues = linalg::eigvals(&batch_matrices)?;
+// There is no separate eigenvalues-only `eigvals` function — use `eig`,
+// which returns both eigenvalues and eigenvectors
+let (batch_eigenvalues, _batch_eigenvectors) = eig(&batch_matrices)?;
 ```
 
 ### Performance Considerations

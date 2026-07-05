@@ -23,7 +23,7 @@ const ZERO_THRESHOLD: f32 = 1e-12;
 /// Both operands are first converted to COO form (via the [`SparseTensor`]
 /// trait), then their `(row, col, value)` triplets are merged: entries that
 /// share the same coordinate are summed, and any coordinate whose accumulated
-/// value falls below [`ZERO_THRESHOLD`] is dropped. The result is returned in
+/// value falls below `ZERO_THRESHOLD` is dropped. The result is returned in
 /// canonical (row-major sorted, duplicate-free) order.
 ///
 /// # Errors

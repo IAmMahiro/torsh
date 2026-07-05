@@ -8,18 +8,28 @@ This crate provides comprehensive time series analysis, forecasting, and modelin
 
 ## Features
 
-- **Forecasting Models**: ARIMA, SARIMA, Prophet, Exponential Smoothing
-- **Neural Forecasting**: LSTM, GRU, Temporal CNNs, Transformers, N-BEATS, DeepAR
-- **Decomposition**: STL, seasonal decomposition, trend extraction
-- **Anomaly Detection**: Isolation forests, statistical methods, autoencoders
-- **State Space Models**: Kalman filters, particle filters, Hidden Markov Models
-- **Feature Engineering**: Lag features, rolling statistics, fourier features
-- **Changepoint Detection**: PELT, Binary segmentation, Bayesian methods
-- **Frequency Analysis**: FFT, spectral analysis, wavelets
-- **Utilities**: Differencing, transformations, stationarity tests
-- **GPU Acceleration**: Neural forecasting models on CUDA
+- **Forecasting Models**: ARIMA, SARIMA, Exponential Smoothing
+- **Neural Forecasting**: LSTM, GRU, Temporal CNNs, and Transformer forward/forecast
+  passes (training (`fit()`) is not implemented yet — see Neural Forecasting Models below).
+  There is no Prophet, N-BEATS, or DeepAR implementation in this crate.
+- **Decomposition**: STL, classical additive/multiplicative, EMD/EEMD, VMD, SSA
+- **Anomaly Detection**: Isolation forest, statistical detector, LSTM-based detector
+- **State Space Models**: Kalman, Extended Kalman, Unscented Kalman, particle filters,
+  Dynamic Linear Models (no Hidden Markov Model implementation)
+- **Feature Engineering**: Lag/difference/interaction features, rolling statistics,
+  trend/seasonality/spectral features (no Fourier-features or calendar-features helper)
+- **Changepoint Detection**: PELT, Binary Segmentation, window-based (CUSUM is a
+  window statistic option, not a standalone Bayesian method; no BOCD implementation)
+- **Frequency Analysis**: FFT/IFFT, PSD (periodogram/Welch/multitaper), coherence
+- **Utilities**: Differencing, Box-Cox, detrending, stationarity tests (ADF, KPSS)
+
+There is no GPU/CUDA acceleration in this crate.
 
 ## Usage
+
+> Several examples below use illustrative helpers (`load_ts(...)`, `generate_seasonal_data(...)`,
+> `plot_decomposition(...)`) to keep the snippets short. These are not real functions in this
+> crate — build a `TimeSeries` directly (see the first example) from your own data instead.
 
 ### Basic Time Series Operations
 
@@ -49,26 +59,10 @@ println!("Std: {:.4}", ts.std()?);
 ```rust
 use torsh_series::decomposition::*;
 
-let data = generate_seasonal_data(365 * 2, 12, 0.1)?;  // 2 years of monthly data
-
-// Perform STL decomposition
-let stl = STL::new()
-    .seasonal_window(13)
-    .trend_window(51)
-    .seasonal_degree(1)
-    .trend_degree(1);
-
+// Perform STL decomposition (real type is `STLDecomposition`, builder only
+// exposes `.robust(bool)` — no seasonal_window/trend_window/degree setters)
+let stl = STLDecomposition::new(/* period */ 12).robust(false);
 let result = stl.fit(&data)?;
-
-let trend = result.trend();
-let seasonal = result.seasonal();
-let residual = result.residual();
-
-println!("Seasonal strength: {:.4}", result.seasonal_strength()?);
-println!("Trend strength: {:.4}", result.trend_strength()?);
-
-// Plot components
-plot_decomposition(&result)?;
 ```
 
 #### Classical Decomposition
@@ -76,17 +70,10 @@ plot_decomposition(&result)?;
 ```rust
 use torsh_series::decomposition::*;
 
-let data = load_ts("airline_passengers.csv")?;
-
-// Additive decomposition: data = trend + seasonal + residual
-let decomp_add = seasonal_decompose(&data, 12, "additive")?;
-
-// Multiplicative decomposition: data = trend * seasonal * residual
-let decomp_mul = seasonal_decompose(&data, 12, "multiplicative")?;
-
-let trend = decomp_add.trend();
-let seasonal = decomp_add.seasonal();
-let residual = decomp_add.residual();
+// Additive / multiplicative decomposition are separate types, not a single
+// `seasonal_decompose(data, period, mode)` free function
+let decomp_add = AdditiveDecomposition::new(/* period */ 12);
+let decomp_mul = MultiplicativeDecomposition::new(/* period */ 12);
 ```
 
 ### ARIMA Models
@@ -177,127 +164,37 @@ let hw = HoltWinters::new()
 
 hw.fit(&data)?;
 let forecast = hw.predict(24)?;
-
-// Auto ETS - automatically selects Error-Trend-Seasonal components
-let auto_ets = AutoETS::new()
-    .information_criterion("aic")
-    .allow_multiplicative_trend(true);
-
-let model = auto_ets.fit(&data)?;
-println!("Selected model: {}", model.name());
 ```
+
+Note: there is no `AutoETS` (automatic Error-Trend-Seasonal selection) in this crate today.
 
 ### Neural Forecasting Models
 
-#### LSTM for Time Series
-
-```rust
-use torsh_series::forecast::neural::*;
-use torsh_nn::prelude::*;
-
-let data = load_ts("stock_prices.csv")?;
-
-// Prepare sequences for LSTM
-let (X, y) = create_sequences(&data, window_size=20, horizon=1)?;
-
-// Define LSTM model
-let lstm = LSTMForecaster::new()
-    .input_size(1)
-    .hidden_size(64)
-    .num_layers(2)
-    .output_size(1)
-    .dropout(0.2)
-    .bidirectional(false);
-
-// Train model
-lstm.fit(&X, &y, epochs=100, batch_size=32, lr=0.001)?;
-
-// Forecast
-let forecast = lstm.predict(&data, horizon=10)?;
-
-// Multi-step forecasting
-let multi_step_forecast = lstm.predict_multi_step(&data, horizon=30)?;
-```
-
-#### Temporal Convolutional Network (TCN)
+**Status**: `LSTMForecaster`, `GRUForecaster`, `CNNForecaster`, and `TransformerForecaster`
+(in `torsh_series::forecast::deep`) have real forward passes — the transformer block
+implements genuine scaled dot-product self-attention with residual connections. **Training
+is not wired up yet**: only `LSTMForecaster` has a `fit()` method at all, and it is
+currently a no-op stub (every parameter is ignored; see `forecast/deep.rs`).
+`GRUForecaster`/`CNNForecaster`/`TransformerForecaster` have no `fit()` method at all today.
+There is no `NBEATS` or `DeepAR` implementation in this crate. Forecasting uses
+`forecast(series, steps)`, not `predict(...)`, and none of these types use a builder
+pattern — constructor arguments are positional.
 
 ```rust
 use torsh_series::forecast::neural::*;
 
-let tcn = TCN::new()
-    .input_channels(1)
-    .output_size(1)
-    .num_channels(vec![32, 32, 32, 32])
-    .kernel_size(3)
-    .dropout(0.2);
+let data: TimeSeries = /* ... */;
 
-tcn.fit(&X, &y, epochs=50, batch_size=64)?;
-let forecast = tcn.predict(&data, horizon=20)?;
-```
+// LSTM — forward pass and forecast() are real; fit() does NOT actually train yet
+let mut lstm = LSTMForecaster::new(/* input_size */ 1, /* hidden_size */ 64, /* num_layers */ 2)?
+    .with_dropout(0.2);
+lstm.fit(&data, 100, 0.001); // currently a no-op — does not train the model
+let forecast = lstm.forecast(&data, 10)?;
 
-#### Transformer for Time Series
-
-```rust
-use torsh_series::forecast::neural::*;
-
-let transformer = TimeSeriesTransformer::new()
-    .d_model(64)
-    .nhead(8)
-    .num_encoder_layers(3)
-    .num_decoder_layers(3)
-    .dim_feedforward(256)
-    .dropout(0.1)
-    .sequence_length(50)
-    .forecast_horizon(10);
-
-transformer.fit(&data, epochs=100, batch_size=32)?;
-let forecast = transformer.predict(&data, horizon=10)?;
-```
-
-#### N-BEATS (Neural Basis Expansion Analysis)
-
-```rust
-use torsh_series::forecast::neural::*;
-
-// N-BEATS: interpretable and accurate forecasting
-let nbeats = NBEATS::new()
-    .stack_types(vec!["trend", "seasonality", "generic"])
-    .num_blocks_per_stack(3)
-    .forecast_length(24)
-    .backcast_length(96)
-    .hidden_layer_units(256)
-    .share_weights_in_stack(true);
-
-nbeats.fit(&data, epochs=100)?;
-let forecast = nbeats.predict(&data, horizon=24)?;
-
-// Get interpretable components
-let (trend, seasonality) = nbeats.decompose(&data)?;
-```
-
-#### DeepAR (Probabilistic Forecasting)
-
-```rust
-use torsh_series::forecast::neural::*;
-
-// DeepAR provides probabilistic forecasts
-let deepar = DeepAR::new()
-    .input_size(1)
-    .hidden_size(40)
-    .num_layers(2)
-    .dropout(0.1)
-    .context_length(30)
-    .prediction_length=10;
-
-deepar.fit(&data, epochs=50)?;
-
-// Get probabilistic forecast with quantiles
-let median_forecast = deepar.predict(&data, quantile=0.5)?;
-let lower_bound = deepar.predict(&data, quantile=0.1)?;
-let upper_bound = deepar.predict(&data, quantile=0.9)?;
-
-// Sample from predictive distribution
-let samples = deepar.sample(&data, num_samples=100)?;
+// GRU / CNN ("TCN") / Transformer forecasters — forward + forecast() only, no fit() yet
+let gru = GRUForecaster::new(1, 64, 2)?;
+let cnn = CNNForecaster::new(vec![1, 32, 32, 32], vec![3, 3, 3])?;
+let transformer = TransformerForecaster::new(/* d_model */ 64, /* nhead */ 8, /* num_layers */ 3)?;
 ```
 
 ### Anomaly Detection
@@ -307,43 +204,19 @@ use torsh_series::anomaly::*;
 
 let data = load_ts("sensor_data.csv")?;
 
-// Statistical anomaly detection
-let detector = StatisticalAnomalyDetector::new()
-    .method("zscore")
-    .threshold(3.0)
-    .window_size(None);
-
+// Statistical anomaly detection (real type is `StatisticalDetector`, not
+// `StatisticalAnomalyDetector`; constructor takes an `AnomalyMethod`, not a builder chain)
+let detector = StatisticalDetector::new(method);
 let anomalies = detector.detect(&data)?;
-println!("Found {} anomalies", anomalies.sum()?);
 
-// Isolation Forest
-let iforest = IsolationForest::new()
-    .n_estimators(100)
-    .contamination(0.1)
-    .max_samples("auto");
+// Isolation Forest (new() takes no args; defaults to 100 estimators, 0.1 contamination)
+let iforest = IsolationForest::new();
 
-iforest.fit(&data)?;
-let anomaly_scores = iforest.score(&data)?;
-let anomalies = iforest.predict(&data)?;  // -1 for anomalies, 1 for normal
-
-// LSTM Autoencoder for anomaly detection
-let ae = LSTMAutoencoder::new()
-    .encoding_dim(16)
-    .sequence_length(50)
-    .threshold_percentile(95);
-
-ae.fit(&data, epochs=50)?;
-let reconstruction_errors = ae.reconstruction_error(&data)?;
-let anomalies = ae.detect_anomalies(&data)?;
-
-// Seasonal Hybrid ESD (S-H-ESD) for seasonal data
-let shesd = SeasonalESD::new()
-    .max_anomalies(10)
-    .alpha(0.05)
-    .periodicity(24);
-
-let anomalies = shesd.detect(&data)?;
+// LSTM-based anomaly detection (real type is `LSTMAnomaly`, not `LSTMAutoencoder`)
+let ae = LSTMAnomaly::new(/* sequence_length */ 50, /* hidden_size */ 16);
 ```
+
+Note: there is no `SeasonalESD` (Seasonal Hybrid ESD) implementation in this crate.
 
 ### Changepoint Detection
 
@@ -362,26 +235,15 @@ let pelt = PELT::new()
 let changepoints = pelt.detect(&data)?;
 println!("Detected changepoints at: {:?}", changepoints);
 
-// Binary Segmentation
-let binseg = BinarySegmentation::new()
-    .n_changepoints(5)
-    .model("l2");
-
+// Binary Segmentation (constructor takes a threshold, not a builder chain)
+let binseg = BinarySegmentation::new(/* threshold */ 5.0);
 let changepoints = binseg.detect(&data)?;
 
-// Bayesian Online Changepoint Detection
-let bocd = BayesianOnlineChangepointDetection::new()
-    .hazard_rate(1.0 / 100.0)
-    .delay(15);
-
-let changepoint_probs = bocd.detect_online(&data)?;
-
-// Cumulative Sum (CUSUM)
-let cusum = CUSUM::new()
-    .threshold(5.0)
-    .drift(1.0);
-
-let changepoints = cusum.detect(&data)?;
+// CUSUM is a `WindowStatistic` option on `WindowDetector`, not its own type,
+// and there is no Bayesian Online Changepoint Detection in this crate.
+let window_detector = WindowDetector::new(/* window_size */ 10, /* threshold */ 5.0)
+    .with_statistic(WindowStatistic::CUSUM);
+let changepoints = window_detector.detect(&data)?;
 ```
 
 ### State Space Models
@@ -391,23 +253,9 @@ let changepoints = cusum.detect(&data)?;
 ```rust
 use torsh_series::state_space::*;
 
-// Linear Kalman Filter
-let kf = KalmanFilter::new()
-    .state_transition(transition_matrix)
-    .observation_matrix(observation_matrix)
-    .process_noise(process_cov)
-    .observation_noise(obs_cov)
-    .initial_state(initial_state)
-    .initial_covariance(initial_cov);
-
-// Filter (estimate current state)
-let filtered_states = kf.filter(&observations)?;
-
-// Smooth (estimate all states given all observations)
-let smoothed_states = kf.smooth(&observations)?;
-
-// Predict future states
-let predictions = kf.predict(horizon=10)?;
+// Linear Kalman Filter (constructor takes dimensions, not a builder chain of
+// matrices — the matrices/covariances are set via separate setter methods)
+let kf = KalmanFilter::new(/* state_dim */ 4, /* obs_dim */ 2);
 ```
 
 #### Particle Filter
@@ -416,218 +264,117 @@ let predictions = kf.predict(horizon=10)?;
 use torsh_series::state_space::*;
 
 // Particle Filter for nonlinear/non-Gaussian systems
-let pf = ParticleFilter::new()
-    .num_particles(1000)
-    .state_transition_fn(transition_fn)
-    .observation_fn(observation_fn)
-    .resampling_strategy("systematic");
-
-let estimated_states = pf.filter(&observations)?;
+let pf = ParticleFilter::new(/* num_particles */ 1000, /* state_dim */ 4);
 ```
 
-#### Hidden Markov Model (HMM)
-
-```rust
-use torsh_series::state_space::*;
-
-// Discrete HMM
-let hmm = HMM::new()
-    .n_states(3)
-    .n_observations(10);
-
-hmm.fit(&observation_sequences)?;
-
-// Viterbi algorithm - find most likely state sequence
-let state_sequence = hmm.viterbi(&observations)?;
-
-// Forward-backward algorithm - compute state probabilities
-let state_probs = hmm.forward_backward(&observations)?;
-
-// Predict next observations
-let predictions = hmm.predict(&observations, horizon=5)?;
-```
+There is also an `ExtendedKalmanFilter`, `UnscentedKalmanFilter`, and `DynamicLinearModel`
+(Bayesian state space with discount factors) in `torsh_series::state_space`. There is no
+Hidden Markov Model (HMM) implementation in this crate.
 
 ### Frequency Domain Analysis
 
 ```rust
 use torsh_series::frequency::*;
 
-let data = load_ts("signal.csv")?;
+// Fast Fourier Transform — analyzer object, not a free `fft()` function
+let fft_analyzer = FFTAnalyzer::new(/* sampling_rate */ 1.0);
+let fft_result = fft_analyzer.fft(&data)?;
+let power_spectrum = fft_result.power();
 
-// Fast Fourier Transform
-let fft_result = fft(&data)?;
-let power_spectrum = fft_result.abs()?.pow(2)?;
+// Dominant frequency via PeriodogramAnalyzer
+let periodogram_analyzer = PeriodogramAnalyzer::new(1.0);
+let dominant_freq = periodogram_analyzer.dominant_frequency(&data)?;
 
-// Find dominant frequencies
-let dominant_freqs = find_dominant_frequencies(&data, top_k=5)?;
-println!("Dominant frequencies: {:?}", dominant_freqs);
-
-// Periodogram
-let (freqs, psd) = periodogram(&data, window="hann")?;
-
-// Welch's method for power spectral density
-let (freqs, psd) = welch(&data, nperseg=256, overlap=128)?;
-
-// Wavelet transform
-let wavelet = WaveletTransform::new("morlet");
-let coeffs = wavelet.transform(&data, scales)?;
-
-// Spectrogram
-let (times, freqs, spec) = spectrogram(&data, window_size=256, overlap=128)?;
+// Power spectral density (Welch's method is one `PSDMethod` option)
+let psd_estimator = PSDEstimator::new(PSDMethod::Welch, 1.0);
+let psd_result = psd_estimator.estimate(&data)?;
 ```
+
+Note: there is no `find_dominant_frequencies()`, `WaveletTransform`, or `spectrogram()` in
+`torsh_series::frequency` today. Wavelet decomposition lives in `torsh_series::decomposition`
+instead.
 
 ### Feature Engineering
 
 ```rust
-use torsh_series::features::*;
+use torsh_series::utils::features::*;
 
-let data = load_ts("sales.csv")?;
+// Lag features (real name is create_lag_features, module is utils::features)
+let lag_features = create_lag_features(&data, &[1, 7, 30])?;
 
-// Create lag features
-let lag_features = create_lags(&data, lags=vec![1, 7, 30])?;
+// Rolling statistics — one call returns mean/std/min/max/median together
+let rolling = rolling_statistics(&data, /* window_size */ 7, None);
 
-// Rolling statistics
-let rolling_mean = rolling_mean(&data, window=7)?;
-let rolling_std = rolling_std(&data, window=7)?;
-let rolling_min = rolling_min(&data, window=7)?;
-let rolling_max = rolling_max(&data, window=7)?;
-
-// Expanding statistics
-let expanding_mean = expanding_mean(&data)?;
-let expanding_std = expanding_std(&data)?;
-
-// Exponentially weighted statistics
-let ewm_mean = ewm_mean(&data, alpha=0.3)?;
-let ewm_std = ewm_std(&data, alpha=0.3)?;
-
-// Time-based features
-let ts_features = TimeSeriesFeatures::new()
-    .add_hour_of_day()
-    .add_day_of_week()
-    .add_day_of_month()
-    .add_month_of_year()
-    .add_quarter()
-    .add_is_weekend()
-    .add_is_holiday(holidays);
-
-let features = ts_features.transform(&timestamps)?;
-
-// Fourier features for seasonality
-let fourier = fourier_features(&timestamps, period=365.25, order=10)?;
-
-// Calendar features
-let calendar = calendar_features(&dates, country="US")?;
+// Difference, trend, seasonality, spectral, and autocorrelation features are
+// also available: create_difference_features, trend_features,
+// seasonality_features, spectral_features, statistical_features, autocorrelation.
 ```
+
+Note: there is no expanding-window (`expanding_mean`/`expanding_std`), exponentially
+weighted (`ewm_mean`/`ewm_std`), `TimeSeriesFeatures`, `fourier_features()`, or
+`calendar_features()` API in this crate today.
 
 ### Stationarity and Transformations
 
 ```rust
-use torsh_series::utils::*;
+use torsh_series::utils::statistical_tests::*;
+use torsh_series::utils::preprocessing::*;
 
-let data = load_ts("non_stationary.csv")?;
-
-// Test for stationarity
-let adf_result = augmented_dickey_fuller(&data, regression="c", lags=None)?;
-println!("ADF statistic: {:.4}, p-value: {:.4}", adf_result.statistic, adf_result.p_value);
-
-if adf_result.p_value > 0.05 {
-    println!("Series is non-stationary");
-}
+// Test for stationarity (real name has a `_test` suffix)
+let adf_result = augmented_dickey_fuller_test(&data, "c", None)?;
 
 // KPSS test
-let kpss_result = kpss_test(&data, regression="c", lags=None)?;
+let kpss_result = kpss_test(&data, "c", None)?;
 
-// Differencing
-let diff1 = difference(&data, periods=1)?;
-let diff2 = difference(&data, periods=2)?;  // Second-order differencing
+// Differencing (order-based; no separate periods/seasonal variant)
+let diff1 = diff(&data, 1);
+let diff2 = diff(&data, 2); // second-order differencing
 
-// Seasonal differencing
-let seasonal_diff = seasonal_difference(&data, period=12)?;
-
-// Log transformation
-let log_data = data.log()?;
-
-// Box-Cox transformation
-let (transformed, lambda) = boxcox(&data)?;
-println!("Optimal lambda: {:.4}", lambda);
-
-// Inverse transform
-let original = inv_boxcox(&transformed, lambda)?;
+// Box-Cox transformation — lambda must be supplied (not estimated automatically)
+let transformed = box_cox(&data, 0.5);
+let original = inv_box_cox(&transformed, 0.5);
 
 // Detrending
-let detrended = detrend(&data, method="linear")?;
+let detrended = detrend(&data, "linear");
 ```
 
 ### Model Selection and Validation
 
 ```rust
-use torsh_series::validation::*;
+use torsh_series::utils::validation::*;
 
-let data = load_ts("training_data.csv")?;
+// The real cross-validation type is `TimeSeriesCV` (there is also
+// `PurgedTimeSeriesCV`, `CombinatorialPurgedCV`, `NestedTimeSeriesCV`,
+// `ScoredTimeSeriesCV`, and `BlockedTimeSeriesCV`). There is no plain
+// `train_test_split()` or `ExpandingWindowSplit` type — expanding-window and
+// walk-forward evaluation are free functions instead:
+let tscv = TimeSeriesCV::new(/* n_splits */ 5);
 
-// Train-test split
-let split = 0.8;
-let (train, test) = train_test_split(&data, split)?;
-
-// Time series cross-validation
-let tscv = TimeSeriesSplit::new(n_splits=5, gap=0);
-
-for (train_idx, val_idx) in tscv.split(&data) {
-    let train_fold = data.index_select(0, &train_idx)?;
-    let val_fold = data.index_select(0, &val_idx)?;
-
-    // Train and validate model
-    model.fit(&train_fold)?;
-    let predictions = model.predict(val_fold.len(), None)?;
-    let score = mae(&val_fold, &predictions)?;
-}
-
-// Expanding window cross-validation
-let expanding_cv = ExpandingWindowSplit::new(
-    initial_train_size=100,
-    forecast_horizon=10,
-    step=10,
-);
-
-// Grid search for hyperparameters
-let param_grid = vec![
-    ("p", vec![0, 1, 2]),
-    ("d", vec![0, 1]),
-    ("q", vec![0, 1, 2]),
-];
-
-let best_params = grid_search_arima(&data, &param_grid, metric="aic")?;
-println!("Best parameters: {:?}", best_params);
+let errors = walk_forward_validation(&data, /* window_size */ 100, /* step_size */ 10, |train| {
+    // ... fit a model on `train` and return a single prediction ...
+    0.0
+})?;
 ```
+
+Note: there is no `grid_search_arima()` hyperparameter search helper in this crate.
 
 ### Evaluation Metrics
 
 ```rust
-use torsh_series::metrics::*;
+use torsh_series::utils::metrics::*;
 
-let y_true = test_data;
-let y_pred = forecasts;
+let y_true: TimeSeries = test_data;
+let y_pred: TimeSeries = forecasts;
 
-// Mean Absolute Error
-let mae = mean_absolute_error(&y_true, &y_pred)?;
+// Real function names are shorter and return a plain f64 (not Result<f64>)
+let mae_score = mae(&y_true, &y_pred);
+let rmse_score = rmse(&y_true, &y_pred);
+let mape_score = mape(&y_true, &y_pred);
+let smape_score = smape(&y_true, &y_pred);
+let mase_score = mase(&y_true, &y_pred, /* seasonal_period */ 1);
 
-// Root Mean Squared Error
-let rmse = root_mean_squared_error(&y_true, &y_pred)?;
-
-// Mean Absolute Percentage Error
-let mape = mean_absolute_percentage_error(&y_true, &y_pred)?;
-
-// Symmetric MAPE
-let smape = symmetric_mape(&y_true, &y_pred)?;
-
-// Mean Absolute Scaled Error
-let mase = mean_absolute_scaled_error(&y_true, &y_pred, &y_train, seasonality=1)?;
-
-// Forecast bias
-let bias = forecast_bias(&y_true, &y_pred)?;
-
-// Tracking signal
-let tracking_signal = tracking_signal(&y_true, &y_pred)?;
+// Also available: r2, theil_u, directional_accuracy, max_error, evaluate_forecast.
+// There is no forecast_bias() or tracking_signal() in this crate.
 ```
 
 ## Integration with SciRS2
@@ -644,22 +391,18 @@ All implementations follow the [SciRS2 POLICY](https://github.com/cool-japan/sci
 
 ## Examples
 
-See the `examples/` directory for detailed examples:
-
-- `arima_forecasting.rs` - ARIMA/SARIMA modeling
-- `lstm_forecasting.rs` - Neural forecasting with LSTM
-- `anomaly_detection.rs` - Time series anomaly detection
-- `decomposition.rs` - STL and seasonal decomposition
-- `changepoint_detection.rs` - Detecting regime changes
-- `kalman_filter.rs` - State space modeling
+There is currently no `examples/` directory in this crate; see the doc comments and the
+`tests/` under each module (e.g. `src/forecast/`, `src/anomaly.rs`, `src/state_space/`)
+for runnable usage patterns.
 
 ## Performance Tips
 
-1. **Use GPU acceleration** for neural forecasting models
-2. **Apply differencing** to make series stationary before ARIMA
-3. **Normalize data** before training neural networks
-4. **Use parallel processing** for cross-validation
-5. **Cache decomposition results** when used multiple times
+1. **Apply differencing** to make series stationary before ARIMA
+2. **Cache decomposition results** when used multiple times
+
+Note: there is no GPU acceleration, and neural forecaster training (`fit()`) is not
+implemented yet (see Neural Forecasting Models above), so "normalize before training" and
+"parallelize cross-validation" tips do not yet apply in practice.
 
 ## License
 

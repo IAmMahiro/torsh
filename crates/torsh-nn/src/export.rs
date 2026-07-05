@@ -198,7 +198,7 @@ impl ModelExporter {
     ///
     /// ONNX and TorchScript currently return a loud
     /// [`TorshError::NotImplemented`] rather than fabricating placeholder bytes;
-    /// see [`Self::export_onnx`] and [`Self::export_torchscript`].
+    /// see `Self::export_onnx` and `Self::export_torchscript`.
     pub fn export_to_bytes<M: Module>(&self, model: &M) -> Result<Vec<u8>> {
         match self.config.format {
             ExportFormat::Onnx => Err(TorshError::NotImplemented(

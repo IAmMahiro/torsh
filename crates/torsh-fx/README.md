@@ -8,7 +8,7 @@ TorshFX is a toolkit for capturing, analyzing, and transforming PyTorch-style pr
 
 - **Graph Capture**: Convert eager mode code to graph representation
 - **Graph Transformation**: Modify and optimize computational graphs
-- **Symbolic Tracing**: Trace through Python code to build graphs
+- **Symbolic Tracing**: Basic module-tracing entry point (`tracer::trace()` / `ModuleTracer`); currently builds a fixed placeholder graph rather than fully tracing arbitrary control flow
 - **Graph Optimization**: Apply passes for performance improvements
 - **Code Generation**: Convert graphs back to executable code
 

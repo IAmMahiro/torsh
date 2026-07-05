@@ -2,6 +2,12 @@
 
 Distributed training support for ToRSh with PyTorch-compatible API.
 
+**Status**: Partial — real MPI collectives (including a Universe-lifetime-correct `barrier()`) and
+tensor-parallel all-gather are implemented and tested, but the high-level `ProcessGroup`
+convenience API currently always runs against an in-process mock backend, and NCCL/Gloo remain
+unimplemented (see "Backends" below). **Tests**: 388 passing, 6 skipped (`cargo nextest run
+--all-features`).
+
 ## Overview
 
 This crate provides distributed and parallel training capabilities including:
@@ -16,30 +22,40 @@ This crate provides distributed and parallel training capabilities including:
 
 ### Basic Distributed Training
 
+> **Note:** `init_process_group`/`ProcessGroup` (the convenience API below) currently construct an
+> in-process `MockBackend` for **every** requested `BackendType` (`Nccl`, `Mpi`, and `Gloo` all
+> resolve to the mock today) — useful for testing training loops without a real cluster, but it is
+> not yet wired up to real networking. Genuine MPI collective communication (including a real,
+> Universe-lifetime-correct `barrier()`) is implemented on `torsh_distributed::backend::MpiBackend`
+> (behind the `mpi` feature), but must currently be constructed and driven directly rather than
+> through `ProcessGroup`. See "Backends" below for the accurate per-backend status.
+
 ```rust
 use torsh_distributed::prelude::*;
 use torsh_nn::prelude::*;
 
-// Initialize process group
-init_process_group(
-    Backend::NCCL,
-    InitMethod::Env,
-    None,
-    None,
-)?;
+// rank/world_size are typically supplied by the launcher via RANK / WORLD_SIZE env vars
+let rank: Rank = std::env::var("RANK")?.parse()?;
+let world_size: WorldSize = std::env::var("WORLD_SIZE")?.parse()?;
 
-// Get rank and world size
-let rank = get_rank();
-let world_size = get_world_size();
+// Initialize process group (backend, rank, world_size, master_addr, master_port)
+let process_group = std::sync::Arc::new(
+    init_process_group(BackendType::Nccl, rank, world_size, "localhost", 29500).await?,
+);
+
+// Get rank and world size back from the process group
+let rank = process_group.rank();
+let world_size = process_group.world_size();
 
 // Create model and wrap with DDP
 let model = create_model();
 let ddp_model = DistributedDataParallel::new(
     model,
-    vec![rank as i32], // device_ids
-    rank as i32,       // output_device
-    vec![],           // broadcast_buffers
-    true,             // find_unused_parameters
+    process_group,
+    vec![rank as usize],       // device_ids
+    Some(rank as usize),       // output_device
+    false,                     // broadcast_buffers
+    25.0,                      // bucket_cap_mb
 )?;
 
 // Distributed optimizer
@@ -65,24 +81,34 @@ destroy_process_group()?;
 
 ### Collective Operations
 
+> **Note:** these are `async fn`s that take a `&ProcessGroup` (so they need `.await` plus a group
+> obtained from `init_process_group`). More importantly, as of this release `all_reduce`,
+> `broadcast`, `reduce`, `send`, and `recv` all have explicitly-commented **mock** bodies that do
+> not perform real cross-process communication (e.g. `all_reduce` never touches the tensor at all;
+> `all_gather` just clones the local input `world_size` times). This matches `ProcessGroup` always
+> using `MockBackend` today (see "Backends" above) — useful for exercising training-loop control
+> flow, but not yet real distributed communication.
+
 ```rust
 use torsh_distributed::collectives::*;
 
 // All-reduce: sum tensors across all processes
-let tensor = create_tensor();
-all_reduce(&mut tensor, ReduceOp::Sum)?;
+let mut tensor = create_tensor();
+all_reduce(&mut tensor, ReduceOp::Sum, &process_group).await?;
 
 // Broadcast: send tensor from rank 0 to all others
-broadcast(&mut tensor, 0)?;
+broadcast(&mut tensor, 0, &process_group).await?;
 
 // Gather: collect tensors from all ranks
-let gathered = all_gather(&tensor)?;
+let mut gathered = Vec::new();
+all_gather(&mut gathered, &tensor, &process_group).await?;
 
 // Scatter: distribute chunks to different ranks
-let chunks = scatter(&tensor, 0)?;
+let mut chunk = create_tensor();
+scatter(&mut chunk, Some(&all_chunks), 0, &process_group).await?;
 
 // Reduce: aggregate to specific rank
-reduce(&mut tensor, ReduceOp::Sum, 0)?;
+reduce(&mut tensor, 0, ReduceOp::Sum, &process_group).await?;
 ```
 
 ### RPC Framework
@@ -140,25 +166,21 @@ let pipeline = PipelineParallel::new(
 let output = pipeline.forward(input)?;
 ```
 
-### Model Parallel
+### Tensor Parallelism
 
 ```rust
-use torsh_distributed::model_parallel::*;
+use torsh_distributed::{TensorParallel, TensorParallelConfig, TensorParallelLayer};
 
-// Tensor parallel linear layer
-let tp_linear = ColumnParallelLinear::new(
-    in_features,
-    out_features,
-    bias,
-    gather_output,
-)?;
+// `tp_layer` wraps a module (Box<dyn Module>) and shards its parameters across
+// the tensor-parallel process group according to `TensorParallelConfig`/`TensorParallelLayer`.
+let tp_layer = TensorParallel::new(module, tp_process_group, tp_config, layer_info)?;
 
-// Attention with tensor parallelism
-let tp_attention = ParallelAttention::new(
-    embed_dim,
-    num_heads,
-    dropout,
-)?;
+// Gather sharded output back into the full, unsharded tensor. `parallel_all_gather`
+// concatenates every rank's shard along `shard_dim` (requires the `scirs2-memory`
+// feature) — earlier versions of this function silently discarded all but one
+// shard; it now correctly reconstructs the full tensor.
+let shard_dim = 0;
+let full_tensor = tp_layer.parallel_all_gather(&local_shard, shard_dim).await?;
 ```
 
 ### Gradient Compression
@@ -208,20 +230,25 @@ println!("Total communication time: {:?}", stats.total_comm_time);
 
 ## Backends
 
-### NCCL (NVIDIA GPUs)
-- Optimized for NVIDIA GPU communication
-- Supports GPUDirect and NVLink
-- Best for single-node multi-GPU
+### NCCL (NVIDIA GPUs) — mocked, not yet functional
+- The `nccl` feature builds a `NcclBackend` that is explicitly documented as using **mock
+  implementations** internally; there are no real NVIDIA NCCL Rust bindings on crates.io today
+  (the `nccl` crate that does exist is an unrelated configuration library), so no actual
+  GPUDirect/NVLink communication happens yet
+- Tracked as permanently blocked pending real NCCL-equivalent Rust bindings — not a near-term fix
 
-### Gloo (CPU and GPU)
-- Cross-platform communication
-- Supports both TCP and InfiniBand
-- Good for CPU training
+### Gloo (CPU and GPU) — not implemented
+- `BackendType::Gloo` is accepted by the API but always resolves to the same in-process
+  `MockBackend` used for testing; there is no real TCP or InfiniBand transport implemented, and no
+  `gloo`-equivalent dependency is linked (it isn't available on crates.io either)
 
-### MPI (HPC environments)
-- Integration with MPI implementations
-- Optimized for HPC clusters
-- Supports various interconnects
+### MPI (HPC environments) — real, behind the `mpi` feature
+- A genuine `MpiBackend` (using the `mpi` crate) implements real collective communication,
+  including `barrier()`, which calls the actual `MPI_Barrier` collective and correctly keeps the
+  MPI `Universe` alive for the backend's lifetime (an earlier version dropped `Universe`
+  immediately after initialization, which finalized MPI before `barrier()` could ever work — fixed)
+- Currently reachable via `torsh_distributed::backend::MpiBackend` directly; not yet wired into the
+  `ProcessGroup`/`init_process_group` convenience path (see the note above)
 
 ## Environment Variables
 

@@ -203,15 +203,12 @@ optimizer.load_state_dict(loaded_state)?;
 ### Advanced Usage
 
 #### Gradient Clipping
-```rust
-use torsh_autograd::grad_mode::clip;
-
-// Clip gradients before optimizer step
-let total_norm = clip::clip_grad_norm(&mut params, 1.0, 2.0);
-
-// Then step
-optimizer.step()?;
-```
+`torsh_autograd::grad_mode::clip` is dead code (commented out in source, pending tensor-integration
+work). There is a `torsh_autograd::clip::clip_grad_norm` function, but it takes
+`&[&dyn AutogradTensor<T>]`, not the `Vec<Arc<RwLock<Tensor>>>` parameter collections used by
+optimizers here — there is currently no drop-in gradient-clipping helper for optimizer parameter
+groups. Clip gradients manually (e.g. via each parameter's tensor norm) before calling `optimizer.step()`
+if you need this today.
 
 #### Custom Optimizer Options
 ```rust

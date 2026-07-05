@@ -280,11 +280,11 @@ impl WaveletUtils {
     /// `e^-1` in amplitude. For wavelets built on a Gaussian envelope
     /// (Morlet, Mexican Hat / DOG, Gaussian-derivative), this is exactly
     /// `sqrt(2) * s` -- the envelope `exp(-t^2 / (2 s^2))` used by
-    /// [`generate_morlet_wavelet`] in this module reaches `1/e` amplitude
+    /// `generate_morlet_wavelet` in this module reaches `1/e` amplitude
     /// precisely at `t = sqrt(2) * s`. For compactly supported orthogonal
     /// wavelets (Haar/Daubechies/Symlet/Coiflet/Biorthogonal), the analogous
     /// quantity is half the dilated filter support, `s * (L - 1) / 2`, where
-    /// `L` is the number of filter taps from [`get_wavelet_filters`] --
+    /// `L` is the number of filter taps from `get_wavelet_filters` --
     /// reusing the same filter tables as the rest of this module.
     ///
     /// The result is clamped to `signal_length / 2`: a cone cannot extend

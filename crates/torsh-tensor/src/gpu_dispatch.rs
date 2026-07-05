@@ -13,7 +13,7 @@
 //! The concrete GPU backend (oxicuda's `CudaBackend`, which delegates to
 //! `oxicuda-driver` / `oxicuda-blas` / `oxicuda-dnn`) lives in the `oxicuda`
 //! *umbrella* crate.  At the time of writing the umbrella is not yet published
-//! at `0.3` on crates.io (only the leaf crates are), so [`active_backend`]
+//! at `0.3` on crates.io (only the leaf crates are), so `active_backend`
 //! returns `None` and every dispatch declines — callers then fall back to
 //! ToRSh's native CPU / SIMD implementations.  This is the **same observable
 //! behaviour** as the previous `scirs2_core::gpu` path, whose
@@ -21,9 +21,9 @@
 //!
 //! Wiring the real CUDA backend is a one-step change once the umbrella
 //! publishes — see the `TODO(oxicuda-umbrella-0.3)` block in
-//! [`active_backend`].
+//! `active_backend`.
 //!
-//! The marshalling helpers ([`run_unary_f32`], [`run_binary_f32`]) are
+//! The marshalling helpers (`run_unary_f32`, `run_binary_f32`) are
 //! exercised against the real [`oxicuda_backend::CpuBackend`] in the unit
 //! tests, so the op mapping and buffer handling are verified end-to-end even
 //! without a GPU present.

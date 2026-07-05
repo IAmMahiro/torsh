@@ -37,6 +37,10 @@ scirs2-stats = { workspace = true }
 num-traits = { workspace = true }
 num-complex = { workspace = true }
 half = { workspace = true }
+# Alignment-safe byte<->element reinterpretation (e.g. lazy_loading.rs file chunk
+# reads); avoids raw pointer casts on unaligned `Vec<u8>` buffers. `extern_crate_alloc`
+# is required for `bytemuck::pod_collect_to_vec` (allocates the returned `Vec<T>`).
+bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
 # ndarray = { workspace = true, optional = true }  # REMOVED: Use scirs2_core::ndarray instead (SciRS2 POLICY)
 rayon = { workspace = true }  # Keep temporarily during migration
 parking_lot = { workspace = true }

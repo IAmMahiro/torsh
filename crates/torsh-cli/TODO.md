@@ -172,9 +172,9 @@ The torsh-cli crate has an **excellent architectural foundation** with comprehen
 
 #### Enhanced Diagnostics 🚧
 - [ ] **Real Hardware Detection**
-  - [ ] CUDA device enumeration and capabilities
-  - [ ] Metal device support detection
-  - [ ] CPU SIMD capabilities analysis
+  - [x] CUDA device enumeration and capabilities
+  - [x] Metal device support detection
+  - [x] CPU SIMD capabilities analysis
   - [ ] Memory availability and optimization suggestions
 
 ## Phase 3: Advanced Integration 📋 (Low Priority)

@@ -21,12 +21,14 @@ pub struct PyTensor {
 #[pymethods]
 impl PyTensor {
     #[new]
+    #[pyo3(signature = (data, dtype=None, device=None, requires_grad=None))]
     pub fn new(
         data: &Bound<'_, PyAny>,
-        _dtype: Option<PyDType>,
+        dtype: Option<PyDType>,
         device: Option<PyDevice>,
         requires_grad: Option<bool>,
     ) -> PyResult<Self> {
+        let _dtype = dtype;
         let device = device.map(|d| d.device).unwrap_or(DeviceType::Cpu);
         let requires_grad = requires_grad.unwrap_or(false);
 
@@ -285,6 +287,45 @@ impl PyTensor {
     }
 
     // ===============================
+    // Python Operator Protocol (dunder methods)
+    // ===============================
+    //
+    // PyTorch-compatible user code relies on operator syntax (e.g.
+    // `loss = pred - target`, `y = w @ x + b`, `-grad`). These dunders do not
+    // reimplement any math; they simply delegate to the already-implemented
+    // named methods above (and `matmul`/`neg` below).
+
+    /// `self + other` (delegates to [`PyTensor::add`])
+    fn __add__(&self, other: &PyTensor) -> PyResult<PyTensor> {
+        self.add(other)
+    }
+
+    /// `self - other` (delegates to [`PyTensor::sub`])
+    fn __sub__(&self, other: &PyTensor) -> PyResult<PyTensor> {
+        self.sub(other)
+    }
+
+    /// `self * other` (delegates to [`PyTensor::mul`])
+    fn __mul__(&self, other: &PyTensor) -> PyResult<PyTensor> {
+        self.mul(other)
+    }
+
+    /// `self / other` (delegates to [`PyTensor::div`])
+    fn __truediv__(&self, other: &PyTensor) -> PyResult<PyTensor> {
+        self.div(other)
+    }
+
+    /// `self @ other` (delegates to [`PyTensor::matmul`])
+    fn __matmul__(&self, other: &PyTensor) -> PyResult<PyTensor> {
+        self.matmul(other)
+    }
+
+    /// `-self` (delegates to [`PyTensor::neg`])
+    fn __neg__(&self) -> PyResult<PyTensor> {
+        self.neg()
+    }
+
+    // ===============================
     // Tensor Manipulation Operations
     // ===============================
 
@@ -312,6 +353,7 @@ impl PyTensor {
     }
 
     /// Squeeze tensor (remove dimensions of size 1)
+    #[pyo3(signature = (dim=None))]
     fn squeeze(&self, dim: Option<i64>) -> PyResult<PyTensor> {
         let dim_to_squeeze = dim.map(|d| d as i32).unwrap_or(0i32);
         let result = py_result!(self.tensor.squeeze(dim_to_squeeze))?;
@@ -325,6 +367,7 @@ impl PyTensor {
     }
 
     /// Flatten tensor
+    #[pyo3(signature = (_start_dim=None, _end_dim=None))]
     fn flatten(&self, _start_dim: Option<i64>, _end_dim: Option<i64>) -> PyResult<PyTensor> {
         // For now, use basic flatten - may need different implementation
         let result = py_result!(self.tensor.flatten())?;
@@ -336,6 +379,7 @@ impl PyTensor {
     // ===============================
 
     /// Sum along specified dimensions
+    #[pyo3(signature = (_dim=None, _keepdim=None))]
     fn sum(&self, _dim: Option<Vec<i64>>, _keepdim: Option<bool>) -> PyResult<PyTensor> {
         // For now, use basic sum - may need different implementation
         let result = py_result!(self.tensor.sum())?;
@@ -343,6 +387,7 @@ impl PyTensor {
     }
 
     /// Mean along specified dimensions
+    #[pyo3(signature = (dim=None, keepdim=None))]
     fn mean(&self, dim: Option<Vec<i64>>, keepdim: Option<bool>) -> PyResult<PyTensor> {
         let keepdim = keepdim.unwrap_or(false);
         let result = if let Some(dims) = dim {
@@ -355,6 +400,7 @@ impl PyTensor {
     }
 
     /// Maximum along specified dimensions
+    #[pyo3(signature = (dim=None, keepdim=None))]
     fn max(&self, dim: Option<i64>, keepdim: Option<bool>) -> PyResult<PyTensor> {
         let dim_opt = dim.map(|d| d as usize);
         let keepdim = keepdim.unwrap_or(false);
@@ -363,6 +409,7 @@ impl PyTensor {
     }
 
     /// Minimum along specified dimensions
+    #[pyo3(signature = (_dim=None, _keepdim=None))]
     fn min(&self, _dim: Option<i64>, _keepdim: Option<bool>) -> PyResult<PyTensor> {
         // For now, use basic min - may need different implementation
         let result = py_result!(self.tensor.min())?;
@@ -450,6 +497,12 @@ impl PyTensor {
     /// Absolute value
     fn abs(&self) -> PyResult<PyTensor> {
         let result = py_result!(self.tensor.abs())?;
+        Ok(PyTensor { tensor: result })
+    }
+
+    /// Negation (element-wise unary minus), backs the `-tensor` operator
+    fn neg(&self) -> PyResult<PyTensor> {
+        let result = py_result!(self.tensor.neg())?;
         Ok(PyTensor { tensor: result })
     }
 
@@ -619,6 +672,7 @@ impl PyTensor {
     // ===============================
 
     /// Clamp tensor values to specified range
+    #[pyo3(signature = (min=None, max=None))]
     fn clamp(&self, min: Option<f32>, max: Option<f32>) -> PyResult<PyTensor> {
         let result = if let (Some(min_val), Some(max_val)) = (min, max) {
             py_result!(self.tensor.clamp(min_val, max_val))?
@@ -653,6 +707,7 @@ impl PyTensor {
     }
 
     /// Apply uniform random initialization
+    #[pyo3(signature = (from=None, to=None))]
     fn uniform_(&mut self, from: Option<f32>, to: Option<f32>) -> PyResult<PyTensor> {
         // ✅ SciRS2 POLICY: Use scirs2_core::random for RNG
         use scirs2_core::random::{thread_rng, Distribution, Uniform};
@@ -684,6 +739,7 @@ impl PyTensor {
     }
 
     /// Apply normal random initialization
+    #[pyo3(signature = (mean=None, std=None))]
     fn normal_(&mut self, mean: Option<f32>, std: Option<f32>) -> PyResult<PyTensor> {
         // ✅ SciRS2 POLICY: Use scirs2_core::random for RNG
         use scirs2_core::random::{thread_rng, Distribution, Normal};
@@ -890,6 +946,7 @@ impl PyTensor {
     }
 
     /// Get diagonal elements
+    #[pyo3(signature = (diagonal=None))]
     fn diag(&self, diagonal: Option<i64>) -> PyResult<PyTensor> {
         // ✅ Proper diagonal extraction implementation
 
@@ -1027,6 +1084,7 @@ impl PyTensor {
     }
 
     /// Standard deviation
+    #[pyo3(signature = (dim=None, keepdim=None, unbiased=None))]
     fn std(
         &self,
         dim: Option<Vec<i64>>,
@@ -1050,6 +1108,7 @@ impl PyTensor {
     }
 
     /// Variance calculation
+    #[pyo3(signature = (dim=None, keepdim=None, unbiased=None))]
     fn var(
         &self,
         dim: Option<Vec<i64>>,
@@ -1073,6 +1132,7 @@ impl PyTensor {
     }
 
     /// Argmax operation
+    #[pyo3(signature = (dim=None, _keepdim=None))]
     fn argmax(&self, dim: Option<i64>, _keepdim: Option<bool>) -> PyResult<PyTensor> {
         let result = if let Some(d) = dim {
             py_result!(self.tensor.argmax(Some(d as i32)))?
@@ -1084,6 +1144,7 @@ impl PyTensor {
     }
 
     /// Argmin operation
+    #[pyo3(signature = (dim=None, _keepdim=None))]
     fn argmin(&self, dim: Option<i64>, _keepdim: Option<bool>) -> PyResult<PyTensor> {
         let result = if let Some(d) = dim {
             py_result!(self.tensor.argmin(Some(d as i32)))?

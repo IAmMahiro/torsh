@@ -7,7 +7,7 @@ Core types and traits for the ToRSh deep learning framework.
 This crate provides the fundamental building blocks used throughout ToRSh:
 
 - **Device abstraction**: Unified interface for CPU, CUDA, Metal, and WebGPU backends
-- **Data types**: Support for various tensor element types (f32, f64, i32, etc.)
+- **Data types**: Support for various tensor element types (f32, f64, f16, bf16, i32, etc.)
 - **Shape utilities**: Shape manipulation, broadcasting, and stride calculations
 - **Storage abstraction**: Backend-agnostic tensor storage with reference counting
 - **Error types**: Comprehensive error handling for ToRSh operations
@@ -15,12 +15,15 @@ This crate provides the fundamental building blocks used throughout ToRSh:
 ## Features
 
 - `std` (default): Standard library support
+- `half` (default): Half-precision floating point support (f16, bf16), including full `FloatElement` trait coverage
+- `parallel` (default): Parallel processing via rayon/crossbeam
 - `no_std`: No standard library (for embedded targets)
 - `serialize`: Serialization support via serde
 
 ## Usage
 
 ```rust
+use torsh_core::device::CpuDevice;
 use torsh_core::prelude::*;
 
 // Create a shape
@@ -28,7 +31,7 @@ let shape = Shape::new(vec![2, 3, 4]);
 println!("Shape: {}, elements: {}", shape, shape.numel());
 
 // Device management
-let device = CpuDevice;
+let device = CpuDevice::new();
 println!("Device: {}", device.name());
 
 // Data types

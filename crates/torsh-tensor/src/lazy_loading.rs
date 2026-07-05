@@ -135,7 +135,18 @@ impl<T: TensorElement> LazyTensor<T> {
     pub fn is_empty(&self) -> bool {
         self.metadata.total_elements == 0
     }
+}
 
+/// Methods that load tensor data from the backing file.
+///
+/// These require `T: bytemuck::Pod` in addition to `TensorElement` because
+/// `LazyTensor::load_chunk_from_file` reinterprets raw file bytes as `[T]`.
+/// That reinterpretation is only sound for "plain old data" types where every
+/// bit pattern is a valid `T` and there is no uninitialized padding to worry
+/// about (`bytemuck::Pod`) -- notably this excludes `bool` (not every byte is
+/// 0/1) even though `bool: TensorElement`, since blindly trusting arbitrary
+/// bytes read from disk to be a valid `bool` would itself be unsound.
+impl<T: TensorElement + bytemuck::Pod> LazyTensor<T> {
     /// Load a specific element by flat index
     ///
     /// # Arguments
@@ -256,6 +267,28 @@ impl<T: TensorElement> LazyTensor<T> {
     }
 
     /// Load chunk data directly from file
+    ///
+    /// Reads `chunk_size` elements of `T` (`self.metadata.element_size` bytes each,
+    /// which must equal `size_of::<T>()`) starting at `start_element` and safely
+    /// reinterprets the raw bytes as a `Vec<T>`.
+    ///
+    /// # Why this is safe
+    /// A prior version of this function read bytes into a `Vec<u8>` (which is only
+    /// guaranteed 1-byte alignment) and then reinterpreted that buffer's raw pointer
+    /// as `*const T` via `std::slice::from_raw_parts`. That is undefined behavior
+    /// whenever the allocator doesn't happen to over-align the `Vec<u8>` allocation
+    /// to `align_of::<T>()` -- over-alignment is not part of the allocator's
+    /// contract (Miri's allocator deliberately does not over-align small
+    /// allocations, and correctly flagged this as "constructing invalid value:
+    /// encountered an unaligned reference").
+    ///
+    /// Instead, [`bytemuck::pod_collect_to_vec`] copies the raw bytes into a
+    /// freshly-allocated `Vec<T>`. Rust always allocates a `Vec<T>`'s backing
+    /// storage via `Layout::array::<T>()`, so that destination is guaranteed to be
+    /// correctly aligned for `T` from the start; the copy itself is a plain
+    /// byte-for-byte `memcpy` with no typed load through a misaligned pointer.
+    /// This requires `T: bytemuck::Pod` (see the impl block), which additionally
+    /// guarantees that any bit pattern read from the file is a valid `T`.
     fn load_chunk_from_file(&self, start_element: usize, chunk_size: usize) -> Result<Vec<T>> {
         let mut file = self.file.lock().expect("lock should not be poisoned");
 
@@ -265,18 +298,36 @@ impl<T: TensorElement> LazyTensor<T> {
         file.seek(SeekFrom::Start(file_offset))
             .map_err(|e| TorshError::IoError(format!("Failed to seek: {}", e)))?;
 
-        let mut buffer = vec![0u8; chunk_size * self.metadata.element_size];
+        // The on-disk element size recorded in the metadata must agree with the
+        // actual in-memory size of `T`; otherwise `chunk_size` elements of `T`
+        // would not correspond to exactly `chunk_size * self.metadata.element_size`
+        // bytes, and the buffer would be silently misinterpreted (too few or too
+        // many elements) rather than erroring out cleanly.
+        let element_size = std::mem::size_of::<T>();
+        if self.metadata.element_size != element_size {
+            return Err(TorshError::InvalidArgument(format!(
+                "Tensor element size mismatch: file metadata declares {} byte(s) per \
+                 element but `{}` is {} byte(s)",
+                self.metadata.element_size,
+                std::any::type_name::<T>(),
+                element_size
+            )));
+        }
+
+        let mut buffer = vec![0u8; chunk_size * element_size];
         file.read_exact(&mut buffer)
             .map_err(|e| TorshError::IoError(format!("Failed to read chunk: {}", e)))?;
 
-        // Convert bytes to elements (this is a simplified version)
-        // In practice, you'd need proper deserialization based on the data type
-        let data =
-            unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const T, chunk_size).to_vec() };
+        // Safe, alignment-agnostic byte-to-element conversion (see doc comment
+        // above). `buffer.len() == chunk_size * size_of::<T>()` exactly (checked
+        // above), so the result is guaranteed to have exactly `chunk_size` elements.
+        let data: Vec<T> = bytemuck::pod_collect_to_vec(&buffer);
 
         Ok(data)
     }
+}
 
+impl<T: TensorElement> LazyTensor<T> {
     /// Clean up old cached chunks
     fn cleanup_cache(&self, cache: &mut HashMap<usize, CachedChunk<T>>) {
         let now = Instant::now();

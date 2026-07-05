@@ -188,11 +188,18 @@ exporter.set_dependencies(dependencies)?;
 ## Dependencies
 
 - `torsh-core`: Core types and error handling
-- `torsh-nn`: Neural network modules
-- `serde`: Serialization support
-- `zip`: Archive compression and extraction
+- `torsh-tensor`: Tensor operations
+- `torsh-nn`: Neural network modules (optional, via the `with-nn` feature)
+- `serde` / `serde_json`: Serialization support
+- `oxicode`: Pure-Rust binary encoding (COOLJAPAN replacement for `bincode`)
+- `oxiarc-archive` / `oxiarc-deflate` / `oxiarc-zstd`: Pure-Rust archive and compression (COOLJAPAN Pure Rust Policy; replaces `zip`/`flate2`/`zstd`)
+- `lzma-rs`: LZMA compression
+- `aes-gcm` / `chacha20poly1305` / `pbkdf2` / `hmac` / `ed25519-dalek`: Pure-Rust cryptography (RustCrypto) for package encryption and signing
 - `chrono`: Date and time handling
 - `semver`: Semantic versioning
+- `sha2`: Cryptographic hashing for integrity checks
+- `memmap2`: Memory-mapped file access
+- `scirs2-core`: Parallel operations and SIMD support
 
 ## Performance
 
@@ -223,3 +230,7 @@ See the `examples/` directory for:
 - Package distribution and deployment
 - Version management and updates
 - Integration with model registries
+
+## Testing
+
+This crate has 317 passing tests (`cargo nextest run -p torsh-package --all-features`).

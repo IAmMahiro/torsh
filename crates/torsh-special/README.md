@@ -2,6 +2,8 @@
 
 Special mathematical functions for ToRSh, leveraging scirs2-special for optimized implementations.
 
+**Status**: Stable. **Tests**: 186/186 passing (`cargo nextest run --all-features`).
+
 ## Overview
 
 This crate provides a comprehensive collection of 135+ special mathematical functions organized into 19 mathematical families:
@@ -26,6 +28,9 @@ This crate provides a comprehensive collection of 135+ special mathematical func
 - **Performance Optimizations**: SIMD-accelerated, fast approximations, smart caching, lookup tables
 - **Visualization Tools**: Function analysis, accuracy comparison, ASCII plotting
 
+All functions are exported directly from the crate root (there is no `special::` namespace); the examples
+below assume `use torsh_special::prelude::*;` (or `use torsh_special::*;`) unless noted otherwise.
+
 ## Usage
 
 ### Bessel Functions
@@ -36,24 +41,24 @@ use torsh_tensor::prelude::*;
 
 // Bessel functions of the first kind
 let x = tensor![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
-let j0 = special::j0(&x)?;  // J₀(x)
-let j1 = special::j1(&x)?;  // J₁(x)
-let jn = special::jn(3, &x)?; // J₃(x)
+let j0 = bessel_j0(&x)?;      // J₀(x)
+let j1 = bessel_j1(&x)?;      // J₁(x)
+let jn = bessel_jn(3, &x)?;   // J₃(x)
 
 // Bessel functions of the second kind
-let y0 = special::y0(&x)?;  // Y₀(x)
-let y1 = special::y1(&x)?;  // Y₁(x)
-let yn = special::yn(3, &x)?; // Y₃(x)
+let y0 = bessel_y0(&x)?;      // Y₀(x)
+let y1 = bessel_y1(&x)?;      // Y₁(x)
+let yn = bessel_yn(3, &x)?;   // Y₃(x)
 
 // Modified Bessel functions
-let i0 = special::i0(&x)?;  // I₀(x)
-let i1 = special::i1(&x)?;  // I₁(x)
-let k0 = special::k0(&x)?;  // K₀(x)
-let k1 = special::k1(&x)?;  // K₁(x)
+let i0 = bessel_i0(&x)?;      // I₀(x)
+let i1 = bessel_i1(&x)?;      // I₁(x)
+let k0 = bessel_k0(&x)?;      // K₀(x)
+let k1 = bessel_k1(&x)?;      // K₁(x)
 
-// Spherical Bessel functions
-let j0_spherical = special::spherical_jn(0, &x)?;
-let y0_spherical = special::spherical_yn(0, &x)?;
+// Spherical Bessel functions (in the `trigonometric` module, not re-exported in `prelude`)
+let j0_spherical = torsh_special::trigonometric::spherical_jn(0, &x)?;
+let y0_spherical = torsh_special::trigonometric::spherical_yn(0, &x)?;
 ```
 
 ### Gamma and Related Functions
@@ -61,27 +66,22 @@ let y0_spherical = special::spherical_yn(0, &x)?;
 ```rust
 // Gamma function
 let x = tensor![0.5, 1.0, 1.5, 2.0, 2.5, 3.0];
-let gamma_x = special::gamma(&x)?;
+let gamma_x = gamma(&x)?;
 
 // Log-gamma function (more stable for large values)
-let lgamma_x = special::lgamma(&x)?;
+let lgamma_x = lgamma(&x)?;
 
 // Digamma (psi) function - derivative of log-gamma
-let digamma_x = special::digamma(&x)?;
+let digamma_x = digamma(&x)?;
 
 // Polygamma functions
-let trigamma = special::polygamma(1, &x)?;  // ψ'(x)
-let tetragamma = special::polygamma(2, &x)?; // ψ''(x)
+let trigamma = polygamma(1, &x)?;   // ψ'(x)
+let tetragamma = polygamma(2, &x)?; // ψ''(x)
 
 // Beta function
 let a = tensor![0.5, 1.0, 2.0];
 let b = tensor![1.0, 2.0, 3.0];
-let beta_ab = special::beta(&a, &b)?;
-
-// Incomplete gamma functions
-let lower_gamma = special::gammainc(&a, &x)?;    // γ(a,x)
-let upper_gamma = special::gammaincc(&a, &x)?;   // Γ(a,x)
-let regularized = special::gammaincp(&a, &x)?;   // P(a,x)
+let beta_ab = beta(&a, &b)?;
 ```
 
 ### Error Functions
@@ -89,60 +89,61 @@ let regularized = special::gammaincp(&a, &x)?;   // P(a,x)
 ```rust
 // Error function and complementary error function
 let x = tensor![-2.0, -1.0, 0.0, 1.0, 2.0];
-let erf_x = special::erf(&x)?;
-let erfc_x = special::erfc(&x)?;
+let erf_x = erf(&x)?;
+let erfc_x = erfc(&x)?;
 
 // Scaled complementary error function (for large x)
-let erfcx_x = special::erfcx(&x)?;  // exp(x²) * erfc(x)
+let erfcx_x = erfcx(&x)?;  // exp(x²) * erfc(x)
 
-// Inverse error functions
+// Inverse error function
 let p = tensor![0.1, 0.5, 0.9];
-let erfinv_p = special::erfinv(&p)?;
-let erfcinv_p = special::erfcinv(&p)?;
+let erfinv_p = erfinv(&p)?;
 
-// Fresnel integrals
-let (s, c) = special::fresnel(&x)?;  // S(x) and C(x)
+// Fresnel integrals (returned as a single (S, C) tuple)
+let (s, c) = fresnel(&x)?;  // S(x) and C(x)
 ```
 
 ### Elliptic Functions
 
 ```rust
 // Complete elliptic integrals
-let k = tensor![0.0, 0.5, 0.9, 0.99];
-let ellipk = special::ellipk(&k)?;  // K(k)
-let ellipe = special::ellipe(&k)?;  // E(k)
+let m = tensor![0.0, 0.5, 0.9, 0.99]; // parameter m = k²
+let ellipk = elliptic_k(&m)?;  // K(m)
+let ellipe = elliptic_e(&m)?;  // E(m)
 
 // Incomplete elliptic integrals
 let phi = tensor![0.5, 1.0, 1.5];
-let ellipf = special::ellipf(&phi, &k)?;  // F(φ,k)
-let ellipe_inc = special::ellipeinc(&phi, &k)?;  // E(φ,k)
+let ellipf = elliptic_f(&phi, &m)?;            // F(φ,m)
+let ellipe_inc = elliptic_e_incomplete(&phi, &m)?; // E(φ,m)
 
-// Jacobi elliptic functions
+// Jacobi elliptic functions (returned individually, not as a combined tuple)
 let u = tensor![0.0, 0.5, 1.0, 1.5];
-let m = tensor![0.0, 0.5, 0.9];
-let (sn, cn, dn) = special::ellipj(&u, &m)?;
+let mm = tensor![0.0, 0.5, 0.9];
+let sn = jacobi_sn(&u, &mm)?;
+let cn = jacobi_cn(&u, &mm)?;
+let dn = jacobi_dn(&u, &mm)?;
 ```
 
 ### Exponential and Logarithmic Integrals
 
 ```rust
 // Exponential integral
-let ei = special::expi(&x)?;  // Ei(x)
+let ei = exponential_integral_ei(&x)?;  // Ei(x)
 
 // Exponential integral E_n(x)
-let e1 = special::expn(1, &x)?;  // E₁(x)
-let e2 = special::expn(2, &x)?;  // E₂(x)
+let e1 = exponential_integral_e1(&x)?;     // E₁(x)
+let e2 = exponential_integral_en(2, &x)?;  // E₂(x)
 
 // Logarithmic integral
-let li = special::li(&x)?;  // li(x)
+let li = logarithmic_integral(&x)?;  // li(x)
 
-// Sine and cosine integrals
-let si = special::sici(&x)?.0;  // Si(x)
-let ci = special::sici(&x)?.1;  // Ci(x)
+// Sine and cosine integrals (returned individually, not as a combined tuple)
+let si = sine_integral(&x)?;    // Si(x)
+let ci = cosine_integral(&x)?;  // Ci(x)
 
 // Hyperbolic sine and cosine integrals
-let shi = special::shichi(&x)?.0;  // Shi(x)
-let chi = special::shichi(&x)?.1;  // Chi(x)
+let shi = hyperbolic_sine_integral(&x)?;   // Shi(x)
+let chi = hyperbolic_cosine_integral(&x)?; // Chi(x)
 ```
 
 ### Other Special Functions
@@ -150,31 +151,32 @@ let chi = special::shichi(&x)?.1;  // Chi(x)
 ```rust
 // Riemann zeta function
 let s = tensor![0.5, 1.5, 2.0, 3.0];
-let zeta_s = special::zeta(&s)?;
+let zeta_s = riemann_zeta(&s)?;
 
-// Airy functions
+// Airy functions (returned individually, not as a combined tuple)
 let x = tensor![-2.0, -1.0, 0.0, 1.0, 2.0];
-let (ai, aip, bi, bip) = special::airy(&x)?;
+let ai = airy_ai(&x)?;
+let aip = airy_ai_prime(&x)?;
+let bi = airy_bi(&x)?;
+let bip = airy_bi_prime(&x)?;
 
-// Struve functions
-let h0 = special::struve(0, &x)?;  // H₀(x)
-let h1 = special::struve(1, &x)?;  // H₁(x)
+// Struve functions (tensor argument first, order second)
+let h0 = struve_h(&x, 0)?;  // H₀(x)
+let h1 = struve_h(&x, 1)?;  // H₁(x)
 
-// Hypergeometric functions
-let a = tensor![0.5];
-let b = tensor![1.0];
-let c = tensor![1.5];
+// Hypergeometric functions (a, b, c are plain scalars; only z is a tensor)
+let (a, b, c) = (0.5_f32, 1.0_f32, 1.5_f32);
 let z = tensor![0.1, 0.5, 0.9];
-let hyp2f1 = special::hyp2f1(&a, &b, &c, &z)?;
+let hyp2f1 = hypergeometric_2f1(a, b, c, &z)?;
 
 // Legendre polynomials
 let n = 3;
 let x = tensor![-1.0, -0.5, 0.0, 0.5, 1.0];
-let pn = special::legendre(n, &x)?;
+let pn = legendre_p(n, &x)?;
 
-// Associated Legendre functions
+// Associated Legendre functions (order n, then degree m)
 let m = 1;
-let pmn = special::lpmv(m, n, &x)?;
+let pmn = legendre_p_associated(n, m, &x)?;
 ```
 
 ### Spheroidal Wave Functions
@@ -187,7 +189,7 @@ let n = 2;  // Degree
 let m = 0;  // Order
 let c = 2.0; // Spheroidicity parameter
 
-// Angular function S_nm(c, η) where η ∈ [-1, 1]
+// Angular function S_nm(c, η) where η ∈ [-1, 1] — scalar in, scalar out
 let eta = 0.5;
 let s_value = prolate_angular(n, m, c, eta)?;
 
@@ -203,6 +205,9 @@ let r_oblate = oblate_radial(n, m, c, xi_oblate)?;
 // Eigenvalues λ_nm(c)
 let lambda_0 = spheroidal_eigenvalue(n, m, 0.0)?; // Spherical limit
 let lambda = spheroidal_eigenvalue(n, m, c)?;    // Spheroidal
+
+// Tensor-batched variants are also available: prolate_angular_tensor,
+// prolate_radial_tensor, oblate_angular_tensor, oblate_radial_tensor.
 ```
 
 ### Batch Operations
@@ -212,29 +217,33 @@ All functions support batched operations:
 ```rust
 // Batch computation on 2D tensors
 let batch_x = randn(&[32, 100]);  // 32 batches of 100 elements
-let batch_gamma = special::gamma(&batch_x)?;
-let batch_erf = special::erf(&batch_x)?;
+let batch_gamma = gamma(&batch_x)?;
+let batch_erf = erf(&batch_x)?;
 
 // Broadcasting
 let x = randn(&[10, 1]);
 let y = randn(&[1, 20]);
-let beta_xy = special::beta(&x, &y)?;  // Shape: [10, 20]
+let beta_xy = beta(&x, &y)?;  // Shape: [10, 20]
 ```
 
 ### Complex Number Support
 
-Some functions support complex inputs:
+Complex-valued functions live in the `complex` module and are always compiled in (there is no
+Cargo feature gate for them). They use `scirs2_core::Complex64`/`Complex32`, not `num_complex`
+directly, per the SciRS2 POLICY:
 
 ```rust
-#[cfg(feature = "complex")]
-{
-    use num_complex::Complex;
-    
-    let z = tensor![Complex::new(1.0, 0.5), Complex::new(2.0, -1.0)];
-    let gamma_z = special::gamma_complex(&z)?;
-    let zeta_z = special::zeta_complex(&z)?;
-}
+use torsh_special::complex::{complex_gamma_c64, complex_zeta_c64};
+use scirs2_core::Complex64;
+
+let z = tensor![Complex64::new(1.0, 0.5), Complex64::new(2.0, -1.0)];
+let gamma_z = complex_gamma_c64(&z)?;
+let zeta_z = complex_zeta_c64(&z)?;
 ```
+
+Complex Bessel, error, Airy, beta, polygamma and incomplete-gamma functions are also available
+under the same `complex_*_c64`/`complex_*_c32` naming convention (e.g. `complex_bessel_j_c64`,
+`complex_erf_c64`, `complex_airy_ai_c64`).
 
 ## Integration with SciRS2
 

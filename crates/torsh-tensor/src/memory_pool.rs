@@ -181,18 +181,25 @@ impl<T: 'static> ReusedBuffer<T> {
             layout: md.layout,
         };
         if let Some(pool_arc) = md.pool.upgrade() {
-            if let Ok(mut guard) = pool_arc.lock() {
-                let type_id = std::any::TypeId::of::<T>();
-                let size_class = guard.find_size_class(raw_entry.capacity_bytes);
-                let align = raw_entry.layout.align();
-                let pool_key = (type_id, size_class, align);
-                if let Some(bucket) = guard.pools.get_mut(&pool_key) {
-                    if bucket.available_buffers.len() < bucket.max_buffers {
-                        bucket.available_buffers.push_back(raw_entry);
-                        bucket.deallocations += 1;
-                        // ManuallyDrop prevents double-free: raw_entry is now owned by the bucket.
-                        return;
-                    }
+            // Recover from poisoning rather than treat it as fatal: a poisoned
+            // pool's inner state is still structurally valid (the only known
+            // panic-while-held path validates arguments before mutating pool
+            // state), so `release_to_pool` should keep pooling buffers instead
+            // of silently degrading to "always deallocate" forever after one
+            // poisoning event.
+            let mut guard = pool_arc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let type_id = std::any::TypeId::of::<T>();
+            let size_class = guard.find_size_class(raw_entry.capacity_bytes);
+            let align = raw_entry.layout.align();
+            let pool_key = (type_id, size_class, align);
+            if let Some(bucket) = guard.pools.get_mut(&pool_key) {
+                if bucket.available_buffers.len() < bucket.max_buffers {
+                    bucket.available_buffers.push_back(raw_entry);
+                    bucket.deallocations += 1;
+                    // ManuallyDrop prevents double-free: raw_entry is now owned by the bucket.
+                    return;
                 }
             }
         }
@@ -211,24 +218,27 @@ impl<T: 'static> Drop for ReusedBuffer<T> {
             layout: self.layout,
         };
         if let Some(pool_arc) = self.pool.upgrade() {
-            if let Ok(mut guard) = pool_arc.lock() {
-                let type_id = std::any::TypeId::of::<T>();
-                let size_class = guard.find_size_class(raw_entry.capacity_bytes);
-                let align = raw_entry.layout.align();
-                let pool_key = (type_id, size_class, align);
-                if let Some(bucket) = guard.pools.get_mut(&pool_key) {
-                    if bucket.available_buffers.len() < bucket.max_buffers {
-                        // Wrap in ManuallyDrop so push_back takes it without scheduling
-                        // a double-free when the local binding goes out of scope.
-                        let md_entry = ManuallyDrop::new(raw_entry);
-                        // SAFETY: ManuallyDrop<RawEntry> has the same layout as RawEntry;
-                        // we read it once here and never again.
-                        bucket
-                            .available_buffers
-                            .push_back(unsafe { std::ptr::read(&*md_entry as *const RawEntry) });
-                        bucket.deallocations += 1;
-                        return;
-                    }
+            // Recover from poisoning rather than treat it as fatal (see the
+            // matching comment in `ReusedBuffer::release_to_pool`).
+            let mut guard = pool_arc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let type_id = std::any::TypeId::of::<T>();
+            let size_class = guard.find_size_class(raw_entry.capacity_bytes);
+            let align = raw_entry.layout.align();
+            let pool_key = (type_id, size_class, align);
+            if let Some(bucket) = guard.pools.get_mut(&pool_key) {
+                if bucket.available_buffers.len() < bucket.max_buffers {
+                    // Wrap in ManuallyDrop so push_back takes it without scheduling
+                    // a double-free when the local binding goes out of scope.
+                    let md_entry = ManuallyDrop::new(raw_entry);
+                    // SAFETY: ManuallyDrop<RawEntry> has the same layout as RawEntry;
+                    // we read it once here and never again.
+                    bucket
+                        .available_buffers
+                        .push_back(unsafe { std::ptr::read(&*md_entry as *const RawEntry) });
+                    bucket.deallocations += 1;
+                    return;
                 }
             }
         }
@@ -339,6 +349,29 @@ impl Default for GlobalMemoryPool {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Validate that `align` is usable for `T`: it must be a power of two and at
+/// least `align_of::<T>()`. Panics otherwise (see callers' `# Panics` docs).
+///
+/// This is a standalone, pre-lock-safe check shared by
+/// [`GlobalMemoryPool::acquire_uninit_aligned`] and [`global_acquire_uninit_aligned`]
+/// specifically so that [`global_acquire_uninit_aligned`] can validate `align`
+/// *before* acquiring the global `MEMORY_POOL` mutex. A `Mutex` poisons on *any*
+/// panicking unwind while it is held -- including an intentional one from a
+/// `#[should_panic]` test -- so validating first means a caller error here
+/// (which depends only on `align` and `T`, never on pool state) can never poison
+/// the global pool lock for every other thread/test in the process.
+fn assert_valid_alignment<T>(align: usize) {
+    let element_align = std::mem::align_of::<T>();
+    assert!(
+        align.is_power_of_two(),
+        "alignment must be a power of two (got {align})"
+    );
+    assert!(
+        align >= element_align,
+        "alignment {align} must be >= align_of::<T>() ({element_align})"
+    );
 }
 
 impl GlobalMemoryPool {
@@ -564,16 +597,8 @@ impl GlobalMemoryPool {
         count: usize,
         align: usize,
     ) -> ReusedBuffer<T> {
+        assert_valid_alignment::<T>(align);
         let element_size = std::mem::size_of::<T>();
-        let element_align = std::mem::align_of::<T>();
-        assert!(
-            align.is_power_of_two(),
-            "alignment must be a power of two (got {align})"
-        );
-        assert!(
-            align >= element_align,
-            "alignment {align} must be >= align_of::<T>() ({element_align})"
-        );
         let size_bytes = count * element_size;
         let size_class = self.find_size_class(size_bytes);
         let type_id = std::any::TypeId::of::<T>();
@@ -758,7 +783,7 @@ pub fn global_acquire_uninit<T: 'static>(count: usize) -> ReusedBuffer<T> {
     let pool_arc = get_memory_pool();
     let mut guard = pool_arc
         .lock()
-        .expect("global memory pool lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.acquire_uninit::<T>(count)
 }
 
@@ -774,10 +799,16 @@ pub fn global_acquire_uninit<T: 'static>(count: usize) -> ReusedBuffer<T> {
 /// # Safety contract on the caller
 /// Same as [`global_acquire_uninit`] — elements must be initialized before being read.
 pub fn global_acquire_uninit_aligned<T: 'static>(count: usize, align: usize) -> ReusedBuffer<T> {
+    // Validate *before* touching the global pool lock at all: an invalid `align`
+    // is a pure caller error (doesn't depend on any pool state), so failing fast
+    // here means the panic below never happens while `MEMORY_POOL` is held. See
+    // `assert_valid_alignment`'s doc comment for why that ordering matters.
+    assert_valid_alignment::<T>(align);
+
     let pool_arc = get_memory_pool();
     let mut guard = pool_arc
         .lock()
-        .expect("global memory pool lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.acquire_uninit_aligned::<T>(count, align)
 }
 
@@ -794,7 +825,9 @@ impl<T: TensorElement> Tensor<T> {
         T: Clone + Default,
     {
         let binding = get_memory_pool();
-        let mut pool = binding.lock().expect("lock should not be poisoned");
+        let mut pool = binding
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.create_large_tensor::<T>(shape, device)
     }
 
@@ -804,7 +837,9 @@ impl<T: TensorElement> Tensor<T> {
         T: Clone + Default,
     {
         let binding = get_memory_pool();
-        let mut pool = binding.lock().expect("lock should not be poisoned");
+        let mut pool = binding
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.create_lazy_tensor::<T>(shape, device)
     }
 
@@ -979,7 +1014,7 @@ impl<T: TensorElement + Copy + Default> PooledTensor<T> {
         // Allocate from pool
         let pool = get_memory_pool();
         let data = {
-            let mut pool_guard = pool.lock().expect("lock should not be poisoned");
+            let mut pool_guard = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             #[allow(deprecated)]
             pool_guard.allocate::<T>(numel)
         };
@@ -987,7 +1022,7 @@ impl<T: TensorElement + Copy + Default> PooledTensor<T> {
         let tensor = Tensor::from_data(data, shape.to_vec(), device)?;
         let type_id = std::any::TypeId::of::<T>();
         let size_class = {
-            let pool_guard = pool.lock().expect("lock should not be poisoned");
+            let pool_guard = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             pool_guard.find_size_class(numel * std::mem::size_of::<T>())
         };
         let align = std::mem::align_of::<T>();
@@ -1045,7 +1080,7 @@ impl<T: TensorElement + std::default::Default> Drop for PooledTensor<T> {
             // Return memory to pool via deallocate (which now simply drops).
             if let Ok(data) = self.tensor.to_vec() {
                 let pool = get_memory_pool();
-                let mut pool_guard = pool.lock().expect("lock should not be poisoned");
+                let mut pool_guard = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 pool_guard.deallocate(data);
             }
         }
@@ -1068,14 +1103,16 @@ impl<T: TensorElement + Copy + Default> Tensor<T> {
 /// Global functions for pool management
 pub fn clear_memory_pool() {
     if let Some(pool) = MEMORY_POOL.get() {
-        pool.lock().expect("lock should not be poisoned").clear();
+        pool.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 }
 
 pub fn get_pool_statistics() -> PoolStatistics {
     get_memory_pool()
         .lock()
-        .expect("lock should not be poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get_statistics()
         .clone()
 }
@@ -1083,14 +1120,14 @@ pub fn get_pool_statistics() -> PoolStatistics {
 pub fn get_pool_hit_rate() -> f64 {
     get_memory_pool()
         .lock()
-        .expect("lock should not be poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .hit_rate()
 }
 
 pub fn cleanup_memory_pool() {
     get_memory_pool()
         .lock()
-        .expect("lock should not be poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .cleanup();
 }
 
@@ -1162,7 +1199,9 @@ mod tests {
 
     #[test]
     fn test_acquire_truly_reuses_allocation() {
-        let _guard = TEST_LOCK.lock().expect("test mutex should not be poisoned");
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_memory_pool();
 
         let buf1: ReusedBuffer<f32> = global_acquire_uninit::<f32>(1024);
@@ -1181,7 +1220,9 @@ mod tests {
 
     #[test]
     fn test_into_vec_transfers_ownership() {
-        let _guard = TEST_LOCK.lock().expect("test mutex should not be poisoned");
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_memory_pool();
 
         let mut buf: ReusedBuffer<f32> = global_acquire_uninit::<f32>(64);
@@ -1196,7 +1237,9 @@ mod tests {
 
     #[test]
     fn test_drop_returns_to_pool() {
-        let _guard = TEST_LOCK.lock().expect("test mutex should not be poisoned");
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_memory_pool();
 
         {
@@ -1218,7 +1261,9 @@ mod tests {
 
     #[test]
     fn test_acquire_capacity_and_uninit_slice() {
-        let _guard = TEST_LOCK.lock().expect("test mutex should not be poisoned");
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_memory_pool();
 
         let buf: ReusedBuffer<u64> = global_acquire_uninit::<u64>(32);
@@ -1230,7 +1275,9 @@ mod tests {
 
     #[test]
     fn test_acquire_aligned_returns_simd_aligned_pointer() {
-        let _guard = TEST_LOCK.lock().expect("test mutex should not be poisoned");
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_memory_pool();
 
         // 32-byte alignment (AVX2 / scirs2_core::simd_aligned::SIMD_ALIGNMENT).
@@ -1247,7 +1294,9 @@ mod tests {
 
     #[test]
     fn test_acquire_aligned_pool_hit_on_release() {
-        let _guard = TEST_LOCK.lock().expect("test mutex should not be poisoned");
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_memory_pool();
 
         let buf1: ReusedBuffer<f32> = global_acquire_uninit_aligned::<f32>(2048, 32);
@@ -1270,7 +1319,9 @@ mod tests {
 
     #[test]
     fn test_aligned_and_natural_buckets_are_independent() {
-        let _guard = TEST_LOCK.lock().expect("test mutex should not be poisoned");
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_memory_pool();
 
         // 32-byte aligned acquire/release for a size that maps to a particular size class.
@@ -1292,7 +1343,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "alignment must be a power of two")]
     fn test_acquire_aligned_rejects_non_power_of_two() {
-        let _guard = TEST_LOCK.lock().expect("test mutex should not be poisoned");
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_memory_pool();
         let _buf: ReusedBuffer<f32> = global_acquire_uninit_aligned::<f32>(16, 6);
     }

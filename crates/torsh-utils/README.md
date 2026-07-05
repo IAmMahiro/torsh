@@ -133,9 +133,10 @@ println!("Available devices: {:?}", env_info.available_devices);
 - `torsh-tensor`: Tensor operations
 - `torsh-nn`: Neural network modules
 - `torsh-profiler`: Performance profiling
-- `reqwest`: HTTP client for model downloads
-- `prometheus`: Metrics collection
-- `sysinfo`: System information gathering
+- `scirs2-core`: Parallel operations and numerical utilities
+- `reqwest`: HTTP client for model downloads (optional, via the `tensorboard` feature)
+- `protobuf`: TensorBoard log serialization (optional, via the `tensorboard` feature)
+- `sysinfo`: System information gathering (optional, via the `collect_env` feature)
 
 ## Performance
 
@@ -160,3 +161,7 @@ See the `examples/` directory for:
 - Profiling and optimization guides
 - TensorBoard integration examples
 - Mobile deployment tutorials
+
+## Testing
+
+This crate has 87 passing tests (`cargo nextest run -p torsh-utils --all-features`).

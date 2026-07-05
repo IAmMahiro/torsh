@@ -1,5 +1,25 @@
 # torsh-signal TODO
 
+## 2026-07 Wavelet Correctness Fix
+
+Previously, the Wavelet Packet Transform (`wpt`/`iwpt`) and the lifting-scheme DWT/IDWT
+(`LiftingSchemeProcessor::lifting_dwt`/`lifting_idwt`) silently returned all-zero tensors of the
+correct shape instead of erroring or computing a real result — a serious silent-wrong-behavior bug
+for anyone relying on them. Both are now fully implemented:
+- **WPT/IWPT** (`WaveletPacketProcessor`): a real recursive filter-bank tree that decomposes both
+  approximation and detail branches at every level (unlike the standard DWT), with an exact
+  (up to floating-point rounding) inverse.
+- **Lifting-scheme DWT/IDWT** (`LiftingSchemeProcessor`): a real Sweldens (1996) predict/update
+  factorization (Haar, and a dedicated D4 factorization for `WaveletType::Daubechies(4)`).
+- **Cone of influence** (`WaveletUtils::cone_of_influence`): replaced a placeholder linear
+  approximation with the real Torrence & Compo e-folding-time formula.
+
+`src/wavelets.rs` was split via `splitrs` into `src/wavelets/{mod.rs,core.rs,packet_lifting.rs,tests.rs}`
+since it exceeded the workspace's 2000-line-per-file policy.
+
+Current verified count: **138/138 tests passing, 3 skipped** (`cargo nextest run -p torsh-signal
+--all-features`).
+
 ## Current Implementation Status (2025-10-04) - UPDATED WITH ENHANCEMENTS
 
 ### **COMPLETED ✅ - Working and Tested**:
@@ -204,11 +224,12 @@
 - ✅ Advanced resampling algorithms (polyphase, cubic interpolation)
 - ✅ Sophisticated pitch detection (YIN algorithm)
 
-### Phase 4: Next Enhancements (In Planning)
-- More wavelet families and better wavelet packet transforms
-- Sinc interpolation and better anti-aliasing
-- Streaming processing architecture
-- GPU acceleration when available
+### ✅ Phase 4: Next Enhancements (COMPLETED)
+- ✅ Wavelet packet transforms (WPT/IWPT) and a lifting-scheme DWT/IDWT — see "2026-07 Wavelet
+  Correctness Fix" section near the top of this file
+- ✅ Sinc interpolation and better anti-aliasing (see 2025-10-24 session above)
+- ✅ Streaming processing architecture (see 2025-10-24 session above)
+- GPU acceleration: still future work, when scirs2 GPU backends become available
 
 ## Recent Updates
 

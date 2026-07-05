@@ -3,17 +3,21 @@
 //! This module provides utilities that keep memory usage proportional to the
 //! number of *edges* rather than the number of *node pairs*:
 //!
-//! - [`SparseGraph`] stores a graph in coordinate (COO) form, extracting only
-//!   the non-negligible entries of a dense adjacency matrix.
-//! - [`sparse_laplacian`] builds the (optionally symmetric-normalized) graph
-//!   Laplacian directly in COO form without ever materializing the dense
-//!   `num_nodes x num_nodes` matrix.
-//! - [`adaptive_coarsening`] reduces a graph to a target number of supernodes
-//!   using greedy edge-contraction (union-find), averaging the node features of
-//!   each contracted cluster.
-//! - [`chunked_neighbor_aggregation`] performs mean neighbor aggregation using a
-//!   sparse adjacency list (`O(E)` memory) and processes destination nodes in
-//!   bounded-size chunks for cache locality.
+//! - [`SparseGraph`](crate::utils::memory_efficient::SparseGraph) stores a
+//!   graph in coordinate (COO) form, extracting only the non-negligible
+//!   entries of a dense adjacency matrix.
+//! - [`sparse_laplacian`](crate::utils::memory_efficient::sparse_laplacian)
+//!   builds the (optionally symmetric-normalized) graph Laplacian directly in
+//!   COO form without ever materializing the dense `num_nodes x num_nodes`
+//!   matrix.
+//! - [`adaptive_coarsening`](crate::utils::memory_efficient::adaptive_coarsening)
+//!   reduces a graph to a target number of supernodes using greedy
+//!   edge-contraction (union-find), averaging the node features of each
+//!   contracted cluster.
+//! - [`chunked_neighbor_aggregation`](crate::utils::memory_efficient::chunked_neighbor_aggregation)
+//!   performs mean neighbor aggregation using a sparse adjacency list
+//!   (`O(E)` memory) and processes destination nodes in bounded-size chunks
+//!   for cache locality.
 
 use std::collections::{HashMap, HashSet};
 

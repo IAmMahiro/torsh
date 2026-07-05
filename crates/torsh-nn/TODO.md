@@ -1277,7 +1277,7 @@ This session represents **critical infrastructure fixes** enabling the torsh-nn 
 - [x] Refactor module trait for better ergonomics - **COMPLETED**: Created ModuleExt trait with 30+ ergonomic helper methods using extension trait pattern
 - [x] Improve parameter management system - **COMPLETED**: Added ParameterExt, ParameterGroup, ParameterConstraint, and ParameterCollectionExt for comprehensive parameter management
 - [ ] Consolidate initialization strategies - **IN PROGRESS**: Good foundation exists, needs minor refinements
-- [ ] Clean up functional API consistency - **PENDING**: Awaiting review and standardization
+- [x] Clean up functional API consistency - **COMPLETED**: `FunctionalConfig`/`FunctionalBuilder` and the `validate_inputs!`/`func_error!` macros are implemented in `src/functional/core.rs`
 
 ## Research Features ✅
 - [x] Implement neural ODE layers - **COMPLETED**: Implemented comprehensive Neural ODE framework including:
@@ -1892,9 +1892,9 @@ This session represents **substantial progress** toward achieving a fully functi
 The torsh-nn crate continues to demonstrate **systematic progress** toward production-ready status with comprehensive API standardization and enhanced test reliability, pending resolution of build system challenges.
 
 ## Future Considerations
-- [ ] Explore compile-time optimization
+- [x] Explore compile-time optimization - implemented in `src/compile_time.rs` (`StaticLinear`, `StaticActivation`, const-generic dispatch)
 - [ ] Investigate hardware-specific layers
-- [ ] Research sparse neural networks
+- [x] Research sparse neural networks - implemented in `src/sparse.rs` (`SparseLinear`, `SparsityPattern`, magnitude pruning, structured sparsity)
 - [ ] Study continual learning modules
 - [ ] Implement federated learning support
 

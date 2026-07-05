@@ -36,7 +36,7 @@ impl LiftingSchemeProcessor {
     /// - Every other wavelet type uses the classic Haar lifting
     ///   factorization (difference then average), matching this module's
     ///   existing convention of defaulting unsupported wavelet types to
-    ///   Haar (see [`get_wavelet_filters`]).
+    ///   Haar (see `get_wavelet_filters`).
     ///
     /// Boundary samples use periodic (circular) wrap-around, which keeps
     /// the transform well-defined for any signal length without discarding
@@ -142,8 +142,8 @@ impl WaveletPacketProcessor {
     /// root, so consecutive pairs `(2i, 2i+1)` always share the same parent.
     ///
     /// Each level applies the wavelet's low-pass/high-pass decomposition
-    /// filters (from [`get_wavelet_filters`], the same filter tables used by
-    /// [`DiscreteWaveletProcessor`]) and downsamples by 2, treating the
+    /// filters (from `get_wavelet_filters`, the same filter tables used by
+    /// [`crate::DiscreteWaveletProcessor`]) and downsamples by 2, treating the
     /// current node as *periodic* (circular convolution) rather than
     /// zero-padding at the boundary. This is the standard technique for
     /// finite-length perfect-reconstruction wavelet transforms: for an
@@ -209,7 +209,7 @@ impl WaveletPacketProcessor {
     /// basis selections work too). Reconstruction proceeds level by level,
     /// from the leaves up to the root: at each level, packets are paired
     /// `(2i, 2i+1)` -- exactly the siblings produced by [`Self::wpt`] -- and
-    /// merged with [`circular_synthesize`], the exact transpose of the
+    /// merged with `circular_synthesize`, the exact transpose of the
     /// forward analysis step.
     pub fn iwpt(&self, packets: &[Tensor<f32>]) -> Result<Tensor<f32>> {
         let n_packets = packets.len();

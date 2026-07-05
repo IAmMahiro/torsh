@@ -9,6 +9,7 @@ pub fn register_creation_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     use pyo3::wrap_pyfunction;
 
     #[pyfunction]
+    #[pyo3(signature = (data, dtype=None, device=None, requires_grad=None))]
     fn tensor(
         data: &Bound<'_, PyAny>,
         dtype: Option<PyDType>,
@@ -19,60 +20,75 @@ pub fn register_creation_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     #[pyfunction]
+    #[pyo3(signature = (size, dtype=None, device=None, requires_grad=None))]
     fn zeros(
         size: Vec<usize>,
-        _dtype: Option<PyDType>,
-        _device: Option<PyDevice>,
+        dtype: Option<PyDType>,
+        device: Option<PyDevice>,
         requires_grad: Option<bool>,
     ) -> PyResult<PyTensor> {
+        let _dtype = dtype;
+        let _device = device;
         let tensor_result = py_result!(torsh_tensor::creation::zeros(&size))?;
         let tensor = tensor_result.requires_grad_(requires_grad.unwrap_or(false));
         Ok(PyTensor { tensor })
     }
 
     #[pyfunction]
+    #[pyo3(signature = (size, dtype=None, device=None, requires_grad=None))]
     fn ones(
         size: Vec<usize>,
-        _dtype: Option<PyDType>,
-        _device: Option<PyDevice>,
+        dtype: Option<PyDType>,
+        device: Option<PyDevice>,
         requires_grad: Option<bool>,
     ) -> PyResult<PyTensor> {
+        let _dtype = dtype;
+        let _device = device;
         let tensor_result = py_result!(torsh_tensor::creation::ones(&size))?;
         let tensor = tensor_result.requires_grad_(requires_grad.unwrap_or(false));
         Ok(PyTensor { tensor })
     }
 
     #[pyfunction]
+    #[pyo3(signature = (size, dtype=None, device=None, requires_grad=None))]
     fn randn(
         size: Vec<usize>,
-        _dtype: Option<PyDType>,
-        _device: Option<PyDevice>,
+        dtype: Option<PyDType>,
+        device: Option<PyDevice>,
         requires_grad: Option<bool>,
     ) -> PyResult<PyTensor> {
+        let _dtype = dtype;
+        let _device = device;
         let tensor_result = py_result!(torsh_tensor::creation::randn(&size))?;
         let tensor = tensor_result.requires_grad_(requires_grad.unwrap_or(false));
         Ok(PyTensor { tensor })
     }
 
     #[pyfunction]
+    #[pyo3(signature = (size, dtype=None, device=None, requires_grad=None))]
     fn rand(
         size: Vec<usize>,
-        _dtype: Option<PyDType>,
-        _device: Option<PyDevice>,
+        dtype: Option<PyDType>,
+        device: Option<PyDevice>,
         requires_grad: Option<bool>,
     ) -> PyResult<PyTensor> {
+        let _dtype = dtype;
+        let _device = device;
         let tensor_result = py_result!(torsh_tensor::creation::rand(&size))?;
         let tensor = tensor_result.requires_grad_(requires_grad.unwrap_or(false));
         Ok(PyTensor { tensor })
     }
 
     #[pyfunction]
+    #[pyo3(signature = (size, dtype=None, device=None, requires_grad=None))]
     fn empty(
         size: Vec<usize>,
-        _dtype: Option<PyDType>,
-        _device: Option<PyDevice>,
+        dtype: Option<PyDType>,
+        device: Option<PyDevice>,
         requires_grad: Option<bool>,
     ) -> PyResult<PyTensor> {
+        let _dtype = dtype;
+        let _device = device;
         // Use zeros as a fallback since empty is not available
         let tensor_result = py_result!(torsh_tensor::creation::zeros(&size))?;
         let tensor = tensor_result.requires_grad_(requires_grad.unwrap_or(false));
@@ -80,26 +96,33 @@ pub fn register_creation_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     #[pyfunction]
+    #[pyo3(signature = (size, fill_value, dtype=None, device=None, requires_grad=None))]
     fn full(
         size: Vec<usize>,
         fill_value: f32,
-        _dtype: Option<PyDType>,
-        _device: Option<PyDevice>,
+        dtype: Option<PyDType>,
+        device: Option<PyDevice>,
         requires_grad: Option<bool>,
     ) -> PyResult<PyTensor> {
+        let _dtype = dtype;
+        let _device = device;
         let tensor_result = py_result!(torsh_tensor::creation::full(&size, fill_value))?;
         let tensor = tensor_result.requires_grad_(requires_grad.unwrap_or(false));
         Ok(PyTensor { tensor })
     }
 
     #[pyfunction]
+    #[pyo3(signature = (n, m=None, dtype=None, device=None, requires_grad=None))]
     fn eye(
         n: usize,
-        _m: Option<usize>,
-        _dtype: Option<PyDType>,
-        _device: Option<PyDevice>,
+        m: Option<usize>,
+        dtype: Option<PyDType>,
+        device: Option<PyDevice>,
         requires_grad: Option<bool>,
     ) -> PyResult<PyTensor> {
+        let _m = m;
+        let _dtype = dtype;
+        let _device = device;
         // torsh_tensor::creation::eye only takes one parameter
         let tensor_result = py_result!(torsh_tensor::creation::eye(n))?;
         let tensor = tensor_result.requires_grad_(requires_grad.unwrap_or(false));
@@ -107,14 +130,17 @@ pub fn register_creation_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     #[pyfunction]
+    #[pyo3(signature = (start, end=None, step=None, dtype=None, device=None, requires_grad=None))]
     fn arange(
         start: f32,
         end: Option<f32>,
         step: Option<f32>,
-        _dtype: Option<PyDType>,
-        _device: Option<PyDevice>,
+        dtype: Option<PyDType>,
+        device: Option<PyDevice>,
         requires_grad: Option<bool>,
     ) -> PyResult<PyTensor> {
+        let _dtype = dtype;
+        let _device = device;
         let (start, end) = if let Some(end) = end {
             (start, end)
         } else {
@@ -127,14 +153,17 @@ pub fn register_creation_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     #[pyfunction]
+    #[pyo3(signature = (start, end, steps, dtype=None, device=None, requires_grad=None))]
     fn linspace(
         start: f32,
         end: f32,
         steps: usize,
-        _dtype: Option<PyDType>,
-        _device: Option<PyDevice>,
+        dtype: Option<PyDType>,
+        device: Option<PyDevice>,
         requires_grad: Option<bool>,
     ) -> PyResult<PyTensor> {
+        let _dtype = dtype;
+        let _device = device;
         let tensor_result = py_result!(torsh_tensor::creation::linspace(start, end, steps))?;
         let tensor = tensor_result.requires_grad_(requires_grad.unwrap_or(false));
         Ok(PyTensor { tensor })
@@ -142,6 +171,7 @@ pub fn register_creation_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // "_like" functions - create tensors with same shape as input
     #[pyfunction]
+    #[pyo3(signature = (input, dtype=None, device=None, requires_grad=None))]
     fn zeros_like(
         input: &PyTensor,
         dtype: Option<PyDType>,
@@ -156,6 +186,7 @@ pub fn register_creation_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     #[pyfunction]
+    #[pyo3(signature = (input, dtype=None, device=None, requires_grad=None))]
     fn ones_like(
         input: &PyTensor,
         dtype: Option<PyDType>,
@@ -170,6 +201,7 @@ pub fn register_creation_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     #[pyfunction]
+    #[pyo3(signature = (input, fill_value, dtype=None, device=None, requires_grad=None))]
     fn full_like(
         input: &PyTensor,
         fill_value: f32,
@@ -186,6 +218,7 @@ pub fn register_creation_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     #[pyfunction]
+    #[pyo3(signature = (input, dtype=None, device=None, requires_grad=None))]
     fn empty_like(
         input: &PyTensor,
         dtype: Option<PyDType>,
@@ -201,6 +234,7 @@ pub fn register_creation_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     #[pyfunction]
+    #[pyo3(signature = (input, dtype=None, device=None, requires_grad=None))]
     fn randn_like(
         input: &PyTensor,
         dtype: Option<PyDType>,
@@ -216,6 +250,7 @@ pub fn register_creation_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     #[pyfunction]
+    #[pyo3(signature = (input, dtype=None, device=None, requires_grad=None))]
     fn rand_like(
         input: &PyTensor,
         dtype: Option<PyDType>,

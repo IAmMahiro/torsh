@@ -14,11 +14,11 @@ This crate leverages scirs2's powerful automatic differentiation capabilities to
 
 ## Features
 
-- **Full scirs2 Integration**: Built on top of scirs2-autograd for robust AD
+- **Full scirs2 Integration**: Built on top of scirs2-autograd for robust AD (default `autograd` feature)
 - **Gradient Modes**: Support for no_grad, inference_mode, and anomaly detection
-- **Advanced Functions**: Jacobian, Hessian, VJP, and JVP computations
-- **Custom Functions**: Define your own differentiable operations
-- **Memory Efficiency**: Gradient checkpointing and accumulation
+- **Higher-Order Gradients**: `HigherOrderGradient` API surface for Jacobian/Hessian computation (infrastructure in place; numerical core is still a placeholder — see TODO.md)
+- **Custom Functions**: Define your own differentiable operations via the `Function` trait
+- **Memory Efficiency**: Gradient accumulation via the `GradientAccumulation` trait; computation-graph checkpoint snapshots via `GraphCheckpoint`
 - **Performance**: Profiling and optimization utilities
 
 ## Usage
@@ -33,8 +33,9 @@ use torsh_tensor::prelude::*;
 let x = tensor![2.0].requires_grad_(true);
 let y = x.pow(2.0)?;
 
-// Compute gradients
-backward(&y, None, false)?;
+// Compute gradients (Tensor::backward is the real entry point; there is no
+// separate free-standing `backward()` function in this crate)
+y.backward()?;
 
 // Access gradient
 let grad = x.grad().unwrap();
@@ -44,6 +45,10 @@ assert_eq!(grad.item(), 4.0); // dy/dx = 2x = 4
 ### Gradient Modes
 
 ```rust
+// no_grad() is re-exported from the crate prelude; inference_mode() and
+// detect_anomaly() live in `grad_mode` and need an explicit import
+use torsh_autograd::grad_mode::{detect_anomaly, inference_mode};
+
 // Disable gradient computation
 {
     let _guard = no_grad();
@@ -62,108 +67,116 @@ assert_eq!(grad.item(), 4.0); // dy/dx = 2x = 4
 {
     let _guard = detect_anomaly();
     // Will detect NaN/Inf in gradients
-    backward(&loss, None, false)?;
+    loss.backward()?;
 }
 ```
 
 ### Advanced Gradient Functions
 
+`torsh-autograd` exposes a `HigherOrderGradient` type (`torsh_autograd::prelude::HigherOrderGradient`)
+with a `compute_hessian`/`compute_jacobian`/`hessian_vector_product` API surface operating on flat
+`&[f32]` data:
+
 ```rust
-// Compute Jacobian matrix
-let jacobian = jacobian(|x| x.pow(2.0), &input, true)?;
+use torsh_autograd::prelude::HigherOrderGradient;
 
-// Compute Hessian matrix
-let hessian = hessian(|x| x.sum(), &input, true)?;
-
-// Vector-Jacobian product
-let (output, vjp) = vjp(|x| model.forward(x), &input, &v, true)?;
-
-// Jacobian-vector product
-let (output, jvp) = jvp(|x| model.forward(x), &input, &v, true)?;
+let mut higher_order = HigherOrderGradient::new();
+let hessian = higher_order.compute_hessian(&data, param_count)?;
 ```
+
+Note: as of this writing the numerical core of `compute_hessian`/`compute_jacobian` is a documented
+placeholder (it returns a zero-filled matrix rather than a real second-derivative computation) —
+see TODO.md for status. There is no closure-based, JAX-style `jacobian()`/`hessian()`/`vjp()`/`jvp()`
+free function that takes an arbitrary closure and a `Tensor`. A lower-level, real (non-placeholder)
+`vjp_optimization::VjpOptimizer::compute_vjp` exists for vector-Jacobian products over an explicitly
+constructed graph of `VjpNode`s (add/mul/relu and a few other ops); see that module's tests for the
+construction pattern.
 
 ### Custom Autograd Functions
 
+The real `Function` trait (`torsh_autograd::function::{Function, FunctionContext}`) operates on
+`&dyn AutogradTensor<T>` / `Box<dyn AutogradTensor<T>>`, not the concrete `torsh_tensor::Tensor<T>`
+type directly, and there is currently no generic `apply_function()` dispatch helper — a `Function`
+impl's `forward`/`backward` are called directly:
+
 ```rust
-use torsh_autograd::function::{Function, FunctionContext, apply_function};
+use torsh_autograd::autograd_traits::AutogradTensor;
+use torsh_autograd::function::{Function, FunctionContext};
 
 struct MyReLU;
 
 impl Function for MyReLU {
-    fn forward<T>(&self, ctx: &mut FunctionContext, inputs: &[&Tensor<T>]) -> Result<Vec<Tensor<T>>>
-    where
-        T: TensorElement,
-    {
-        // Save input for backward
-        ctx.save_for_backward(inputs);
-        
-        // Compute ReLU: max(0, x)
-        let output = inputs[0].clamp_min(0.0)?;
+    fn forward<T: TensorElement>(
+        &self,
+        ctx: &mut FunctionContext,
+        inputs: &[&dyn AutogradTensor<T>],
+    ) -> Result<Vec<Box<dyn AutogradTensor<T>>>> {
+        ctx.save_value(0.0_f64); // save whatever backward() will need
+        let data: Vec<T> = inputs[0].to_vec();
+        // elided: apply max(0, x) element-wise to `data` here (via to_f64()/from_f64()
+        // round-tripping, as TensorElement has no direct Ord bound) before wrapping back up
+        let output = inputs[0].with_data(data)?;
         Ok(vec![output])
     }
-    
-    fn backward<T>(&self, ctx: &mut FunctionContext, grad_outputs: &[&Tensor<T>]) -> Result<Vec<Option<Tensor<T>>>>
-    where
-        T: TensorElement,
-    {
-        let saved = ctx.saved_tensors::<T>()?;
-        let input = &saved[0];
-        
-        // Gradient is 1 where input > 0, else 0
-        let grad_input = grad_outputs[0].mul(&input.gt(&zeros_like(input))?)?;
-        Ok(vec![Some(grad_input)])
+
+    fn backward<T: TensorElement>(
+        &self,
+        ctx: &mut FunctionContext,
+        grad_outputs: &[&dyn AutogradTensor<T>],
+    ) -> Result<Vec<Option<Box<dyn AutogradTensor<T>>>>> {
+        // elided: recover what forward() saved from `ctx`, mask grad_outputs by (input > 0)
+        Ok(vec![None])
     }
 }
-
-// Apply custom function
-let output = apply_function(MyReLU, &[&input])?;
 ```
 
 ### Gradient Accumulation
 
+There is no `GradientAccumulator` struct in this crate; gradient accumulation is exposed as the
+`GradientAccumulation` trait (`torsh_autograd::autograd_traits::GradientAccumulation`), implemented
+per-tensor:
+
 ```rust
-use torsh_autograd::accumulate::GradientAccumulator;
+use torsh_autograd::autograd_traits::GradientAccumulation;
 
-let mut accumulator = GradientAccumulator::new();
-
-// Accumulate gradients over multiple batches
+// `tensor` implements GradientAccumulation
 for batch in batches {
     let loss = model.forward(&batch)?;
-    backward(&loss, None, true)?;
-    accumulator.accumulate();
+    loss.backward()?;
+    tensor.accumulate_grad(loss.grad().expect("gradient after backward"))?;
 }
 
-// Get averaged gradients
-let avg_grads = accumulator.average();
+let accumulated = tensor.grad();
 ```
 
 ### Memory-Efficient Training
 
-```rust
-use torsh_autograd::checkpoint::checkpoint;
+There is no closure-based `checkpoint()` helper in this crate. `context::optimization` exposes a
+`GraphCheckpoint` snapshot (node/edge/cache counts plus a timestamp) for inspecting computation-graph
+growth rather than a PyTorch-style recompute-to-save-memory wrapper:
 
-// Checkpoint a function to save memory
-let outputs = checkpoint(
-    |inputs| {
-        // Memory-intensive computation
-        let x = expensive_layer1(&inputs[0])?;
-        let y = expensive_layer2(&x)?;
-        Ok(vec![y])
-    },
-    &[input],
-)?;
+```rust
+use torsh_autograd::context::optimization::GraphCheckpoint;
+
+let checkpoint: GraphCheckpoint = ctx.checkpoint();
+println!("nodes={} edges={}", checkpoint.node_count, checkpoint.edge_count);
 ```
 
 ### Gradient Clipping
 
+`clip_grad_norm`/`clip_grad_value` live at the crate root (`torsh_autograd::clip`), not under
+`grad_mode::clip` (that module is currently commented out), and operate on `&dyn AutogradTensor<T>`
+rather than a `model.parameters()`-style collection:
+
 ```rust
-use torsh_autograd::grad_mode::clip::{clip_grad_norm, clip_grad_value};
+use torsh_autograd::clip::{clip_grad_norm, clip_grad_value};
 
-// Clip gradients by global norm
-let total_norm = clip_grad_norm(&mut model.parameters(), 1.0, 2.0);
+// Returns the computed gradient norm (Result<T>); note this computes the norm
+// but does not itself mutate `gradients` in place
+let total_norm = clip_grad_norm(&gradients, 1.0f32, 2.0)?;
 
-// Clip gradients by value
-clip_grad_value(&mut model.parameters(), 0.5);
+// Returns a new clipped Vec<T> bounded to [min_value, max_value]
+let clipped = clip_grad_value(gradient, -0.5f32, 0.5)?;
 ```
 
 ## Integration with SciRS2

@@ -22,6 +22,7 @@ This crate provides the core `Tensor` type with a familiar PyTorch-like API, wra
 - **True buffer pool reuse** (v0.1.2): `GlobalMemoryPool::acquire_uninit::<T>()` returns `ReusedBuffer<T>` with zero copy on pool hit
 - **`simd` and `parallel` features enabled by default** — no `--features` flag required
 - **Allocation tracking benchmark** (v0.1.2): `benches/alloc_tracking.rs` (harness=false, dhat) proves `GlobalMemoryPool` achieves 100% alloc reduction — 10,000 blocks in naive path vs 0 in pooled path
+- **`norm_lp(p, dims, keepdim)`**: full PyTorch-semantics Lp-norm — `p == 1.0`/`2.0` dispatch to L1/L2, `p == 0.0` counts non-zero elements, `p == ±∞` gives max/min absolute value, and any other finite `p` computes the general `(sum(|x|^p))^(1/p)`, with optional per-dimension reduction and `keepdim` support
 
 ## Usage
 

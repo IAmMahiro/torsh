@@ -728,7 +728,6 @@ let model = ModelType::load("model.safetensors")?;
 - Wide ResNet
 - EfficientNet (B0-B7)
 - MobileNet (V2, V3)
-- VGG (11, 13, 16, 19)
 - DenseNet (121, 161, 169, 201)
 - Vision Transformer (ViT)
 - Swin Transformer
@@ -742,6 +741,9 @@ let model = ModelType::load("model.safetensors")?;
 - BART
 - XLNet
 - ELECTRA
+- DeBERTa
+- Longformer
+- BigBird
 
 ### Audio
 - Wav2Vec2
@@ -749,13 +751,23 @@ let model = ModelType::load("model.safetensors")?;
 - HuBERT
 - WavLM
 
+### Multimodal
+- CLIP
+- ALIGN
+- BLIP / InstructBLIP
+- Flamingo
+- LLaVA
+- DALL-E
+
 ### Detection & Segmentation
-- Faster R-CNN
 - Mask R-CNN
 - YOLO (v5, v8)
 - DETR
-- DeepLabV3
-- U-Net
+- U-Net (2D and 3D)
+
+## Testing
+
+This crate has 319 passing tests, 6 skipped (`cargo nextest run -p torsh-models --all-features`).
 
 ## License
 
