@@ -55,6 +55,13 @@ metrics,core,profiler}; gpu_dispatch tests (CpuBackend + REAL A4000) pass; torsh
 **Pre-existing, UNRELATED to this work** (reproduced at HEAD with my changes `git stash`ed):
 - `torsh-data/src/core_framework.rs:314` — `Tensor::cat(&Vec<Tensor>, isize)` vs expected
   `cat(&[&Tensor], i32)`. Blocks `cargo check --workspace`. Independent of the GPU migration.
+  - **RE-VERIFIED 2026-07-06 (during a trustformers 0.2.0 dependency review): no longer reproduces.**
+    `core_framework.rs:315` now calls `Tensor::cat(&channel_refs, channel_dim as i32)` with
+    `channel_refs: Vec<&Tensor<T>>`, matching the real signature at
+    `torsh-tensor/src/advanced_ops.rs:773` (`pub fn cat(tensors: &[&Self], dim: i32) -> Result<Self>`).
+    Confirmed with a clean `cargo check -p torsh-data` and a full `cargo check --workspace`
+    (both green, no errors) on this HEAD. This was flagged externally as a candidate 0.2.0
+    release blocker for publishing — it is not one; closing this line item as resolved.
 
 ---
 
@@ -1687,3 +1694,24 @@ These are gated on unbuilt/unstable upstream APIs (chiefly `scirs2-core` GPU / p
   - **Approach:** fold into the existing planned workspace-hygiene pass (the "20 of 32 crates have hardcoded dependency versions" item under "Policy Check Findings" → "Workspace hygiene").
   - **Scope:** trivial.
   - **Risk:** none.
+
+## Downstream Dependency Review Findings (added 2026-07-06, from an external trustformers 0.2.0 dependency review)
+
+- [ ] **Publishing 0.2.0 to crates.io is now a concrete unblock for at least one downstream consumer, not just an internal milestone.** The last crates.io release is still `torsh = "0.1.3"` (pinning `scirs2-core 0.5.1`), while this workspace's `Cargo.toml:134` has moved to `scirs2-core = "0.6.0"`. The `trustformers` project (a separate COOLJAPAN ecosystem member) reports it cannot currently adopt torsh as a dependency without pulling in a second, type-incompatible `scirs2` 0.5.x stack alongside its own 0.6.x one — it has deferred a planned `torsh-interop` feature to its own 0.3.x specifically pending a torsh 0.2.0 crates.io release on scirs2 0.6. This doesn't change anything about *how* 0.2.0 should be finished, but it does add external urgency to the existing "no unwrap / zero warnings / all green" release gate already tracked elsewhere in this file — worth factoring into release sequencing/priority.
+  - **Approach:** no code change; just release-planning context. When 0.2.0 is otherwise ready and the user explicitly authorizes it, publishing unblocks this downstream consumer.
+  - **Scope:** none (informational).
+  - **Risk:** none.
+
+- [ ] **No real pure-Rust PyTorch pickle (`.pt`) deserializer exists anywhere in the workspace — three separate partial/placeholder implementations, none of which actually parses the pickle format.** Verified against current HEAD:
+  - `torsh-hub/src/lib.rs:1416` — the model-loading path has a bare comment, `// This would require implementing PyTorch pickle format parsing`, with no implementation behind it.
+  - `torsh-models/src/utils.rs` — `load`/`save` helpers around lines 163–191, 554, 601–620 are all explicitly self-described as "simplified"/"placeholder": comments read "a full implementation would parse the pickle format properly", "real implementation would use PyTorch's pickle deserialization", "this is a placeholder — real PyTorch loading would parse the pickle format". Its own tests (lines ~729–785) assert the *opposite* of a placeholder file — they check that no literal `"placeholder safetensors file"` / `"placeholder safetensors file with tensor data"` byte strings get written — confirming the placeholder nature is a known, tracked gap rather than an oversight.
+  - `torsh-cli/src/commands/model/pytorch_parser.rs` — this crate's `.pt` "parser" is metadata-heuristics only (file/tensor-shape inference), not a real pickle deserializer.
+  - This has a concrete, newly-created downstream customer: `trustformers` just removed its `tch` (libtorch FFI) dependency, so a genuine pure-Rust pickle parser in torsh would become the ecosystem's primary PyTorch-interop path rather than an internal nice-to-have.
+  - **Approach:** implement a real pure-Rust pickle protocol 0–5 opcode interpreter (`torsh-hub` or a new small `torsh-pickle`-style module) sufficient to reconstruct the `OrderedDict[str, Tensor]` state-dict shape PyTorch `.pt`/`.pth` checkpoints use (storage/tensor `REDUCE` opcodes, `BINPERSID` for storage refs, zip-container `.pt` unwrapping via the existing OxiARC pure-Rust archive stack — not `zip`/`flate2`). This is a substantial, well-scoped IMPLEMENT-POLICY item, not a quick fix.
+  - **Scope:** large — a real pickle VM is nontrivial but well-precedented (many pure implementations exist to reference for the opcode set); should be its own dedicated multi-session effort.
+  - **Risk:** low to add (purely additive new capability); the risk is scope-creep into full PyTorch tensor-storage/dtype fidelity (fp16/bf16, quantized dtypes, sparse layouts) which should be staged rather than attempted in one pass.
+
+- [ ] **`torsh-distributed`'s default-members exclusion and `torsh-python`/`torsh-ffi`'s PyO3 surface both remain informal maturity gaps, not yet centrally tracked.** `Cargo.toml:59` excludes `crates/torsh-distributed` from `default-members` with the inline comment "Tests/examples need additional API updates (scheduled for alpha.3)" (it is still a full workspace member per `Cargo.toml:20`/`:118`, just not built by default). This is a distinct, more basic maturity signal than the already-tracked `torsh-distributed` `ProcessGroup`/`MockBackend` functional gap further up in this file (the "`init_process_group`/`ProcessGroup` API always constructs `MockBackend`" entry) — that entry is about *what the code does*, this one is about *whether it's even built/tested by default*; worth cross-referencing together when torsh-distributed maturity is next picked up. Separately, `torsh-python`/`torsh-ffi` compile clean at HEAD (`cargo check --workspace` green, including both crates) and are not currently flagged with open PyO3-version-compatibility build errors in this file — the scalar-operand and no-op-stub gaps already tracked above (`torsh-python`'s Tensor operator overloads / distributed collectives entries) are the real, current maturity gaps for that pair of crates; no additional PyO3 compatibility issue was found to add here.
+  - **Approach:** when torsh-distributed's alpha.3 default-members re-inclusion is scheduled, resolve it alongside the existing `ProcessGroup`/`MockBackend` wiring fix so both the "not built by default" and "mocked when built" gaps close together.
+  - **Scope:** small to re-enable default-members (mechanical); the real work is the already-tracked ProcessGroup wiring (medium, see that entry).
+  - **Risk:** low; re-adding to default-members just changes CI/default build surface, no runtime behavior change.
