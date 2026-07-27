@@ -290,7 +290,7 @@ cranelift-codegen = "0.133"
 cranelift-frontend = "0.133"
 
 # FFT operations
-oxifft = "0.3.2"
+oxifft = "0.4.0"
 
 # GPU compute backend — pure-Rust CUDA replacement.
 # `oxicuda-backend` = dependency-free `ComputeBackend` trait + CpuBackend (always builds).
