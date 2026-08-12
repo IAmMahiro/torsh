@@ -4,6 +4,65 @@
 
 ---
 
+## 🛡️ 0.2.0 Production-Hardening Campaign (2026-08-12, IN PROGRESS)
+
+A 13-agent exhaustive audit (stubs / bugs / missing features / perf / dependency purity)
+produced **318 verified-by-reading findings (80 critical / 103 high / 110 medium / 25 low)**.
+Implementation runs in parallel subagent waves; every bug fix follows a **verify-first
+protocol** (write a failing reproduction test before touching production code; findings whose
+repro passes are recorded INVALID and left untouched).
+
+**Baseline at campaign start (all green)**: `cargo check --workspace --all-targets`,
+`cargo clippy --all-targets -- -D warnings`, `cargo nextest run --workspace` (9,980 pass / 74 skip).
+Two pre-existing breakages already fixed inline: oxiarc 0.4.0/0.4.1 mixed-lock E0599 (cargo
+update of oxiarc-{lzhuf,brotli,bzip2,lzma,snappy}); torsh-jit E0275 inference overflow
+(explicit HashMap type annotations in `analysis.rs::analyze_dependencies`).
+
+### Headline findings being fixed
+- **torsh-tensor**: dim-ignoring cumsum/sort/argmin/argmax/sum_dim/var/std; mul/div drop the
+  autograd graph; matmul/conv backward holes; naive ijk matmul (no BLAS); hard-coded RNG
+  seed 42; f16/bf16 randn transmute garbage; in-place-on-view stride corruption; SimdOptimized
+  storage rejecting mutation (breaks set/set_slice/in-place ≥10KB); dangling-Weak view design;
+  13k lines of dead `src/ops/**`; buffer pool never recycles.
+- **torsh-nn**: Parameter never sets requires_grad; Dropout is identity; softmax ignores dim;
+  BatchNorm wrong reshape + running stats never updated; conv_transpose returns zeros;
+  cross-attention ignores k/v; LSTM/GRU ignore num_layers.
+- **Security**: tar/zip-slip in torsh-hub + torsh-package extraction; hub downloads never
+  integrity-checked; fake signature verification (string compares); no-op ModelSandbox.
+- **Fabricated data**: CLI train/quantize fabricate losses/accuracy; profiler/bottleneck/
+  benchmark report hardcoded metrics; eig/svd return fabricated results beyond 5×5;
+  distributed collectives no-op with fake success (DDP silently scales grads by 1/N).
+- **Python bindings**: `import rstorch` fails (uint16 import, functional module, sys.modules
+  registration); root pyproject.toml cannot build.
+- **Deps/purity**: default build compiles BoringSSL (reqwest), Oniguruma/esaxx C++ (tokenizers),
+  blake3 asm (scirs2-datasets); banned rustfft via unused imageproc; optirs/tonic/prost/sprs +
+  ~20 deps declared-but-unused; no deny.toml. **NEW POLICY: minimize non-COOLJAPAN deps.**
+
+### Wave plan
+- [x] **Wave 0**: build blockers (oxiarc lock mix, torsh-jit E0275) — done inline.
+- [ ] **Wave 1 (running)**: torsh-tensor foundation (dim ops + BLAS matmul / autograd graph
+  completeness / storage+creation+RNG / views+strides / math_ops copies+in-place) ×5 Opus,
+  torsh-core honesty (Sonnet), torsh-data samplers+loaders (Sonnet), metrics/cluster/series
+  formulas (Sonnet), hub+package security (Sonnet), profiler/utils fabrication removal (Sonnet).
+- [ ] **Wave 2**: torsh-nn (parameter/dropout/norm/attention/RNN), torsh-optim (amsgrad, F040
+  param-replacement design), torsh-autograd (clip_grad_norm, no_grad wiring, checkpointing),
+  torsh-functional (losses/attention), torsh-linalg (real eig/svd via scirs2/oxiblas),
+  torsh-signal (real filter design), torsh-text (BPE loop, tokenizers purity), torsh-vision,
+  torsh-quantization (scale math), torsh-fx/jit (graph rewrites), torsh-graph (Result forwards).
+- [ ] **Wave 3**: torsh-distributed (honest errors + real local backend), torsh-backend Phase 4
+  CUDA deletion (~50k lines; NB memory/manager.rs live consumer), torsh-python/ffi import fixes
+  + torsh-ffi split (torsh-capi/torsh-node/torsh-wasm), torsh-cli real train/quantize,
+  torsh-models (checksums, orphans), hub real signing (RustCrypto), dead-code deletion
+  (torsh-tensor src/ops, orphan files, .bak files).
+- [ ] **Wave 4**: workspace deps minimization + deny.toml + purity (reqwest/tokenizers/hdf5/
+  parquet feature surgery), lock-poison expect() remediation via torsh-core sync helpers,
+  README/docs truth pass, examples relocation, CHANGELOG.
+- [ ] **Final**: workspace check/clippy/nextest green + cargo deny check bans + gatekeeper review.
+
+Full finding digest: session scratchpad `discovery.json` / `digest.md` (318 items, F000–F317).
+
+---
+
 ## 🚀 GPU Backend Migration: scirs2-core → oxicuda 0.3 (IN PROGRESS — 2026-06-25)
 
 ### Implementation status (2026-06-25)

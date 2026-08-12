@@ -242,9 +242,9 @@ impl GraphAnalyzer {
 
     /// Analyze dependencies
     fn analyze_dependencies(graph: &ComputationGraph) -> JitResult<DependencyInfo> {
-        let mut direct = HashMap::new();
-        let mut transitive = HashMap::new();
-        let mut depth = HashMap::new();
+        let mut direct: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        let mut transitive: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
+        let mut depth: HashMap<NodeId, usize> = HashMap::new();
 
         // Get topological order
         let order = graph
