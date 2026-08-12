@@ -831,6 +831,7 @@ macro_rules! with_no_throw {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use torsh_core::sync::MutexExt;
 
     #[test]
     fn test_transaction_creation() {
@@ -871,11 +872,11 @@ mod tests {
         let applied_clone2 = applied.clone();
 
         let operation = TransactionOperation::new("test_op".to_string(), move || {
-            *applied_clone1.lock().expect("lock should not be poisoned") = true;
+            *applied_clone1.lock_or_recover() = true;
             Ok(())
         })
         .with_rollback(move || {
-            *applied_clone2.lock().expect("lock should not be poisoned") = false;
+            *applied_clone2.lock_or_recover() = false;
             Ok(())
         });
 
@@ -1007,7 +1008,7 @@ mod tests {
 
         // Commit the transaction
         {
-            let mut tx = transaction.lock().expect("lock should not be poisoned");
+            let mut tx = transaction.lock_or_recover();
             tx.commit().unwrap();
         }
 

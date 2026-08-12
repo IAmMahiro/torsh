@@ -14,6 +14,7 @@ pub struct PyMSELoss {
 #[pymethods]
 impl PyMSELoss {
     #[new]
+    #[pyo3(signature = (reduction=None))]
     fn new(reduction: Option<String>) -> PyClassInitializer<Self> {
         let reduction = reduction.unwrap_or_else(|| "mean".to_string());
         (
@@ -66,6 +67,7 @@ pub struct PyCrossEntropyLoss {
 #[pymethods]
 impl PyCrossEntropyLoss {
     #[new]
+    #[pyo3(signature = (reduction=None))]
     fn new(reduction: Option<String>) -> PyClassInitializer<Self> {
         let reduction = reduction.unwrap_or_else(|| "mean".to_string());
         (
@@ -116,6 +118,7 @@ pub struct PyBCELoss {
 #[pymethods]
 impl PyBCELoss {
     #[new]
+    #[pyo3(signature = (reduction=None))]
     fn new(reduction: Option<String>) -> PyClassInitializer<Self> {
         let reduction = reduction.unwrap_or_else(|| "mean".to_string());
         (

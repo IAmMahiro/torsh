@@ -19,8 +19,16 @@ use torsh_core::{
     shape::Shape,
 };
 
-use crate::core_ops::{Operation, Tensor};
-use crate::memory_pool::global_acquire_uninit;
+use crate::core_ops::{Operation, Tensor, ViewKind};
+
+/// Row-major (C-order) strides for `shape`.
+fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
+    let mut strides = vec![1usize; shape.len()];
+    for axis in (0..shape.len().saturating_sub(1)).rev() {
+        strides[axis] = strides[axis + 1] * shape[axis + 1];
+    }
+    strides
+}
 
 impl<T: TensorElement + Copy> Tensor<T> {
     /// Get size of a specific dimension
@@ -28,10 +36,69 @@ impl<T: TensorElement + Copy> Tensor<T> {
         self.shape().size(dim)
     }
 
+    /// Strong handle to the tensor a new view of `self` should point at.
+    ///
+    /// A view of a view keeps pointing at the original base; a base tensor hands
+    /// out a handle to itself. The handle is stored by the view, so — unlike the
+    /// `Weak` it replaces — it is alive for as long as the view is.
+    fn view_base(&self) -> Arc<Self> {
+        match &self.base_tensor {
+            Some(base) => Arc::clone(base),
+            None => Arc::new(self.clone()),
+        }
+    }
+
+    /// Zero-copy view of `self` with `new_shape`, for a contiguous source.
+    ///
+    /// The element order is unchanged, so only the metadata differs. `None`
+    /// strides mean "plain row-major block starting at the beginning of the
+    /// storage" and are therefore only used when the source itself is one; a
+    /// contiguous *window* into a larger buffer keeps explicit strides so reads
+    /// keep going through the offset-aware path.
+    fn contiguous_view_of(&self, new_shape: Vec<usize>) -> Self {
+        let strides = if self.strides.is_none() && self.storage_offset == 0 {
+            None
+        } else {
+            Some(contiguous_strides(&new_shape))
+        };
+
+        Self {
+            storage: self.storage.clone(),
+            shape: Shape::new(new_shape),
+            device: self.device,
+            requires_grad: crate::should_record_grad(self.requires_grad),
+            grad: Arc::new(RwLock::new(None)), // Views don't share gradients
+            operation: Operation::Leaf,        // Overwritten by `record_view`
+            strides,
+            storage_offset: self.storage_offset,
+            base_tensor: Some(self.view_base()),
+        }
+    }
+
+    /// Record `result` as a shape-only view of `self` in the autograd graph.
+    ///
+    /// Nothing is recorded when the source does not require gradients, so
+    /// inference pipelines keep building plain leaves.
+    fn record_view(&self, result: &mut Self, kind: ViewKind) {
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = Operation::View {
+                input: Arc::new(self.clone()),
+                kind,
+            };
+        }
+    }
+
     /// Reshapes the tensor to a new shape (creates a view or copy if needed).
     ///
     /// This is equivalent to PyTorch's `view()` operation. The total number of elements
     /// must remain the same. You can use `-1` for one dimension to have it inferred automatically.
+    ///
+    /// A contiguous source is reshaped **without copying**: the result shares its
+    /// storage, so writing through either tensor is visible in the other. Only a
+    /// non-contiguous source (a transposed or otherwise strided view) is
+    /// materialised in view order first. Either way `requires_grad` is
+    /// propagated and the reshape is recorded, so gradients keep flowing.
     ///
     /// # Arguments
     ///
@@ -156,9 +223,20 @@ impl<T: TensorElement + Copy> Tensor<T> {
             )));
         }
 
-        // Create a new tensor with the same data but different shape
-        let data = self.to_vec()?;
-        Self::from_data(data, new_shape, self.device)
+        // A reshape of a contiguous tensor is pure metadata: the result shares
+        // the source's storage (PyTorch `view` semantics). A non-contiguous
+        // source has to be materialised in view order first, which is the only
+        // case where data is copied.
+        let mut result = if self.is_contiguous() {
+            self.contiguous_view_of(new_shape)
+        } else {
+            let data = self.to_vec()?;
+            let mut copied = Self::from_data(data, new_shape, self.device)?;
+            copied.requires_grad = crate::should_record_grad(self.requires_grad);
+            copied
+        };
+        self.record_view(&mut result, ViewKind::Reshape);
+        Ok(result)
     }
 
     /// Create an efficient view with different shape (shares data, no copying)
@@ -183,26 +261,16 @@ impl<T: TensorElement + Copy> Tensor<T> {
         }
 
         // Create new tensor sharing the same storage
-        Ok(Self {
-            storage: self.storage.clone(),
-            shape: Shape::new(shape.to_vec()),
-            device: self.device,
-            requires_grad: self.requires_grad,
-            grad: Arc::new(RwLock::new(None)), // Views don't share gradients
-            operation: Operation::Leaf,        // Views reset operation tracking
-            strides: None,                     // Use default contiguous strides for simple reshapes
-            storage_offset: self.storage_offset,
-            base_tensor: if self.is_view() {
-                // If this is already a view, keep reference to the original base
-                self.base_tensor.clone()
-            } else {
-                // This is a base tensor, so create a weak reference to it
-                Some(Arc::downgrade(&Arc::new(self.clone())))
-            },
-        })
+        let mut result = self.contiguous_view_of(shape.to_vec());
+        self.record_view(&mut result, ViewKind::Reshape);
+        Ok(result)
     }
 
-    /// Create a view of a slice along a dimension (shares data, no copying)
+    /// Create a view of a slice along a dimension (shares data, no copying).
+    ///
+    /// Under `requires_grad` the slice is recorded as a gather so gradients
+    /// scatter back into the source, which means the source is retained for the
+    /// graph's lifetime; inference (no grad) keeps the plain zero-copy view.
     pub fn slice_tensor(&self, dim: usize, start: usize, end: usize) -> Result<Self> {
         if dim >= self.ndim() {
             return Err(TorshError::InvalidArgument(format!(
@@ -228,21 +296,47 @@ impl<T: TensorElement + Copy> Tensor<T> {
         let current_strides = self.strides();
         let offset_adjustment = start * current_strides[dim];
 
-        Ok(Self {
+        let mut result = Self {
             storage: self.storage.clone(),
-            shape: Shape::new(new_shape),
+            shape: Shape::new(new_shape.clone()),
             device: self.device,
-            requires_grad: self.requires_grad,
+            requires_grad: crate::should_record_grad(self.requires_grad),
             grad: Arc::new(RwLock::new(None)),
             operation: Operation::Leaf,
             strides: Some(current_strides),
             storage_offset: self.storage_offset + offset_adjustment,
-            base_tensor: if self.is_view() {
-                self.base_tensor.clone()
-            } else {
-                Some(Arc::downgrade(&Arc::new(self.clone())))
-            },
-        })
+            base_tensor: Some(self.view_base()),
+        };
+
+        // Record the slice as a gather so gradients scatter back into `self`.
+        // The map uses `self`'s *logical* (default row-major) strides — not the
+        // view's physical strides — because the backward scatter target is a
+        // zeros tensor in `self`'s logical order.
+        if crate::should_record_grad(self.requires_grad) {
+            let input_strides = self.compute_default_strides();
+            let out_numel: usize = new_shape.iter().product();
+            let mut index_map = Vec::with_capacity(out_numel);
+            let mut coords = vec![0usize; new_shape.len()];
+            for _ in 0..out_numel {
+                let mut input_flat = 0usize;
+                for (axis, &coord) in coords.iter().enumerate() {
+                    let input_coord = if axis == dim { coord + start } else { coord };
+                    input_flat += input_coord * input_strides[axis];
+                }
+                index_map.push(input_flat);
+                // Advance the row-major odometer over `new_shape`.
+                for axis in (0..new_shape.len()).rev() {
+                    coords[axis] += 1;
+                    if coords[axis] < new_shape[axis] {
+                        break;
+                    }
+                    coords[axis] = 0;
+                }
+            }
+            self.record_gather(&mut result, index_map);
+        }
+
+        Ok(result)
     }
 
     /// Create a transposed view (shares data, no copying)
@@ -268,21 +362,23 @@ impl<T: TensorElement + Copy> Tensor<T> {
         new_shape.swap(dim0, dim1);
         new_strides.swap(dim0, dim1);
 
-        Ok(Self {
+        let mut result = Self {
             storage: self.storage.clone(),
             shape: Shape::new(new_shape),
             device: self.device,
-            requires_grad: self.requires_grad,
+            requires_grad: crate::should_record_grad(self.requires_grad),
             grad: Arc::new(RwLock::new(None)),
             operation: Operation::Leaf,
             strides: Some(new_strides),
             storage_offset: self.storage_offset,
-            base_tensor: if self.is_view() {
-                self.base_tensor.clone()
-            } else {
-                Some(Arc::downgrade(&Arc::new(self.clone())))
-            },
-        })
+            base_tensor: Some(self.view_base()),
+        };
+
+        // A transpose is the permutation that swaps the two axes.
+        let mut perm: Vec<usize> = (0..self.ndim()).collect();
+        perm.swap(dim0, dim1);
+        self.record_view(&mut result, ViewKind::Permute(perm));
+        Ok(result)
     }
 
     /// Squeeze a tensor along a specific dimension (removes dimension of size 1)
@@ -310,21 +406,21 @@ impl<T: TensorElement + Copy> Tensor<T> {
         let mut new_strides = self.strides();
         new_strides.remove(dim);
 
-        Ok(Self {
+        let mut result = Self {
             storage: self.storage.clone(),
             shape: Shape::new(new_shape),
             device: self.device,
-            requires_grad: self.requires_grad,
+            requires_grad: crate::should_record_grad(self.requires_grad),
             grad: Arc::new(RwLock::new(None)),
             operation: Operation::Leaf,
             strides: Some(new_strides),
             storage_offset: self.storage_offset,
-            base_tensor: if self.is_view() {
-                self.base_tensor.clone()
-            } else {
-                Some(Arc::downgrade(&Arc::new(self.clone())))
-            },
-        })
+            base_tensor: Some(self.view_base()),
+        };
+        // Dropping an extent-1 axis keeps the element order, so the gradient is
+        // just reshaped back.
+        self.record_view(&mut result, ViewKind::Reshape);
+        Ok(result)
     }
 
     /// Unsqueeze a tensor at a specific dimension (adds dimension of size 1)
@@ -342,35 +438,43 @@ impl<T: TensorElement + Copy> Tensor<T> {
         new_shape.insert(dim, 1);
 
         let mut new_strides = self.strides();
-        // For the new dimension, stride should be the product of all dimensions to the right
+        // The inserted axis has extent 1, so any stride addresses the same
+        // element — but it must be the *contiguous* one, or a contiguous tensor
+        // would start reporting itself as non-contiguous. That is the stride of
+        // the axis which now follows it, times that axis' extent (1 when the new
+        // axis is appended last).
         let new_stride = if dim == new_shape.len() - 1 {
             1 // Last dimension always has stride 1
         } else {
-            new_strides[dim] // Use the stride that was at this position
+            new_strides[dim] * new_shape[dim + 1]
         };
         new_strides.insert(dim, new_stride);
 
-        Ok(Self {
+        let mut result = Self {
             storage: self.storage.clone(),
             shape: Shape::new(new_shape),
             device: self.device,
-            requires_grad: self.requires_grad,
+            requires_grad: crate::should_record_grad(self.requires_grad),
             grad: Arc::new(RwLock::new(None)),
             operation: Operation::Leaf,
             strides: Some(new_strides),
             storage_offset: self.storage_offset,
-            base_tensor: if self.is_view() {
-                self.base_tensor.clone()
-            } else {
-                Some(Arc::downgrade(&Arc::new(self.clone())))
-            },
-        })
+            base_tensor: Some(self.view_base()),
+        };
+        // Inserting an extent-1 axis keeps the element order.
+        self.record_view(&mut result, ViewKind::Reshape);
+        Ok(result)
     }
 
     /// Transposes two dimensions of the tensor.
     ///
-    /// Swaps the specified dimensions, creating a new tensor. For 2D tensors, calling
-    /// `transpose(0, 1)` produces the standard matrix transpose operation.
+    /// Swaps the specified dimensions. For 2D tensors, calling `transpose(0, 1)`
+    /// produces the standard matrix transpose operation.
+    ///
+    /// The result is a **view** for every rank: it shares storage with the
+    /// source and only swaps the two strides, so writing through either tensor
+    /// is visible in the other. Call [`Self::contiguous`] when a packed buffer is
+    /// needed.
     ///
     /// # Arguments
     ///
@@ -431,38 +535,9 @@ impl<T: TensorElement + Copy> Tensor<T> {
             )));
         }
 
-        if ndim == 2 && dim0 != dim1 {
-            self.transpose_2d()
-        } else {
-            self.transpose_view(dim0, dim1)
-        }
-    }
-
-    /// 2D transpose implementation
-    fn transpose_2d(&self) -> Result<Self> {
-        let shape = self.shape.dims();
-        if shape.len() != 2 {
-            return Err(TorshError::InvalidArgument(
-                "transpose_2d only works with 2D tensors".to_string(),
-            ));
-        }
-
-        let (rows, cols) = (shape[0], shape[1]);
-        let data = self.to_vec()?;
-        let n = data.len();
-        let mut buf = global_acquire_uninit::<T>(n);
-        let uninit = buf.as_uninit_slice_mut();
-        let mut count = 0;
-
-        for col in 0..cols {
-            for row in 0..rows {
-                uninit[count].write(data[row * cols + col]);
-                count += 1;
-            }
-        }
-
-        let transposed_data = buf.into_vec(count);
-        Self::from_data(transposed_data, vec![cols, rows], self.device)
+        // Every rank goes through the same path: `transpose` is a view, exactly
+        // like PyTorch's. Callers that need a packed buffer call `.contiguous()`.
+        self.transpose_view(dim0, dim1)
     }
 
     /// Permute dimensions according to the given order
@@ -513,21 +588,19 @@ impl<T: TensorElement + Copy> Tensor<T> {
         let new_shape: Vec<usize> = perm_dims.iter().map(|&i| old_shape[i]).collect();
         let new_strides: Vec<usize> = perm_dims.iter().map(|&i| old_strides[i]).collect();
 
-        Ok(Self {
+        let mut result = Self {
             storage: self.storage.clone(),
             shape: Shape::new(new_shape),
             device: self.device,
-            requires_grad: self.requires_grad,
+            requires_grad: crate::should_record_grad(self.requires_grad),
             grad: Arc::new(RwLock::new(None)),
             operation: Operation::Leaf,
             strides: Some(new_strides),
             storage_offset: self.storage_offset,
-            base_tensor: if self.is_view() {
-                self.base_tensor.clone()
-            } else {
-                Some(Arc::downgrade(&Arc::new(self.clone())))
-            },
-        })
+            base_tensor: Some(self.view_base()),
+        };
+        self.record_view(&mut result, ViewKind::Permute(perm_dims));
+        Ok(result)
     }
 
     /// Removes a dimension of size 1 at the specified position.
@@ -582,18 +655,25 @@ impl<T: TensorElement + Copy> Tensor<T> {
     }
 
     /// Squeeze all dimensions with size 1
+    ///
+    /// Dropping extent-1 axes never changes the element order, so this goes
+    /// through [`Self::view`]: the result shares storage with a contiguous
+    /// source and keeps the tensor connected to the autograd graph. When every
+    /// dimension is 1 the result is a scalar (0-dimensional) tensor.
     pub fn squeeze_all(&self) -> Result<Self> {
         let shape = self.shape.dims();
-        let new_shape: Vec<usize> = shape.iter().copied().filter(|&s| s != 1).collect();
+        let new_shape: Result<Vec<i32>> = shape
+            .iter()
+            .copied()
+            .filter(|&s| s != 1)
+            .map(|s| {
+                i32::try_from(s).map_err(|_| {
+                    TorshError::InvalidShape(format!("Dimension {s} is too large to reshape"))
+                })
+            })
+            .collect();
 
-        if new_shape.is_empty() {
-            // If all dimensions were 1, result should be a scalar (0-dimensional tensor)
-            let data = self.to_vec()?;
-            Self::from_data(data, vec![], self.device)
-        } else {
-            let data = self.to_vec()?;
-            Self::from_data(data, new_shape, self.device)
-        }
+        self.view(&new_shape?)
     }
 
     /// Adds a dimension of size 1 at the specified position.
@@ -693,11 +773,19 @@ impl<T: TensorElement + Copy> Tensor<T> {
     /// Make tensor contiguous if it isn't already
     pub fn contiguous(&self) -> Result<Self> {
         if self.is_contiguous() {
+            // Already contiguous: the clone shares the gradient slot, so the graph
+            // (and any recorded operation) is preserved unchanged.
             Ok(self.clone())
         } else {
-            // Need to copy data to make it contiguous
+            // The copy reorders nothing logically — output element `i` equals
+            // input element `i` in row-major order — so the backward rule is the
+            // identity, recorded as a reshape to the (identical) input shape.
+            // Without this the copy would reset to `Operation::Leaf` and detach
+            // the graph.
             let data = self.to_vec()?;
-            Self::from_data(data, self.shape.dims().to_vec(), self.device)
+            let mut result = Self::from_data(data, self.shape.dims().to_vec(), self.device)?;
+            self.record_view(&mut result, ViewKind::Reshape);
+            Ok(result)
         }
     }
 
@@ -739,21 +827,20 @@ impl<T: TensorElement + Copy> Tensor<T> {
         }
         // Any leading broadcast dimensions already have stride 0 from initialization.
 
-        Ok(Self {
+        let mut result = Self {
             storage: self.storage.clone(),
             shape: Shape::new(shape.to_vec()),
             device: self.device,
-            requires_grad: false,
+            requires_grad: crate::should_record_grad(self.requires_grad),
             grad: Arc::new(RwLock::new(None)),
             operation: Operation::Leaf,
             strides: Some(new_strides),
             storage_offset: self.storage_offset,
-            base_tensor: if self.is_view() {
-                self.base_tensor.clone()
-            } else {
-                Some(Arc::downgrade(&Arc::new(self.clone())))
-            },
-        })
+            base_tensor: Some(self.view_base()),
+        };
+        // Backward sums the gradient over the stride-0 (broadcast) axes.
+        self.record_view(&mut result, ViewKind::Expand);
+        Ok(result)
     }
 
     /// Move dimensions from source positions to destination positions
@@ -1065,6 +1152,38 @@ mod tests {
 
         let contiguous = transposed.contiguous().expect("contiguous should succeed");
         assert!(contiguous.is_contiguous());
+    }
+
+    /// F152/F272: a view's base handle must still be usable after the
+    /// constructor returns (the old `Arc::downgrade(&Arc::new(..))` idiom made
+    /// it dead on arrival), and a view of a view must point at the original.
+    #[test]
+    fn test_view_constructors_keep_the_base_alive() {
+        let base = Tensor::from_data(vec![1.0f32, 2.0], vec![1, 2], DeviceType::Cpu)
+            .expect("tensor creation should succeed");
+
+        let expanded = base.expand(&[3, 2]).expect("expand should succeed");
+        let recorded = expanded
+            .base_tensor
+            .as_ref()
+            .expect("expand must record its source");
+        assert_eq!(recorded.shape().dims(), &[1, 2]);
+        assert_eq!(recorded.to_vec().expect("to_vec"), vec![1.0, 2.0]);
+
+        // A view of a view keeps pointing at the original base tensor.
+        let chained = expanded
+            .transpose_view(0, 1)
+            .expect("transpose_view should succeed");
+        let chained_base = chained
+            .base_tensor
+            .as_ref()
+            .expect("a chained view must keep a base");
+        assert_eq!(chained_base.shape().dims(), &[1, 2]);
+        assert!(Arc::ptr_eq(recorded, chained_base));
+
+        // The public accessor exposes the same handle.
+        assert!(base.base_tensor().is_none(), "a base tensor has no source");
+        assert!(expanded.base_tensor().is_some());
     }
 
     #[test]

@@ -106,34 +106,132 @@ impl Transform for CenterCrop {
     }
 }
 
-/// Convert PIL image to tensor
+/// Memory layout of an image tensor
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImageLayout {
+    /// Height x Width x Channels — the layout produced by image decoders
+    /// (`image::DynamicImage`, PIL, OpenCV). This is the default input layout
+    /// of [`ToTensor`], matching torchvision.
+    #[default]
+    Hwc,
+    /// Channels x Height x Width — the layout every ToRSh vision op expects.
+    Chw,
+}
+
+/// Convert a decoded image tensor into the CHW tensor layout used by the models
 ///
-/// This transform typically converts PIL images or other formats to tensors.
-/// For the current implementation, it acts as an identity transform.
+/// This mirrors `torchvision.transforms.ToTensor`: the input is interpreted as an
+/// interleaved image (HWC, or NHWC when batched) holding 8-bit sample values in
+/// `0..=255`, and the output is a planar CHW (or NCHW) tensor scaled into
+/// `0.0..=1.0`.
+///
+/// Both steps are configurable and applied unconditionally — the transform never
+/// inspects the data to guess whether it should scale, so the same pipeline always
+/// produces the same normalisation.
+///
+/// * Inputs with 2 dimensions are treated as a single-channel `H x W` image and
+///   gain a leading channel axis.
+/// * Use [`ToTensor::from_chw`] when the input is already planar and only the
+///   `1/255` scaling is wanted.
+/// * Use [`ToTensor::with_scale`] to disable the scaling for inputs that already
+///   live in `0.0..=1.0`.
 ///
 /// # Examples
 ///
 /// ```rust
 /// use torsh_vision::transforms::{ToTensor, Transform};
 ///
+/// // torchvision semantics: HWC in 0..=255 -> CHW in 0.0..=1.0
 /// let to_tensor = ToTensor::new();
-/// // Apply to tensor: result = to_tensor.forward(&input_tensor)?;
+///
+/// // Already planar, still needs the 1/255 scaling
+/// let planar = ToTensor::from_chw();
+///
+/// // Planar and already scaled: a no-op pass-through
+/// let identity = ToTensor::from_chw().with_scale(false);
 /// ```
-#[derive(Debug, Clone, Default)]
-pub struct ToTensor;
+#[derive(Debug, Clone, Copy)]
+pub struct ToTensor {
+    layout: ImageLayout,
+    scale: bool,
+}
+
+impl Default for ToTensor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ToTensor {
-    /// Create a new ToTensor transform
+    /// Create a new ToTensor transform with torchvision semantics
+    ///
+    /// The input is treated as HWC/NHWC in `0..=255` and the output is CHW/NCHW
+    /// in `0.0..=1.0`.
     pub fn new() -> Self {
-        Self
+        Self {
+            layout: ImageLayout::Hwc,
+            scale: true,
+        }
+    }
+
+    /// Create a ToTensor transform for input that is already in CHW/NCHW layout
+    ///
+    /// Only the `1/255` scaling is applied.
+    pub fn from_chw() -> Self {
+        Self {
+            layout: ImageLayout::Chw,
+            scale: true,
+        }
+    }
+
+    /// Create a ToTensor transform for an explicit input layout
+    pub fn with_layout(layout: ImageLayout) -> Self {
+        Self {
+            layout,
+            scale: true,
+        }
+    }
+
+    /// Enable or disable the `1/255` scaling
+    pub fn with_scale(mut self, scale: bool) -> Self {
+        self.scale = scale;
+        self
+    }
+
+    /// Get the expected input layout
+    pub fn layout(&self) -> ImageLayout {
+        self.layout
+    }
+
+    /// Whether the transform divides the samples by 255
+    pub fn scales(&self) -> bool {
+        self.scale
     }
 }
 
 impl Transform for ToTensor {
     fn forward(&self, input: &Tensor<f32>) -> Result<Tensor<f32>> {
-        // This would typically convert from PIL image to tensor
-        // For now, just return the input as is
-        Ok(input.clone())
+        let dims = input.shape().dims().to_vec();
+
+        let planar = match (dims.len(), self.layout) {
+            // Single-channel image: add the channel axis.
+            (2, _) => input.view(&[1, dims[0] as i32, dims[1] as i32])?,
+            (3, ImageLayout::Hwc) => input.permute(&[2, 0, 1])?.contiguous()?,
+            (4, ImageLayout::Hwc) => input.permute(&[0, 3, 1, 2])?.contiguous()?,
+            (3, ImageLayout::Chw) | (4, ImageLayout::Chw) => input.clone(),
+            _ => {
+                return Err(VisionError::InvalidShape(format!(
+                    "ToTensor expects a 2D (H, W), 3D (H, W, C) or 4D (N, H, W, C) tensor, got {}D",
+                    dims.len()
+                )))
+            }
+        };
+
+        if self.scale {
+            Ok(planar.div_scalar(255.0)?)
+        } else {
+            Ok(planar)
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -141,11 +239,14 @@ impl Transform for ToTensor {
     }
 
     fn parameters(&self) -> Vec<(&'static str, String)> {
-        Vec::new()
+        vec![
+            ("layout", format!("{:?}", self.layout)),
+            ("scale", format!("{}", self.scale)),
+        ]
     }
 
     fn clone_transform(&self) -> Box<dyn Transform> {
-        Box::new(ToTensor::new())
+        Box::new(*self)
     }
 }
 
@@ -192,6 +293,34 @@ impl Normalize {
             "Mean and std must have the same length"
         );
         Self { mean, std }
+    }
+
+    /// Fallible variant of [`Self::new`]
+    ///
+    /// Returns [`VisionError::InvalidArgument`] instead of panicking when `mean`
+    /// and `std` have different lengths, when either is empty, or when any
+    /// standard deviation is zero (which would make the normalisation divide by
+    /// zero).
+    pub fn try_new(mean: Vec<f32>, std: Vec<f32>) -> Result<Self> {
+        if mean.len() != std.len() {
+            return Err(VisionError::InvalidArgument(format!(
+                "Normalize: mean and std must have the same length, got {} and {}",
+                mean.len(),
+                std.len()
+            )));
+        }
+        if mean.is_empty() {
+            return Err(VisionError::InvalidArgument(
+                "Normalize: mean and std must not be empty".to_string(),
+            ));
+        }
+        if let Some(idx) = std.iter().position(|s| *s == 0.0) {
+            return Err(VisionError::InvalidArgument(format!(
+                "Normalize: std[{}] is 0.0, which would divide by zero",
+                idx
+            )));
+        }
+        Ok(Self { mean, std })
     }
 
     /// Create ImageNet normalization (RGB)
@@ -381,31 +510,73 @@ mod tests {
     fn test_to_tensor_creation() {
         let to_tensor = ToTensor::new();
         assert_eq!(to_tensor.name(), "ToTensor");
+        assert_eq!(to_tensor.layout(), ImageLayout::Hwc);
+        assert!(to_tensor.scales());
 
         let params = to_tensor.parameters();
-        assert_eq!(params.len(), 0);
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].0, "layout");
+        assert_eq!(params[1].0, "scale");
     }
 
     #[test]
     fn test_to_tensor_default() {
         let to_tensor = ToTensor::default();
         assert_eq!(to_tensor.name(), "ToTensor");
+        assert_eq!(to_tensor.layout(), ImageLayout::Hwc);
+        assert!(to_tensor.scales());
     }
 
     #[test]
-    fn test_to_tensor_forward() {
+    fn test_to_tensor_forward_hwc_to_chw() {
         let to_tensor = ToTensor::new();
+        // 4x8 image with 3 interleaved channels.
+        let input = creation::ones(&[4, 8, 3]).expect("creation should succeed");
+
+        let result = to_tensor
+            .forward(&input)
+            .expect("forward pass should succeed");
+        assert_eq!(result.shape().dims(), &[3, 4, 8]);
+        assert!(
+            (result
+                .get(&[0, 0, 0])
+                .expect("element retrieval should succeed for valid index")
+                - 1.0 / 255.0)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn test_to_tensor_forward_chw_passthrough() {
+        let to_tensor = ToTensor::from_chw().with_scale(false);
         let input = creation::ones(&[3, 32, 32]).expect("creation should succeed");
 
         let result = to_tensor
             .forward(&input)
             .expect("forward pass should succeed");
+        assert_eq!(result.shape().dims(), &[3, 32, 32]);
         assert_eq!(
             result
                 .get(&[0, 0, 0])
                 .expect("element retrieval should succeed for valid index"),
             1.0
         );
+    }
+
+    #[test]
+    fn test_to_tensor_rejects_unsupported_rank() {
+        let to_tensor = ToTensor::new();
+        let input = creation::ones(&[5]).expect("creation should succeed");
+        assert!(to_tensor.forward(&input).is_err());
+    }
+
+    #[test]
+    fn test_normalize_try_new_rejects_mismatched_lengths() {
+        assert!(Normalize::try_new(vec![0.5, 0.5], vec![0.5, 0.5, 0.5]).is_err());
+        assert!(Normalize::try_new(vec![], vec![]).is_err());
+        assert!(Normalize::try_new(vec![0.5], vec![0.0]).is_err());
+        assert!(Normalize::try_new(vec![0.5], vec![0.25]).is_ok());
     }
 
     #[test]

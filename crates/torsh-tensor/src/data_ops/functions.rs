@@ -43,8 +43,25 @@ impl<T: TensorElement + Copy> Tensor<T> {
     {
         self.fill_(T::one())
     }
-    /// Copy data from another tensor (in-place)
+    /// Copy data from another tensor (in-place), copy-on-write safe.
+    ///
+    /// Delegates to [`Tensor::copy_from`], so a snapshot taken with `.clone()`
+    /// (which shares storage) is never clobbered by the write.
     pub fn copy_(&mut self, other: &Self) -> Result<()>
+    where
+        T: Copy,
+    {
+        self.copy_from(other)
+    }
+
+    /// Overwrite this tensor's contents with `other`'s, copy-on-write safe.
+    ///
+    /// The two tensors must have the same shape. Before writing, this makes the
+    /// storage uniquely owned (and contiguous), so any tensor that shares this
+    /// one's buffer — a `.clone()` snapshot, or a base tensor this is a view of —
+    /// keeps its old values. This is the primitive optimizers use to write an
+    /// updated parameter back without disturbing retained snapshots.
+    pub fn copy_from(&mut self, other: &Self) -> Result<()>
     where
         T: Copy,
     {
@@ -54,11 +71,51 @@ impl<T: TensorElement + Copy> Tensor<T> {
                 got: other.shape().dims().to_vec(),
             });
         }
+        // Read the source *before* isolating our storage: the source may alias
+        // it (e.g. a clone), and `make_unique` would otherwise leave `other`
+        // pointing at the pre-copy buffer.
         let other_data = other.to_vec()?;
-        for (i, &value) in other_data.iter().enumerate() {
-            self.storage.set(i, value)?;
+        // A strided/offset view aliases a sub-region of another tensor's buffer,
+        // and PyTorch's in-place-on-a-view semantics write *through* to that base
+        // (that is exactly how scatter-style aggregation into slices works).
+        // `set_slice` already performs a stride-aware store, mapping each logical
+        // element back to its physical slot in the base storage. Skipping the CoW
+        // step here is deliberate: `make_unique` would detach the view and the
+        // write would never reach the base. The contiguous-base path below keeps
+        // its copy-on-write behaviour so optimizer snapshots stay intact.
+        if self.is_view() {
+            return self.set_slice(0, &other_data);
         }
-        Ok(())
+        self.make_unique()?;
+        self.set_slice(0, &other_data)
+    }
+
+    /// Overwrite this tensor's contents from a flat, row-major slice,
+    /// copy-on-write safe.
+    ///
+    /// `data.len()` must equal this tensor's element count. Like
+    /// [`Tensor::copy_from`], the storage is made uniquely owned first, so
+    /// shared snapshots are preserved.
+    pub fn set_data(&mut self, data: &[T]) -> Result<()>
+    where
+        T: Copy,
+    {
+        let numel = self.numel();
+        if data.len() != numel {
+            return Err(TorshError::InvalidArgument(format!(
+                "set_data: slice has {} elements but the tensor holds {}",
+                data.len(),
+                numel
+            )));
+        }
+        // See `copy_from`: an in-place write into a view writes through to the
+        // base via the stride-aware `set_slice`; the contiguous path stays
+        // copy-on-write so shared snapshots are preserved.
+        if self.is_view() {
+            return self.set_slice(0, data);
+        }
+        self.make_unique()?;
+        self.set_slice(0, data)
     }
     /// Get an element by multi-dimensional index
     pub fn get_item(&self, indices: &[usize]) -> Result<T>

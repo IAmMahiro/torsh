@@ -3,7 +3,10 @@
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
 use std::collections::HashMap;
-use torsh_core::{error::Result, DeviceType};
+use torsh_core::{
+    error::{Result, TorshError},
+    DeviceType,
+};
 use torsh_nn::prelude::*;
 use torsh_nn::{Module, Parameter};
 use torsh_tensor::{creation, Tensor};
@@ -287,8 +290,18 @@ pub fn contrastive_loss(
 
     let batch_size = vision_features.size(0)? as i64;
 
+    // CLIP computes cosine similarities: both embeddings are L2-normalised
+    // before the dot product. Skipping this makes the logits scale with the
+    // embedding magnitude — for `embed_dim = 64` standard-normal features the
+    // raw dot products have a standard deviation of ~8, which after the
+    // division by a typical temperature of 0.07 lands around ±114 and drives
+    // the cross-entropy far outside any sane range. Normalising bounds every
+    // similarity to [-1, 1], so the logits never exceed 1/temperature.
+    let vision_normalized = l2_normalize_rows(vision_features)?;
+    let text_normalized = l2_normalize_rows(text_features)?;
+
     // Compute similarity matrix: [batch_size, batch_size]
-    let logits = vision_features.matmul(&text_features.transpose(-2, -1)?)?;
+    let logits = vision_normalized.matmul(&text_normalized.transpose(-2, -1)?)?;
     let logits = logits.div_scalar(temperature)?;
 
     // Create target labels: diagonal indices (0, 1, 2, ..., batch_size-1)
@@ -308,6 +321,25 @@ pub fn contrastive_loss(
     let total_loss = loss_v2t.add(&loss_t2v)?.div_scalar(2.0)?;
 
     Ok(total_loss)
+}
+
+/// L2-normalise every row of a `[batch_size, embed_dim]` embedding matrix.
+///
+/// A small epsilon is added to the norm so an all-zero embedding yields zeros
+/// instead of `NaN`.
+fn l2_normalize_rows(features: &Tensor) -> Result<Tensor> {
+    let shape_binding = features.shape();
+    let dims = shape_binding.dims().to_vec();
+    if dims.len() != 2 {
+        return Err(TorshError::InvalidArgument(format!(
+            "contrastive_loss expects [batch_size, embed_dim] embeddings, got {dims:?}"
+        )));
+    }
+
+    let squared_norm = features.mul(features)?.sum_dim(&[1], true)?;
+    let norm = squared_norm.sqrt()?.add_scalar(1e-12)?;
+    let expanded = norm.expand(&dims)?;
+    features.div(&expanded)
 }
 
 /// Helper function to compute cross-entropy loss with proper numerical stability

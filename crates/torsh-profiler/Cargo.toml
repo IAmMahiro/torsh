@@ -26,16 +26,17 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-backtrace = "0.3"
-num_cpus = "1.17"
+backtrace = { workspace = true }
+num_cpus = { workspace = true }
 scirs2-core = { workspace = true, features = ["profiling"] }
 anyhow = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 uuid = { workspace = true }
-prometheus = "0.14"
+prometheus = { workspace = true }
+oxiarc-zstd = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

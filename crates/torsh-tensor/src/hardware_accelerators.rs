@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use torsh_core::sync::MutexExt;
 // use serde::{Serialize, Deserialize}; // Temporarily removed to avoid dependency issues
 
 use crate::cross_platform_validator::HardwareDetectionReport;
@@ -620,38 +621,23 @@ impl HardwareAcceleratorSystem {
         hardware_report: &HardwareDetectionReport,
     ) -> Result<AcceleratorInitializationReport, Box<dyn std::error::Error>> {
         // Initialize CPU accelerators
-        let mut cpu_accelerators = self
-            .cpu_accelerators
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut cpu_accelerators = self.cpu_accelerators.lock_or_recover();
         cpu_accelerators.initialize_for_cpu(&hardware_report.cpu_info)?;
 
         // Initialize GPU accelerators
-        let mut gpu_accelerators = self
-            .gpu_accelerators
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut gpu_accelerators = self.gpu_accelerators.lock_or_recover();
         gpu_accelerators.initialize_for_gpu(&hardware_report.gpu_info)?;
 
         // Initialize memory accelerators
-        let mut memory_accelerators = self
-            .memory_accelerators
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut memory_accelerators = self.memory_accelerators.lock_or_recover();
         memory_accelerators.initialize_for_memory(&hardware_report.memory_info)?;
 
         // Initialize network accelerators
-        let mut network_accelerators = self
-            .network_accelerators
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut network_accelerators = self.network_accelerators.lock_or_recover();
         network_accelerators.initialize_for_network(&hardware_report.platform_info)?;
 
         // Initialize specialized accelerators
-        let mut specialized_accelerators = self
-            .specialized_accelerators
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut specialized_accelerators = self.specialized_accelerators.lock_or_recover();
         specialized_accelerators.initialize_for_specialized(&hardware_report.specialized_info)?;
 
         Ok(AcceleratorInitializationReport {
@@ -713,10 +699,7 @@ impl HardwareAcceleratorSystem {
         &self,
         workload: &AccelerationWorkload,
     ) -> Result<CpuAccelerationMetrics, Box<dyn std::error::Error>> {
-        let _cpu_accelerators = self
-            .cpu_accelerators
-            .lock()
-            .expect("lock should not be poisoned");
+        let _cpu_accelerators = self.cpu_accelerators.lock_or_recover();
 
         // Calculate metrics based on workload size and complexity
         let workload_size_factor = (workload.data_size as f64 / 1_000_000.0).min(1.0);
@@ -755,10 +738,7 @@ impl HardwareAcceleratorSystem {
         &self,
         workload: &AccelerationWorkload,
     ) -> Result<GpuAccelerationMetrics, Box<dyn std::error::Error>> {
-        let _gpu_accelerators = self
-            .gpu_accelerators
-            .lock()
-            .expect("lock should not be poisoned");
+        let _gpu_accelerators = self.gpu_accelerators.lock_or_recover();
 
         // GPU efficiency scales better with large workloads
         let workload_size_factor = (workload.data_size as f64 / 10_000_000.0).min(1.0);
@@ -804,10 +784,7 @@ impl HardwareAcceleratorSystem {
         &self,
         workload: &AccelerationWorkload,
     ) -> Result<MemoryAccelerationMetrics, Box<dyn std::error::Error>> {
-        let _memory_accelerators = self
-            .memory_accelerators
-            .lock()
-            .expect("lock should not be poisoned");
+        let _memory_accelerators = self.memory_accelerators.lock_or_recover();
 
         // Memory performance degrades with larger working sets
         let workload_size_factor = (workload.data_size as f64 / 1_000_000.0).min(2.0);
@@ -847,10 +824,7 @@ impl HardwareAcceleratorSystem {
         &self,
         workload: &AccelerationWorkload,
     ) -> Result<NetworkAccelerationMetrics, Box<dyn std::error::Error>> {
-        let _network_accelerators = self
-            .network_accelerators
-            .lock()
-            .expect("lock should not be poisoned");
+        let _network_accelerators = self.network_accelerators.lock_or_recover();
 
         // Network performance depends on message size and communication patterns
         let workload_size_factor = (workload.data_size as f64 / 100_000.0).min(1.5);

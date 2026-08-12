@@ -2,7 +2,12 @@
 
 This document outlines planned features, enhancements, and deferred implementations for future ToRSh releases.
 
-## Version 0.2.0 (Next Release) - Optimizer & State Management Enhancements
+> **Status note.** The shipping 0.2.0 release is a **production-hardening &
+> Python-bindings** release (see `CHANGELOG.md`), not primarily the optimizer
+> redesign originally sketched below. The advanced-optimizer and NLP items in
+> this section remain **planned / deferred** to a later 0.2.x or 0.3.0.
+
+## Version 0.2.0+ (Planned) - Optimizer & State Management Enhancements
 
 ### torsh-optim: Advanced Optimizer Improvements
 

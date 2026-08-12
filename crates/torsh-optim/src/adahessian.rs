@@ -255,7 +255,7 @@ impl Optimizer for AdaHessian {
 
                 // Apply update (re-acquire param regardless)
                 let mut param = param_arc.write();
-                *param = param.sub(&update)?;
+                crate::param_update::sub_assign(&mut param, &update)?;
 
                 // Update state
                 state.insert("step".to_string(), step_tensor);
@@ -278,6 +278,13 @@ impl Optimizer for AdaHessian {
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
         self.base.set_lr(lr);
+    }
+
+    fn set_lrs(&mut self, lrs: &[f32]) {
+        if let Some(&lr) = lrs.first() {
+            self.lr = lr;
+        }
+        self.base.set_lrs(lrs);
     }
 
     fn add_param_group(&mut self, params: Vec<Arc<RwLock<Tensor>>>, options: HashMap<String, f32>) {

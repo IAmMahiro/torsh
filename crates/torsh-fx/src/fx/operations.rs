@@ -144,25 +144,20 @@ impl FxGraph {
         // Start with compressed graph
         let mut optimized = self.compress()?;
 
-        // Remove orphaned nodes
-        let orphaned_nodes = optimized.find_orphaned_nodes();
-        for &orphaned_idx in &orphaned_nodes {
-            optimized.graph.remove_node(orphaned_idx);
+        // Remove orphaned and dead-end nodes in a single batch: removing them one by
+        // one through petgraph would swap-remove and invalidate the indices that are
+        // still pending in these lists (and in inputs/outputs).
+        let mut removable: HashSet<NodeIndex> =
+            optimized.find_orphaned_nodes().into_iter().collect();
+        removable.extend(optimized.find_dead_end_nodes());
+        // Declared inputs/outputs are part of the graph signature and are kept.
+        for idx in optimized.inputs.iter().chain(optimized.outputs.iter()) {
+            removable.remove(idx);
         }
 
-        // Remove dead-end nodes that don't contribute to outputs
-        let dead_end_nodes = optimized.find_dead_end_nodes();
-        for &dead_end_idx in &dead_end_nodes {
-            optimized.graph.remove_node(dead_end_idx);
+        if !removable.is_empty() {
+            optimized.remove_nodes(&removable);
         }
-
-        // Update input/output lists to remove any invalid indices
-        optimized
-            .inputs
-            .retain(|&idx| optimized.graph.node_weight(idx).is_some());
-        optimized
-            .outputs
-            .retain(|&idx| optimized.graph.node_weight(idx).is_some());
 
         Ok(optimized)
     }

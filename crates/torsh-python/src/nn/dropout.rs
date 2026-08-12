@@ -16,6 +16,7 @@ pub struct PyDropout {
 #[pymethods]
 impl PyDropout {
     #[new]
+    #[pyo3(signature = (p=None, inplace=None))]
     fn new(p: Option<f32>, inplace: Option<bool>) -> PyResult<PyClassInitializer<Self>> {
         let p = p.unwrap_or(0.5);
         let inplace = inplace.unwrap_or(false);
@@ -125,6 +126,7 @@ pub struct PyDropout2d {
 #[pymethods]
 impl PyDropout2d {
     #[new]
+    #[pyo3(signature = (p=None, inplace=None))]
     fn new(p: Option<f32>, inplace: Option<bool>) -> PyResult<PyClassInitializer<Self>> {
         let p = p.unwrap_or(0.5);
         let inplace = inplace.unwrap_or(false);
@@ -255,6 +257,7 @@ pub struct PyDropout3d {
 #[pymethods]
 impl PyDropout3d {
     #[new]
+    #[pyo3(signature = (p=None, inplace=None))]
     fn new(p: Option<f32>, inplace: Option<bool>) -> PyResult<PyClassInitializer<Self>> {
         let p = p.unwrap_or(0.5);
         let inplace = inplace.unwrap_or(false);
@@ -385,6 +388,7 @@ pub struct PyAlphaDropout {
 #[pymethods]
 impl PyAlphaDropout {
     #[new]
+    #[pyo3(signature = (p=None, inplace=None))]
     fn new(p: Option<f32>, inplace: Option<bool>) -> PyResult<PyClassInitializer<Self>> {
         let p = p.unwrap_or(0.5);
         let inplace = inplace.unwrap_or(false);

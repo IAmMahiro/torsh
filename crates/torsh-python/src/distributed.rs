@@ -28,21 +28,38 @@ impl PyProcessGroup {
         self.world_size
     }
 
+    #[pyo3(signature = (_tensor, _op=None))]
     fn all_reduce(&self, _tensor: &PyTensor, _op: Option<String>) -> PyResult<()> {
-        Ok(())
+        Err(not_implemented("ProcessGroup.all_reduce"))
     }
 
     fn all_gather(&self, _tensors: Vec<PyTensor>, _tensor: &PyTensor) -> PyResult<()> {
-        Ok(())
+        Err(not_implemented("ProcessGroup.all_gather"))
     }
 
     fn broadcast(&self, _tensor: &PyTensor, _src: u32) -> PyResult<()> {
-        Ok(())
+        Err(not_implemented("ProcessGroup.broadcast"))
     }
 
     fn barrier(&self) -> PyResult<()> {
-        Ok(())
+        Err(not_implemented("ProcessGroup.barrier"))
     }
+}
+
+/// Build an honest `NotImplementedError` for a collective that is not yet wired
+/// to a real multi-process backend.
+///
+/// The previous implementations returned `Ok(())` while ignoring every
+/// argument, so a data-parallel run silently trained with unsynchronised
+/// gradients. Raising here makes the gap loud instead of corrupting results.
+/// A real backend (TCP transport + initialised process group) is future work;
+/// `torsh-distributed` currently only ships a mock backend.
+fn not_implemented(op: &str) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(format!(
+        "rstorch.distributed.{op} is not implemented: the Python bindings are \
+         not yet wired to a real distributed backend. Track this in the ToRSh \
+         distributed roadmap.",
+    ))
 }
 
 /// Distributed Data Parallel wrapper
@@ -55,6 +72,7 @@ pub struct PyDDP {
 #[pymethods]
 impl PyDDP {
     #[new]
+    #[pyo3(signature = (module, _device_ids=None, _output_device=None, _broadcast_buffers=None, process_group=None, _bucket_cap_mb=None, _find_unused_parameters=None, _check_reduction=None, _gradient_as_bucket_view=None))]
     fn new(
         module: Py<PyAny>,
         _device_ids: Option<Vec<u32>>,
@@ -92,6 +110,7 @@ impl PyDDP {
         method.call0(py)
     }
 
+    #[pyo3(signature = (mode=None))]
     fn train(&mut self, py: Python<'_>, mode: Option<bool>) -> PyResult<()> {
         let method = self.module.getattr(py, "train")?;
         method.call1(py, (mode.unwrap_or(true),))?;
@@ -114,30 +133,35 @@ pub fn register_distributed_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> 
     m.add_class::<PyDDP>()?;
 
     #[pyfunction]
+    #[pyo3(signature = (backend, init_method=None, world_size=None, rank=None, store=None, timeout=None, group_name=None, pg_options=None))]
     fn init_process_group(
-        _backend: String,
-        _init_method: Option<String>,
+        backend: String,
+        init_method: Option<String>,
         world_size: Option<u32>,
         rank: Option<u32>,
-        _store: Option<Py<PyAny>>,
-        _timeout: Option<f64>,
-        _group_name: Option<String>,
-        _pg_options: Option<Py<PyAny>>,
+        store: Option<Py<PyAny>>,
+        timeout: Option<f64>,
+        group_name: Option<String>,
+        pg_options: Option<Py<PyAny>>,
     ) -> PyProcessGroup {
+        let _ = (backend, init_method, store, timeout, group_name, pg_options);
         PyProcessGroup::new(rank.unwrap_or(0), world_size.unwrap_or(1))
     }
 
     #[pyfunction]
+    #[pyo3(signature = (_group=None))]
     fn destroy_process_group(_group: Option<Py<PyAny>>) -> PyResult<()> {
         Ok(())
     }
 
     #[pyfunction]
+    #[pyo3(signature = (_group=None))]
     fn get_rank(_group: Option<Py<PyAny>>) -> u32 {
         0
     }
 
     #[pyfunction]
+    #[pyo3(signature = (_group=None))]
     fn get_world_size(_group: Option<Py<PyAny>>) -> u32 {
         1
     }
@@ -149,65 +173,74 @@ pub fn register_distributed_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> 
 
     #[pyfunction]
     fn is_available() -> bool {
-        true
+        // Honest: the Python bindings are not wired to a working distributed
+        // backend yet, so collective communication is not available here.
+        false
     }
 
     #[pyfunction]
+    #[pyo3(signature = (_group=None))]
     fn barrier(_group: Option<Py<PyAny>>) -> PyResult<()> {
-        Ok(())
+        Err(not_implemented("barrier"))
     }
 
     #[pyfunction]
+    #[pyo3(signature = (_tensor, _op=None, _group=None))]
     fn all_reduce(
         _tensor: &PyTensor,
         _op: Option<String>,
         _group: Option<Py<PyAny>>,
     ) -> PyResult<()> {
-        Ok(())
+        Err(not_implemented("all_reduce"))
     }
 
     #[pyfunction]
+    #[pyo3(signature = (_tensor_list, _tensor, _group=None))]
     fn all_gather(
         _tensor_list: Vec<PyTensor>,
         _tensor: &PyTensor,
         _group: Option<Py<PyAny>>,
     ) -> PyResult<()> {
-        Ok(())
+        Err(not_implemented("all_gather"))
     }
 
     #[pyfunction]
+    #[pyo3(signature = (_tensor, _src, _group=None))]
     fn broadcast(_tensor: &PyTensor, _src: u32, _group: Option<Py<PyAny>>) -> PyResult<()> {
-        Ok(())
+        Err(not_implemented("broadcast"))
     }
 
     #[pyfunction]
+    #[pyo3(signature = (_tensor, _dst, _op=None, _group=None))]
     fn reduce(
         _tensor: &PyTensor,
         _dst: u32,
         _op: Option<String>,
         _group: Option<Py<PyAny>>,
     ) -> PyResult<()> {
-        Ok(())
+        Err(not_implemented("reduce"))
     }
 
     #[pyfunction]
+    #[pyo3(signature = (_tensor, _scatter_list=None, _src=0, _group=None))]
     fn scatter(
         _tensor: &PyTensor,
         _scatter_list: Option<Vec<PyTensor>>,
         _src: u32,
         _group: Option<Py<PyAny>>,
     ) -> PyResult<()> {
-        Ok(())
+        Err(not_implemented("scatter"))
     }
 
     #[pyfunction]
+    #[pyo3(signature = (_tensor, _gather_list=None, _dst=0, _group=None))]
     fn gather(
         _tensor: &PyTensor,
         _gather_list: Option<Vec<PyTensor>>,
         _dst: u32,
         _group: Option<Py<PyAny>>,
     ) -> PyResult<()> {
-        Ok(())
+        Err(not_implemented("gather"))
     }
 
     m.add_function(wrap_pyfunction!(init_process_group, m)?)?;

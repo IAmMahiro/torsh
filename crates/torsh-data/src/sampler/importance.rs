@@ -97,6 +97,48 @@ impl ImportanceSampler {
         }
     }
 
+    /// Fallible variant of [`Self::new`] that returns an error instead of
+    /// panicking when `importance_weights` is empty (with `num_samples > 0`),
+    /// contains negative values, or sums to a non-positive/non-finite value.
+    pub fn try_new(
+        importance_weights: Vec<f64>,
+        num_samples: usize,
+        replacement: bool,
+    ) -> torsh_core::error::Result<Self> {
+        if importance_weights.is_empty() && num_samples != 0 {
+            return Err(torsh_core::error::TorshError::InvalidArgument(
+                "importance_weights cannot be empty when num_samples > 0".to_string(),
+            ));
+        }
+        if !importance_weights.iter().all(|&w| w >= 0.0) {
+            return Err(torsh_core::error::TorshError::InvalidArgument(
+                "importance_weights must be non-negative".to_string(),
+            ));
+        }
+        if !importance_weights.is_empty() {
+            let weight_sum: f64 = importance_weights.iter().sum();
+            if !(weight_sum > 0.0 && weight_sum.is_finite()) {
+                return Err(torsh_core::error::TorshError::InvalidArgument(
+                    "importance_weights must sum to a positive finite value".to_string(),
+                ));
+            }
+        }
+
+        let clamped_num_samples = if !replacement {
+            num_samples.min(importance_weights.len())
+        } else {
+            num_samples
+        };
+
+        Ok(Self {
+            importance_weights,
+            num_samples: clamped_num_samples,
+            replacement,
+            temperature: 1.0,
+            generator: None,
+        })
+    }
+
     /// Set temperature for softmax scaling of importance weights
     ///
     /// Temperature controls the sharpness of the importance distribution:
@@ -121,6 +163,18 @@ impl ImportanceSampler {
         assert!(temperature > 0.0, "temperature must be positive");
         self.temperature = temperature;
         self
+    }
+
+    /// Fallible variant of [`Self::with_temperature`] that returns an error
+    /// instead of panicking when `temperature` is not positive.
+    pub fn try_with_temperature(mut self, temperature: f64) -> torsh_core::error::Result<Self> {
+        if temperature <= 0.0 {
+            return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                "temperature must be positive, got {temperature}"
+            )));
+        }
+        self.temperature = temperature;
+        Ok(self)
     }
 
     /// Set random generator seed

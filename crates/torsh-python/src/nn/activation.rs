@@ -14,6 +14,7 @@ pub struct PyReLU {
 #[pymethods]
 impl PyReLU {
     #[new]
+    #[pyo3(signature = (inplace=None))]
     fn new(inplace: Option<bool>) -> PyClassInitializer<Self> {
         (
             Self {
@@ -65,6 +66,7 @@ pub struct PySigmoid {
 #[pymethods]
 impl PySigmoid {
     #[new]
+    #[pyo3(signature = ())]
     fn new() -> PyClassInitializer<Self> {
         (Self { training: true }, PyModule::new()).into()
     }
@@ -105,6 +107,7 @@ pub struct PyTanh {
 #[pymethods]
 impl PyTanh {
     #[new]
+    #[pyo3(signature = ())]
     fn new() -> PyClassInitializer<Self> {
         (Self { training: true }, PyModule::new()).into()
     }

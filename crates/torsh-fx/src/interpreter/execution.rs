@@ -221,6 +221,13 @@ impl GraphInterpreter {
                 Ok(())
             }
             Node::Call(op_name, args) => {
+                // Constant nodes carry their value in the argument list rather than
+                // in incoming edges, so they are materialised before dispatch.
+                if let Some(tensor) = Self::materialize_constant(op_name, args)? {
+                    self.env.store(node_idx, tensor);
+                    return Ok(());
+                }
+
                 // Get input tensors
                 let input_tensors = self.get_inputs_for_args(graph, node_idx, args)?;
 
@@ -250,28 +257,98 @@ impl GraphInterpreter {
         }
     }
 
+    /// Materialize a constant node into a scalar tensor
+    ///
+    /// Recognises the constant nodes produced by the graph passes:
+    /// `constant(<literal>)` (constant folding), `constant_zero` and `constant_one`
+    /// (graph simplification).
+    ///
+    /// # Arguments
+    /// * `op_name` - Operation name of the node
+    /// * `args` - Node arguments
+    ///
+    /// # Returns
+    /// * `TorshResult<Option<Tensor>>` - The materialized constant, or `None` when
+    ///   the node is not a constant
+    fn materialize_constant(op_name: &str, args: &[String]) -> TorshResult<Option<Tensor>> {
+        let value = match op_name {
+            "constant" => {
+                let literal = args.first().ok_or_else(|| {
+                    TorshError::InvalidArgument(
+                        "constant node requires a literal argument".to_string(),
+                    )
+                })?;
+                literal.parse::<f32>().map_err(|_| {
+                    TorshError::InvalidArgument(format!(
+                        "constant node has a non-numeric literal: {literal}"
+                    ))
+                })?
+            }
+            "constant_zero" => 0.0,
+            "constant_one" => 1.0,
+            _ => return Ok(None),
+        };
+
+        Ok(Some(full(&[1], value)?))
+    }
+
     /// Get input tensors for operation arguments
+    ///
+    /// Operands are ordered by the node's argument list: each argument is matched
+    /// against the name carried by the incoming edge that supplies it. Order matters
+    /// for non-commutative operations (`sub`, `div`, `matmul`, `conv2d`, `linear`),
+    /// and `neighbors_directed` yields edges in reverse insertion order, so relying
+    /// on the raw predecessor order computes `sub(a, b)` as `b - a`.
+    ///
+    /// Incoming values that no argument names (and every value when the node has no
+    /// arguments) keep their edge insertion order and are appended at the end.
     ///
     /// # Arguments
     /// * `graph` - FX graph containing the node
     /// * `node_idx` - Index of the node to get inputs for
-    /// * `_args` - Operation arguments (currently unused)
+    /// * `args` - Operation arguments, in the order the operation expects them
     ///
     /// # Returns
-    /// * `TorshResult<Vec<Tensor>>` - Vector of input tensors
+    /// * `TorshResult<Vec<Tensor>>` - Vector of input tensors in argument order
     fn get_inputs_for_args(
         &self,
         graph: &FxGraph,
         node_idx: NodeIndex,
-        _args: &[String],
+        args: &[String],
     ) -> TorshResult<Vec<Tensor>> {
-        let predecessors: Vec<_> = graph
+        use petgraph::visit::EdgeRef;
+
+        // Edge insertion order: petgraph iterates incoming edges newest first.
+        let mut incoming: Vec<(petgraph::graph::EdgeIndex, String, NodeIndex)> = graph
             .graph
-            .neighbors_directed(node_idx, petgraph::Direction::Incoming)
+            .edges_directed(node_idx, petgraph::Direction::Incoming)
+            .map(|edge| (edge.id(), edge.weight().name.clone(), edge.source()))
             .collect();
+        incoming.sort_by_key(|(edge_idx, _, _)| edge_idx.index());
+
+        let mut consumed = vec![false; incoming.len()];
+        let mut ordered: Vec<NodeIndex> = Vec::with_capacity(incoming.len());
+
+        for arg in args {
+            if let Some(position) = incoming
+                .iter()
+                .enumerate()
+                .position(|(slot, (_, name, _))| !consumed[slot] && name == arg)
+            {
+                consumed[position] = true;
+                ordered.push(incoming[position].2);
+            }
+        }
+
+        // Anything the argument list did not name keeps its declaration order.
+        for (slot, (_, _, source)) in incoming.iter().enumerate() {
+            if !consumed[slot] {
+                ordered.push(*source);
+            }
+        }
 
         let mut inputs = Vec::new();
-        for pred_idx in predecessors {
+        for pred_idx in ordered {
             if let Some(tensor) = self.env.get(pred_idx) {
                 inputs.push(tensor.clone());
             } else {
@@ -396,6 +473,28 @@ impl GraphInterpreter {
             "conv2d_relu" => {
                 let conv_result = self.execute_conv2d(&inputs)?;
                 conv_result.relu()
+            }
+            "conv2d_bn" => {
+                if inputs.len() < 2 {
+                    return Err(TorshError::InvalidArgument(
+                        "Fused Conv2D+BatchNorm requires at least 2 inputs (input, weight)"
+                            .to_string(),
+                    ));
+                }
+                self.execute_conv2d_bn(&inputs)
+            }
+            "conv2d_bn_relu" => {
+                if inputs.len() < 2 {
+                    return Err(TorshError::InvalidArgument(
+                        "Fused Conv2D+BatchNorm+ReLU requires at least 2 inputs (input, weight)"
+                            .to_string(),
+                    ));
+                }
+                self.execute_conv2d_bn(&inputs)?.relu()
+            }
+            "identity" => {
+                self.validate_input_count(&inputs, 1, "Identity")?;
+                Ok(inputs[0].clone())
             }
             _ => Err(TorshError::InvalidArgument(format!(
                 "Unknown operation: {}",
@@ -594,6 +693,28 @@ impl GraphInterpreter {
     ///
     /// # Returns
     /// * `TorshResult<Tensor>` - Convolved tensor
+    /// Execute the fused conv2d + batch_norm operation
+    ///
+    /// Emitted by [`crate::subgraph_rewriter::SubgraphPattern::conv_bn_fusion`]. The
+    /// operand list is the concatenation of the convolution's operands and the batch
+    /// norm's remaining operands, which is exactly what the rewriter builds when it
+    /// re-attaches the batch norm's external inputs to the fused node.
+    ///
+    /// # Arguments
+    /// * `inputs` - `[input, weight, (bn weight, bn bias, running mean, running var)]`
+    ///
+    /// # Returns
+    /// * `TorshResult<Tensor>` - Normalized convolution result
+    fn execute_conv2d_bn(&self, inputs: &[Tensor]) -> TorshResult<Tensor> {
+        let conv_result = self.execute_conv2d(&inputs[..2])?;
+
+        let mut norm_inputs = Vec::with_capacity(inputs.len() - 1);
+        norm_inputs.push(conv_result);
+        norm_inputs.extend(inputs[2..].iter().cloned());
+
+        self.execute_batch_norm(&norm_inputs)
+    }
+
     fn execute_conv2d(&self, inputs: &[Tensor]) -> TorshResult<Tensor> {
         let input = &inputs[0]; // Input tensor: [N, C_in, H_in, W_in]
         let weight = &inputs[1]; // Weight tensor: [C_out, C_in, K_h, K_w]

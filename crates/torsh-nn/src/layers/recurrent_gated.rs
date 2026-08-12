@@ -6,53 +6,117 @@
 use super::*;
 
 // ============================================================================
+// Shared helpers
+// ============================================================================
+
+/// PyTorch parameter-name suffix for a direction (`""` forward, `"_reverse"`).
+fn direction_suffix(direction: usize) -> &'static str {
+    if direction == 0 {
+        ""
+    } else {
+        "_reverse"
+    }
+}
+
+/// Stack `[batch, features]` step tensors into `[steps, batch, features]`.
+///
+/// # Autograd
+///
+/// The step tensors are copied element-wise, so the result is a fresh leaf: the
+/// stacked sequence is *not* connected to the cells that produced it. A
+/// graph-preserving version needs a differentiable `Tensor::stack` in
+/// torsh-tensor (`cat`/`stack` currently rebuild through `from_data`), which is
+/// tracked as follow-up work; the recurrent graph is severed earlier anyway,
+/// where `narrow` splits the gate pre-activations.
+fn stack_time_major(steps: &[Tensor]) -> Result<Tensor> {
+    if steps.is_empty() {
+        return Err(torsh_core::TorshError::InvalidArgument(
+            "No outputs to stack".to_string(),
+        ));
+    }
+
+    let binding = steps[0].shape();
+    let first = binding.dims();
+    if first.len() != 2 {
+        return Err(torsh_core::TorshError::InvalidShape(format!(
+            "expected 2-D [batch, features] step tensors, got {}-D",
+            first.len()
+        )));
+    }
+    let batch_size = first[0];
+    let features = first[1];
+
+    let mut stacked_data = Vec::with_capacity(steps.len() * batch_size * features);
+    for step in steps {
+        if step.shape().dims() != [batch_size, features] {
+            return Err(torsh_core::TorshError::ShapeMismatch {
+                expected: vec![batch_size, features],
+                got: step.shape().dims().to_vec(),
+            });
+        }
+        stacked_data.extend(step.to_vec()?);
+    }
+
+    Tensor::from_vec(stacked_data, &[steps.len(), batch_size, features])
+}
+
+/// Concatenate two `[batch, features]` tensors along the feature axis.
+fn concat_features(left: &Tensor, right: &Tensor) -> Result<Tensor> {
+    let left_binding = left.shape();
+    let left_shape = left_binding.dims();
+    let right_binding = right.shape();
+    let right_shape = right_binding.dims();
+
+    if left_shape.len() != 2 || right_shape.len() != 2 || left_shape[0] != right_shape[0] {
+        return Err(torsh_core::TorshError::ShapeMismatch {
+            expected: left_shape.to_vec(),
+            got: right_shape.to_vec(),
+        });
+    }
+
+    let batch_size = left_shape[0];
+    let left_features = left_shape[1];
+    let right_features = right_shape[1];
+    let left_data = left.to_vec()?;
+    let right_data = right.to_vec()?;
+
+    let mut combined = Vec::with_capacity(batch_size * (left_features + right_features));
+    for batch in 0..batch_size {
+        combined.extend_from_slice(&left_data[batch * left_features..(batch + 1) * left_features]);
+        combined
+            .extend_from_slice(&right_data[batch * right_features..(batch + 1) * right_features]);
+    }
+
+    Tensor::from_vec(combined, &[batch_size, left_features + right_features])
+}
+
+// ============================================================================
 // LSTM
 // ============================================================================
 
-/// LSTM layer
+/// Multi-layer LSTM.
+///
+/// # PyTorch compatibility
+///
+/// Parameters follow `torch.nn.LSTM` naming: `weight_ih_l{k}`, `weight_hh_l{k}`,
+/// `bias_ih_l{k}`, `bias_hh_l{k}`, with a `_reverse` suffix for the backward
+/// direction of a bidirectional layer. Layer `k > 0` consumes the previous
+/// layer's output, so its input size is `hidden_size * num_directions`.
+/// Gate order inside the packed weights is input, forget, cell, output.
 pub struct LSTM {
     pub(super) base: ModuleBase,
     pub(super) input_size: usize,
     pub(super) hidden_size: usize,
     pub(super) num_layers: usize,
-    #[allow(dead_code)]
     pub(super) bias: bool,
     pub(super) batch_first: bool,
-    #[allow(dead_code)]
     pub(super) dropout: f32,
-    #[allow(dead_code)]
     pub(super) bidirectional: bool,
 }
 
 impl LSTM {
     pub fn new(input_size: usize, hidden_size: usize, num_layers: usize) -> Result<Self> {
-        let mut base = ModuleBase::new();
-
-        // Initialize weights for each layer (4 gates: input, forget, cell, output)
-        for layer in 0..num_layers {
-            let input_dim = if layer == 0 { input_size } else { hidden_size };
-
-            let weight_ih = crate::init::xavier_uniform(&[4 * hidden_size, input_dim])?;
-            let weight_hh = crate::init::xavier_uniform(&[4 * hidden_size, hidden_size])?;
-            let bias_ih = zeros(&[4 * hidden_size])?;
-            let bias_hh = zeros(&[4 * hidden_size])?;
-
-            base.register_parameter(format!("weight_ih_l{}", layer), Parameter::new(weight_ih));
-            base.register_parameter(format!("weight_hh_l{}", layer), Parameter::new(weight_hh));
-            base.register_parameter(format!("bias_ih_l{}", layer), Parameter::new(bias_ih));
-            base.register_parameter(format!("bias_hh_l{}", layer), Parameter::new(bias_hh));
-        }
-
-        Ok(Self {
-            base,
-            input_size,
-            hidden_size,
-            num_layers,
-            bias: true,
-            batch_first: false,
-            dropout: 0.0,
-            bidirectional: false,
-        })
+        Self::with_config(input_size, hidden_size, num_layers, true, false, 0.0, false)
     }
 
     pub fn with_config(
@@ -64,15 +128,86 @@ impl LSTM {
         dropout: f32,
         bidirectional: bool,
     ) -> Result<Self> {
-        let mut lstm = Self::new(input_size, hidden_size, num_layers)?;
-        lstm.bias = bias;
-        lstm.batch_first = batch_first;
-        lstm.dropout = dropout;
-        lstm.bidirectional = bidirectional;
-        Ok(lstm)
+        if num_layers == 0 {
+            return Err(torsh_core::TorshError::InvalidArgument(
+                "LSTM requires at least one layer".to_string(),
+            ));
+        }
+
+        let mut base = ModuleBase::new();
+        let directions = if bidirectional { 2 } else { 1 };
+
+        // Initialize weights for each layer and direction (4 gates: input, forget, cell, output)
+        for layer in 0..num_layers {
+            let layer_input = if layer == 0 {
+                input_size
+            } else {
+                hidden_size * directions
+            };
+
+            for direction in 0..directions {
+                let suffix = direction_suffix(direction);
+                let weight_ih = crate::init::xavier_uniform(&[4 * hidden_size, layer_input])?;
+                let weight_hh = crate::init::xavier_uniform(&[4 * hidden_size, hidden_size])?;
+
+                base.register_parameter(
+                    format!("weight_ih_l{}{}", layer, suffix),
+                    Parameter::new(weight_ih),
+                );
+                base.register_parameter(
+                    format!("weight_hh_l{}{}", layer, suffix),
+                    Parameter::new(weight_hh),
+                );
+
+                if bias {
+                    base.register_parameter(
+                        format!("bias_ih_l{}{}", layer, suffix),
+                        Parameter::new(zeros(&[4 * hidden_size])?),
+                    );
+                    base.register_parameter(
+                        format!("bias_hh_l{}{}", layer, suffix),
+                        Parameter::new(zeros(&[4 * hidden_size])?),
+                    );
+                }
+            }
+        }
+
+        Ok(Self {
+            base,
+            input_size,
+            hidden_size,
+            num_layers,
+            bias,
+            batch_first,
+            dropout,
+            bidirectional,
+        })
     }
 
-    /// Single LSTM cell computation
+    /// Number of directions (2 when bidirectional).
+    fn directions(&self) -> usize {
+        if self.bidirectional {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Fallible parameter lookup: a renamed or missing key must not panic.
+    fn parameter(&self, name: &str) -> Result<Tensor> {
+        Ok(self
+            .base
+            .parameters
+            .get(name)
+            .ok_or_else(|| {
+                torsh_core::TorshError::InvalidArgument(format!("LSTM is missing parameter {name}"))
+            })?
+            .tensor()
+            .read()
+            .clone())
+    }
+
+    /// Single LSTM cell computation for the forward direction of `layer`.
     pub(super) fn lstm_cell(
         &self,
         input: &Tensor,
@@ -80,30 +215,29 @@ impl LSTM {
         cell: &Tensor,
         layer: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let weight_ih = self.base.parameters[&format!("weight_ih_l{}", layer)]
-            .tensor()
-            .read()
-            .clone();
-        let weight_hh = self.base.parameters[&format!("weight_hh_l{}", layer)]
-            .tensor()
-            .read()
-            .clone();
-        let bias_ih = self.base.parameters[&format!("bias_ih_l{}", layer)]
-            .tensor()
-            .read()
-            .clone();
-        let bias_hh = self.base.parameters[&format!("bias_hh_l{}", layer)]
-            .tensor()
-            .read()
-            .clone();
+        self.lstm_cell_directional(input, hidden, cell, layer, 0)
+    }
+
+    /// Single LSTM cell computation for one layer and direction.
+    fn lstm_cell_directional(
+        &self,
+        input: &Tensor,
+        hidden: &Tensor,
+        cell: &Tensor,
+        layer: usize,
+        direction: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let suffix = direction_suffix(direction);
+        let weight_ih = self.parameter(&format!("weight_ih_l{}{}", layer, suffix))?;
+        let weight_hh = self.parameter(&format!("weight_hh_l{}{}", layer, suffix))?;
 
         // Compute input and hidden transformations
-        let gi = input
-            .matmul(&weight_ih.transpose(0, 1)?)?
-            .add_op(&bias_ih)?;
-        let gh = hidden
-            .matmul(&weight_hh.transpose(0, 1)?)?
-            .add_op(&bias_hh)?;
+        let mut gi = input.matmul(&weight_ih.transpose(0, 1)?)?;
+        let mut gh = hidden.matmul(&weight_hh.transpose(0, 1)?)?;
+        if self.bias {
+            gi = gi.add_op(&self.parameter(&format!("bias_ih_l{}{}", layer, suffix))?)?;
+            gh = gh.add_op(&self.parameter(&format!("bias_hh_l{}{}", layer, suffix))?)?;
+        }
         let gates = gi.add_op(&gh)?;
 
         // Split into 4 gates
@@ -128,186 +262,173 @@ impl LSTM {
 
     /// Stack outputs from time steps
     pub(super) fn stack_outputs(&self, outputs: &[Tensor]) -> Result<Tensor> {
-        if outputs.is_empty() {
-            return Err(torsh_core::TorshError::InvalidArgument(
-                "No outputs to stack".to_string(),
-            ));
-        }
-
-        let seq_len = outputs.len();
-        let batch_size = outputs[0].shape().dims()[0];
-        let hidden_size = outputs[0].shape().dims()[1];
-
-        let mut stacked_data = Vec::with_capacity(seq_len * batch_size * hidden_size);
-
-        for output in outputs {
-            let data = output.to_vec()?;
-            stacked_data.extend(data);
-        }
-
-        Ok(Tensor::from_vec(
-            stacked_data,
-            &[seq_len, batch_size, hidden_size],
-        )?)
-    }
-
-    /// Forward pass for unidirectional LSTM
-    fn forward_unidirectional(&self, input: &Tensor) -> Result<Tensor> {
-        let binding = input.shape();
-        let input_shape = binding.dims();
-        let (seq_len, batch_size) = if self.batch_first {
-            (input_shape[1], input_shape[0])
-        } else {
-            (input_shape[0], input_shape[1])
-        };
-
-        // Initialize hidden and cell states
-        let mut hidden = zeros(&[batch_size, self.hidden_size])?;
-        let mut cell = zeros(&[batch_size, self.hidden_size])?;
-        let mut outputs = Vec::new();
-
-        // Process each time step
-        for t in 0..seq_len {
-            // Get input at time step t
-            let x_t = if self.batch_first {
-                input.narrow(1, t as i64, 1)?.squeeze(1)?
-            } else {
-                input.narrow(0, t as i64, 1)?.squeeze(0)?
-            };
-
-            let (new_hidden, new_cell) = self.lstm_cell(&x_t, &hidden, &cell, 0)?;
-            hidden = new_hidden;
-            cell = new_cell;
-            outputs.push(hidden.clone());
-        }
-
-        // Stack outputs
-        let stacked_outputs = self.stack_outputs(&outputs)?;
-
-        if self.batch_first {
-            Ok(stacked_outputs.transpose(0, 1)?)
-        } else {
-            Ok(stacked_outputs)
-        }
-    }
-
-    /// Forward pass for bidirectional LSTM
-    fn forward_bidirectional(&self, input: &Tensor) -> Result<Tensor> {
-        let binding = input.shape();
-        let input_shape = binding.dims();
-        let (seq_len, batch_size) = if self.batch_first {
-            (input_shape[1], input_shape[0])
-        } else {
-            (input_shape[0], input_shape[1])
-        };
-
-        // Forward direction
-        let mut hidden_forward = zeros(&[batch_size, self.hidden_size])?;
-        let mut cell_forward = zeros(&[batch_size, self.hidden_size])?;
-        let mut forward_outputs = Vec::new();
-
-        for t in 0..seq_len {
-            let x_t = if self.batch_first {
-                input.narrow(1, t as i64, 1)?.squeeze(1)?
-            } else {
-                input.narrow(0, t as i64, 1)?.squeeze(0)?
-            };
-
-            let (new_hidden, new_cell) = self.lstm_cell(&x_t, &hidden_forward, &cell_forward, 0)?;
-            hidden_forward = new_hidden;
-            cell_forward = new_cell;
-            forward_outputs.push(hidden_forward.clone());
-        }
-
-        // Backward direction
-        let mut hidden_backward = zeros(&[batch_size, self.hidden_size])?;
-        let mut cell_backward = zeros(&[batch_size, self.hidden_size])?;
-        let mut backward_outputs = Vec::new();
-
-        for t in (0..seq_len).rev() {
-            let x_t = if self.batch_first {
-                input.narrow(1, t as i64, 1)?.squeeze(1)?
-            } else {
-                input.narrow(0, t as i64, 1)?.squeeze(0)?
-            };
-
-            let (new_hidden, new_cell) =
-                self.lstm_cell(&x_t, &hidden_backward, &cell_backward, 0)?;
-            hidden_backward = new_hidden;
-            cell_backward = new_cell;
-            backward_outputs.push(hidden_backward.clone());
-        }
-
-        // Reverse backward outputs to match forward order
-        backward_outputs.reverse();
-
-        // Concatenate forward and backward outputs
-        let mut combined_outputs = Vec::new();
-        for (forward, backward) in forward_outputs.iter().zip(backward_outputs.iter()) {
-            let forward_data = forward.to_vec()?;
-            let backward_data = backward.to_vec()?;
-            let forward_shape_binding = forward.shape();
-            let forward_shape = forward_shape_binding.dims();
-            let batch_size = forward_shape[0];
-            let hidden_size = forward_shape[1];
-
-            let mut combined_data = Vec::with_capacity(batch_size * 2 * hidden_size);
-            for b in 0..batch_size {
-                // Add forward hidden state
-                for h in 0..hidden_size {
-                    combined_data.push(forward_data[b * hidden_size + h]);
-                }
-                // Add backward hidden state
-                for h in 0..hidden_size {
-                    combined_data.push(backward_data[b * hidden_size + h]);
-                }
-            }
-            let combined = Tensor::from_vec(combined_data, &[batch_size, 2 * hidden_size])?;
-            combined_outputs.push(combined);
-        }
-
-        let stacked_outputs = self.stack_combined_outputs(&combined_outputs)?;
-
-        if self.batch_first {
-            Ok(stacked_outputs.transpose(0, 1)?)
-        } else {
-            Ok(stacked_outputs)
-        }
+        stack_time_major(outputs)
     }
 
     /// Stack outputs for bidirectional case (hidden_size * 2)
     fn stack_combined_outputs(&self, outputs: &[Tensor]) -> Result<Tensor> {
-        if outputs.is_empty() {
-            return Err(torsh_core::TorshError::InvalidArgument(
-                "No outputs to stack".to_string(),
-            ));
+        stack_time_major(outputs)
+    }
+
+    /// Run every layer (and direction) over a time-major input sequence.
+    ///
+    /// Returns the last layer's output sequence together with the final hidden
+    /// and cell state of every (layer, direction) pair, in PyTorch order
+    /// (`layer 0 forward, layer 0 reverse, layer 1 forward, ...`).
+    fn run_layers(
+        &self,
+        input: &Tensor,
+        state: Option<(&Tensor, &Tensor)>,
+    ) -> Result<(Tensor, Vec<Tensor>, Vec<Tensor>)> {
+        let binding = input.shape();
+        let input_shape = binding.dims();
+        let seq_len = input_shape[0];
+        let batch_size = input_shape[1];
+        let directions = self.directions();
+
+        if input_shape[2] != self.input_size {
+            return Err(torsh_core::TorshError::InvalidShape(format!(
+                "LSTM expects an input of size {}, got {}",
+                self.input_size, input_shape[2]
+            )));
         }
 
-        let seq_len = outputs.len();
-        let batch_size = outputs[0].shape().dims()[0];
-        let combined_hidden_size = outputs[0].shape().dims()[1]; // Should be hidden_size * 2
+        let (h0, c0) = match state {
+            Some((h, c)) => {
+                let expected = [self.num_layers * directions, batch_size, self.hidden_size];
+                for (name, tensor) in [("h0", h), ("c0", c)] {
+                    if tensor.shape().dims() != expected {
+                        return Err(torsh_core::TorshError::InvalidShape(format!(
+                            "LSTM {name} must have shape {:?}, got {:?}",
+                            expected,
+                            tensor.shape().dims()
+                        )));
+                    }
+                }
+                (Some(h.clone()), Some(c.clone()))
+            }
+            None => (None, None),
+        };
 
-        let mut stacked_data = Vec::with_capacity(seq_len * batch_size * combined_hidden_size);
+        let mut layer_input = input.clone();
+        let mut final_hidden = Vec::with_capacity(self.num_layers * directions);
+        let mut final_cell = Vec::with_capacity(self.num_layers * directions);
 
-        for output in outputs {
-            let data = output.to_vec()?;
-            stacked_data.extend(data);
+        for layer in 0..self.num_layers {
+            let mut direction_outputs: Vec<Vec<Tensor>> = Vec::with_capacity(directions);
+
+            for direction in 0..directions {
+                let state_index = layer * directions + direction;
+                let mut hidden = match &h0 {
+                    Some(h) => h.narrow(0, state_index as i64, 1)?.squeeze(0)?,
+                    None => zeros(&[batch_size, self.hidden_size])?,
+                };
+                let mut cell = match &c0 {
+                    Some(c) => c.narrow(0, state_index as i64, 1)?.squeeze(0)?,
+                    None => zeros(&[batch_size, self.hidden_size])?,
+                };
+
+                let mut outputs = Vec::with_capacity(seq_len);
+                for step in 0..seq_len {
+                    let t = if direction == 0 {
+                        step
+                    } else {
+                        seq_len - 1 - step
+                    };
+                    let x_t = layer_input.narrow(0, t as i64, 1)?.squeeze(0)?;
+                    let (new_hidden, new_cell) = if direction == 0 {
+                        self.lstm_cell(&x_t, &hidden, &cell, layer)?
+                    } else {
+                        self.lstm_cell_directional(&x_t, &hidden, &cell, layer, direction)?
+                    };
+                    hidden = new_hidden;
+                    cell = new_cell;
+                    outputs.push(hidden.clone());
+                }
+
+                if direction == 1 {
+                    // The reverse pass produced outputs from the last step
+                    // backwards; restore time order before concatenating.
+                    outputs.reverse();
+                }
+
+                final_hidden.push(hidden);
+                final_cell.push(cell);
+                direction_outputs.push(outputs);
+            }
+
+            // Concatenate the directions along the feature axis, then stack time.
+            let mut steps = Vec::with_capacity(seq_len);
+            for t in 0..seq_len {
+                if directions == 1 {
+                    steps.push(direction_outputs[0][t].clone());
+                } else {
+                    steps.push(concat_features(
+                        &direction_outputs[0][t],
+                        &direction_outputs[1][t],
+                    )?);
+                }
+            }
+
+            let mut stacked = if directions == 1 {
+                self.stack_outputs(&steps)?
+            } else {
+                self.stack_combined_outputs(&steps)?
+            };
+            // Inter-layer dropout, exactly as PyTorch: applied to the output of
+            // every layer except the last, and only while training.
+            if layer + 1 < self.num_layers && self.dropout > 0.0 && self.base.training() {
+                stacked = crate::functional::dropout(&stacked, self.dropout, true)?;
+            }
+            layer_input = stacked;
         }
 
-        Ok(Tensor::from_vec(
-            stacked_data,
-            &[seq_len, batch_size, combined_hidden_size],
-        )?)
+        Ok((layer_input, final_hidden, final_cell))
+    }
+
+    /// Forward pass with explicit initial state.
+    ///
+    /// `state` is `(h_0, c_0)`, each shaped
+    /// `[num_layers * num_directions, batch, hidden_size]`; `None` starts from
+    /// zeros. Returns `(output, (h_n, c_n))` with the same layout conventions as
+    /// `torch.nn.LSTM`, honouring [`Self::batch_first`] for `output`.
+    pub fn forward_with_state(
+        &self,
+        input: &Tensor,
+        state: Option<(&Tensor, &Tensor)>,
+    ) -> Result<(Tensor, (Tensor, Tensor))> {
+        if input.shape().ndim() != 3 {
+            return Err(torsh_core::TorshError::InvalidShape(format!(
+                "LSTM expects a 3-D input, got {}-D",
+                input.shape().ndim()
+            )));
+        }
+
+        // Work time-major internally.
+        let time_major = if self.batch_first {
+            input.transpose(0, 1)?
+        } else {
+            input.clone()
+        };
+
+        let (output, hidden, cell) = self.run_layers(&time_major, state)?;
+        let h_n = stack_time_major(&hidden)?;
+        let c_n = stack_time_major(&cell)?;
+
+        let output = if self.batch_first {
+            output.transpose(0, 1)?
+        } else {
+            output
+        };
+
+        Ok((output, (h_n, c_n)))
     }
 }
 
 impl Module for LSTM {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        if self.bidirectional {
-            self.forward_bidirectional(input)
-        } else {
-            self.forward_unidirectional(input)
-        }
+        let (output, _) = self.forward_with_state(input, None)?;
+        Ok(output)
     }
 
     fn parameters(&self) -> HashMap<String, Parameter> {
@@ -353,50 +474,28 @@ impl std::fmt::Debug for LSTM {
 // GRU
 // ============================================================================
 
-/// GRU layer
+/// Multi-layer GRU.
+///
+/// # PyTorch compatibility
+///
+/// Parameters follow `torch.nn.GRU` naming: `weight_ih_l{k}`, `weight_hh_l{k}`,
+/// `bias_ih_l{k}`, `bias_hh_l{k}`, with a `_reverse` suffix for the backward
+/// direction of a bidirectional layer. Gate order inside the packed weights is
+/// reset, update, new.
 pub struct GRU {
     pub(super) base: ModuleBase,
     pub(super) input_size: usize,
     pub(super) hidden_size: usize,
     pub(super) num_layers: usize,
-    #[allow(dead_code)]
     pub(super) bias: bool,
     pub(super) batch_first: bool,
-    #[allow(dead_code)]
     pub(super) dropout: f32,
-    #[allow(dead_code)]
     pub(super) bidirectional: bool,
 }
 
 impl GRU {
     pub fn new(input_size: usize, hidden_size: usize, num_layers: usize) -> Result<Self> {
-        let mut base = ModuleBase::new();
-
-        // Initialize weights for each layer (3 gates: reset, update, new)
-        for layer in 0..num_layers {
-            let input_dim = if layer == 0 { input_size } else { hidden_size };
-
-            let weight_ih = crate::init::xavier_uniform(&[3 * hidden_size, input_dim])?;
-            let weight_hh = crate::init::xavier_uniform(&[3 * hidden_size, hidden_size])?;
-            let bias_ih = zeros(&[3 * hidden_size])?;
-            let bias_hh = zeros(&[3 * hidden_size])?;
-
-            base.register_parameter(format!("weight_ih_l{}", layer), Parameter::new(weight_ih));
-            base.register_parameter(format!("weight_hh_l{}", layer), Parameter::new(weight_hh));
-            base.register_parameter(format!("bias_ih_l{}", layer), Parameter::new(bias_ih));
-            base.register_parameter(format!("bias_hh_l{}", layer), Parameter::new(bias_hh));
-        }
-
-        Ok(Self {
-            base,
-            input_size,
-            hidden_size,
-            num_layers,
-            bias: true,
-            batch_first: false,
-            dropout: 0.0,
-            bidirectional: false,
-        })
+        Self::with_config(input_size, hidden_size, num_layers, true, false, 0.0, false)
     }
 
     pub fn with_config(
@@ -408,40 +507,109 @@ impl GRU {
         dropout: f32,
         bidirectional: bool,
     ) -> Result<Self> {
-        let mut gru = Self::new(input_size, hidden_size, num_layers)?;
-        gru.bias = bias;
-        gru.batch_first = batch_first;
-        gru.dropout = dropout;
-        gru.bidirectional = bidirectional;
-        Ok(gru)
+        if num_layers == 0 {
+            return Err(torsh_core::TorshError::InvalidArgument(
+                "GRU requires at least one layer".to_string(),
+            ));
+        }
+
+        let mut base = ModuleBase::new();
+        let directions = if bidirectional { 2 } else { 1 };
+
+        // Initialize weights for each layer and direction (3 gates: reset, update, new)
+        for layer in 0..num_layers {
+            let layer_input = if layer == 0 {
+                input_size
+            } else {
+                hidden_size * directions
+            };
+
+            for direction in 0..directions {
+                let suffix = direction_suffix(direction);
+                let weight_ih = crate::init::xavier_uniform(&[3 * hidden_size, layer_input])?;
+                let weight_hh = crate::init::xavier_uniform(&[3 * hidden_size, hidden_size])?;
+
+                base.register_parameter(
+                    format!("weight_ih_l{}{}", layer, suffix),
+                    Parameter::new(weight_ih),
+                );
+                base.register_parameter(
+                    format!("weight_hh_l{}{}", layer, suffix),
+                    Parameter::new(weight_hh),
+                );
+
+                if bias {
+                    base.register_parameter(
+                        format!("bias_ih_l{}{}", layer, suffix),
+                        Parameter::new(zeros(&[3 * hidden_size])?),
+                    );
+                    base.register_parameter(
+                        format!("bias_hh_l{}{}", layer, suffix),
+                        Parameter::new(zeros(&[3 * hidden_size])?),
+                    );
+                }
+            }
+        }
+
+        Ok(Self {
+            base,
+            input_size,
+            hidden_size,
+            num_layers,
+            bias,
+            batch_first,
+            dropout,
+            bidirectional,
+        })
     }
 
-    /// Single GRU cell computation
+    /// Number of directions (2 when bidirectional).
+    fn directions(&self) -> usize {
+        if self.bidirectional {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Fallible parameter lookup: a renamed or missing key must not panic.
+    fn parameter(&self, name: &str) -> Result<Tensor> {
+        Ok(self
+            .base
+            .parameters
+            .get(name)
+            .ok_or_else(|| {
+                torsh_core::TorshError::InvalidArgument(format!("GRU is missing parameter {name}"))
+            })?
+            .tensor()
+            .read()
+            .clone())
+    }
+
+    /// Single GRU cell computation for the forward direction of `layer`.
     pub(super) fn gru_cell(&self, input: &Tensor, hidden: &Tensor, layer: usize) -> Result<Tensor> {
-        let weight_ih = self.base.parameters[&format!("weight_ih_l{}", layer)]
-            .tensor()
-            .read()
-            .clone();
-        let weight_hh = self.base.parameters[&format!("weight_hh_l{}", layer)]
-            .tensor()
-            .read()
-            .clone();
-        let bias_ih = self.base.parameters[&format!("bias_ih_l{}", layer)]
-            .tensor()
-            .read()
-            .clone();
-        let bias_hh = self.base.parameters[&format!("bias_hh_l{}", layer)]
-            .tensor()
-            .read()
-            .clone();
+        self.gru_cell_directional(input, hidden, layer, 0)
+    }
+
+    /// Single GRU cell computation for one layer and direction.
+    fn gru_cell_directional(
+        &self,
+        input: &Tensor,
+        hidden: &Tensor,
+        layer: usize,
+        direction: usize,
+    ) -> Result<Tensor> {
+        let suffix = direction_suffix(direction);
+        let weight_ih = self.parameter(&format!("weight_ih_l{}{}", layer, suffix))?;
+        let weight_hh = self.parameter(&format!("weight_hh_l{}{}", layer, suffix))?;
 
         // Compute input and hidden transformations
-        let gi = input
-            .matmul(&weight_ih.transpose(0, 1)?)?
-            .add_op(&bias_ih)?;
-        let gh = hidden
-            .matmul(&weight_hh.transpose(0, 1)?)?
-            .add_op(&bias_hh)?;
+        let mut gi = input.matmul(&weight_ih.transpose(0, 1)?)?;
+        let mut gh = hidden.matmul(&weight_hh.transpose(0, 1)?)?;
+        if self.bias {
+            gi = gi.add_op(&self.parameter(&format!("bias_ih_l{}{}", layer, suffix))?)?;
+            gh = gh.add_op(&self.parameter(&format!("bias_hh_l{}{}", layer, suffix))?)?;
+        }
 
         // Split into 3 gates
         let chunk_size = self.hidden_size;
@@ -472,178 +640,147 @@ impl GRU {
 
     /// Stack outputs from time steps
     pub(super) fn stack_outputs(&self, outputs: &[Tensor]) -> Result<Tensor> {
-        if outputs.is_empty() {
-            return Err(torsh_core::TorshError::InvalidArgument(
-                "No outputs to stack".to_string(),
-            ));
-        }
-
-        let seq_len = outputs.len();
-        let batch_size = outputs[0].shape().dims()[0];
-        let hidden_size = outputs[0].shape().dims()[1];
-
-        let mut stacked_data = Vec::with_capacity(seq_len * batch_size * hidden_size);
-
-        for output in outputs {
-            let data = output.to_vec()?;
-            stacked_data.extend(data);
-        }
-
-        Ok(Tensor::from_vec(
-            stacked_data,
-            &[seq_len, batch_size, hidden_size],
-        )?)
-    }
-
-    /// Forward pass for unidirectional GRU
-    fn forward_unidirectional(&self, input: &Tensor) -> Result<Tensor> {
-        let binding = input.shape();
-        let input_shape = binding.dims();
-        let (seq_len, batch_size) = if self.batch_first {
-            (input_shape[1], input_shape[0])
-        } else {
-            (input_shape[0], input_shape[1])
-        };
-
-        // Initialize hidden state
-        let mut hidden = zeros(&[batch_size, self.hidden_size])?;
-        let mut outputs = Vec::new();
-
-        // Process each time step
-        for t in 0..seq_len {
-            // Get input at time step t
-            let x_t = if self.batch_first {
-                input.narrow(1, t as i64, 1)?.squeeze(1)?
-            } else {
-                input.narrow(0, t as i64, 1)?.squeeze(0)?
-            };
-
-            hidden = self.gru_cell(&x_t, &hidden, 0)?;
-            outputs.push(hidden.clone());
-        }
-
-        // Stack outputs
-        let stacked_outputs = self.stack_outputs(&outputs)?;
-
-        if self.batch_first {
-            Ok(stacked_outputs.transpose(0, 1)?)
-        } else {
-            Ok(stacked_outputs)
-        }
-    }
-
-    /// Forward pass for bidirectional GRU
-    fn forward_bidirectional(&self, input: &Tensor) -> Result<Tensor> {
-        let binding = input.shape();
-        let input_shape = binding.dims();
-        let (seq_len, batch_size) = if self.batch_first {
-            (input_shape[1], input_shape[0])
-        } else {
-            (input_shape[0], input_shape[1])
-        };
-
-        // Forward direction
-        let mut hidden_forward = zeros(&[batch_size, self.hidden_size])?;
-        let mut forward_outputs = Vec::new();
-
-        for t in 0..seq_len {
-            let x_t = if self.batch_first {
-                input.narrow(1, t as i64, 1)?.squeeze(1)?
-            } else {
-                input.narrow(0, t as i64, 1)?.squeeze(0)?
-            };
-
-            hidden_forward = self.gru_cell(&x_t, &hidden_forward, 0)?;
-            forward_outputs.push(hidden_forward.clone());
-        }
-
-        // Backward direction
-        let mut hidden_backward = zeros(&[batch_size, self.hidden_size])?;
-        let mut backward_outputs = Vec::new();
-
-        for t in (0..seq_len).rev() {
-            let x_t = if self.batch_first {
-                input.narrow(1, t as i64, 1)?.squeeze(1)?
-            } else {
-                input.narrow(0, t as i64, 1)?.squeeze(0)?
-            };
-
-            // Use layer 1 for backward weights (assuming they exist)
-            hidden_backward = self.gru_cell(&x_t, &hidden_backward, 0)?; // For now use same weights
-            backward_outputs.push(hidden_backward.clone());
-        }
-
-        // Reverse backward outputs to match forward order
-        backward_outputs.reverse();
-
-        // Concatenate forward and backward outputs
-        let mut combined_outputs = Vec::new();
-        for (forward, backward) in forward_outputs.iter().zip(backward_outputs.iter()) {
-            // Manual concatenation along hidden dimension
-            let forward_data = forward.to_vec()?;
-            let backward_data = backward.to_vec()?;
-            let forward_shape_binding = forward.shape();
-            let forward_shape = forward_shape_binding.dims();
-            let batch_size = forward_shape[0];
-            let hidden_size = forward_shape[1];
-
-            let mut combined_data = Vec::with_capacity(batch_size * 2 * hidden_size);
-            for b in 0..batch_size {
-                // Add forward hidden state
-                for h in 0..hidden_size {
-                    combined_data.push(forward_data[b * hidden_size + h]);
-                }
-                // Add backward hidden state
-                for h in 0..hidden_size {
-                    combined_data.push(backward_data[b * hidden_size + h]);
-                }
-            }
-            let combined = Tensor::from_vec(combined_data, &[batch_size, 2 * hidden_size])?;
-            combined_outputs.push(combined);
-        }
-
-        let stacked_outputs = self.stack_combined_outputs(&combined_outputs)?;
-
-        if self.batch_first {
-            Ok(stacked_outputs.transpose(0, 1)?)
-        } else {
-            Ok(stacked_outputs)
-        }
+        stack_time_major(outputs)
     }
 
     /// Stack outputs for bidirectional case (hidden_size * 2)
     pub(super) fn stack_combined_outputs(&self, outputs: &[Tensor]) -> Result<Tensor> {
-        if outputs.is_empty() {
-            return Err(torsh_core::TorshError::InvalidArgument(
-                "No outputs to stack".to_string(),
-            ));
+        stack_time_major(outputs)
+    }
+
+    /// Run every layer (and direction) over a time-major input sequence.
+    fn run_layers(&self, input: &Tensor, state: Option<&Tensor>) -> Result<(Tensor, Vec<Tensor>)> {
+        let binding = input.shape();
+        let input_shape = binding.dims();
+        let seq_len = input_shape[0];
+        let batch_size = input_shape[1];
+        let directions = self.directions();
+
+        if input_shape[2] != self.input_size {
+            return Err(torsh_core::TorshError::InvalidShape(format!(
+                "GRU expects an input of size {}, got {}",
+                self.input_size, input_shape[2]
+            )));
         }
 
-        let seq_len = outputs.len();
-        let batch_size = outputs[0].shape().dims()[0];
-        let combined_hidden_size = outputs[0].shape().dims()[1]; // Should be hidden_size * 2
+        let h0 = match state {
+            Some(h) => {
+                let expected = [self.num_layers * directions, batch_size, self.hidden_size];
+                if h.shape().dims() != expected {
+                    return Err(torsh_core::TorshError::InvalidShape(format!(
+                        "GRU h0 must have shape {:?}, got {:?}",
+                        expected,
+                        h.shape().dims()
+                    )));
+                }
+                Some(h.clone())
+            }
+            None => None,
+        };
 
-        let mut stacked_data = Vec::with_capacity(seq_len * batch_size * combined_hidden_size);
+        let mut layer_input = input.clone();
+        let mut final_hidden = Vec::with_capacity(self.num_layers * directions);
 
-        for output in outputs {
-            let data = output.to_vec()?;
-            stacked_data.extend(data);
+        for layer in 0..self.num_layers {
+            let mut direction_outputs: Vec<Vec<Tensor>> = Vec::with_capacity(directions);
+
+            for direction in 0..directions {
+                let state_index = layer * directions + direction;
+                let mut hidden = match &h0 {
+                    Some(h) => h.narrow(0, state_index as i64, 1)?.squeeze(0)?,
+                    None => zeros(&[batch_size, self.hidden_size])?,
+                };
+
+                let mut outputs = Vec::with_capacity(seq_len);
+                for step in 0..seq_len {
+                    let t = if direction == 0 {
+                        step
+                    } else {
+                        seq_len - 1 - step
+                    };
+                    let x_t = layer_input.narrow(0, t as i64, 1)?.squeeze(0)?;
+                    hidden = if direction == 0 {
+                        self.gru_cell(&x_t, &hidden, layer)?
+                    } else {
+                        self.gru_cell_directional(&x_t, &hidden, layer, direction)?
+                    };
+                    outputs.push(hidden.clone());
+                }
+
+                if direction == 1 {
+                    outputs.reverse();
+                }
+
+                final_hidden.push(hidden);
+                direction_outputs.push(outputs);
+            }
+
+            let mut steps = Vec::with_capacity(seq_len);
+            for t in 0..seq_len {
+                if directions == 1 {
+                    steps.push(direction_outputs[0][t].clone());
+                } else {
+                    steps.push(concat_features(
+                        &direction_outputs[0][t],
+                        &direction_outputs[1][t],
+                    )?);
+                }
+            }
+
+            let mut stacked = if directions == 1 {
+                self.stack_outputs(&steps)?
+            } else {
+                self.stack_combined_outputs(&steps)?
+            };
+            if layer + 1 < self.num_layers && self.dropout > 0.0 && self.base.training() {
+                stacked = crate::functional::dropout(&stacked, self.dropout, true)?;
+            }
+            layer_input = stacked;
         }
 
-        Ok(Tensor::from_vec(
-            stacked_data,
-            &[seq_len, batch_size, combined_hidden_size],
-        )?)
+        Ok((layer_input, final_hidden))
+    }
+
+    /// Forward pass with an explicit initial hidden state.
+    ///
+    /// `state` is `h_0` shaped `[num_layers * num_directions, batch, hidden_size]`
+    /// (`None` starts from zeros). Returns `(output, h_n)` following
+    /// `torch.nn.GRU`, honouring [`Self::batch_first`] for `output`.
+    pub fn forward_with_state(
+        &self,
+        input: &Tensor,
+        state: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        if input.shape().ndim() != 3 {
+            return Err(torsh_core::TorshError::InvalidShape(format!(
+                "GRU expects a 3-D input, got {}-D",
+                input.shape().ndim()
+            )));
+        }
+
+        let time_major = if self.batch_first {
+            input.transpose(0, 1)?
+        } else {
+            input.clone()
+        };
+
+        let (output, hidden) = self.run_layers(&time_major, state)?;
+        let h_n = stack_time_major(&hidden)?;
+
+        let output = if self.batch_first {
+            output.transpose(0, 1)?
+        } else {
+            output
+        };
+
+        Ok((output, h_n))
     }
 }
 
 impl Module for GRU {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        if self.bidirectional {
-            self.forward_bidirectional(input)
-        } else {
-            self.forward_unidirectional(input)
-        }
+        let (output, _) = self.forward_with_state(input, None)?;
+        Ok(output)
     }
 
     fn parameters(&self) -> HashMap<String, Parameter> {

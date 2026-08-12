@@ -489,7 +489,7 @@ pub fn create_default_data() -> DashboardData {
             load_average: 0.0,
             available_memory_mb: 0.0,
             disk_usage_percent: 0.0,
-            network_io_mbps: 0.0,
+            network_io_mbps: None,
         },
         alerts: Vec::new(),
         top_operations: Vec::new(),

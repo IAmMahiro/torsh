@@ -146,7 +146,11 @@ pub struct SystemMetrics {
     pub load_average: f64,
     pub available_memory_mb: f64,
     pub disk_usage_percent: f64,
-    pub network_io_mbps: f64,
+    /// Network I/O throughput in MB/s, when it can be measured from the
+    /// OS. `None` if unmeasured (this crate has no portable network I/O
+    /// counter reader), rather than a fabricated `0.0` that would read as
+    /// "measured and idle".
+    pub network_io_mbps: Option<f64>,
 }
 
 /// Operation summary for dashboard

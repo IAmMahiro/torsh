@@ -284,6 +284,31 @@ pub enum Operation<T: TensorElement> {
         lhs: Arc<Tensor<T>>,
         rhs: Arc<Tensor<T>>,
     },
+    /// Division operation: a / b
+    Div {
+        /// Numerator
+        lhs: Arc<Tensor<T>>,
+        /// Denominator
+        rhs: Arc<Tensor<T>>,
+    },
+    /// Multiplication by a constant: `input * scalar`.
+    ///
+    /// Recorded separately from [`Operation::Mul`] so a scalar multiply does not
+    /// have to materialise a whole tensor of copies of the constant; the
+    /// backward rule is simply `grad * scalar`.
+    MulScalar {
+        /// The tensor that was scaled
+        input: Arc<Tensor<T>>,
+        /// The constant factor
+        scalar: T,
+    },
+    /// Division by a constant: `input / scalar`. Backward is `grad / scalar`.
+    DivScalar {
+        /// The tensor that was divided
+        input: Arc<Tensor<T>>,
+        /// The constant divisor
+        scalar: T,
+    },
     /// Mean reduction operation: mean(input)
     Mean {
         /// The input tensor before reduction
@@ -305,4 +330,144 @@ pub enum Operation<T: TensorElement> {
     },
     /// Custom operation with name and inputs
     Custom(String, Vec<Weak<Tensor<T>>>),
+    /// Shape-only view of `input` (reshape, axis permutation or broadcast).
+    ///
+    /// The forward pass moves no data (or, for a non-contiguous source, copies
+    /// it unchanged), so the backward pass only has to map the gradient back
+    /// onto the input's layout — see `kind`.
+    View {
+        /// The tensor the view was taken of
+        input: Arc<Tensor<T>>,
+        /// How the view re-indexes its input
+        kind: ViewKind,
+    },
+    /// im2col (unfold) of an `[N, C, H, W]` tensor into per-group patch
+    /// matrices, the gather that turns a convolution into a matrix product.
+    ///
+    /// The forward pass copies each sliding window into one row; the backward
+    /// pass is col2im, which scatter-adds every patch element back onto the
+    /// input position it was read from (overlapping windows accumulate).
+    Im2Col {
+        /// The tensor that was unfolded
+        input: Arc<Tensor<T>>,
+        /// Geometry needed to invert the gather
+        config: Im2ColConfig,
+    },
+    /// Concatenation of several tensors along `dim` ([`Tensor::cat`]).
+    ///
+    /// The backward pass narrows the upstream gradient back to each input's
+    /// extent along `dim` (each input's grad is a contiguous slab of the seed).
+    Concat {
+        /// The tensors that were concatenated, in order
+        inputs: Vec<Arc<Tensor<T>>>,
+        /// Axis the inputs were joined along
+        dim: usize,
+    },
+    /// Stacking of several equally-shaped tensors along a *new* axis `dim`
+    /// ([`Tensor::stack`]).
+    ///
+    /// The backward pass selects each input's slice of the upstream gradient at
+    /// its index along `dim`, dropping the inserted axis.
+    Stack {
+        /// The tensors that were stacked, in order
+        inputs: Vec<Arc<Tensor<T>>>,
+        /// The newly-inserted axis
+        dim: usize,
+    },
+    /// A gather (basic/advanced indexing, `narrow`, `select`, `slice_tensor`).
+    ///
+    /// `index_map[o]` is the *logical* flat index of `input` that supplied
+    /// output element `o`. The backward pass scatter-adds each output gradient
+    /// back onto that input position (duplicated reads accumulate), which is the
+    /// zeros-everywhere-except-the-slice rule for contiguous slices.
+    Gather {
+        /// The tensor that was indexed
+        input: Arc<Tensor<T>>,
+        /// Output-position → input logical flat index
+        index_map: Arc<Vec<usize>>,
+    },
+    /// `log_softmax(input, dim)` ([`Tensor::log_softmax`]).
+    ///
+    /// The backward rule is the exact, numerically stable Jacobian-vector
+    /// product `g - softmax(input) * sum(g, dim, keepdim)`; it needs no gradient
+    /// through the max shift.
+    LogSoftmax {
+        /// The tensor the log-softmax was taken of
+        input: Arc<Tensor<T>>,
+        /// Axis the normalisation ran over
+        dim: usize,
+    },
+    /// A differentiable element-wise unary function (`exp`, `ln`, `sqrt`, `sin`,
+    /// `cos`, `tanh`, `sigmoid`, `relu`).
+    ///
+    /// The forward value may have been produced by any dispatch path (SIMD,
+    /// parallel, GPU or scalar); the derivative is recomputed from `input` in
+    /// the backward pass, so every path shares one correct rule.
+    Unary {
+        /// The operand
+        input: Arc<Tensor<T>>,
+        /// Which function was applied
+        kind: UnaryKind,
+    },
+}
+
+/// The differentiable element-wise unary functions recorded by
+/// [`Operation::Unary`]. Each fully determines its own derivative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryKind {
+    /// `exp(x)`; derivative `exp(x)`.
+    Exp,
+    /// `ln(x)`; derivative `1/x`.
+    Ln,
+    /// `sqrt(x)`; derivative `1/(2*sqrt(x))`.
+    Sqrt,
+    /// `sin(x)`; derivative `cos(x)`.
+    Sin,
+    /// `cos(x)`; derivative `-sin(x)`.
+    Cos,
+    /// `tanh(x)`; derivative `1 - tanh(x)^2`.
+    Tanh,
+    /// `sigmoid(x)`; derivative `s*(1-s)` with `s = sigmoid(x)`.
+    Sigmoid,
+    /// `relu(x)`; sub-gradient `1` for `x > 0`, else `0`.
+    Relu,
+}
+
+/// Geometry of an [`Operation::Im2Col`] gather.
+///
+/// Everything the backward pass needs to map a patch element back onto the
+/// input element it was copied from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Im2ColConfig {
+    /// Input shape `[batch, channels, height, width]`
+    pub input_shape: [usize; 4],
+    /// Kernel extent `(kh, kw)`
+    pub kernel: (usize, usize),
+    /// Stride `(sh, sw)`
+    pub stride: (usize, usize),
+    /// Zero padding `(ph, pw)` applied to the input before gathering
+    pub padding: (usize, usize),
+    /// Dilation `(dh, dw)` of the kernel taps
+    pub dilation: (usize, usize),
+    /// Number of channel groups the patches are split into
+    pub groups: usize,
+    /// Output spatial extent `(out_h, out_w)`
+    pub output: (usize, usize),
+}
+
+/// How a [`Operation::View`] node re-indexes the tensor it was taken of.
+///
+/// Each variant fully determines the backward rule, which is why the view
+/// constructors can share a single `Operation` variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewKind {
+    /// Row-major reshape: the element order is unchanged, so the gradient is
+    /// simply reshaped back to the input's shape.
+    Reshape,
+    /// Axis permutation, where `perm[i]` is the input axis that became output
+    /// axis `i`. The gradient is permuted by the inverse of `perm`.
+    Permute(Vec<usize>),
+    /// Broadcast expansion. The gradient is summed over the axes that were
+    /// prepended or stretched from extent 1.
+    Expand,
 }

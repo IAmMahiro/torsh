@@ -16,6 +16,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
+use torsh_core::sync::RwLockExt;
 
 use torsh_core::{
     dtype::TensorElement,
@@ -121,7 +122,7 @@ impl CustomTypeRegistry {
 
     /// Register a custom data type
     pub fn register_type(&self, metadata: CustomTypeMetadata) -> Result<()> {
-        let mut types = self.types.write().expect("lock should not be poisoned");
+        let mut types = self.types.write_or_recover();
 
         if types.contains_key(&metadata.type_id) {
             return Err(TorshError::InvalidArgument(format!(
@@ -150,19 +151,19 @@ impl CustomTypeRegistry {
 
     /// Get metadata for a registered type
     pub fn get_metadata<T: 'static>(&self) -> Option<CustomTypeMetadata> {
-        let types = self.types.read().expect("lock should not be poisoned");
+        let types = self.types.read_or_recover();
         types.get(&TypeId::of::<T>()).cloned()
     }
 
     /// Check if a type is registered
     pub fn is_registered<T: 'static>(&self) -> bool {
-        let types = self.types.read().expect("lock should not be poisoned");
+        let types = self.types.read_or_recover();
         types.contains_key(&TypeId::of::<T>())
     }
 
     /// Get all registered type names
     pub fn registered_types(&self) -> Vec<String> {
-        let types = self.types.read().expect("lock should not be poisoned");
+        let types = self.types.read_or_recover();
         types.values().map(|meta| meta.name.clone()).collect()
     }
 
@@ -175,7 +176,7 @@ impl CustomTypeRegistry {
 
         // Ensure type is registered
         {
-            let types = self.types.read().expect("lock should not be poisoned");
+            let types = self.types.read_or_recover();
             if !types.contains_key(&type_id) {
                 return Err(TorshError::InvalidArgument(
                     "Type must be registered before adding operations".to_string(),
@@ -183,10 +184,7 @@ impl CustomTypeRegistry {
             }
         }
 
-        let mut ops = self
-            .operations
-            .write()
-            .expect("lock should not be poisoned");
+        let mut ops = self.operations.write_or_recover();
         let type_ops = ops.entry(type_id).or_insert_with(HashMap::new);
 
         if type_ops.contains_key(operation.name()) {
@@ -202,7 +200,7 @@ impl CustomTypeRegistry {
 
     /// Get a registered operation for a type
     pub fn get_operation<T: 'static>(&self, op_name: &str) -> Option<Arc<dyn CustomOperation>> {
-        let ops = self.operations.read().expect("lock should not be poisoned");
+        let ops = self.operations.read_or_recover();
         let type_id = TypeId::of::<T>();
 
         ops.get(&type_id)
@@ -212,7 +210,7 @@ impl CustomTypeRegistry {
 
     /// List all operations registered for a type
     pub fn list_operations<T: 'static>(&self) -> Vec<String> {
-        let ops = self.operations.read().expect("lock should not be poisoned");
+        let ops = self.operations.read_or_recover();
         let type_id = TypeId::of::<T>();
 
         ops.get(&type_id)
@@ -228,10 +226,7 @@ impl CustomTypeRegistry {
         let from_id = TypeId::of::<From>();
         let to_id = TypeId::of::<To>();
 
-        let mut conversions = self
-            .conversions
-            .write()
-            .expect("lock should not be poisoned");
+        let mut conversions = self.conversions.write_or_recover();
 
         if conversions.contains_key(&(from_id, to_id)) {
             return Err(TorshError::InvalidArgument(
@@ -245,37 +240,22 @@ impl CustomTypeRegistry {
 
     /// Check if a conversion exists
     pub fn has_conversion<From: 'static, To: 'static>(&self) -> bool {
-        let conversions = self
-            .conversions
-            .read()
-            .expect("lock should not be poisoned");
+        let conversions = self.conversions.read_or_recover();
         conversions.contains_key(&(TypeId::of::<From>(), TypeId::of::<To>()))
     }
 
     /// Clear all registrations
     pub fn clear(&self) {
-        self.types
-            .write()
-            .expect("lock should not be poisoned")
-            .clear();
-        self.operations
-            .write()
-            .expect("lock should not be poisoned")
-            .clear();
-        self.conversions
-            .write()
-            .expect("lock should not be poisoned")
-            .clear();
+        self.types.write_or_recover().clear();
+        self.operations.write_or_recover().clear();
+        self.conversions.write_or_recover().clear();
     }
 
     /// Get statistics about the registry
     pub fn stats(&self) -> RegistryStats {
-        let types = self.types.read().expect("lock should not be poisoned");
-        let operations = self.operations.read().expect("lock should not be poisoned");
-        let conversions = self
-            .conversions
-            .read()
-            .expect("lock should not be poisoned");
+        let types = self.types.read_or_recover();
+        let operations = self.operations.read_or_recover();
+        let conversions = self.conversions.read_or_recover();
 
         let total_operations: usize = operations.values().map(|ops| ops.len()).sum();
 

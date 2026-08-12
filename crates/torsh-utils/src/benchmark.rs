@@ -329,13 +329,47 @@ pub fn benchmark_model<M: Module>(model: &M, config: BenchmarkConfig) -> Result<
         None
     };
 
-    // Perform validation if mobile benchmarking was done
+    // Perform validation if mobile benchmarking was done. The three
+    // additional mobile sub-tests run here (rather than inside
+    // `benchmark_mobile_model`) so their real measured results can be
+    // written directly onto the `ValidationResults` fields that report
+    // them.
     let validation_results = if let Some(mobile_config) = &config.mobile_config {
-        Some(validate_mobile_performance(
-            &results_by_batch,
-            mobile_config,
-            mobile_results.as_ref(),
-        )?)
+        let mut validation =
+            validate_mobile_performance(&results_by_batch, mobile_config, mobile_results.as_ref())?;
+
+        // Same convention as `benchmark_batch_size`: prepend a batch size
+        // of 1 to the caller's configured (batch-less) input shape.
+        let mut mobile_input_shape = vec![1usize];
+        mobile_input_shape.extend_from_slice(&config.input_shapes[0]);
+
+        if mobile_config.test_memory_pressure {
+            validation.memory_pressure_impact =
+                run_memory_pressure_test(model, &mobile_input_shape, mobile_config)?;
+        }
+
+        if mobile_config.test_frequency_scaling {
+            // Frequency-scaling control cannot be portably measured in
+            // pure Rust (see `run_frequency_scaling_test`); report it as
+            // skipped rather than failing the entire benchmark run over
+            // one orthogonal, best-effort sub-test.
+            if let Err(e) = run_frequency_scaling_test(model, mobile_config) {
+                validation
+                    .recommendations
+                    .push(format!("Frequency scaling test skipped: {e}"));
+            }
+        }
+
+        if let Some(duration) = mobile_config.stress_test_duration_minutes {
+            validation.sustained_performance_degradation = run_sustained_performance_test(
+                model,
+                &mobile_input_shape,
+                mobile_config,
+                duration,
+            )?;
+        }
+
+        Some(validation)
     } else {
         None
     };
@@ -374,18 +408,11 @@ pub fn benchmark_mobile_model<M: Module>(
         &mobile_config.platform_info,
     );
 
-    // Additional mobile-specific tests
-    if mobile_config.test_memory_pressure {
-        run_memory_pressure_test(model, mobile_config)?;
-    }
-
-    if mobile_config.test_frequency_scaling {
-        run_frequency_scaling_test(model, mobile_config)?;
-    }
-
-    if let Some(duration) = mobile_config.stress_test_duration_minutes {
-        run_sustained_performance_test(model, mobile_config, duration)?;
-    }
+    // Memory-pressure, frequency-scaling, and sustained-performance testing
+    // run in `benchmark_model` instead of here: that caller also builds
+    // `ValidationResults`, so their real measured outputs can be written
+    // directly onto `memory_pressure_impact` / `sustained_performance_degradation`
+    // there rather than being computed here and then discarded.
 
     Ok(mobile_results)
 }
@@ -474,12 +501,34 @@ pub fn validate_mobile_performance(
     })
 }
 
-/// Convert module to optimized model representation
-fn convert_to_optimized_model<M: Module>(_model: &M) -> Result<OptimizedModel> {
+/// Convert module to optimized model representation for benchmarking.
+///
+/// This is an identity conversion: the returned [`ModelGraph`] is empty and
+/// `weights` is empty because this crate has no generic way to extract a
+/// layer graph from an arbitrary [`Module`] (the trait exposes no such
+/// method). What genuinely *is* derived from `model` is its total
+/// parameter byte size -- `numel * dtype size`, summed recursively over
+/// every parameter including submodules via [`Module::all_parameters`] --
+/// real data, replacing the fixed 10MB/8MB placeholder this used to report
+/// for every model regardless of its actual size.
+///
+/// Because no optimization pass actually runs here, `optimized_size`
+/// equals `original_size` (nothing was compressed) and
+/// `compression_ratio`/`estimated_speedup` are the true values for an
+/// identity transform (`1.0` each) rather than invented numbers.
+fn convert_to_optimized_model<M: Module>(model: &M) -> Result<OptimizedModel> {
     use crate::mobile_optimizer::{ModelGraph, OptimizationMetadata};
 
-    // This is a simplified conversion for demonstration
-    // In practice, would extract actual model structure and weights
+    let total_bytes: usize = model
+        .all_parameters()
+        .values()
+        .map(|param| {
+            let tensor = param.tensor();
+            let tensor = tensor.read();
+            tensor.numel() * tensor.dtype().size_bytes()
+        })
+        .sum();
+
     Ok(OptimizedModel {
         graph: ModelGraph {
             nodes: vec![],
@@ -489,49 +538,166 @@ fn convert_to_optimized_model<M: Module>(_model: &M) -> Result<OptimizedModel> {
         },
         weights: HashMap::new(),
         metadata: OptimizationMetadata {
-            original_size: 10_000_000, // 10MB placeholder
-            optimized_size: 8_000_000, // 8MB placeholder
-            compression_ratio: 1.25,
+            original_size: total_bytes,
+            optimized_size: total_bytes,
+            // original_size == optimized_size always here (no compression
+            // actually happened), so 1.0 is the true ratio -- not computed
+            // via a division that could divide zero by zero for a
+            // parameter-less model.
+            compression_ratio: 1.0,
             applied_passes: vec!["benchmark_conversion".to_string()],
-            estimated_speedup: 1.2,
+            estimated_speedup: 1.0,
             backend_metadata: HashMap::new(),
         },
         backend_data: None,
     })
 }
 
-/// Run memory pressure test
-fn run_memory_pressure_test<M: Module>(_model: &M, _config: &MobileBenchmarkConfig) -> Result<()> {
-    println!("Running memory pressure test...");
-    // Simulate high memory usage conditions
-    // In practice, would allocate memory to create pressure and measure impact
-    Ok(())
+/// Run `samples` real forward passes of `model` and return each one's real
+/// wall-clock duration in milliseconds.
+fn time_forward_passes<M: Module>(
+    model: &M,
+    input_shape: &[usize],
+    samples: usize,
+) -> Result<Vec<f32>> {
+    let mut latencies_ms = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let input = torsh_tensor::creation::randn(input_shape)?;
+        let start = Instant::now();
+        let _ = model.forward(&input)?;
+        latencies_ms.push(start.elapsed().as_secs_f32() * 1000.0);
+    }
+    Ok(latencies_ms)
 }
 
-/// Run frequency scaling test
+/// Arithmetic mean, or `0.0` for an empty slice.
+fn mean(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f32>() / values.len() as f32
+    }
+}
+
+/// Run a real memory-pressure test: measure how much slower `model`'s
+/// forward pass becomes while a large, genuinely-committed allocation
+/// competes for memory, compared to an unpressured baseline.
+///
+/// Returns `Ok(None)` only if too few timing samples were usable to compute
+/// a meaningful comparison (e.g. all baseline latencies were reported as
+/// zero) -- never a fabricated placeholder percentage. `_config` is
+/// currently unused (the pressure amount is a fixed, modest constant) but
+/// kept for API stability and future tuning.
+fn run_memory_pressure_test<M: Module>(
+    model: &M,
+    input_shape: &[usize],
+    _config: &MobileBenchmarkConfig,
+) -> Result<Option<f32>> {
+    const SAMPLES: usize = 8;
+    // 64 MiB: enough to create real memory pressure without being an
+    // antisocial allocation on a machine that may be shared with other
+    // concurrent work.
+    const PRESSURE_BYTES: usize = 64 * 1024 * 1024;
+
+    let baseline = time_forward_passes(model, input_shape, SAMPLES)?;
+
+    // Force real page commitment: a freshly-zeroed `vec![0u8; N]` can stay
+    // backed by a single shared zero page on some allocators/OSes until
+    // written, which would measure noise while claiming to measure memory
+    // pressure. Writing one byte per 4 KiB page (the smallest common page
+    // size) guarantees every page is actually resident.
+    let mut pressure = vec![0u8; PRESSURE_BYTES];
+    for page in pressure.chunks_mut(4096) {
+        page[0] = 1;
+    }
+
+    let pressured = time_forward_passes(model, input_shape, SAMPLES)?;
+    drop(pressure);
+
+    let baseline_mean_ms = mean(&baseline);
+    let pressured_mean_ms = mean(&pressured);
+    if baseline_mean_ms <= 0.0 {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        (pressured_mean_ms - baseline_mean_ms) / baseline_mean_ms * 100.0,
+    ))
+}
+
+/// CPU/GPU frequency-scaling control (e.g. Linux cpufreq governors) requires
+/// privileged, platform-specific system APIs this crate does not have --
+/// portably reading or writing them needs root and/or FFI, which is outside
+/// this crate's pure-Rust, unprivileged default. Returns an honest error
+/// rather than the fabricated `Ok(())` (a printed line and no actual test)
+/// this used to unconditionally report; callers should treat this as
+/// "frequency scaling testing is unavailable", not a real pass/fail result.
 fn run_frequency_scaling_test<M: Module>(
     _model: &M,
     _config: &MobileBenchmarkConfig,
 ) -> Result<()> {
-    println!("Running frequency scaling test...");
-    // Test performance at different CPU/GPU frequencies
-    // In practice, would interface with system APIs to control frequencies
-    Ok(())
+    Err(torsh_core::TorshError::NotImplemented(
+        "CPU/GPU frequency-scaling control requires privileged, platform-specific system APIs \
+         not available in pure Rust"
+            .to_string(),
+    ))
 }
 
-/// Run sustained performance test
+/// Run a real sustained-load test: repeatedly execute `model`'s forward
+/// pass and compare the mean latency of the first half of the collected
+/// samples against the second half, to detect real performance
+/// degradation over time (e.g. thermal throttling) -- instead of the
+/// fabricated `None` this used to unconditionally report after printing a
+/// line and doing no actual work.
+///
+/// Bounded by both `duration_minutes` (the caller's requested wall-clock
+/// budget) and a hard sample cap, whichever is reached first, so a
+/// pathological configuration (a very fast model paired with a very long
+/// requested duration) cannot run unbounded in an automated context. At
+/// least a small minimum number of samples is always collected (even for
+/// `duration_minutes == 0`) so a real, if brief, comparison can still be
+/// made.
 fn run_sustained_performance_test<M: Module>(
-    _model: &M,
+    model: &M,
+    input_shape: &[usize],
     _config: &MobileBenchmarkConfig,
     duration_minutes: u32,
-) -> Result<()> {
-    println!(
-        "Running sustained performance test for {} minutes...",
-        duration_minutes
-    );
-    // Run continuous inference to detect thermal throttling and sustained performance
-    // In practice, would run for the specified duration and monitor performance degradation
-    Ok(())
+) -> Result<Option<f32>> {
+    const MIN_SAMPLES: usize = 8;
+    const MAX_SAMPLES: usize = 100_000;
+
+    let budget = Duration::from_secs(u64::from(duration_minutes) * 60);
+    let start = Instant::now();
+    let mut latencies_ms = Vec::new();
+
+    loop {
+        let input = torsh_tensor::creation::randn(input_shape)?;
+        let sample_start = Instant::now();
+        let _ = model.forward(&input)?;
+        latencies_ms.push(sample_start.elapsed().as_secs_f32() * 1000.0);
+
+        let min_met = latencies_ms.len() >= MIN_SAMPLES;
+        let time_up = start.elapsed() >= budget;
+        let hit_cap = latencies_ms.len() >= MAX_SAMPLES;
+        if (min_met && time_up) || hit_cap {
+            break;
+        }
+    }
+
+    if latencies_ms.len() < 2 {
+        return Ok(None);
+    }
+
+    let half = latencies_ms.len() / 2;
+    let first_half_mean = mean(&latencies_ms[..half]);
+    let second_half_mean = mean(&latencies_ms[half..]);
+    if first_half_mean <= 0.0 {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        (second_half_mean - first_half_mean) / first_half_mean * 100.0,
+    ))
 }
 
 /// Validate platform-specific requirements
@@ -651,10 +817,13 @@ fn benchmark_batch_size<M: Module>(
     })
 }
 
-/// Count model parameters
+/// Count model parameters, recursively including submodules.
+///
+/// Uses [`Module::all_parameters`] (not the non-recursive `parameters()`)
+/// so a model built from nested submodules is not undercounted.
 fn count_parameters<M: Module>(model: &M) -> usize {
     model
-        .parameters()
+        .all_parameters()
         .values()
         .map(|p| p.tensor().read().numel())
         .sum()
@@ -866,5 +1035,155 @@ mod tests {
         assert_eq!(stats.min, Duration::from_millis(10));
         assert_eq!(stats.max, Duration::from_millis(14));
         assert_eq!(stats.median, Duration::from_millis(12));
+    }
+
+    // --- F173 regression tests ------------------------------------------
+    //
+    // `convert_to_optimized_model`, `run_memory_pressure_test`,
+    // `run_frequency_scaling_test`, and `run_sustained_performance_test`
+    // are private, so their real-measurement behavior is verified here
+    // rather than from an external `tests/` integration test. See
+    // `tests/hardening_profiler.rs` for the public-API-visible half of
+    // F173 (the `ValidationResults` fields these feed into).
+
+    fn f173_test_platform_info() -> PlatformBenchmarkInfo {
+        use crate::mobile_optimizer::{CpuInfo, MemoryInfo};
+
+        PlatformBenchmarkInfo {
+            platform: MobilePlatform::iOS {
+                chip: "A15".to_string(),
+                neural_engine: true,
+            },
+            device_model: "test-device".to_string(),
+            os_version: "1.0".to_string(),
+            cpu_info: CpuInfo {
+                cores_performance: 2,
+                cores_efficiency: 4,
+                max_frequency_ghz: 3.0,
+                cache_l1_kb: 128,
+                cache_l2_kb: 4096,
+                cache_l3_kb: None,
+            },
+            memory_info: MemoryInfo {
+                total_mb: 4096,
+                bandwidth_gb_s: 30.0,
+                memory_type: "LPDDR5".to_string(),
+            },
+            thermal_design_power: None,
+        }
+    }
+
+    fn f173_test_mobile_config(
+        test_memory_pressure: bool,
+        test_frequency_scaling: bool,
+    ) -> MobileBenchmarkConfig {
+        MobileBenchmarkConfig {
+            platform_info: f173_test_platform_info(),
+            monitor_thermal: false,
+            measure_power: false,
+            test_frequency_scaling,
+            test_memory_pressure,
+            stress_test_duration_minutes: None,
+            latency_thresholds: LatencyThresholds::default(),
+            energy_targets: None,
+        }
+    }
+
+    /// F173: `convert_to_optimized_model` must derive `original_size` from
+    /// the real model passed in, not report the same fixed 10MB/8MB
+    /// placeholder for every model regardless of its actual size.
+    #[test]
+    fn test_convert_to_optimized_model_uses_real_model_size() {
+        use torsh_nn::layers::Linear;
+
+        let small = Linear::new(4, 4, true);
+        let large = Linear::new(256, 256, true);
+
+        let small_result = convert_to_optimized_model(&small).expect("conversion should succeed");
+        let large_result = convert_to_optimized_model(&large).expect("conversion should succeed");
+
+        assert_ne!(
+            small_result.metadata.original_size, 10_000_000,
+            "original_size must not be the historical fixed placeholder"
+        );
+        assert_ne!(
+            small_result.metadata.original_size, large_result.metadata.original_size,
+            "differently-sized real models must report different real sizes"
+        );
+
+        // Linear(4, 4, bias=true): weight [4,4] + bias [4] = 20 f32 params.
+        assert_eq!(small_result.metadata.original_size, 20 * 4);
+        // Linear(256, 256, bias=true): weight [256,256] + bias [256] = 65_792 f32 params.
+        assert_eq!(large_result.metadata.original_size, 65_792 * 4);
+
+        // No real compression pass runs in this conversion, so the honest
+        // values for an identity transform are 1.0, not an invented guess
+        // like the historical 1.25 / 1.2.
+        for result in [&small_result, &large_result] {
+            assert_eq!(
+                result.metadata.optimized_size,
+                result.metadata.original_size
+            );
+            assert_eq!(result.metadata.compression_ratio, 1.0);
+            assert_eq!(result.metadata.estimated_speedup, 1.0);
+        }
+    }
+
+    /// F173: frequency-scaling control cannot be portably measured in pure
+    /// Rust; this must return an honest error rather than the historical
+    /// fabricated `Ok(())` (a printed line and no actual test).
+    #[test]
+    fn test_run_frequency_scaling_test_is_honest_about_being_unimplemented() {
+        use torsh_nn::layers::Linear;
+
+        let model = Linear::new(4, 4, true);
+        let config = f173_test_mobile_config(false, true);
+
+        let result = run_frequency_scaling_test(&model, &config);
+        assert!(
+            result.is_err(),
+            "frequency scaling control must return an honest error, not a fabricated Ok(())"
+        );
+    }
+
+    /// F173: memory pressure testing must return a real, finite measured
+    /// value derived from actually timing the model, not the historical
+    /// `Ok(())` that discarded any notion of measurement entirely.
+    #[test]
+    fn test_run_memory_pressure_test_returns_finite_measured_value() {
+        use torsh_nn::layers::Linear;
+
+        let model = Linear::new(8, 8, true);
+        let config = f173_test_mobile_config(true, false);
+
+        let result = run_memory_pressure_test(&model, &[1, 8], &config)
+            .expect("memory pressure test should succeed on a real, working model");
+        let value = result
+            .expect("enough real timing samples were collected, so a comparison must be Some(_)");
+        assert!(
+            value.is_finite(),
+            "measured degradation must be a real finite number, got {value}"
+        );
+    }
+
+    /// F173: sustained-performance testing must return a real, finite
+    /// measured value derived from actually timing the model repeatedly,
+    /// not the historical unconditional `None`. `duration_minutes = 0`
+    /// still takes a small minimum number of real samples, so this
+    /// completes quickly while still being a genuine measurement.
+    #[test]
+    fn test_run_sustained_performance_test_returns_finite_measured_value() {
+        use torsh_nn::layers::Linear;
+
+        let model = Linear::new(8, 8, true);
+        let config = f173_test_mobile_config(false, false);
+
+        let result = run_sustained_performance_test(&model, &[1, 8], &config, 0)
+            .expect("sustained performance test should succeed on a real, working model");
+        let value = result.expect("enough real timing samples were collected for a comparison");
+        assert!(
+            value.is_finite(),
+            "measured degradation must be a real finite number, got {value}"
+        );
     }
 }

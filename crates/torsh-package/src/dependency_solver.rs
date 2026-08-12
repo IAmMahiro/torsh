@@ -239,7 +239,7 @@ impl CdclSolver {
             }
 
             // Make a decision
-            let decision_var = self.choose_decision_variable();
+            let decision_var = self.choose_decision_variable()?;
             self.current_level += 1;
             self.assign(decision_var, true, self.current_level);
 
@@ -325,8 +325,17 @@ impl CdclSolver {
         all_vars.iter().all(|var| self.assignment.is_assigned(*var))
     }
 
-    /// Choose next decision variable using activity heuristics
-    fn choose_decision_variable(&self) -> SatVariable {
+    /// Choose next decision variable using activity heuristics.
+    ///
+    /// # Errors
+    /// Returns `Err(TorshError::InvalidState(..))` if no unassigned variable
+    /// can be found even though the caller's `is_complete()` check reported
+    /// the assignment incomplete (F306). This is an internal solver
+    /// invariant rather than a user-input error, but a pathological or
+    /// malformed dependency manifest driving the search into an unexpected
+    /// state should surface as a diagnosable resolution failure rather than
+    /// aborting the process.
+    fn choose_decision_variable(&self) -> Result<SatVariable> {
         // Get all variables
         let mut unassigned_vars: Vec<_> = self
             .activity
@@ -339,21 +348,26 @@ impl CdclSolver {
             for clause in self.clauses.iter().chain(self.learned_clauses.iter()) {
                 for literal in &clause.literals {
                     if !self.assignment.is_assigned(literal.variable) {
-                        return literal.variable;
+                        return Ok(literal.variable);
                     }
                 }
             }
-            // Should never reach here if is_complete() check is correct
-            panic!("No unassigned variables found");
+            // Should never reach here if is_complete() check is correct;
+            // surface a diagnosable error instead of aborting the process.
+            return Err(TorshError::InvalidState(
+                "dependency solver internal invariant violated: no unassigned variable found \
+                 at a decision point despite an incomplete assignment"
+                    .to_string(),
+            ));
         }
 
-        // Sort by activity (highest first)
-        unassigned_vars.sort_by(|a, b| {
-            b.1.partial_cmp(a.1)
-                .expect("Activity values should be valid floats (not NaN)")
-        });
+        // Sort by activity (highest first). An activity score is never
+        // expected to be NaN in practice, but treat that case as "equal"
+        // rather than risk a panic in this comparator (production code
+        // path must never abort the process on an unexpected float).
+        unassigned_vars.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        *unassigned_vars[0].0
+        Ok(*unassigned_vars[0].0)
     }
 
     /// Analyze conflict and learn a new clause
@@ -701,6 +715,37 @@ mod tests {
         let solution = solver.solve().unwrap();
         assert!(solution.conflicts.is_empty());
         assert!(solution.selected_versions.contains_key("pkg-a"));
+    }
+
+    /// F306: `choose_decision_variable` must return a diagnosable `Err`
+    /// instead of panicking when called in a state with no unassigned
+    /// variables anywhere (activity map empty and no clauses/learned
+    /// clauses reference an unassigned variable either) — the exact
+    /// condition the removed `panic!("No unassigned variables found")`
+    /// used to hit.
+    #[test]
+    fn f306_choose_decision_variable_returns_err_instead_of_panicking() {
+        let solver = CdclSolver::new();
+        let result = solver.choose_decision_variable();
+        assert!(
+            result.is_err(),
+            "choose_decision_variable must fail closed (Err), not panic, \
+             when no unassigned variable exists"
+        );
+    }
+
+    /// Control case: with an actual unassigned variable present,
+    /// `choose_decision_variable` must still succeed and return it.
+    #[test]
+    fn f306_choose_decision_variable_succeeds_with_unassigned_variable() {
+        let mut solver = CdclSolver::new();
+        let var = SatVariable(0);
+        solver.add_clause(SatClause::new(vec![SatLiteral::positive(var)]));
+
+        let chosen = solver
+            .choose_decision_variable()
+            .expect("an unassigned variable exists, so this must succeed");
+        assert_eq!(chosen, var);
     }
 
     #[test]

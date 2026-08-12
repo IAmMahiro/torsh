@@ -93,6 +93,7 @@
 pub mod advanced_filters;
 pub mod audio;
 pub mod filters;
+mod iir_design;
 pub mod performance;
 pub mod resampling;
 pub mod spectral;

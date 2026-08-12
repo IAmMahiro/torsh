@@ -1041,12 +1041,25 @@ impl CompressionManager {
     ) -> Result<BufferedEvent, Box<dyn std::error::Error>> {
         let start = Instant::now();
 
-        // Simulate compression (in real implementation, would actually compress the event data)
         let original_size = event.size_bytes;
-        let compressed_size = (original_size as f64 * 0.7) as usize; // Simulate 30% compression
+
+        // Actually compress the serialized event payload via oxiarc-zstd
+        // rather than fabricating a fixed 30% compression ratio.
+        // `CompressionAlgorithm::None` means the caller explicitly opted
+        // out; every other configured algorithm currently shares this one
+        // real zstd backend (per-algorithm backends are not implemented).
+        let compressed_size = if matches!(self.config.algorithm, CompressionAlgorithm::None) {
+            original_size
+        } else {
+            let serialized = serde_json::to_vec(&event.event)?;
+            let level = (self.config.level as i32).clamp(1, 21);
+            let compressed = oxiarc_zstd::encode_all(serialized.as_slice(), level)
+                .map_err(|e| format!("zstd compression failed: {e}"))?;
+            compressed.len()
+        };
 
         event.size_bytes = compressed_size;
-        event.compressed = true;
+        event.compressed = !matches!(self.config.algorithm, CompressionAlgorithm::None);
 
         let compression_time = start.elapsed();
 

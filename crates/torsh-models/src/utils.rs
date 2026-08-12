@@ -187,22 +187,16 @@ fn load_pytorch<P: AsRef<Path>>(
         });
     }
 
-    // For now, we'll extract the raw data as a single tensor
-    // In a full implementation, we'd parse the pickle format properly
-    let mut tensors = HashMap::new();
-    tensors.insert("pytorch_data".to_string(), data);
-
-    // Create basic metadata
-    let metadata = ModelMetadata {
-        name: "pytorch_model".to_string(),
-        version: "unknown".to_string(),
-        architecture: "unknown".to_string(),
-        framework: "PyTorch".to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        extra: HashMap::new(),
-    };
-
-    Ok((tensors, Some(metadata)))
+    // The file is a genuine PyTorch pickle, but ToRSh has no pickle/ZIP reader
+    // to extract named tensors with correct shapes and dtypes. Returning the
+    // raw pickle bytes as a single "tensor" would fabricate meaningless numbers,
+    // so we refuse honestly instead. Convert to SafeTensors and load that.
+    Err(ModelError::InvalidFormat {
+        format: "PyTorch pickle format is detected but not supported: ToRSh cannot parse pickled \
+                 tensor storages. Convert the model to SafeTensors (.safetensors) and load it \
+                 with ModelFormat::SafeTensors / load_safetensors_weights."
+            .to_string(),
+    })
 }
 
 /// Load model from custom ToRSh format
@@ -592,51 +586,45 @@ pub fn convert_to_pytorch_state_dict(
     Ok(pytorch_dict)
 }
 
-/// Load PyTorch checkpoint file (.pth, .pt)
+/// Load a PyTorch checkpoint file (`.pth`, `.pt`).
+///
+/// A real PyTorch checkpoint is a ZIP archive of pickled tensor storages.
+/// ToRSh does not ship a pickle/ZIP reader for that format, so rather than
+/// reinterpret the raw pickle bytes as a flat `f32` tensor (which produces
+/// meaningless numbers with no shape, name or dtype), this function returns an
+/// honest error pointing at the supported format.
+///
+/// Use [`load_safetensors_weights`] with a `.safetensors` file, which preserves
+/// shapes and dtypes correctly.
 pub fn load_pytorch_checkpoint<P: AsRef<Path>>(
-    path: P,
-    device: Option<DeviceType>,
+    _path: P,
+    _device: Option<DeviceType>,
 ) -> ModelResult<HashMap<String, Tensor>> {
-    // For now, treat PyTorch files as binary data
-    // Real implementation would use PyTorch's pickle deserialization
-    let data = std::fs::read(path)?;
-
-    // This is a placeholder - real PyTorch loading would parse the pickle format
-    // and extract tensor data with proper shapes and dtypes
-    let mut dummy_dict = HashMap::new();
-    dummy_dict.insert("checkpoint_data".to_string(), data);
-
-    convert_pytorch_state_dict(&dummy_dict, device)
+    Err(ModelError::InvalidFormat {
+        format: "PyTorch checkpoint (.pth/.pt) loading is not supported: a .pth file is a ZIP of \
+                 pickled storages and ToRSh has no pickle reader. Convert the checkpoint to \
+                 SafeTensors and use load_safetensors_weights instead."
+            .to_string(),
+    })
 }
 
-/// Save tensors as PyTorch checkpoint
+/// Save tensors as a PyTorch checkpoint.
+///
+/// ToRSh cannot produce a genuine PyTorch pickle/ZIP checkpoint, so instead of
+/// writing a bespoke `name:<bytes>` format that PyTorch cannot read while
+/// claiming to be a PyTorch checkpoint, this returns an honest error. Use
+/// [`save_tensors_to_safetensors`] for a portable, round-trippable format.
 pub fn save_pytorch_checkpoint<P: AsRef<Path>>(
-    path: P,
-    tensors: &HashMap<String, Tensor>,
-    extra_metadata: Option<&HashMap<String, String>>,
+    _path: P,
+    _tensors: &HashMap<String, Tensor>,
+    _extra_metadata: Option<&HashMap<String, String>>,
 ) -> ModelResult<()> {
-    let pytorch_dict = convert_to_pytorch_state_dict(tensors)?;
-
-    // Simplified save - real implementation would use PyTorch's pickle format
-    let mut all_data = Vec::new();
-
-    // Add metadata header (simplified)
-    if let Some(metadata) = extra_metadata {
-        let metadata_str = format!("{:?}", metadata);
-        all_data.extend_from_slice(metadata_str.as_bytes());
-        all_data.extend_from_slice(b"\n---TENSORS---\n");
-    }
-
-    // Add tensor data
-    for (name, data) in pytorch_dict {
-        all_data.extend_from_slice(name.as_bytes());
-        all_data.extend_from_slice(b":");
-        all_data.extend_from_slice(&data);
-        all_data.extend_from_slice(b"\n");
-    }
-
-    std::fs::write(path, all_data)?;
-    Ok(())
+    Err(ModelError::InvalidFormat {
+        format: "PyTorch checkpoint (.pth/.pt) saving is not supported: ToRSh cannot write \
+                 PyTorch's pickle/ZIP format. Use save_tensors_to_safetensors to write a \
+                 portable .safetensors file instead."
+            .to_string(),
+    })
 }
 
 /// Create a proper model conversion pipeline

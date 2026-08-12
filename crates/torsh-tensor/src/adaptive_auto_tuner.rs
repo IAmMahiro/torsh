@@ -13,6 +13,7 @@ use scirs2_core::parallel_ops::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
+use torsh_core::sync::{MutexExt, RwLockExt};
 use torsh_core::TensorElement;
 
 /// Adaptive auto-tuning coordinator for dynamic performance optimization
@@ -511,11 +512,7 @@ impl AdaptiveAutoTuner {
     {
         println!("🎯 Tuning operation: {}", operation_name);
 
-        let mut best_params = self
-            .optimal_parameters
-            .read()
-            .expect("lock should not be poisoned")
-            .clone();
+        let mut best_params = self.optimal_parameters.read_or_recover().clone();
         let mut best_performance = 0.0;
         let mut tuning_iterations = 0;
 
@@ -560,10 +557,7 @@ impl AdaptiveAutoTuner {
 
         // Update optimal parameters
         {
-            let mut optimal = self
-                .optimal_parameters
-                .write()
-                .expect("lock should not be poisoned");
+            let mut optimal = self.optimal_parameters.write_or_recover();
             *optimal = best_params.clone();
         }
 
@@ -579,10 +573,7 @@ impl AdaptiveAutoTuner {
 
     /// Get current optimal parameters
     pub fn get_optimal_parameters(&self) -> OptimalParameters {
-        self.optimal_parameters
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.optimal_parameters.read_or_recover().clone()
     }
 
     /// Update performance feedback
@@ -592,21 +583,15 @@ impl AdaptiveAutoTuner {
         parameters: &OptimalParameters,
         performance_metrics: &PerformanceMetrics,
     ) {
-        let mut tracker = self
-            .performance_tracker
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut tracker = self.performance_tracker.lock_or_recover();
         tracker.record_performance(operation, parameters, performance_metrics);
 
         // Update ML model with new data
-        let mut predictor = self
-            .ml_predictor
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut predictor = self.ml_predictor.lock_or_recover();
         predictor.add_training_sample(operation, parameters, performance_metrics);
 
         // Update statistics
-        let mut stats = self.statistics.lock().expect("lock should not be poisoned");
+        let mut stats = self.statistics.lock_or_recover();
         stats.total_operations += 1;
         stats.avg_performance = (stats.avg_performance * (stats.total_operations - 1) as f64
             + performance_metrics.overall_score)
@@ -615,11 +600,8 @@ impl AdaptiveAutoTuner {
 
     /// Generate comprehensive auto-tuning report
     pub fn generate_auto_tuning_report(&self) -> AutoTuningReport {
-        let statistics = self.statistics.lock().expect("lock should not be poisoned");
-        let current_params = self
-            .optimal_parameters
-            .read()
-            .expect("lock should not be poisoned");
+        let statistics = self.statistics.lock_or_recover();
+        let current_params = self.optimal_parameters.read_or_recover();
 
         AutoTuningReport {
             summary: format!(
@@ -638,18 +620,12 @@ impl AdaptiveAutoTuner {
     // Private implementation methods
 
     fn analyze_hardware_capabilities(&self) -> HardwareCapabilities {
-        let analyzer = self
-            .hardware_analyzer
-            .lock()
-            .expect("lock should not be poisoned");
+        let analyzer = self.hardware_analyzer.lock_or_recover();
         analyzer.analyze_current_hardware()
     }
 
     fn classify_workload_patterns(&self) -> Vec<WorkloadPattern> {
-        let classifier = self
-            .workload_classifier
-            .lock()
-            .expect("lock should not be poisoned");
+        let classifier = self.workload_classifier.lock_or_recover();
         classifier.classify_current_workload()
     }
 
@@ -657,28 +633,19 @@ impl AdaptiveAutoTuner {
         &self,
         patterns: &[WorkloadPattern],
     ) -> PredictedConfiguration {
-        let predictor = self
-            .ml_predictor
-            .lock()
-            .expect("lock should not be poisoned");
+        let predictor = self.ml_predictor.lock_or_recover();
         predictor.predict_configuration(patterns)
     }
 
     fn optimize_parameters(&self, predicted: &PredictedConfiguration) -> OptimizedParameters {
-        let optimizer = self
-            .parameter_optimizer
-            .lock()
-            .expect("lock should not be poisoned");
+        let optimizer = self.parameter_optimizer.lock_or_recover();
         optimizer.optimize(predicted)
     }
 
     fn apply_and_validate_parameters(&self, params: &OptimizedParameters) -> ValidationResult {
         // Apply parameters
         {
-            let mut optimal = self
-                .optimal_parameters
-                .write()
-                .expect("lock should not be poisoned");
+            let mut optimal = self.optimal_parameters.write_or_recover();
             optimal.simd_params = params.simd_params.clone();
             optimal.memory_params = params.memory_params.clone();
             optimal.parallel_params = params.parallel_params.clone();
@@ -693,16 +660,10 @@ impl AdaptiveAutoTuner {
     }
 
     fn update_learning_system(&self, result: &ValidationResult) {
-        let mut predictor = self
-            .ml_predictor
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut predictor = self.ml_predictor.lock_or_recover();
         predictor.update_model(result);
 
-        let mut history = self
-            .learning_history
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut history = self.learning_history.lock_or_recover();
         history.push_back(LearningRecord {
             timestamp: SystemTime::now(),
             performance_improvement: result.actual_improvement,
@@ -722,11 +683,7 @@ impl AdaptiveAutoTuner {
         test_sizes: &[usize],
     ) -> Vec<OptimalParameters> {
         let mut candidates = Vec::new();
-        let base_params = self
-            .optimal_parameters
-            .read()
-            .expect("lock should not be poisoned")
-            .clone();
+        let base_params = self.optimal_parameters.read_or_recover().clone();
 
         // Determine parameter variation based on operation type and test sizes
         let avg_size = if !test_sizes.is_empty() {

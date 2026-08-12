@@ -161,14 +161,14 @@ fn create_karate_club_graph() -> Result<GraphData, Box<dyn std::error::Error>> {
 /// Test GCN model on the graph
 fn test_gcn_model(graph: &GraphData) -> Result<(), Box<dyn std::error::Error>> {
     // Create a 2-layer GCN
-    let gcn1 = GCNConv::new(8, 16, true); // 8 -> 16 features
-    let gcn2 = GCNConv::new(16, 4, true); // 16 -> 4 features (4 classes)
+    let gcn1 = GCNConv::new(8, 16, true).expect("operation should succeed"); // 8 -> 16 features
+    let gcn2 = GCNConv::new(16, 4, true).expect("operation should succeed"); // 16 -> 4 features (4 classes)
 
     // Forward pass
-    let hidden = gcn1.forward(graph);
+    let hidden = gcn1.forward(graph).expect("operation should succeed");
     println!("   GCN Layer 1 output shape: {:?}", hidden.x.shape().dims());
 
-    let output = gcn2.forward(&hidden);
+    let output = gcn2.forward(&hidden).expect("operation should succeed");
     println!("   GCN Layer 2 output shape: {:?}", output.x.shape().dims());
     println!("   ✓ GCN forward pass successful");
 
@@ -187,10 +187,10 @@ fn test_gcn_model(graph: &GraphData) -> Result<(), Box<dyn std::error::Error>> {
 /// Test GAT model on the graph
 fn test_gat_model(graph: &GraphData) -> Result<(), Box<dyn std::error::Error>> {
     // Create GAT with 4 attention heads
-    let gat = GATConv::new(8, 16, 4, 0.1, true); // 8 -> 16 features, 4 heads
+    let gat = GATConv::new(8, 16, 4, 0.1, true).expect("operation should succeed"); // 8 -> 16 features, 4 heads
 
     // Forward pass
-    let output = gat.forward(graph);
+    let output = gat.forward(graph).expect("operation should succeed");
     println!("   GAT output shape: {:?}", output.x.shape().dims());
     println!("   ✓ GAT forward pass successful (4 attention heads)");
 
@@ -204,10 +204,10 @@ fn test_gat_model(graph: &GraphData) -> Result<(), Box<dyn std::error::Error>> {
 /// Test GraphSAGE model on the graph
 fn test_sage_model(graph: &GraphData) -> Result<(), Box<dyn std::error::Error>> {
     // Create GraphSAGE layer
-    let sage = SAGEConv::new(8, 16, true); // 8 -> 16 features
+    let sage = SAGEConv::new(8, 16, true).expect("operation should succeed"); // 8 -> 16 features
 
     // Forward pass
-    let output = sage.forward(graph);
+    let output = sage.forward(graph).expect("operation should succeed");
     println!("   SAGE output shape: {:?}", output.x.shape().dims());
     println!("   ✓ GraphSAGE forward pass successful");
 

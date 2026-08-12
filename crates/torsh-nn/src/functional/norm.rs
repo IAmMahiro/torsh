@@ -36,7 +36,153 @@ pub fn batch_norm_2d(
     )
 }
 
+/// Outcome of a batch-normalization pass, including the updated running
+/// statistics.
+///
+/// The plain `batch_norm_*` entry points return only the normalized tensor for
+/// backward compatibility; use [`batch_norm_nd_with_running_stats`] when the
+/// caller owns the running buffers and needs the momentum update to land.
+#[derive(Debug, Clone)]
+pub struct BatchNormOutput {
+    /// Normalized (and optionally affine-transformed) activations.
+    pub output: Tensor,
+    /// Running mean after the momentum update. `None` outside training mode or
+    /// when no running mean was supplied.
+    pub running_mean: Option<Tensor>,
+    /// Running variance after the momentum update. `None` outside training mode
+    /// or when no running variance was supplied.
+    pub running_var: Option<Tensor>,
+}
+
+/// Broadcast shape that lines a per-channel vector up with an `NC...` tensor.
+fn channel_broadcast_shape(rank: usize, channels: usize) -> Vec<i32> {
+    let mut shape = vec![1i32; rank];
+    if rank >= 2 {
+        shape[1] = channels as i32;
+    }
+    shape
+}
+
+/// Per-channel mean and *biased* variance of an `NC...` tensor.
+///
+/// Statistics are reduced over the batch axis and every spatial axis, leaving
+/// the channel axis intact. Reducing explicitly (rather than reinterpreting the
+/// buffer with `view`) is what keeps channels from being mixed: an `NCHW`
+/// buffer is laid out channel-major within each sample, so a bare
+/// `view([N*H*W, C])` would slice across channels whenever `H*W > 1`.
+fn channel_statistics(input: &Tensor) -> Result<(Tensor, Tensor)> {
+    let shape_binding = input.shape();
+    let dims = shape_binding.dims();
+    let channels = dims[1];
+    let reduce_dims: Vec<usize> = std::iter::once(0usize).chain(2..dims.len()).collect();
+    let broadcast = channel_broadcast_shape(dims.len(), channels);
+
+    let mean = input.mean(Some(&reduce_dims), false)?;
+    let centered = input.sub(&mean.view(&broadcast)?)?;
+    let variance = centered.pow_scalar(2.0)?.mean(Some(&reduce_dims), false)?;
+
+    Ok((mean, variance))
+}
+
+/// Number of elements that contribute to each channel statistic.
+fn samples_per_channel(dims: &[usize]) -> usize {
+    dims.iter()
+        .enumerate()
+        .filter(|(axis, _)| *axis != 1)
+        .map(|(_, size)| *size)
+        .product()
+}
+
+/// `running = (1 - momentum) * running + momentum * batch`
+fn momentum_update(running: &Tensor, batch: &Tensor, momentum: f32) -> Result<Tensor> {
+    running
+        .mul_scalar(1.0 - momentum)?
+        .add(&batch.mul_scalar(momentum)?)
+}
+
+/// Batch normalization over an `NC...` tensor of any spatial rank.
+///
+/// Statistics are computed per channel over the batch and all spatial axes.
+/// In training mode the running statistics are updated with
+/// `running = (1 - momentum) * running + momentum * batch`, using the
+/// *unbiased* batch variance for the update while normalizing with the biased
+/// one — this matches PyTorch. In evaluation mode the supplied running
+/// statistics are used unchanged (defaulting to mean 0 / variance 1).
+#[allow(clippy::too_many_arguments)]
+pub fn batch_norm_nd_with_running_stats(
+    input: &Tensor,
+    weight: Option<&Tensor>,
+    bias: Option<&Tensor>,
+    running_mean: Option<&Tensor>,
+    running_var: Option<&Tensor>,
+    training: bool,
+    momentum: f32,
+    eps: f32,
+) -> Result<BatchNormOutput> {
+    let shape_binding = input.shape();
+    let dims = shape_binding.dims();
+
+    if dims.len() < 2 {
+        return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+            "batch_norm expects an (N, C, ...) tensor, got {dims:?}"
+        )));
+    }
+
+    let channels = dims[1];
+    let broadcast = channel_broadcast_shape(dims.len(), channels);
+
+    let (mean, variance, updated_mean, updated_var) = if training {
+        let (batch_mean, batch_var) = channel_statistics(input)?;
+
+        let count = samples_per_channel(dims);
+        let (new_mean, new_var) = if let (Some(r_mean), Some(r_var)) = (running_mean, running_var) {
+            // PyTorch tracks the unbiased variance in `running_var`.
+            let unbiased = if count > 1 {
+                batch_var.mul_scalar(count as f32 / (count - 1) as f32)?
+            } else {
+                batch_var.clone()
+            };
+            (
+                Some(momentum_update(r_mean, &batch_mean, momentum)?),
+                Some(momentum_update(r_var, &unbiased, momentum)?),
+            )
+        } else {
+            (None, None)
+        };
+
+        (batch_mean, batch_var, new_mean, new_var)
+    } else {
+        let mean = match running_mean {
+            Some(m) => m.clone(),
+            None => torsh_tensor::creation::zeros(&[channels])?,
+        };
+        let var = match running_var {
+            Some(v) => v.clone(),
+            None => torsh_tensor::creation::ones(&[channels])?,
+        };
+        (mean, var, None, None)
+    };
+
+    let inv_std = variance.add_scalar(eps)?.rsqrt()?;
+    let centered = input.sub(&mean.view(&broadcast)?)?;
+    let mut output = centered.mul_op(&inv_std.view(&broadcast)?)?;
+
+    if let Some(w) = weight {
+        output = output.mul_op(&w.view(&broadcast)?)?;
+    }
+    if let Some(b) = bias {
+        output = output.add(&b.view(&broadcast)?)?;
+    }
+
+    Ok(BatchNormOutput {
+        output,
+        running_mean: updated_mean,
+        running_var: updated_var,
+    })
+}
+
 /// Enhanced batch normalization with configuration
+#[allow(clippy::too_many_arguments)]
 pub fn batch_norm_2d_with_config(
     input: &Tensor,
     weight: Option<&Tensor>,
@@ -57,96 +203,17 @@ pub fn batch_norm_2d_with_config(
         validation::validate_range(momentum, 0.0, 1.0, "momentum")
     );
 
-    // Enhanced batch normalization leveraging SciRS2's numerical stability techniques
-    let input_shape_obj = input.shape();
-    let input_shape = input_shape_obj.dims();
-    let batch_size = input_shape[0];
-    let channels = input_shape[1];
-
-    if training {
-        // Compute batch statistics with enhanced numerical stability
-        // Reshape input for channel-wise computation: [N, C, H, W] -> [N*H*W, C]
-        let spatial_dims: usize = input_shape[2..].iter().product();
-        let total_spatial = batch_size * spatial_dims;
-
-        // Compute mean with Welford's online algorithm for numerical stability
-        let reshaped = input.view(&[total_spatial as i32, channels as i32])?;
-        let mean = reshaped.mean(Some(&[0]), false)?;
-
-        // Compute variance using the stable two-pass algorithm
-        let centered = reshaped.sub(&mean.unsqueeze(0)?)?;
-        let variance = centered.pow_scalar(2.0)?.mean(Some(&[0]), false)?;
-
-        // Add epsilon for numerical stability
-        let eps_tensor = torsh_tensor::creation::full(&[channels], eps)?;
-        let stable_var = variance.add(&eps_tensor)?;
-        let inv_std = stable_var.rsqrt()?;
-
-        // Apply normalization
-        let normalized = centered.mul_op(&inv_std.unsqueeze(0)?)?;
-
-        // Reshape back to original shape
-        let input_shape_i32: Vec<i32> = input_shape.iter().map(|&x| x as i32).collect();
-        let output = normalized.view(&input_shape_i32)?;
-
-        // Apply scale and shift if provided
-        let mut result = output;
-        if let Some(w) = weight {
-            let weight_expanded = w.view(&[1, channels as i32, 1, 1])?;
-            result = result.mul_op(&weight_expanded)?;
-        }
-        if let Some(b) = bias {
-            let bias_expanded = b.view(&[1, channels as i32, 1, 1])?;
-            result = result.add(&bias_expanded)?;
-        }
-
-        // Update running statistics with momentum
-        if let (Some(r_mean), Some(r_var)) = (running_mean, running_var) {
-            // running_mean = (1 - momentum) * running_mean + momentum * batch_mean
-            let momentum_tensor = torsh_tensor::creation::full(&[1], momentum)?;
-            let one_minus_momentum = torsh_tensor::creation::full(&[1], 1.0 - momentum)?;
-
-            let _new_running_mean = r_mean
-                .mul_op(&one_minus_momentum)?
-                .add(&mean.mul_op(&momentum_tensor)?)?;
-            let _new_running_var = r_var
-                .mul_op(&one_minus_momentum)?
-                .add(&variance.mul_op(&momentum_tensor)?)?;
-
-            // Note: In practice, these would update the module's buffers
-        }
-
-        Ok(result)
-    } else {
-        // Use running statistics for inference
-        let default_mean = torsh_tensor::creation::zeros(&[channels])?;
-        let default_var = torsh_tensor::creation::ones(&[channels])?;
-        let r_mean = running_mean.unwrap_or(&default_mean);
-        let r_var = running_var.unwrap_or(&default_var);
-
-        // Apply normalization using running statistics
-        let eps_tensor = torsh_tensor::creation::full(&[channels], eps)?;
-        let stable_var = r_var.add(&eps_tensor)?;
-        let inv_std = stable_var.rsqrt()?;
-
-        let mean_expanded = r_mean.view(&[1, channels as i32, 1, 1])?;
-        let inv_std_expanded = inv_std.view(&[1, channels as i32, 1, 1])?;
-
-        let normalized = input.sub(&mean_expanded)?.mul_op(&inv_std_expanded)?;
-
-        // Apply scale and shift
-        let mut result = normalized;
-        if let Some(w) = weight {
-            let weight_expanded = w.view(&[1, channels as i32, 1, 1])?;
-            result = result.mul_op(&weight_expanded)?;
-        }
-        if let Some(b) = bias {
-            let bias_expanded = b.view(&[1, channels as i32, 1, 1])?;
-            result = result.add(&bias_expanded)?;
-        }
-
-        Ok(result)
-    }
+    Ok(batch_norm_nd_with_running_stats(
+        input,
+        weight,
+        bias,
+        running_mean,
+        running_var,
+        training,
+        momentum,
+        eps,
+    )?
+    .output)
 }
 
 /// 1D batch normalization
@@ -164,6 +231,11 @@ pub fn batch_norm_2d_with_config(
 /// * `training` - Whether in training mode
 /// * `momentum` - Momentum for running statistics update
 /// * `eps` - Small value for numerical stability
+///
+/// The running statistics are read but not written back through the `&Tensor`
+/// arguments; use [`batch_norm_nd_with_running_stats`] to obtain the updated
+/// buffers.
+#[allow(clippy::too_many_arguments)]
 pub fn batch_norm_1d(
     input: &Tensor,
     weight: Option<&Tensor>,
@@ -184,78 +256,17 @@ pub fn batch_norm_1d(
         });
     }
 
-    let batch_size = input_shape[0];
-    let channels = input_shape[1];
-    let length = input_shape[2];
-
-    if training {
-        // Compute batch statistics
-        // Reshape to [batch * length, channels] to compute statistics across batch and spatial dims
-        let total_spatial = batch_size * length;
-        let reshaped = input.view(&[total_spatial as i32, channels as i32])?;
-        let mean = reshaped.mean(Some(&[0]), false)?;
-
-        // Compute variance
-        let centered = reshaped.sub(&mean.unsqueeze(0)?)?;
-        let variance = centered.pow_scalar(2.0)?.mean(Some(&[0]), false)?;
-
-        // Add epsilon for numerical stability
-        let eps_tensor = torsh_tensor::creation::full(&[channels], eps)?;
-        let stable_var = variance.add(&eps_tensor)?;
-        let inv_std = stable_var.rsqrt()?;
-
-        // Apply normalization
-        let normalized = centered.mul_op(&inv_std.unsqueeze(0)?)?;
-
-        // Reshape back to original shape
-        let input_shape_i32: Vec<i32> = input_shape.iter().map(|&x| x as i32).collect();
-        let output = normalized.view(&input_shape_i32)?;
-
-        // Apply scale and shift
-        let mut result = output;
-        if let Some(w) = weight {
-            let weight_expanded = w.view(&[1, channels as i32, 1])?;
-            result = result.mul_op(&weight_expanded)?;
-        }
-        if let Some(b) = bias {
-            let bias_expanded = b.view(&[1, channels as i32, 1])?;
-            result = result.add(&bias_expanded)?;
-        }
-
-        // Update running statistics (would be done by the module in practice)
-        let _ = (running_mean, running_var, momentum, mean, variance);
-
-        Ok(result)
-    } else {
-        // Use running statistics for inference
-        let default_mean = torsh_tensor::creation::zeros(&[channels])?;
-        let default_var = torsh_tensor::creation::ones(&[channels])?;
-        let r_mean = running_mean.unwrap_or(&default_mean);
-        let r_var = running_var.unwrap_or(&default_var);
-
-        // Apply normalization
-        let eps_tensor = torsh_tensor::creation::full(&[channels], eps)?;
-        let stable_var = r_var.add(&eps_tensor)?;
-        let inv_std = stable_var.rsqrt()?;
-
-        let mean_expanded = r_mean.view(&[1, channels as i32, 1])?;
-        let inv_std_expanded = inv_std.view(&[1, channels as i32, 1])?;
-
-        let normalized = input.sub(&mean_expanded)?.mul_op(&inv_std_expanded)?;
-
-        // Apply scale and shift
-        let mut result = normalized;
-        if let Some(w) = weight {
-            let weight_expanded = w.view(&[1, channels as i32, 1])?;
-            result = result.mul_op(&weight_expanded)?;
-        }
-        if let Some(b) = bias {
-            let bias_expanded = b.view(&[1, channels as i32, 1])?;
-            result = result.add(&bias_expanded)?;
-        }
-
-        Ok(result)
-    }
+    Ok(batch_norm_nd_with_running_stats(
+        input,
+        weight,
+        bias,
+        running_mean,
+        running_var,
+        training,
+        momentum,
+        eps,
+    )?
+    .output)
 }
 
 /// 3D batch normalization
@@ -273,6 +284,11 @@ pub fn batch_norm_1d(
 /// * `training` - Whether in training mode
 /// * `momentum` - Momentum for running statistics update
 /// * `eps` - Small value for numerical stability
+///
+/// The running statistics are read but not written back through the `&Tensor`
+/// arguments; use [`batch_norm_nd_with_running_stats`] to obtain the updated
+/// buffers.
+#[allow(clippy::too_many_arguments)]
 pub fn batch_norm_3d(
     input: &Tensor,
     weight: Option<&Tensor>,
@@ -293,80 +309,17 @@ pub fn batch_norm_3d(
         });
     }
 
-    let batch_size = input_shape[0];
-    let channels = input_shape[1];
-    let depth = input_shape[2];
-    let height = input_shape[3];
-    let width = input_shape[4];
-
-    if training {
-        // Compute batch statistics
-        // Reshape to [batch * depth * height * width, channels]
-        let total_spatial = batch_size * depth * height * width;
-        let reshaped = input.view(&[total_spatial as i32, channels as i32])?;
-        let mean = reshaped.mean(Some(&[0]), false)?;
-
-        // Compute variance
-        let centered = reshaped.sub(&mean.unsqueeze(0)?)?;
-        let variance = centered.pow_scalar(2.0)?.mean(Some(&[0]), false)?;
-
-        // Add epsilon for numerical stability
-        let eps_tensor = torsh_tensor::creation::full(&[channels], eps)?;
-        let stable_var = variance.add(&eps_tensor)?;
-        let inv_std = stable_var.rsqrt()?;
-
-        // Apply normalization
-        let normalized = centered.mul_op(&inv_std.unsqueeze(0)?)?;
-
-        // Reshape back to original shape
-        let input_shape_i32: Vec<i32> = input_shape.iter().map(|&x| x as i32).collect();
-        let output = normalized.view(&input_shape_i32)?;
-
-        // Apply scale and shift
-        let mut result = output;
-        if let Some(w) = weight {
-            let weight_expanded = w.view(&[1, channels as i32, 1, 1, 1])?;
-            result = result.mul_op(&weight_expanded)?;
-        }
-        if let Some(b) = bias {
-            let bias_expanded = b.view(&[1, channels as i32, 1, 1, 1])?;
-            result = result.add(&bias_expanded)?;
-        }
-
-        // Update running statistics (would be done by the module in practice)
-        let _ = (running_mean, running_var, momentum, mean, variance);
-
-        Ok(result)
-    } else {
-        // Use running statistics for inference
-        let default_mean = torsh_tensor::creation::zeros(&[channels])?;
-        let default_var = torsh_tensor::creation::ones(&[channels])?;
-        let r_mean = running_mean.unwrap_or(&default_mean);
-        let r_var = running_var.unwrap_or(&default_var);
-
-        // Apply normalization
-        let eps_tensor = torsh_tensor::creation::full(&[channels], eps)?;
-        let stable_var = r_var.add(&eps_tensor)?;
-        let inv_std = stable_var.rsqrt()?;
-
-        let mean_expanded = r_mean.view(&[1, channels as i32, 1, 1, 1])?;
-        let inv_std_expanded = inv_std.view(&[1, channels as i32, 1, 1, 1])?;
-
-        let normalized = input.sub(&mean_expanded)?.mul_op(&inv_std_expanded)?;
-
-        // Apply scale and shift
-        let mut result = normalized;
-        if let Some(w) = weight {
-            let weight_expanded = w.view(&[1, channels as i32, 1, 1, 1])?;
-            result = result.mul_op(&weight_expanded)?;
-        }
-        if let Some(b) = bias {
-            let bias_expanded = b.view(&[1, channels as i32, 1, 1, 1])?;
-            result = result.add(&bias_expanded)?;
-        }
-
-        Ok(result)
-    }
+    Ok(batch_norm_nd_with_running_stats(
+        input,
+        weight,
+        bias,
+        running_mean,
+        running_var,
+        training,
+        momentum,
+        eps,
+    )?
+    .output)
 }
 
 /// Batch normalization function (generic)

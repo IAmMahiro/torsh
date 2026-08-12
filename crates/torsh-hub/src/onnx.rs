@@ -369,8 +369,10 @@ impl OnnxLoader {
 
         let model_path = temp_dir.path().join("model.onnx");
 
-        // Download the model
-        download_file(url, &model_path, true)?;
+        // Download the model. No registry checksum is available for an
+        // arbitrary caller-supplied URL, so integrity verification is not
+        // requested here.
+        download_file(url, &model_path, true, None)?;
 
         // Load the model
         OnnxModel::from_file(&model_path, config)

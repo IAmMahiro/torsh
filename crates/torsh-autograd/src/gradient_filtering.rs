@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use torsh_core::dtype::FloatElement;
 use torsh_core::error::{Result, TorshError};
+use torsh_core::sync::MutexExt;
 
 /// Advanced gradient filtering techniques beyond basic smoothing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,10 +135,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive + Float> AdvancedGradientFilt
 
     /// Apply Kalman filtering for optimal gradient estimation under noise
     fn apply_kalman_filter(&self, gradients: &[Vec<T>]) -> Result<Vec<Vec<T>>> {
-        let mut states = self
-            .kalman_states
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut states = self.kalman_states.lock_or_recover();
 
         // Initialize Kalman states if needed
         if states.is_empty() {
@@ -752,10 +750,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive + Float> AdvancedGradientFilt
             return Ok(());
         }
 
-        let mut params = self
-            .adaptive_params
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut params = self.adaptive_params.lock_or_recover();
 
         // Estimate noise characteristics
         let mut all_values = Vec::new();
@@ -796,23 +791,12 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive + Float> AdvancedGradientFilt
 
     /// Get current filter statistics
     pub fn get_filter_statistics(&self) -> FilterStatistics<T> {
-        let params = self
-            .adaptive_params
-            .lock()
-            .expect("lock should not be poisoned");
+        let params = self.adaptive_params.lock_or_recover();
         FilterStatistics {
             noise_variance: params.noise_variance,
             snr_estimate: params.snr_estimate,
-            num_kalman_states: self
-                .kalman_states
-                .lock()
-                .expect("lock should not be poisoned")
-                .len(),
-            history_length: self
-                .gradient_history
-                .lock()
-                .expect("lock should not be poisoned")
-                .len(),
+            num_kalman_states: self.kalman_states.lock_or_recover().len(),
+            history_length: self.gradient_history.lock_or_recover().len(),
         }
     }
 }

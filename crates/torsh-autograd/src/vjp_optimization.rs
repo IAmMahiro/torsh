@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use torsh_core::dtype::FloatElement;
 use torsh_core::error::{Result, TorshError};
+use torsh_core::sync::RwLockExt;
 
 /// VJP computation strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,10 +241,7 @@ impl<T: FloatElement + Send + Sync + 'static> VjpOptimizer<T> {
 
     /// Initialize built-in VJP functions
     fn initialize_vjp_functions(&mut self) {
-        let mut registry = self
-            .vjp_registry
-            .write()
-            .expect("lock should not be poisoned");
+        let mut registry = self.vjp_registry.write_or_recover();
 
         // Addition VJP
         registry.insert(
@@ -269,12 +267,8 @@ impl<T: FloatElement + Send + Sync + 'static> VjpOptimizer<T> {
                         ));
                     }
 
-                    let a = saved_tensors[0]
-                        .read()
-                        .expect("lock should not be poisoned");
-                    let b = saved_tensors[1]
-                        .read()
-                        .expect("lock should not be poisoned");
+                    let a = saved_tensors[0].read_or_recover();
+                    let b = saved_tensors[1].read_or_recover();
 
                     let grad_a: Vec<T> = grad_output
                         .iter()
@@ -321,9 +315,7 @@ impl<T: FloatElement + Send + Sync + 'static> VjpOptimizer<T> {
                         ));
                     }
 
-                    let input = saved_tensors[0]
-                        .read()
-                        .expect("lock should not be poisoned");
+                    let input = saved_tensors[0].read_or_recover();
                     let grad_input: Vec<T> = grad_output
                         .iter()
                         .zip(input.iter())
@@ -344,10 +336,7 @@ impl<T: FloatElement + Send + Sync + 'static> VjpOptimizer<T> {
 
     /// Initialize fusion patterns
     fn initialize_fusion_patterns(&mut self) {
-        let mut patterns = self
-            .fusion_patterns
-            .write()
-            .expect("lock should not be poisoned");
+        let mut patterns = self.fusion_patterns.write_or_recover();
 
         // Add-ReLU fusion
         patterns.push(FusionPattern {
@@ -397,7 +386,7 @@ impl<T: FloatElement + Send + Sync + 'static> VjpOptimizer<T> {
 
         // Update statistics
         {
-            let mut stats = self.stats.write().expect("lock should not be poisoned");
+            let mut stats = self.stats.write_or_recover();
             stats.total_vjp_computations += 1;
             let computation_time = start_time.elapsed().as_millis() as f64;
             stats.total_computation_time_ms += computation_time;
@@ -431,7 +420,7 @@ impl<T: FloatElement + Send + Sync + 'static> VjpOptimizer<T> {
 
         // Update stats
         {
-            let mut stats = self.stats.write().expect("lock should not be poisoned");
+            let mut stats = self.stats.write_or_recover();
             stats.checkpoints_created = context.checkpoints.len();
         }
 
@@ -451,7 +440,7 @@ impl<T: FloatElement + Send + Sync + 'static> VjpOptimizer<T> {
 
         // Update stats
         {
-            let mut stats = self.stats.write().expect("lock should not be poisoned");
+            let mut stats = self.stats.write_or_recover();
             stats.operations_fused += fused_count;
         }
 
@@ -607,10 +596,7 @@ impl<T: FloatElement + Send + Sync + 'static> VjpOptimizer<T> {
     /// Identify opportunities for operation fusion
     fn identify_fusion_opportunities(&self, nodes: &[VjpNode<T>]) -> Result<Vec<(usize, usize)>> {
         let mut opportunities = Vec::new();
-        let patterns = self
-            .fusion_patterns
-            .read()
-            .expect("lock should not be poisoned");
+        let patterns = self.fusion_patterns.read_or_recover();
 
         for i in 0..nodes.len().saturating_sub(1) {
             let current_op = &nodes[i].operation;
@@ -679,10 +665,7 @@ impl<T: FloatElement + Send + Sync + 'static> VjpOptimizer<T> {
         } else {
             // Try to get from registry
             let op_name = self.operation_to_string(&node.operation);
-            let registry = self
-                .vjp_registry
-                .read()
-                .expect("lock should not be poisoned");
+            let registry = self.vjp_registry.read_or_recover();
             let vjp_fn = registry.get(&op_name).ok_or_else(|| {
                 TorshError::AutogradError(format!("No VJP function for operation: {op_name}"))
             })?;
@@ -718,19 +701,13 @@ impl<T: FloatElement + Send + Sync + 'static> VjpOptimizer<T> {
 
     /// Register a custom VJP function
     pub fn register_vjp_function(&self, name: String, vjp_fn: VjpFunction<T>) {
-        let mut registry = self
-            .vjp_registry
-            .write()
-            .expect("lock should not be poisoned");
+        let mut registry = self.vjp_registry.write_or_recover();
         registry.insert(name, vjp_fn);
     }
 
     /// Get VJP statistics
     pub fn get_stats(&self) -> VjpStats {
-        self.stats
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.stats.read_or_recover().clone()
     }
 
     /// Get current memory usage
@@ -740,7 +717,7 @@ impl<T: FloatElement + Send + Sync + 'static> VjpOptimizer<T> {
 
     /// Reset statistics
     pub fn reset_stats(&self) {
-        let mut stats = self.stats.write().expect("lock should not be poisoned");
+        let mut stats = self.stats.write_or_recover();
         *stats = VjpStats::default();
 
         let mut memory_tracker = self.memory_tracker.lock();

@@ -247,7 +247,7 @@ pub fn randomized_svd(
     let (q, b) = randomized_qb(matrix, config)?;
 
     // Compute exact SVD of small matrix B
-    let (u_b, s, vt) = crate::decomposition::svd(&b, true)?;
+    let (u_b, s, vt) = crate::decomposition::svd(&b, false)?;
 
     // Compute final U = Q * U_b
     let u = q.matmul(&u_b)?;

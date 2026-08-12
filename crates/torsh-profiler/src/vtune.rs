@@ -174,8 +174,11 @@ impl VTuneProfiler {
             duration_us,
             thread_id: 0, // Thread ID tracking simplified
             operation_count: Some(1),
-            flops: Some(0), // Would be calculated based on instruction analysis
-            bytes_transferred: Some(0), // Would be calculated based on memory access analysis
+            // Instruction-level FLOPs/memory-access analysis is not
+            // performed here; `None` rather than a `Some(0)` that would
+            // read as "measured and zero".
+            flops: None,
+            bytes_transferred: None,
             stack_trace: Some(metadata),
         });
 
@@ -221,8 +224,9 @@ impl VTuneProfiler {
             duration_us,
             thread_id,
             operation_count: Some(1),
-            flops: Some(0),
-            bytes_transferred: Some(0),
+            // Not applicable to a threading/synchronization event.
+            flops: None,
+            bytes_transferred: None,
             stack_trace: Some(metadata),
         });
 
@@ -271,8 +275,9 @@ impl VTuneProfiler {
             duration_us,
             thread_id: 0, // Thread ID tracking simplified
             operation_count: Some(1),
-            flops: Some(0),
-            bytes_transferred: Some(size as u64),
+            // Not applicable to a memory access event.
+            flops: None,
+            bytes_transferred: Some(size as u64), // real: caller-supplied access size
             stack_trace: Some(metadata),
         });
 

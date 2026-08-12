@@ -23,12 +23,10 @@ torsh-tensor = { workspace = true }
 torsh-autograd = { workspace = true }
 torsh-linalg = { workspace = true }
 
-# Leverage scirs2's optimizers and optirs
+# Leverage scirs2's optimizers
 scirs2-core = { workspace = true }
 scirs2-optimize = { workspace = true }
-# OptiRS - Advanced ML optimization (re-enabled with crates.io beta.3)
-optirs = { workspace = true }
-optirs-core = { workspace = true }
+# optirs / optirs-core REMOVED: zero use sites in src (verified).
 
 # Utilities
 parking_lot = { workspace = true }

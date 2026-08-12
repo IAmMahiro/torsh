@@ -7,6 +7,7 @@ use crate::memory::{MemoryManager, MemoryPool, MemoryStats, PoolStats};
 use crate::{Buffer, BufferDescriptor, Device};
 use torsh_core::device::DeviceType;
 use torsh_core::error::{Result, TorshError};
+use torsh_core::sync::MutexExt;
 
 #[cfg(feature = "std")]
 use std::collections::HashMap;
@@ -733,10 +734,7 @@ impl MemoryManager for CpuMemoryManager {
     }
 
     fn stats(&self) -> MemoryStats {
-        self.stats
-            .lock()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.stats.lock_or_recover().clone()
     }
 
     fn garbage_collect(&mut self) -> Result<usize> {
@@ -1222,16 +1220,8 @@ impl MemoryPool for CpuMemoryPool {
     }
 
     fn fragmentation_info(&self) -> crate::memory::FragmentationInfo {
-        let allocated_count = self
-            .allocated_blocks
-            .lock()
-            .expect("lock should not be poisoned")
-            .len();
-        let free_count = self
-            .free_blocks
-            .lock()
-            .expect("lock should not be poisoned")
-            .len();
+        let allocated_count = self.allocated_blocks.lock_or_recover().len();
+        let free_count = self.free_blocks.lock_or_recover().len();
 
         crate::memory::FragmentationInfo {
             overall_fragmentation: 0.1,
@@ -1257,16 +1247,8 @@ impl MemoryPool for CpuMemoryPool {
             duration_ms: 0.0,
             largest_free_before: self.size_class,
             largest_free_after: self.size_class,
-            free_blocks_before: self
-                .free_blocks
-                .lock()
-                .expect("lock should not be poisoned")
-                .len(),
-            free_blocks_after: self
-                .free_blocks
-                .lock()
-                .expect("lock should not be poisoned")
-                .len(),
+            free_blocks_before: self.free_blocks.lock_or_recover().len(),
+            free_blocks_after: self.free_blocks.lock_or_recover().len(),
             success: true,
         })
     }

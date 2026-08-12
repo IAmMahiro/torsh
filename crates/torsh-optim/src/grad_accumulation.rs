@@ -20,11 +20,44 @@ pub struct GradientAccumulator<O: Optimizer> {
 }
 
 impl<O: Optimizer> GradientAccumulator<O> {
+    /// Create a new gradient accumulator wrapper, returning an error for an
+    /// invalid step count.
+    ///
+    /// This is the recoverable form of [`GradientAccumulator::new`] and the one
+    /// to prefer when the step count is computed at run time (e.g. derived from
+    /// a target batch size), where aborting the process mid-training is not an
+    /// acceptable failure mode.
+    ///
+    /// # Arguments
+    /// * `optimizer` - The underlying optimizer to wrap
+    /// * `accumulation_steps` - Number of gradient accumulation steps before taking an optimizer step
+    ///
+    /// # Errors
+    /// Returns [`crate::OptimizerError::InvalidParameter`] if `accumulation_steps` is zero.
+    pub fn try_new(optimizer: O, accumulation_steps: u32) -> OptimizerResult<Self> {
+        if accumulation_steps == 0 {
+            return Err(crate::OptimizerError::InvalidParameter(
+                "Accumulation steps must be greater than 0".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            optimizer,
+            accumulation_steps,
+            current_step: 0,
+            accumulated_grads: HashMap::new(),
+        })
+    }
+
     /// Create a new gradient accumulator wrapper
     ///
     /// # Arguments
     /// * `optimizer` - The underlying optimizer to wrap
     /// * `accumulation_steps` - Number of gradient accumulation steps before taking an optimizer step
+    ///
+    /// # Panics
+    /// Panics if `accumulation_steps` is zero. Use [`GradientAccumulator::try_new`]
+    /// to handle an invalid step count without unwinding.
     pub fn new(optimizer: O, accumulation_steps: u32) -> Self {
         if accumulation_steps == 0 {
             panic!("Accumulation steps must be greater than 0");
@@ -239,7 +272,12 @@ pub trait GradientAccumulationSupport {
     fn should_average_gradients(&self) -> bool;
 
     /// Set the number of accumulation steps
-    fn set_accumulation_steps(&mut self, steps: u32);
+    ///
+    /// # Errors
+    /// Returns an error if `steps` is zero; a zero step count would make the
+    /// accumulation modulo undefined, and this is reachable from a run-time
+    /// computed value, so it must not abort the process.
+    fn set_accumulation_steps(&mut self, steps: u32) -> Result<()>;
 
     /// Get the number of accumulation steps
     fn get_accumulation_steps(&self) -> u32;
@@ -407,11 +445,14 @@ impl<O: Optimizer> GradientAccumulationSupport for AccumulatingOptimizer<O> {
             && self.current_step % self.accumulation_steps == 0
     }
 
-    fn set_accumulation_steps(&mut self, steps: u32) {
+    fn set_accumulation_steps(&mut self, steps: u32) -> Result<()> {
         if steps == 0 {
-            panic!("Accumulation steps must be greater than 0");
+            return Err(TorshError::InvalidArgument(
+                "Accumulation steps must be greater than 0".to_string(),
+            ));
         }
         self.accumulation_steps = steps;
+        Ok(())
     }
 
     fn get_accumulation_steps(&self) -> u32 {
@@ -463,7 +504,9 @@ mod tests {
         let sgd = SGD::new(vec![param], 0.01, None, None, None, false);
 
         let mut acc_optimizer = AccumulatingOptimizer::new(sgd);
-        acc_optimizer.set_accumulation_steps(2);
+        acc_optimizer
+            .set_accumulation_steps(2)
+            .expect("non-zero step count");
 
         assert_eq!(acc_optimizer.get_accumulation_steps(), 2);
         assert!(!acc_optimizer.should_average_gradients());
@@ -596,7 +639,7 @@ mod tests {
         let param = Arc::new(RwLock::new(creation::ones::<f32>(&[2]).unwrap()));
         let sgd = SGD::new(vec![param.clone()], 0.01, None, None, None, false);
         let mut acc = AccumulatingOptimizer::new(sgd);
-        acc.set_accumulation_steps(2);
+        acc.set_accumulation_steps(2).expect("non-zero step count");
 
         {
             let grad = creation::ones::<f32>(&[2])

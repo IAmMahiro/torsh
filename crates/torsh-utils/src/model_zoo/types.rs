@@ -5,8 +5,10 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(feature = "reqwest")]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "reqwest")]
 use std::time::{SystemTime, UNIX_EPOCH};
 use torsh_core::error::{Result, TorshError};
 
@@ -477,7 +479,6 @@ impl ModelZoo {
     }
     /// Sync with HuggingFace Hub
     pub fn sync_with_huggingface(&mut self, organization: Option<&str>) -> Result<Vec<String>> {
-        let mut synced_models = Vec::new();
         let base_url = "https://huggingface.co/api/models";
         let url = if let Some(org) = organization {
             format!("{}?author={}", base_url, org)
@@ -486,7 +487,8 @@ impl ModelZoo {
         };
         #[cfg(feature = "reqwest")]
         {
-            let client = reqwest::blocking::Client::builder()
+            let mut synced_models = Vec::new();
+            let client = crate::tls::blocking_client_builder()?
                 .timeout(std::time::Duration::from_secs(
                     self.registry_config.timeout_seconds,
                 ))
@@ -513,15 +515,17 @@ impl ModelZoo {
                     }
                 }
             }
+            Ok(synced_models)
         }
         #[cfg(not(feature = "reqwest"))]
         {
-            println!("Would sync with HuggingFace URL: {}", url);
-            synced_models.push("mock_hf_model".to_string());
+            Err(TorshError::Other(format!(
+                "Cannot sync with HuggingFace ({url}): network downloads are not available in this build (enable the `reqwest` feature)"
+            )))
         }
-        Ok(synced_models)
     }
     /// Parse HuggingFace model metadata into ModelInfo
+    #[cfg(feature = "reqwest")]
     fn parse_huggingface_model(&self, data: &serde_json::Value) -> Result<Option<ModelInfo>> {
         let model_id = data["id"].as_str().unwrap_or("unknown");
         let author = data["author"].as_str().unwrap_or("unknown");
@@ -576,6 +580,7 @@ impl ModelZoo {
         Ok(Some(model_info))
     }
     /// Infer model architecture from HuggingFace model ID
+    #[cfg(feature = "reqwest")]
     fn infer_architecture_from_name(&self, model_id: &str) -> String {
         let lower_id = model_id.to_lowercase();
         if lower_id.contains("bert") {
@@ -595,6 +600,7 @@ impl ModelZoo {
         }
     }
     /// Estimate model size from name (rough heuristic)
+    #[cfg(feature = "reqwest")]
     fn estimate_model_size(&self, model_id: &str) -> f32 {
         let lower_id = model_id.to_lowercase();
         if lower_id.contains("large") {
@@ -760,10 +766,10 @@ impl ModelZoo {
     }
     /// Check health of a specific mirror
     fn check_mirror_health(&self, mirror_url: &str) -> Result<MirrorStatus> {
-        let start_time = std::time::Instant::now();
         #[cfg(feature = "reqwest")]
         {
-            let client = reqwest::blocking::Client::builder()
+            let start_time = std::time::Instant::now();
+            let client = crate::tls::blocking_client_builder()?
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .map_err(|e| TorshError::Other(format!("Failed to create HTTP client: {}", e)))?;
@@ -780,13 +786,9 @@ impl ModelZoo {
         }
         #[cfg(not(feature = "reqwest"))]
         {
-            Ok(MirrorStatus {
-                url: mirror_url.to_string(),
-                last_check: chrono::Utc::now().to_rfc3339(),
-                response_time_ms: 100,
-                available: true,
-                region: Self::detect_mirror_region(mirror_url),
-            })
+            Err(TorshError::Other(format!(
+                "Cannot check mirror health for {mirror_url}: network downloads are not available in this build (enable the `reqwest` feature)"
+            )))
         }
     }
     /// Download with retry logic and mirror failover
@@ -1137,7 +1139,7 @@ impl ModelZoo {
         #[cfg(feature = "reqwest")]
         {
             use std::fs::OpenOptions;
-            let client = reqwest::blocking::Client::builder()
+            let client = crate::tls::blocking_client_builder()?
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .map_err(|e| TorshError::Other(format!("Failed to create HTTP client: {}", e)))?;
@@ -1232,20 +1234,21 @@ impl ModelZoo {
         }
         #[cfg(not(feature = "reqwest"))]
         {
-            println!(
-                "Would download from {} to {:?} (resume from: {:?})",
-                url, final_path, resume_from
+            let _ = (
+                &final_path,
+                &partial_path,
+                &metadata_path,
+                &resume_from,
+                &info,
+                &progress_callback,
             );
-            std::fs::write(final_path, b"dummy model data")?;
-            if let Some(ref callback) = progress_callback {
-                callback(DownloadProgress::complete(
-                    (info.size_mb * 1024.0 * 1024.0) as u64,
-                ));
-            }
-            Ok(())
+            Err(TorshError::Other(format!(
+                "Cannot download {url}: network downloads are not available in this build (enable the `reqwest` feature)"
+            )))
         }
     }
     /// Save download metadata
+    #[cfg(feature = "reqwest")]
     fn save_download_metadata(&self, metadata: &DownloadMetadata, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(metadata)
             .map_err(|e| TorshError::Other(format!("Failed to serialize metadata: {}", e)))?;
@@ -1540,4 +1543,38 @@ pub struct DownloadMetadata {
     pub started_at: u64,
     /// Last modified time
     pub modified_at: u64,
+}
+
+#[cfg(all(test, not(feature = "reqwest")))]
+mod no_network_honesty_tests {
+    //! Regression tests: when the crate is built WITHOUT the `reqwest` feature,
+    //! the network paths must return an honest error instead of fabricating
+    //! model data (previously they returned `"mock_hf_model"` / a fake healthy
+    //! mirror / `b"dummy model data"`).
+    use super::*;
+
+    fn temp_zoo() -> ModelZoo {
+        let dir = std::env::temp_dir().join(format!("torsh_zoo_honesty_{}", std::process::id()));
+        ModelZoo::new(&dir).expect("model zoo must construct")
+    }
+
+    #[test]
+    fn sync_without_reqwest_returns_error_not_mock_model() {
+        let mut zoo = temp_zoo();
+        let result = zoo.sync_with_huggingface(None);
+        assert!(
+            result.is_err(),
+            "no-network sync must return an honest error, not fabricated models"
+        );
+    }
+
+    #[test]
+    fn mirror_health_without_reqwest_returns_error_not_fake_status() {
+        let zoo = temp_zoo();
+        let result = zoo.check_mirror_health("https://example.com");
+        assert!(
+            result.is_err(),
+            "no-network mirror health check must return an honest error, not a fake healthy status"
+        );
+    }
 }

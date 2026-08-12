@@ -204,7 +204,7 @@ impl Optimizer for KFAC {
                 if param.shape().ndim() != 2 {
                     // Fall back to regular gradient descent for non-2D parameters
                     let update = grad.mul_scalar(self.lr)?;
-                    *param = param.sub(&update)?;
+                    crate::param_update::sub_assign(&mut param, &update)?;
                     continue;
                 }
 
@@ -308,10 +308,10 @@ impl Optimizer for KFAC {
                         .mul_scalar(self.momentum)?
                         .add(&preconditioned_grad)?;
                     let update = momentum_buffer.mul_scalar(self.lr)?;
-                    *param = param.sub(&update)?;
+                    crate::param_update::sub_assign(&mut param, &update)?;
                 } else {
                     let update = preconditioned_grad.mul_scalar(self.lr)?;
-                    *param = param.sub(&update)?;
+                    crate::param_update::sub_assign(&mut param, &update)?;
                 }
 
                 // Update state
@@ -338,6 +338,13 @@ impl Optimizer for KFAC {
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
         self.base.set_lr(lr);
+    }
+
+    fn set_lrs(&mut self, lrs: &[f32]) {
+        if let Some(&lr) = lrs.first() {
+            self.lr = lr;
+        }
+        self.base.set_lrs(lrs);
     }
 
     fn add_param_group(&mut self, params: Vec<Arc<RwLock<Tensor>>>, options: HashMap<String, f32>) {

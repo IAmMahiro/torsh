@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Mutex, RwLock};
+use torsh_core::sync::{MutexExt, RwLockExt};
 
 /// Supported automatic differentiation frameworks
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -900,8 +901,7 @@ impl ADFrameworkCompatibilityManager {
     ) -> AutogradResult<CompatibilityLevel> {
         if let Some(level) = self
             .compatibility_matrix
-            .read()
-            .expect("rwlock should not be poisoned")
+            .read_or_recover()
             .get(&(source.clone(), target.clone()))
         {
             return Ok(*level);
@@ -927,8 +927,7 @@ impl ADFrameworkCompatibilityManager {
 
         // Cache the result
         self.compatibility_matrix
-            .write()
-            .expect("rwlock should not be poisoned")
+            .write_or_recover()
             .insert((source.clone(), target.clone()), compatibility);
 
         Ok(compatibility)
@@ -1018,12 +1017,7 @@ impl ADFrameworkCompatibilityManager {
     ) -> AutogradResult<MigrationPlan> {
         let cache_key = format!("{}_{}", source, target);
 
-        if let Some(cached_plan) = self
-            .migration_cache
-            .lock()
-            .expect("lock should not be poisoned")
-            .get(&cache_key)
-        {
+        if let Some(cached_plan) = self.migration_cache.lock_or_recover().get(&cache_key) {
             return Ok(cached_plan.clone());
         }
 
@@ -1047,8 +1041,7 @@ impl ADFrameworkCompatibilityManager {
 
         // Cache the plan
         self.migration_cache
-            .lock()
-            .expect("lock should not be poisoned")
+            .lock_or_recover()
             .insert(cache_key, plan.clone());
 
         Ok(plan)
@@ -1148,7 +1141,7 @@ pub fn convert_tensor(
     target_framework: ADFramework,
 ) -> AutogradResult<Box<dyn FrameworkTensor>> {
     let manager = get_global_compatibility_manager();
-    let manager_lock = manager.lock().expect("lock should not be poisoned");
+    let manager_lock = manager.lock_or_recover();
     let adapter = manager_lock.get_adapter(&target_framework).ok_or_else(|| {
         AutogradError::gradient_computation(
             "adapter_lookup",
@@ -1164,7 +1157,7 @@ pub fn migrate_model(
     data: &MigrationData,
 ) -> AutogradResult<MigrationResult> {
     let manager = get_global_compatibility_manager();
-    let manager_lock = manager.lock().expect("lock should not be poisoned");
+    let manager_lock = manager.lock_or_recover();
     manager_lock.execute_migration(source, target, data)
 }
 
@@ -1173,7 +1166,7 @@ pub fn check_framework_compatibility(
     target: ADFramework,
 ) -> AutogradResult<CompatibilityLevel> {
     let manager = get_global_compatibility_manager();
-    let manager_lock = manager.lock().expect("lock should not be poisoned");
+    let manager_lock = manager.lock_or_recover();
     manager_lock.check_compatibility(&source, &target)
 }
 

@@ -10,9 +10,12 @@
 //! - **Memory-Efficient Processing**: Optimized memory layout for large graphs
 //! - **Adaptive Message Passing**: Dynamic message routing based on graph topology
 //! - **Multi-Scale Features**: Hierarchical node and edge feature processing
-
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
+
 use crate::parameter::Parameter;
 use crate::{GraphData, GraphLayer};
 use torsh_tensor::{
@@ -76,72 +79,49 @@ impl MPNNConv {
         update_hidden_dim: usize,
         aggregation_type: AggregationType,
         bias: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         // Message function: takes concatenated [h_i, h_j, e_ij] and outputs message
         let message_input_dim = 2 * in_features + edge_features;
-        let message_layer1 = Parameter::new(
-            randn(&[message_input_dim, message_hidden_dim])
-                .expect("failed to create message layer 1 weights"),
-        );
-        let message_layer2 = Parameter::new(
-            randn(&[message_hidden_dim, out_features])
-                .expect("failed to create message layer 2 weights"),
-        );
+        let message_layer1 = Parameter::new(randn(&[message_input_dim, message_hidden_dim])?);
+        let message_layer2 = Parameter::new(randn(&[message_hidden_dim, out_features])?);
 
         let message_bias1 = if bias {
-            Some(Parameter::new(
-                zeros(&[message_hidden_dim]).expect("failed to create message bias 1"),
-            ))
+            Some(Parameter::new(zeros(&[message_hidden_dim])?))
         } else {
             None
         };
 
         let message_bias2 = if bias {
-            Some(Parameter::new(
-                zeros(&[out_features]).expect("failed to create message bias 2"),
-            ))
+            Some(Parameter::new(zeros(&[out_features])?))
         } else {
             None
         };
 
         // Update function: takes [h_i, aggregated_messages] and outputs new h_i
         let update_input_dim = in_features + out_features;
-        let update_layer1 = Parameter::new(
-            randn(&[update_input_dim, update_hidden_dim])
-                .expect("failed to create update layer 1 weights"),
-        );
-        let update_layer2 = Parameter::new(
-            randn(&[update_hidden_dim, out_features])
-                .expect("failed to create update layer 2 weights"),
-        );
+        let update_layer1 = Parameter::new(randn(&[update_input_dim, update_hidden_dim])?);
+        let update_layer2 = Parameter::new(randn(&[update_hidden_dim, out_features])?);
 
         let update_bias1 = if bias {
-            Some(Parameter::new(
-                zeros(&[update_hidden_dim]).expect("failed to create update bias 1"),
-            ))
+            Some(Parameter::new(zeros(&[update_hidden_dim])?))
         } else {
             None
         };
 
         let update_bias2 = if bias {
-            Some(Parameter::new(
-                zeros(&[out_features]).expect("failed to create update bias 2"),
-            ))
+            Some(Parameter::new(zeros(&[out_features])?))
         } else {
             None
         };
 
         // Edge embedding (optional, used if edge_features > 0)
         let edge_embedding = if edge_features > 0 {
-            Some(Parameter::new(
-                randn(&[edge_features, edge_features])
-                    .expect("failed to create edge embedding weights"),
-            ))
+            Some(Parameter::new(randn(&[edge_features, edge_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             edge_features,
@@ -157,39 +137,37 @@ impl MPNNConv {
             update_bias2,
             edge_embedding,
             aggregation_type,
-        }
+        })
     }
 
     /// Apply MPNN convolution
-    pub fn forward(&self, graph: &GraphData) -> GraphData {
+    pub fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         let num_nodes = graph.num_nodes;
-        let edge_data = crate::utils::tensor_to_vec2::<f32>(&graph.edge_index)
-            .expect("failed to extract edge index data");
+        let edge_data = crate::utils::tensor_to_vec2::<f32>(&graph.edge_index)?;
         let _num_edges = edge_data[0].len();
 
         // Step 1: Compute messages for each edge
-        let messages = self.compute_messages(graph);
+        let messages = self.compute_messages(graph)?;
 
         // Step 2: Aggregate messages at nodes
-        let aggregated = self.aggregate_messages(&messages, &edge_data, num_nodes);
+        let aggregated = self.aggregate_messages(&messages, &edge_data, num_nodes)?;
 
         // Step 3: Update node states
-        let updated_features = self.update_nodes(&graph.x, &aggregated);
+        let updated_features = self.update_nodes(&graph.x, &aggregated)?;
 
-        GraphData {
+        Ok(GraphData {
             x: updated_features,
             edge_index: graph.edge_index.clone(),
             edge_attr: graph.edge_attr.clone(),
             batch: graph.batch.clone(),
             num_nodes: graph.num_nodes,
             num_edges: graph.num_edges,
-        }
+        })
     }
 
     /// Compute messages for each edge
-    fn compute_messages(&self, graph: &GraphData) -> Tensor {
-        let edge_data = crate::utils::tensor_to_vec2::<f32>(&graph.edge_index)
-            .expect("failed to extract edge index data");
+    fn compute_messages(&self, graph: &GraphData) -> Result<Tensor> {
+        let edge_data = crate::utils::tensor_to_vec2::<f32>(&graph.edge_index)?;
         let num_edges = edge_data[0].len();
 
         let mut all_messages = Vec::new();
@@ -201,89 +179,60 @@ impl MPNNConv {
             // Get source and destination node features
             let h_i = graph
                 .x
-                .slice_tensor(0, src_idx, src_idx + 1)
-                .expect("failed to slice source node features")
-                .squeeze_tensor(0)
-                .expect("failed to squeeze source node features");
+                .slice_tensor(0, src_idx, src_idx + 1)?
+                .squeeze_tensor(0)?;
             let h_j = graph
                 .x
-                .slice_tensor(0, dst_idx, dst_idx + 1)
-                .expect("failed to slice destination node features")
-                .squeeze_tensor(0)
-                .expect("failed to squeeze destination node features");
+                .slice_tensor(0, dst_idx, dst_idx + 1)?
+                .squeeze_tensor(0)?;
 
             // Get edge features if available
             let edge_feat = if let Some(ref edge_attr) = graph.edge_attr {
                 if self.edge_features > 0 {
                     let e_ij = edge_attr
-                        .slice_tensor(0, edge_idx, edge_idx + 1)
-                        .expect("failed to slice edge attributes")
-                        .squeeze_tensor(0)
-                        .expect("failed to squeeze edge attributes");
+                        .slice_tensor(0, edge_idx, edge_idx + 1)?
+                        .squeeze_tensor(0)?;
 
                     // Apply edge embedding if available
                     if let Some(ref edge_emb) = self.edge_embedding {
                         // Ensure e_ij is 2D for matrix multiplication
-                        let e_ij_2d = e_ij
-                            .unsqueeze_tensor(0)
-                            .expect("failed to unsqueeze edge features");
-                        e_ij_2d
-                            .matmul(&edge_emb.clone_data())
-                            .expect("failed to apply edge embedding")
-                            .squeeze_tensor(0)
-                            .expect("failed to squeeze embedded edge features")
+                        let e_ij_2d = e_ij.unsqueeze_tensor(0)?;
+                        e_ij_2d.matmul(&edge_emb.clone_data())?.squeeze_tensor(0)?
                     } else {
                         e_ij
                     }
                 } else {
-                    zeros(&[self.edge_features]).expect("failed to create zero edge features")
+                    zeros(&[self.edge_features])?
                 }
             } else {
-                zeros(&[self.edge_features]).expect("failed to create zero edge features")
+                zeros(&[self.edge_features])?
             };
 
             // Concatenate [h_i, h_j, e_ij]
-            let message_input = Tensor::cat(&[&h_i, &h_j, &edge_feat], 0)
-                .expect("failed to concatenate message input");
+            let message_input = Tensor::cat(&[&h_i, &h_j, &edge_feat], 0)?;
 
             // Apply message function (2-layer MLP with ReLU)
             // Ensure message_input is 2D for matrix multiplication
-            let message_input_2d = message_input
-                .unsqueeze_tensor(0)
-                .expect("failed to unsqueeze message input");
+            let message_input_2d = message_input.unsqueeze_tensor(0)?;
             let mut message = message_input_2d
-                .matmul(&self.message_layer1.clone_data())
-                .expect("failed to apply message layer 1")
-                .squeeze_tensor(0)
-                .expect("failed to squeeze message layer 1 output");
+                .matmul(&self.message_layer1.clone_data())?
+                .squeeze_tensor(0)?;
 
             if let Some(ref bias1) = self.message_bias1 {
-                message = message
-                    .add(&bias1.clone_data())
-                    .expect("operation should succeed");
+                message = message.add(&bias1.clone_data())?;
             }
 
             // Apply ReLU activation
-            message = message
-                .maximum(
-                    &zeros(&message.shape().dims()).expect("failed to create zero tensor for ReLU"),
-                )
-                .expect("failed to apply ReLU activation");
+            message = message.maximum(&zeros(&message.shape().dims())?)?;
 
             // Second layer
-            let message_2d = message
-                .unsqueeze_tensor(0)
-                .expect("failed to unsqueeze message for layer 2");
+            let message_2d = message.unsqueeze_tensor(0)?;
             message = message_2d
-                .matmul(&self.message_layer2.clone_data())
-                .expect("failed to apply message layer 2")
-                .squeeze_tensor(0)
-                .expect("failed to squeeze message layer 2 output");
+                .matmul(&self.message_layer2.clone_data())?
+                .squeeze_tensor(0)?;
 
             if let Some(ref bias2) = self.message_bias2 {
-                message = message
-                    .add(&bias2.clone_data())
-                    .expect("operation should succeed");
+                message = message.add(&bias2.clone_data())?;
             }
 
             all_messages.push(message);
@@ -291,21 +240,20 @@ impl MPNNConv {
 
         // Stack all messages
         if all_messages.is_empty() {
-            zeros(&[0, self.out_features]).expect("failed to create empty messages tensor")
+            Ok(zeros(&[0, self.out_features])?)
         } else {
             // Convert Vec<Tensor> to single tensor by stacking
             let mut message_data = Vec::new();
             for msg in &all_messages {
-                let msg_vec = msg.to_vec().expect("conversion should succeed");
+                let msg_vec = msg.to_vec()?;
                 message_data.extend(msg_vec);
             }
 
-            torsh_tensor::creation::from_vec(
+            Ok(torsh_tensor::creation::from_vec(
                 message_data,
                 &[all_messages.len(), self.out_features],
                 torsh_core::device::DeviceType::Cpu,
-            )
-            .expect("failed to create messages tensor from data")
+            )?)
         }
     }
 
@@ -315,13 +263,12 @@ impl MPNNConv {
         messages: &Tensor,
         edge_data: &[Vec<f32>],
         num_nodes: usize,
-    ) -> Tensor {
-        let mut aggregated = zeros(&[num_nodes, self.out_features])
-            .expect("failed to create aggregated messages tensor");
+    ) -> Result<Tensor> {
+        let mut aggregated = zeros(&[num_nodes, self.out_features])?;
         let num_edges = edge_data[0].len();
 
         if num_edges == 0 {
-            return aggregated;
+            return Ok(aggregated);
         }
 
         match self.aggregation_type {
@@ -333,27 +280,17 @@ impl MPNNConv {
                     let dst_idx = edge_data[1][edge_idx] as usize;
                     if dst_idx < num_nodes {
                         let message = messages
-                            .slice_tensor(0, edge_idx, edge_idx + 1)
-                            .expect("failed to slice message")
-                            .squeeze_tensor(0)
-                            .expect("failed to squeeze message");
+                            .slice_tensor(0, edge_idx, edge_idx + 1)?
+                            .squeeze_tensor(0)?;
 
                         let current = aggregated
-                            .slice_tensor(0, dst_idx, dst_idx + 1)
-                            .expect("failed to slice aggregated tensor")
-                            .squeeze_tensor(0)
-                            .expect("failed to squeeze aggregated tensor");
-                        let updated = current.add(&message).expect("operation should succeed");
+                            .slice_tensor(0, dst_idx, dst_idx + 1)?
+                            .squeeze_tensor(0)?;
+                        let updated = current.add(&message)?;
 
                         aggregated
-                            .slice_tensor(0, dst_idx, dst_idx + 1)
-                            .expect("failed to slice aggregated tensor for update")
-                            .copy_(
-                                &updated
-                                    .unsqueeze_tensor(0)
-                                    .expect("failed to unsqueeze updated tensor"),
-                            )
-                            .expect("failed to copy updated tensor");
+                            .slice_tensor(0, dst_idx, dst_idx + 1)?
+                            .copy_(&updated.unsqueeze_tensor(0)?)?;
 
                         node_counts[dst_idx] += 1;
                     }
@@ -364,23 +301,13 @@ impl MPNNConv {
                     for node in 0..num_nodes {
                         if node_counts[node] > 0 {
                             let current = aggregated
-                                .slice_tensor(0, node, node + 1)
-                                .expect("failed to slice aggregated tensor for mean")
-                                .squeeze_tensor(0)
-                                .expect("failed to squeeze aggregated tensor for mean");
-                            let normalized = current
-                                .div_scalar(node_counts[node] as f32)
-                                .expect("failed to normalize aggregated tensor");
+                                .slice_tensor(0, node, node + 1)?
+                                .squeeze_tensor(0)?;
+                            let normalized = current.div_scalar(node_counts[node] as f32)?;
 
                             aggregated
-                                .slice_tensor(0, node, node + 1)
-                                .expect("failed to slice aggregated tensor for normalized update")
-                                .copy_(
-                                    &normalized
-                                        .unsqueeze_tensor(0)
-                                        .expect("failed to unsqueeze normalized tensor"),
-                                )
-                                .expect("failed to copy normalized tensor");
+                                .slice_tensor(0, node, node + 1)?
+                                .copy_(&normalized.unsqueeze_tensor(0)?)?;
                         }
                     }
                 }
@@ -388,43 +315,29 @@ impl MPNNConv {
 
             AggregationType::Max => {
                 // Initialize with very negative values
-                aggregated
-                    .fill_(-1e9_f32)
-                    .expect("failed to fill aggregated tensor with initial values");
+                aggregated.fill_(-1e9_f32)?;
 
                 for edge_idx in 0..num_edges {
                     let dst_idx = edge_data[1][edge_idx] as usize;
                     if dst_idx < num_nodes {
                         let message = messages
-                            .slice_tensor(0, edge_idx, edge_idx + 1)
-                            .expect("failed to slice message for max aggregation")
-                            .squeeze_tensor(0)
-                            .expect("failed to squeeze message for max aggregation");
+                            .slice_tensor(0, edge_idx, edge_idx + 1)?
+                            .squeeze_tensor(0)?;
 
                         let current = aggregated
-                            .slice_tensor(0, dst_idx, dst_idx + 1)
-                            .expect("failed to slice aggregated tensor for max")
-                            .squeeze_tensor(0)
-                            .expect("failed to squeeze aggregated tensor for max");
-                        let updated = current
-                            .maximum(&message)
-                            .expect("failed to compute maximum");
+                            .slice_tensor(0, dst_idx, dst_idx + 1)?
+                            .squeeze_tensor(0)?;
+                        let updated = current.maximum(&message)?;
 
                         aggregated
-                            .slice_tensor(0, dst_idx, dst_idx + 1)
-                            .expect("failed to slice aggregated tensor for max update")
-                            .copy_(
-                                &updated
-                                    .unsqueeze_tensor(0)
-                                    .expect("failed to unsqueeze max updated tensor"),
-                            )
-                            .expect("failed to copy max updated tensor");
+                            .slice_tensor(0, dst_idx, dst_idx + 1)?
+                            .copy_(&updated.unsqueeze_tensor(0)?)?;
                     }
                 }
 
                 // Replace -1e9 with zeros for nodes with no incoming edges
                 // Create a new tensor where values <= -1e8 are set to 0
-                let aggregated_data = aggregated.to_vec().expect("conversion should succeed");
+                let aggregated_data = aggregated.to_vec()?;
                 let filtered_data: Vec<f32> = aggregated_data
                     .iter()
                     .map(|&x| if x <= -1e8_f32 { 0.0 } else { x })
@@ -433,8 +346,7 @@ impl MPNNConv {
                     filtered_data,
                     aggregated.shape().dims().to_vec(),
                     aggregated.device(),
-                )
-                .expect("failed to create filtered aggregated tensor");
+                )?;
             }
 
             AggregationType::Attention => {
@@ -444,89 +356,71 @@ impl MPNNConv {
             }
         }
 
-        aggregated
+        Ok(aggregated)
     }
 
     /// Update node states using aggregated messages
-    fn update_nodes(&self, current_states: &Tensor, aggregated_messages: &Tensor) -> Tensor {
+    fn update_nodes(
+        &self,
+        current_states: &Tensor,
+        aggregated_messages: &Tensor,
+    ) -> Result<Tensor> {
         let num_nodes = current_states.shape().dims()[0];
-        let mut updated_states =
-            zeros(&[num_nodes, self.out_features]).expect("failed to create updated states tensor");
+        let mut updated_states = zeros(&[num_nodes, self.out_features])?;
 
         for node in 0..num_nodes {
             // Get current node state
             let h_i = current_states
-                .slice_tensor(0, node, node + 1)
-                .expect("failed to slice current node state")
-                .squeeze_tensor(0)
-                .expect("failed to squeeze current node state");
+                .slice_tensor(0, node, node + 1)?
+                .squeeze_tensor(0)?;
 
             // Get aggregated message
             let m_i = aggregated_messages
-                .slice_tensor(0, node, node + 1)
-                .expect("failed to slice aggregated message")
-                .squeeze_tensor(0)
-                .expect("failed to squeeze aggregated message");
+                .slice_tensor(0, node, node + 1)?
+                .squeeze_tensor(0)?;
 
             // Concatenate [h_i, m_i]
-            let update_input =
-                Tensor::cat(&[&h_i, &m_i], 0).expect("failed to concatenate update input");
+            let update_input = Tensor::cat(&[&h_i, &m_i], 0)?;
 
             // Apply update function (2-layer MLP with ReLU)
             // Ensure update_input is 2D for matrix multiplication
-            let update_input_2d = update_input
-                .unsqueeze_tensor(0)
-                .expect("failed to unsqueeze update input");
+            let update_input_2d = update_input.unsqueeze_tensor(0)?;
             let mut updated = update_input_2d
-                .matmul(&self.update_layer1.clone_data())
-                .expect("failed to apply update layer 1")
-                .squeeze_tensor(0)
-                .expect("failed to squeeze update layer 1 output");
+                .matmul(&self.update_layer1.clone_data())?
+                .squeeze_tensor(0)?;
 
             if let Some(ref bias1) = self.update_bias1 {
-                updated = updated
-                    .add(&bias1.clone_data())
-                    .expect("operation should succeed");
+                updated = updated.add(&bias1.clone_data())?;
             }
 
             // Apply ReLU activation (clamp minimum to 0)
             let mut updated_temp = updated;
-            updated_temp
-                .clamp_(0.0, f32::INFINITY)
-                .expect("failed to clamp update values");
+            updated_temp.clamp_(0.0, f32::INFINITY)?;
             updated = updated_temp;
 
             // Second layer
-            let updated_2d = updated
-                .unsqueeze_tensor(0)
-                .expect("failed to unsqueeze for update layer 2");
+            let updated_2d = updated.unsqueeze_tensor(0)?;
             updated = updated_2d
-                .matmul(&self.update_layer2.clone_data())
-                .expect("failed to apply update layer 2")
-                .squeeze_tensor(0)
-                .expect("failed to squeeze update layer 2 output");
+                .matmul(&self.update_layer2.clone_data())?
+                .squeeze_tensor(0)?;
 
             if let Some(ref bias2) = self.update_bias2 {
-                updated = updated
-                    .add(&bias2.clone_data())
-                    .expect("operation should succeed");
+                updated = updated.add(&bias2.clone_data())?;
             }
 
             // Store updated state in the corresponding row
-            let updated_data = updated.to_vec().expect("conversion should succeed");
+            let updated_data = updated.to_vec()?;
             for (i, &value) in updated_data.iter().enumerate() {
-                updated_states
-                    .set_item(&[node, i], value)
-                    .expect("failed to set updated state value");
+                updated_states.set_item(&[node, i], value)?;
             }
         }
 
-        updated_states
+        Ok(updated_states)
     }
 }
 
 impl GraphLayer for MPNNConv {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         self.forward(graph)
     }
 
@@ -571,7 +465,7 @@ mod tests {
     #[test]
     fn test_mpnn_creation() {
         let mpnn = MPNNConv::new(8, 16, 4, 32, 32, AggregationType::Sum, true);
-        let params = mpnn.parameters();
+        let params = mpnn.expect("operation should succeed").parameters();
 
         // Should have: message_layer1, message_layer2, update_layer1, update_layer2,
         // message_bias1, message_bias2, update_bias1, update_bias2, edge_embedding
@@ -603,7 +497,10 @@ mod tests {
 
         let graph = GraphData::new(x, edge_index).with_edge_attr(edge_attr);
 
-        let output = mpnn.forward(&graph);
+        let output = mpnn
+            .expect("operation should succeed")
+            .forward(&graph)
+            .expect("operation should succeed");
         assert_eq!(output.x.shape().dims(), &[3, 8]);
         assert_eq!(output.num_nodes, 3);
     }
@@ -624,9 +521,9 @@ mod tests {
         let graph = GraphData::new(x, edge_index);
 
         // All should run without panicking
-        let _output_sum = mpnn_sum.forward(&graph);
-        let _output_mean = mpnn_mean.forward(&graph);
-        let _output_max = mpnn_max.forward(&graph);
+        let _output_sum = mpnn_sum.expect("operation should succeed").forward(&graph);
+        let _output_mean = mpnn_mean.expect("operation should succeed").forward(&graph);
+        let _output_max = mpnn_max.expect("operation should succeed").forward(&graph);
     }
 
     #[test]
@@ -640,7 +537,10 @@ mod tests {
         let edge_index = zeros(&[2, 0]).expect("zeros should succeed");
         let graph = GraphData::new(x, edge_index);
 
-        let output = mpnn.forward(&graph);
+        let output = mpnn
+            .expect("operation should succeed")
+            .forward(&graph)
+            .expect("operation should succeed");
         assert_eq!(output.x.shape().dims(), &[1, 8]);
         assert_eq!(output.num_nodes, 1);
     }
@@ -765,20 +665,24 @@ impl AdvancedSIMDMPNN {
     }
 
     /// SIMD-optimized forward pass with vectorized message passing
-    pub fn forward_simd(&mut self, graph: &GraphData) -> GraphData {
+    ///
+    /// # Errors
+    /// Returns an error when node features or edge attributes are not 2D, or
+    /// when the output tensor cannot be rebuilt.
+    pub fn forward_simd(&mut self, graph: &GraphData) -> Result<GraphData> {
         let batch_size = graph.num_nodes;
 
         if batch_size == 0 {
-            return graph.clone();
+            return Ok(graph.clone());
         }
 
         // Convert tensors to ndarray for SIMD operations
-        let node_features = self.tensor_to_array2(&graph.x);
+        let node_features = self.tensor_to_array2(&graph.x)?;
         let edge_indices = self.extract_edge_indices(&graph.edge_index);
-        let edge_attributes = graph
-            .edge_attr
-            .as_ref()
-            .map(|attr| self.tensor_to_array2(attr));
+        let edge_attributes = match graph.edge_attr.as_ref() {
+            Some(attr) => Some(self.tensor_to_array2(attr)?),
+            None => None,
+        };
 
         // SIMD-optimized message computation
         let messages = if self.memory_efficient && batch_size > self.simd_chunk_size {
@@ -795,13 +699,13 @@ impl AdvancedSIMDMPNN {
         let updated_features = self.update_nodes_simd(&node_features, &aggregated_messages);
 
         // Convert back to tensor format
-        let output_tensor = self.array2_to_tensor(&updated_features);
+        let output_tensor = self.array2_to_tensor(&updated_features)?;
 
         // Update performance cache
         self.update_performance_cache(batch_size, edge_indices.len());
 
-        GraphData::new(output_tensor, graph.edge_index.clone())
-            .with_edge_attr_opt(graph.edge_attr.clone())
+        Ok(GraphData::new(output_tensor, graph.edge_index.clone())
+            .with_edge_attr_opt(graph.edge_attr.clone()))
     }
 
     /// Initialize weights with SIMD-friendly patterns
@@ -1237,35 +1141,34 @@ impl AdvancedSIMDMPNN {
     }
 
     /// Utility functions for tensor/array conversion
-    fn tensor_to_array2(&self, tensor: &Tensor) -> Array2<f64> {
-        match tensor.to_vec() {
-            Ok(vec_data) => {
-                let shape = tensor.shape();
-                let dims = shape.dims();
-                if dims.len() == 2 {
-                    let rows = dims[0];
-                    let cols = dims[1];
-                    let data_f64: Vec<f64> = vec_data.iter().map(|&x| x as f64).collect();
-                    Array2::from_shape_vec((rows, cols), data_f64)
-                        .expect("failed to create Array2 from shape and data")
-                } else {
-                    Array2::zeros((1, 1))
-                }
-            }
-            Err(_) => Array2::zeros((1, 1)),
+    fn tensor_to_array2(&self, tensor: &Tensor) -> Result<Array2<f64>> {
+        let vec_data = tensor.to_vec()?;
+        let shape = tensor.shape();
+        let dims = shape.dims();
+        if dims.len() != 2 {
+            return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                "tensor_to_array2 requires a 2D tensor, got {dims:?}"
+            )));
         }
+        let rows = dims[0];
+        let cols = dims[1];
+        let data_f64: Vec<f64> = vec_data.iter().map(|&x| x as f64).collect();
+        Array2::from_shape_vec((rows, cols), data_f64).map_err(|e| {
+            torsh_core::error::TorshError::InvalidArgument(format!(
+                "failed to build a {rows}x{cols} array: {e}"
+            ))
+        })
     }
 
-    fn array2_to_tensor(&self, array: &Array2<f64>) -> Tensor {
+    fn array2_to_tensor(&self, array: &Array2<f64>) -> Result<Tensor> {
         let (rows, cols) = array.dim();
         let data_f32: Vec<f32> = array.iter().map(|&x| x as f32).collect();
 
-        torsh_tensor::creation::from_vec(
+        Ok(torsh_tensor::creation::from_vec(
             data_f32,
             &[rows, cols],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("failed to create tensor from array data")
+        )?)
     }
 
     fn extract_edge_indices(&self, edge_index: &Tensor) -> Vec<(usize, usize)> {

@@ -170,8 +170,12 @@ impl NsightProfiler {
             duration_us,
             thread_id: self.config.device_id as usize,
             operation_count: Some(1),
-            flops: Some(0),             // Would be calculated based on kernel analysis
-            bytes_transferred: Some(0), // Would be calculated based on memory analysis
+            // FLOPs/bytes for a kernel launch require analyzing the actual
+            // kernel (instruction mix, launch config); not measured here.
+            // `None` rather than a `Some(0)` that would read as "measured
+            // and zero".
+            flops: None,
+            bytes_transferred: None,
             stack_trace: None,
         });
 
@@ -219,8 +223,10 @@ impl NsightProfiler {
             duration_us,
             thread_id: self.config.device_id as usize,
             operation_count: Some(1),
-            flops: Some(0),
-            bytes_transferred: Some(size_bytes as u64),
+            // Not applicable to a pure memory transfer -- no computation
+            // is being measured, so `None` rather than a misleading zero.
+            flops: None,
+            bytes_transferred: Some(size_bytes as u64), // real: caller-supplied transfer size
             stack_trace: None,
         });
 

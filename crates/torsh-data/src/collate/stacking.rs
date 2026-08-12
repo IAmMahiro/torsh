@@ -121,26 +121,45 @@ impl TensorStacker {
         new_dims
     }
 
+    /// Split each source tensor's flat buffer into an `outer_size` (product of
+    /// dims before `dim`) by `inner_size` (product of dims from `dim` onward)
+    /// view. Stacking a new batch axis at `dim` means each of the
+    /// `outer_size` blocks gets one `inner_size`-long chunk copied in from
+    /// every source tensor in turn, which is exactly `dim == 0` (`outer_size
+    /// == 1`) generalized to any `dim`.
+    fn outer_inner_split(&self, dims: &[usize], dim: usize) -> (usize, usize) {
+        let dim = dim.min(dims.len());
+        let outer_size: usize = dims[..dim].iter().product();
+        let inner_size: usize = dims[dim..].iter().product();
+        (outer_size, inner_size)
+    }
+
     /// Sequential tensor stacking
     fn stack_sequential<T: TensorElement + Copy>(
         &self,
         tensors: &[Tensor<T>],
         dim: usize,
     ) -> Result<Tensor<T>> {
-        let new_dims = self.create_new_shape(tensors[0].shape().dims(), tensors.len(), dim);
-        let tensor_size = tensors[0].numel();
+        let original_dims = tensors[0].shape().dims().to_vec();
+        let new_dims = self.create_new_shape(&original_dims, tensors.len(), dim);
+        let (outer_size, inner_size) = self.outer_inner_split(&original_dims, dim);
         let total_elements = new_dims.iter().product::<usize>();
-        // Optimize: pre-allocate without unnecessary zero-initialization
-        let mut new_data = Vec::with_capacity(total_elements);
-        // SAFETY: We immediately fill all elements in the loop below
-        unsafe { new_data.set_len(total_elements) };
 
-        // Copy data sequentially
-        for (i, tensor) in tensors.iter().enumerate() {
-            let data = tensor.to_vec()?;
-            let start_idx = i * tensor_size;
-            let end_idx = start_idx + tensor_size;
-            new_data[start_idx..end_idx].copy_from_slice(&data);
+        // Gather every source tensor's data BEFORE allocating the output
+        // buffer, so a mid-batch conversion error surfaces via `?` before any
+        // partially-filled buffer exists (avoids the set_len-before-fully-
+        // initialized UB the old implementation had).
+        let all_data: Vec<Vec<T>> = tensors
+            .iter()
+            .map(|tensor| tensor.to_vec())
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut new_data = Vec::with_capacity(total_elements);
+        for outer in 0..outer_size {
+            let offset = outer * inner_size;
+            for data in &all_data {
+                new_data.extend_from_slice(&data[offset..offset + inner_size]);
+            }
         }
 
         torsh_tensor::Tensor::from_data(new_data, new_dims, tensors[0].device())
@@ -153,25 +172,32 @@ impl TensorStacker {
         tensors: &[Tensor<T>],
         dim: usize,
     ) -> Result<Tensor<T>> {
-        let new_dims = self.create_new_shape(tensors[0].shape().dims(), tensors.len(), dim);
-        let tensor_size = tensors[0].numel();
-        let total_elements = new_dims.iter().product::<usize>();
-        // Optimize: pre-allocate without unnecessary zero-initialization
-        let mut new_data = Vec::with_capacity(total_elements);
-        // SAFETY: We immediately fill all elements after parallel collection
-        unsafe { new_data.set_len(total_elements) };
+        let original_dims = tensors[0].shape().dims().to_vec();
+        let new_dims = self.create_new_shape(&original_dims, tensors.len(), dim);
+        let (outer_size, inner_size) = self.outer_inner_split(&original_dims, dim);
 
-        // Parallel data collection
+        // Parallel data collection - gathered fully before any output buffer
+        // exists, so a conversion error surfaces via `?` before any
+        // partially-filled buffer would need to be dropped.
         let parallel_data: std::result::Result<Vec<Vec<T>>, TorshError> =
             tensors.par_iter().map(|tensor| tensor.to_vec()).collect();
-        let parallel_data = parallel_data?;
+        let all_data = parallel_data?;
 
-        for (i, data) in parallel_data.into_iter().enumerate() {
-            let start_idx = i * tensor_size;
-            let end_idx = start_idx + tensor_size;
-            new_data[start_idx..end_idx].copy_from_slice(&data);
-        }
+        // Stack each of the `outer_size` interleaved blocks in parallel, then
+        // flatten the per-block chunks back together in order.
+        let chunks: Vec<Vec<T>> = (0..outer_size)
+            .into_par_iter()
+            .map(|outer| {
+                let offset = outer * inner_size;
+                let mut chunk = Vec::with_capacity(all_data.len() * inner_size);
+                for data in &all_data {
+                    chunk.extend_from_slice(&data[offset..offset + inner_size]);
+                }
+                chunk
+            })
+            .collect();
 
+        let new_data: Vec<T> = chunks.into_iter().flatten().collect();
         torsh_tensor::Tensor::from_data(new_data, new_dims, tensors[0].device())
     }
 

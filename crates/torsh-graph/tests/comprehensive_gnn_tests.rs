@@ -47,11 +47,11 @@ fn create_small_graph() -> GraphData {
 }
 
 fn create_medium_graph() -> GraphData {
-    generation::erdos_renyi(12, 0.3)
+    generation::erdos_renyi(12, 0.3).expect("operation should succeed")
 }
 
 fn create_large_graph() -> GraphData {
-    generation::barabasi_albert(25, 4)
+    generation::barabasi_albert(25, 4).expect("operation should succeed")
 }
 
 // =============================================================================
@@ -60,14 +60,14 @@ fn create_large_graph() -> GraphData {
 
 #[test]
 fn test_gcn_layer_creation() {
-    let gcn = GCNConv::new(4, 8, true);
+    let gcn = GCNConv::new(4, 8, true).expect("operation should succeed");
     let params = gcn.parameters();
     assert_eq!(params.len(), 2); // weight + bias
 }
 
 #[test]
 fn test_gcn_layer_creation_no_bias() {
-    let gcn = GCNConv::new(4, 8, false);
+    let gcn = GCNConv::new(4, 8, false).expect("operation should succeed");
     let params = gcn.parameters();
     assert_eq!(params.len(), 1); // weight only
 }
@@ -75,9 +75,9 @@ fn test_gcn_layer_creation_no_bias() {
 #[test]
 fn test_gcn_forward_pass() {
     let graph = create_standard_test_graph();
-    let gcn = GCNConv::new(4, 16, true);
+    let gcn = GCNConv::new(4, 16, true).expect("operation should succeed");
 
-    let output = gcn.forward(&graph);
+    let output = gcn.forward(&graph).expect("operation should succeed");
 
     // Validate output dimensions
     assert_eq!(output.x.shape().dims(), &[6, 16]);
@@ -98,8 +98,8 @@ fn test_gcn_different_sizes() {
     ];
 
     for (name, graph, in_features, expected_nodes) in graphs {
-        let gcn = GCNConv::new(in_features, 8, true);
-        let output = gcn.forward(&graph);
+        let gcn = GCNConv::new(in_features, 8, true).expect("operation should succeed");
+        let output = gcn.forward(&graph).expect("operation should succeed");
 
         assert_eq!(
             output.num_nodes, expected_nodes,
@@ -119,7 +119,7 @@ fn test_gcn_different_sizes() {
 
 #[test]
 fn test_gcn_parameter_gradients_accessible() {
-    let gcn = GCNConv::new(4, 8, true);
+    let gcn = GCNConv::new(4, 8, true).expect("operation should succeed");
     let params = gcn.parameters();
 
     // Validate parameter shapes
@@ -143,7 +143,7 @@ fn test_gcn_parameter_gradients_accessible() {
 
 #[test]
 fn test_sage_layer_creation() {
-    let sage = SAGEConv::new(4, 8, true);
+    let sage = SAGEConv::new(4, 8, true).expect("operation should succeed");
     let params = sage.parameters();
     assert_eq!(params.len(), 3); // weight_neighbor + weight_self + bias
 }
@@ -151,9 +151,9 @@ fn test_sage_layer_creation() {
 #[test]
 fn test_sage_forward_pass() {
     let graph = create_standard_test_graph();
-    let sage = SAGEConv::new(4, 12, true);
+    let sage = SAGEConv::new(4, 12, true).expect("operation should succeed");
 
-    let output = sage.forward(&graph);
+    let output = sage.forward(&graph).expect("operation should succeed");
 
     assert_eq!(output.x.shape().dims(), &[6, 12]);
     assert_eq!(output.num_nodes, 6);
@@ -165,11 +165,11 @@ fn test_sage_forward_pass() {
 #[test]
 fn test_sage_aggregation_consistency() {
     let graph = create_standard_test_graph();
-    let sage = SAGEConv::new(4, 8, false);
+    let sage = SAGEConv::new(4, 8, false).expect("operation should succeed");
 
     // Run multiple forward passes and check consistency
-    let output1 = sage.forward(&graph);
-    let output2 = sage.forward(&graph);
+    let output1 = sage.forward(&graph).expect("operation should succeed");
+    let output2 = sage.forward(&graph).expect("operation should succeed");
 
     let vals1 = output1.x.to_vec().unwrap();
     let vals2 = output2.x.to_vec().unwrap();
@@ -185,14 +185,14 @@ fn test_sage_aggregation_consistency() {
 
 #[test]
 fn test_gin_layer_creation() {
-    let gin = GINConv::new(4, 8, 0.0, false, true);
+    let gin = GINConv::new(4, 8, 0.0, false, true).expect("operation should succeed");
     let params = gin.parameters();
     assert_eq!(params.len(), 3); // mlp layers + bias
 }
 
 #[test]
 fn test_gin_layer_trainable_eps() {
-    let gin = GINConv::new(4, 8, 0.5, true, false);
+    let gin = GINConv::new(4, 8, 0.5, true, false).expect("operation should succeed");
     let params = gin.parameters();
     assert_eq!(params.len(), 3); // mlp layers + trainable eps
 }
@@ -200,9 +200,9 @@ fn test_gin_layer_trainable_eps() {
 #[test]
 fn test_gin_forward_pass() {
     let graph = create_standard_test_graph();
-    let gin = GINConv::new(4, 10, 0.0, false, true);
+    let gin = GINConv::new(4, 10, 0.0, false, true).expect("operation should succeed");
 
-    let output = gin.forward(&graph);
+    let output = gin.forward(&graph).expect("operation should succeed");
 
     assert_eq!(output.x.shape().dims(), &[6, 10]);
     assert_eq!(output.num_nodes, 6);
@@ -219,8 +219,8 @@ fn test_gin_epsilon_values() {
     let epsilons = vec![0.0, 0.5, 1.0, 2.0];
 
     for eps in epsilons {
-        let gin = GINConv::new(2, 4, eps, false, false);
-        let output = gin.forward(&graph);
+        let gin = GINConv::new(2, 4, eps, false, false).expect("operation should succeed");
+        let output = gin.forward(&graph).expect("operation should succeed");
 
         assert_eq!(output.x.shape().dims(), &[2, 4]);
         let output_vals = output.x.to_vec().unwrap();
@@ -245,7 +245,7 @@ fn test_mpnn_creation_all_aggregations() {
     ];
 
     for agg in aggregations {
-        let mpnn = MPNNConv::new(4, 8, 2, 16, 16, agg, true);
+        let mpnn = MPNNConv::new(4, 8, 2, 16, 16, agg, true).expect("operation should succeed");
         let params = mpnn.parameters();
         assert!(
             params.len() >= 4,
@@ -262,8 +262,9 @@ fn test_mpnn_forward_with_edge_attributes() {
     let edge_attr = randn(&[graph.num_edges, 2]).unwrap();
     graph = graph.with_edge_attr(edge_attr);
 
-    let mpnn = MPNNConv::new(4, 6, 2, 12, 12, AggregationType::Mean, true);
-    let output = mpnn.forward(&graph);
+    let mpnn = MPNNConv::new(4, 6, 2, 12, 12, AggregationType::Mean, true)
+        .expect("operation should succeed");
+    let output = mpnn.forward(&graph).expect("operation should succeed");
 
     assert_eq!(output.x.shape().dims(), &[6, 6]);
     assert_eq!(output.num_nodes, 6);
@@ -275,9 +276,10 @@ fn test_mpnn_forward_with_edge_attributes() {
 #[test]
 fn test_mpnn_without_edge_attributes() {
     let graph = create_standard_test_graph();
-    let mpnn = MPNNConv::new(4, 8, 0, 16, 16, AggregationType::Sum, false);
+    let mpnn = MPNNConv::new(4, 8, 0, 16, 16, AggregationType::Sum, false)
+        .expect("operation should succeed");
 
-    let output = mpnn.forward(&graph);
+    let output = mpnn.forward(&graph).expect("operation should succeed");
 
     assert_eq!(output.x.shape().dims(), &[6, 8]);
     let output_vals = output.x.to_vec().unwrap();
@@ -290,7 +292,8 @@ fn test_mpnn_without_edge_attributes() {
 
 #[test]
 fn test_graph_transformer_creation() {
-    let transformer = GraphTransformer::new(4, 12, 3, 2, 0.1, true);
+    let transformer =
+        GraphTransformer::new(4, 12, 3, 2, 0.1, true).expect("operation should succeed");
     let params = transformer.parameters();
     assert_eq!(params.len(), 6); // Q, K, V, edge, output weights + bias
 }
@@ -298,9 +301,12 @@ fn test_graph_transformer_creation() {
 #[test]
 fn test_graph_transformer_forward() {
     let graph = create_standard_test_graph();
-    let transformer = GraphTransformer::new(4, 8, 2, 2, 0.1, true);
+    let transformer =
+        GraphTransformer::new(4, 8, 2, 2, 0.1, true).expect("operation should succeed");
 
-    let output = transformer.forward(&graph);
+    let output = transformer
+        .forward(&graph)
+        .expect("operation should succeed");
 
     assert_eq!(output.x.shape().dims(), &[6, 8]);
     assert_eq!(output.num_nodes, 6);
@@ -315,8 +321,11 @@ fn test_graph_transformer_multihead() {
     let heads = vec![1, 2, 4];
 
     for num_heads in heads {
-        let transformer = GraphTransformer::new(2, 8, 2, num_heads, 0.0, false);
-        let output = transformer.forward(&graph);
+        let transformer = GraphTransformer::new(2, 8, 2, num_heads, 0.0, false)
+            .expect("operation should succeed");
+        let output = transformer
+            .forward(&graph)
+            .expect("operation should succeed");
 
         assert_eq!(output.x.shape().dims(), &[2, 8]);
         let output_vals = output.x.to_vec().unwrap();
@@ -337,16 +346,16 @@ fn test_comprehensive_layer_chaining() {
     let graph = create_standard_test_graph();
 
     // Create a deep GNN pipeline
-    let gcn1 = GCNConv::new(4, 16, true);
-    let sage = SAGEConv::new(16, 12, true);
-    let gin = GINConv::new(12, 8, 0.0, false, true);
-    let gcn2 = GCNConv::new(8, 6, false);
+    let gcn1 = GCNConv::new(4, 16, true).expect("operation should succeed");
+    let sage = SAGEConv::new(16, 12, true).expect("operation should succeed");
+    let gin = GINConv::new(12, 8, 0.0, false, true).expect("operation should succeed");
+    let gcn2 = GCNConv::new(8, 6, false).expect("operation should succeed");
 
     // Forward pass through pipeline
-    let h1 = gcn1.forward(&graph);
-    let h2 = sage.forward(&h1);
-    let h3 = gin.forward(&h2);
-    let final_output = gcn2.forward(&h3);
+    let h1 = gcn1.forward(&graph).expect("operation should succeed");
+    let h2 = sage.forward(&h1).expect("operation should succeed");
+    let h3 = gin.forward(&h2).expect("operation should succeed");
+    let final_output = gcn2.forward(&h3).expect("operation should succeed");
 
     // Validate final output
     assert_eq!(final_output.x.shape().dims(), &[6, 6]);
@@ -370,11 +379,11 @@ fn test_residual_connections() {
     let graph = create_standard_test_graph();
 
     // Test residual-like connections (same dimensions)
-    let gcn1 = GCNConv::new(4, 4, true);
-    let gcn2 = GCNConv::new(4, 4, true);
+    let gcn1 = GCNConv::new(4, 4, true).expect("operation should succeed");
+    let gcn2 = GCNConv::new(4, 4, true).expect("operation should succeed");
 
-    let h1 = gcn1.forward(&graph);
-    let h2 = gcn2.forward(&h1);
+    let h1 = gcn1.forward(&graph).expect("operation should succeed");
+    let h2 = gcn2.forward(&h1).expect("operation should succeed");
 
     // Simulate residual connection (would need tensor addition)
     // For now, just validate both outputs are valid
@@ -411,13 +420,18 @@ fn test_extreme_value_handling() {
     let extreme_graph = GraphData::new(x, edge_index);
 
     let layers = vec![
-        Box::new(GCNConv::new(4, 8, true)) as Box<dyn GraphLayer>,
-        Box::new(SAGEConv::new(4, 8, true)) as Box<dyn GraphLayer>,
-        Box::new(GINConv::new(4, 8, 0.0, false, true)) as Box<dyn GraphLayer>,
+        Box::new(GCNConv::new(4, 8, true).expect("operation should succeed"))
+            as Box<dyn GraphLayer>,
+        Box::new(SAGEConv::new(4, 8, true).expect("operation should succeed"))
+            as Box<dyn GraphLayer>,
+        Box::new(GINConv::new(4, 8, 0.0, false, true).expect("operation should succeed"))
+            as Box<dyn GraphLayer>,
     ];
 
     for (i, layer) in layers.iter().enumerate() {
-        let output = layer.forward(&extreme_graph);
+        let output = layer
+            .forward(&extreme_graph)
+            .expect("operation should succeed");
         let output_vals = output.x.to_vec().unwrap();
         assert!(
             output_vals.iter().all(|&x| x.is_finite()),
@@ -435,8 +449,8 @@ fn test_zero_graph_handling() {
         from_vec(vec![0.0, 1.0, 2.0, 1.0, 2.0, 0.0], &[2, 3], DeviceType::Cpu).unwrap();
     let zero_graph = GraphData::new(x, edge_index);
 
-    let gcn = GCNConv::new(4, 6, true);
-    let output = gcn.forward(&zero_graph);
+    let gcn = GCNConv::new(4, 6, true).expect("operation should succeed");
+    let output = gcn.forward(&zero_graph).expect("operation should succeed");
 
     assert_eq!(output.x.shape().dims(), &[3, 6]);
     let output_vals = output.x.to_vec().unwrap();
@@ -450,8 +464,10 @@ fn test_single_node_graph() {
     let edge_index = zeros(&[2, 0]).unwrap();
     let single_graph = GraphData::new(x, edge_index);
 
-    let gcn = GCNConv::new(4, 8, true);
-    let output = gcn.forward(&single_graph);
+    let gcn = GCNConv::new(4, 8, true).expect("operation should succeed");
+    let output = gcn
+        .forward(&single_graph)
+        .expect("operation should succeed");
 
     assert_eq!(output.num_nodes, 1);
     assert_eq!(output.num_edges, 0);
@@ -483,7 +499,10 @@ fn test_all_activation_functions() {
     ];
 
     for (name, activation) in activations {
-        let vals = activation.to_vec().unwrap();
+        let vals = activation
+            .expect("operation should succeed")
+            .to_vec()
+            .unwrap();
         assert!(
             vals.iter().all(|&x| x.is_finite()),
             "Activation {} produced non-finite values",
@@ -500,10 +519,10 @@ fn test_all_activation_functions() {
 #[test]
 fn test_large_graph_memory_efficiency() {
     // Test with a larger graph to check memory usage
-    let large_graph = generation::barabasi_albert(100, 5);
+    let large_graph = generation::barabasi_albert(100, 5).expect("operation should succeed");
 
-    let gcn = GCNConv::new(16, 32, true);
-    let output = gcn.forward(&large_graph);
+    let gcn = GCNConv::new(16, 32, true).expect("operation should succeed");
+    let output = gcn.forward(&large_graph).expect("operation should succeed");
 
     assert_eq!(output.num_nodes, 100);
     assert_eq!(output.x.shape().dims(), &[100, 32]);
@@ -521,7 +540,7 @@ fn test_gcn_parameter_count_validation() {
     ];
 
     for (layer, expected_count) in test_cases {
-        let params = layer.parameters();
+        let params = layer.expect("operation should succeed").parameters();
         assert_eq!(
             params.len(),
             expected_count,
@@ -539,7 +558,7 @@ fn test_sage_parameter_count_validation() {
     ];
 
     for (layer, expected_count) in test_cases {
-        let params = layer.parameters();
+        let params = layer.expect("operation should succeed").parameters();
         assert_eq!(
             params.len(),
             expected_count,
@@ -604,9 +623,11 @@ fn create_challenging_topology_graph() -> GraphData {
 #[test]
 fn test_gcn_numerical_stability_extreme_values() {
     let extreme_graph = create_extreme_value_graph();
-    let gcn = GCNConv::new(4, 8, true);
+    let gcn = GCNConv::new(4, 8, true).expect("operation should succeed");
 
-    let output = gcn.forward(&extreme_graph);
+    let output = gcn
+        .forward(&extreme_graph)
+        .expect("operation should succeed");
 
     // Check output is finite and well-behaved
     let output_vals = output.x.to_vec().unwrap();
@@ -635,9 +656,11 @@ fn test_gat_attention_stability_extreme_values() {
     use torsh_graph::conv::GATConv;
 
     let extreme_graph = create_extreme_value_graph();
-    let gat = GATConv::new(4, 6, 2, 0.1, true);
+    let gat = GATConv::new(4, 6, 2, 0.1, true).expect("operation should succeed");
 
-    let output = gat.forward(&extreme_graph);
+    let output = gat
+        .forward(&extreme_graph)
+        .expect("operation should succeed");
 
     // Check attention mechanism remains stable with extreme values
     let output_vals = output.x.to_vec().unwrap();
@@ -663,9 +686,11 @@ fn test_gat_attention_stability_extreme_values() {
 #[test]
 fn test_sage_aggregation_stability() {
     let challenging_graph = create_challenging_topology_graph();
-    let sage = SAGEConv::new(3, 5, true);
+    let sage = SAGEConv::new(3, 5, true).expect("operation should succeed");
 
-    let output = sage.forward(&challenging_graph);
+    let output = sage
+        .forward(&challenging_graph)
+        .expect("operation should succeed");
 
     // SAGE aggregation should handle star topology gracefully
     let output_vals = output.x.to_vec().unwrap();
@@ -705,9 +730,11 @@ fn test_sage_aggregation_stability() {
 #[test]
 fn test_gin_epsilon_learning_stability() {
     let extreme_graph = create_extreme_value_graph();
-    let gin = GINConv::new(4, 6, 0.5, true, true);
+    let gin = GINConv::new(4, 6, 0.5, true, true).expect("operation should succeed");
 
-    let output = gin.forward(&extreme_graph);
+    let output = gin
+        .forward(&extreme_graph)
+        .expect("operation should succeed");
 
     // GIN should handle extreme values through epsilon parameter
     let output_vals = output.x.to_vec().unwrap();
@@ -732,9 +759,12 @@ fn test_gin_epsilon_learning_stability() {
 #[test]
 fn test_graph_transformer_attention_numerical_stability() {
     let extreme_graph = create_extreme_value_graph();
-    let transformer = GraphTransformer::new(4, 8, 2, 2, 0.1, true);
+    let transformer =
+        GraphTransformer::new(4, 8, 2, 2, 0.1, true).expect("operation should succeed");
 
-    let output = transformer.forward(&extreme_graph);
+    let output = transformer
+        .forward(&extreme_graph)
+        .expect("operation should succeed");
 
     // Graph transformer should handle extreme values in attention computation
     let output_vals = output.x.to_vec().unwrap();
@@ -770,8 +800,11 @@ fn test_mpnn_aggregation_types_stability() {
     ];
 
     for aggr_type in aggregation_types {
-        let mpnn = MPNNConv::new(4, 6, 2, 8, 8, aggr_type.clone(), true);
-        let output = mpnn.forward(&simple_graph);
+        let mpnn = MPNNConv::new(4, 6, 2, 8, 8, aggr_type.clone(), true)
+            .expect("operation should succeed");
+        let output = mpnn
+            .forward(&simple_graph)
+            .expect("operation should succeed");
 
         let output_vals = output.x.to_vec().unwrap();
         for (i, &val) in output_vals.iter().enumerate() {
@@ -800,9 +833,9 @@ fn test_pooling_operations_numerical_stability() {
     let extreme_graph = create_extreme_value_graph();
 
     // Test various pooling operations with extreme values
-    let global_mean = global::global_mean_pool(&extreme_graph);
-    let global_max = global::global_max_pool(&extreme_graph);
-    let global_sum = global::global_sum_pool(&extreme_graph);
+    let global_mean = global::global_mean_pool(&extreme_graph).expect("operation should succeed");
+    let global_max = global::global_max_pool(&extreme_graph).expect("operation should succeed");
+    let global_sum = global::global_sum_pool(&extreme_graph).expect("operation should succeed");
 
     // Global mean should reduce extreme values
     let mean_vals = global_mean.to_vec().unwrap();
@@ -855,9 +888,11 @@ fn test_graph_laplacian_numerical_stability() {
 
     // Test both normalized and unnormalized Laplacians
     let unnormalized_laplacian =
-        graph_laplacian(&extreme_graph.edge_index, extreme_graph.num_nodes, false);
+        graph_laplacian(&extreme_graph.edge_index, extreme_graph.num_nodes, false)
+            .expect("operation should succeed");
     let normalized_laplacian =
-        graph_laplacian(&extreme_graph.edge_index, extreme_graph.num_nodes, true);
+        graph_laplacian(&extreme_graph.edge_index, extreme_graph.num_nodes, true)
+            .expect("operation should succeed");
 
     // Check Laplacian matrices are finite and well-conditioned
     let unnorm_vals = unnormalized_laplacian.to_vec().unwrap();
@@ -924,7 +959,10 @@ fn test_activation_functions_extreme_values() {
     ];
 
     for (name, activation) in activations {
-        let vals = activation.to_vec().unwrap();
+        let vals = activation
+            .expect("operation should succeed")
+            .to_vec()
+            .unwrap();
         for (i, &val) in vals.iter().enumerate() {
             assert!(
                 val.is_finite(),
@@ -983,12 +1021,14 @@ fn test_memory_efficient_operations_stability() {
 
     // Test sparse representation with extreme values
     let dense_adj = zeros(&[4, 4]).unwrap();
-    let sparse_graph = SparseGraph::from_dense(&dense_adj, 0.1);
+    let sparse_graph = SparseGraph::from_dense(&dense_adj, 0.1).expect("operation should succeed");
     assert!(sparse_graph.memory_footprint() > 0);
 
     // Test sparse Laplacian computation
-    let sparse_laplacian_norm = sparse_laplacian(&extreme_graph.edge_index, 4, true);
-    let sparse_laplacian_unnorm = sparse_laplacian(&extreme_graph.edge_index, 4, false);
+    let sparse_laplacian_norm =
+        sparse_laplacian(&extreme_graph.edge_index, 4, true).expect("operation should succeed");
+    let sparse_laplacian_unnorm =
+        sparse_laplacian(&extreme_graph.edge_index, 4, false).expect("operation should succeed");
 
     assert!(sparse_laplacian_norm.edge_weights.is_some());
     assert!(sparse_laplacian_unnorm.edge_weights.is_some());
@@ -1006,7 +1046,7 @@ fn test_memory_efficient_operations_stability() {
     }
 
     // Test adaptive coarsening doesn't break with extreme values
-    let coarsened = adaptive_coarsening(&extreme_graph, 2);
+    let coarsened = adaptive_coarsening(&extreme_graph, 2).expect("operation should succeed");
     assert!(coarsened.num_nodes <= 2);
     assert!(coarsened.num_nodes > 0);
 
@@ -1029,11 +1069,15 @@ fn test_gradient_flow_numerical_stability() {
     let _challenging_graph = create_challenging_topology_graph();
 
     // Test multiple layers in sequence don't explode/vanish
-    let gcn1 = GCNConv::new(4, 8, true);
-    let gcn2 = GCNConv::new(8, 4, true);
+    let gcn1 = GCNConv::new(4, 8, true).expect("operation should succeed");
+    let gcn2 = GCNConv::new(8, 4, true).expect("operation should succeed");
 
-    let intermediate = gcn1.forward(&extreme_graph);
-    let output = gcn2.forward(&intermediate);
+    let intermediate = gcn1
+        .forward(&extreme_graph)
+        .expect("operation should succeed");
+    let output = gcn2
+        .forward(&intermediate)
+        .expect("operation should succeed");
 
     let output_vals = output.x.to_vec().unwrap();
     for (i, &val) in output_vals.iter().enumerate() {

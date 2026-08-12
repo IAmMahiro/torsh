@@ -39,7 +39,7 @@ semver = { workspace = true }
 
 # Advanced compression (COOLJAPAN Pure Rust Policy)
 oxiarc-zstd = { workspace = true }
-lzma-rs = { workspace = true }
+oxiarc-lzma = { workspace = true }
 
 # Security features (Pure-Rust RustCrypto, replaces C/asm `ring`)
 aes-gcm = { workspace = true }
@@ -55,7 +55,7 @@ scirs2-core = { workspace = true, features = ["parallel"] }
 
 # Utilities
 uuid = { workspace = true, features = ["v4"] }
-rand = { workspace = true }
+# rand REMOVED: zero use sites in src (security uses ed25519-dalek + getrandom).
 md5 = { workspace = true }
 hostname = { workspace = true }
 once_cell = { workspace = true }

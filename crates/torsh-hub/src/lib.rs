@@ -31,7 +31,9 @@
 //! - **Debugging**: Advanced debugging tools with interactive sessions
 //! - **Analytics**: Real-time analytics and usage tracking
 //! - **Visualization**: Performance visualization and dashboard generation
-//! - **Security**: Model sandboxing and security scanning
+//! - **Security**: Ed25519 model signing/verification, cooperative model
+//!   sandboxing (in-process resource accounting, not OS-level isolation), and
+//!   security scanning
 //!
 //! ## SciRS2 POLICY Compliance
 //!
@@ -110,8 +112,8 @@ pub mod quantization;
 pub mod registry;
 pub mod retry;
 pub mod security;
-#[cfg(feature = "tensorflow")]
 pub mod tensorflow;
+mod tls;
 pub mod upload;
 pub mod utils;
 pub mod visualization;
@@ -173,7 +175,7 @@ pub use metadata::{
     QualityScores, UsageStatistics,
 };
 pub use model_info::{
-    ModelCard, ModelCardBuilder, ModelCardManager, ModelCardRenderer, ModelInfo, Version,
+    FileInfo, ModelCard, ModelCardBuilder, ModelCardManager, ModelCardRenderer, ModelInfo, Version,
     VersionHistory,
 };
 pub use model_ops::{
@@ -210,7 +212,6 @@ pub use security::{
     SecurityManager, Severity as SecuritySeverity, SignatureAlgorithm, Vulnerability,
     VulnerabilityScanResult, VulnerabilityScanner, VulnerabilityType,
 };
-#[cfg(feature = "tensorflow")]
 pub use tensorflow::{
     TfConfig, TfLoader, TfModel, TfModelMetadata, TfModelType, TfTensorInfo, TfToTorshWrapper,
 };
@@ -221,7 +222,8 @@ pub use upload::{
 pub use utils::{
     cleanup_old_cache, compare_versions, estimate_parameters_from_size, extract_extension,
     format_parameter_count, format_size, get_model_cache_dir, get_temp_dir, is_safe_path,
-    is_supported_model_format, parse_repo_string, sanitize_model_name, validate_semver,
+    is_supported_model_format, parse_repo_string, sanitize_archive_entry_path, sanitize_model_name,
+    validate_semver,
 };
 pub use visualization::{
     ChartData, ChartType, DashboardTemplate, PerformanceVisualization, TrainingVisualization,
@@ -736,12 +738,7 @@ fn create_model_from_config(
         "resnet" => create_resnet_model(model_def, repo_dir, pretrained),
         "custom" => create_custom_model(model_def, repo_dir, pretrained),
         "onnx" => create_onnx_model(model_def, repo_dir, pretrained),
-        #[cfg(feature = "tensorflow")]
         "tensorflow" | "tf" => create_tensorflow_model(model_def, repo_dir, pretrained),
-        #[cfg(not(feature = "tensorflow"))]
-        "tensorflow" | "tf" => Err(TorshError::Other(
-            "TensorFlow support is disabled. Enable the 'tensorflow' feature to use TensorFlow models".to_string(),
-        )),
         _ => Err(TorshError::InvalidArgument(format!(
             "Unsupported model architecture: {}",
             model_def.architecture
@@ -1016,13 +1013,12 @@ fn create_onnx_config_from_params(
 }
 
 /// Create a TensorFlow model
-#[cfg(feature = "tensorflow")]
 fn create_tensorflow_model(
     model_def: &ModelDefinition,
     repo_dir: &Path,
     _pretrained: bool,
 ) -> Result<Box<dyn torsh_nn::Module>> {
-    use crate::tensorflow::{TfConfig, TfModel, TfToTorshWrapper};
+    use crate::tensorflow::{TfModel, TfToTorshWrapper};
 
     // Get model directory path
     let model_dir =
@@ -1065,7 +1061,6 @@ fn create_tensorflow_model(
 }
 
 /// Create TensorFlow configuration from model parameters
-#[cfg(feature = "tensorflow")]
 fn create_tf_config_from_params(
     params: &std::collections::HashMap<String, toml::Value>,
 ) -> crate::tensorflow::TfConfig {
@@ -1130,7 +1125,9 @@ fn load_pretrained_weights(
         let weights_path = cache_dir.join(weights_filename);
 
         if !weights_path.exists() {
-            download::download_file(weights_url, &weights_path, true)?;
+            // hubconf.toml carries no checksum field today, so integrity
+            // verification is not requested here.
+            download::download_file(weights_url, &weights_path, true, None)?;
         }
         weights_path
     } else {
@@ -1311,7 +1308,9 @@ fn download_url_to_file(url: &str, dst_dir: &Path, progress: bool) -> Result<Pat
         return Ok(dst_path);
     }
 
-    download::download_file(url, &dst_path, progress)?;
+    // No checksum is available at this call site (see `ModelInfo::download_files`
+    // for the checksum-verified download path).
+    download::download_file(url, &dst_path, progress, None)?;
 
     Ok(dst_path)
 }

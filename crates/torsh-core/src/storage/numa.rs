@@ -6,6 +6,7 @@
 use crate::error::Result;
 use crate::storage::allocation::{BackendAllocator, RawMemoryHandle};
 use crate::storage::memory_info::{AllocationStrategy, MemoryInfo};
+use crate::sync::RwLockExt;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 
@@ -448,7 +449,7 @@ impl<A: BackendAllocator> NumaAllocator<A> {
 
     /// Choose the optimal NUMA node for allocation
     fn choose_numa_node(&self, size_bytes: usize) -> Option<usize> {
-        let topology = self.topology.read().expect("lock should not be poisoned");
+        let topology = self.topology.read_or_recover();
 
         // Skip NUMA allocation for single-node systems
         if topology.node_count <= 1 {
@@ -515,7 +516,7 @@ impl<A: BackendAllocator> NumaAllocator<A> {
 
         // Update topology
         {
-            let mut topology = self.topology.write().expect("lock should not be poisoned");
+            let mut topology = self.topology.write_or_recover();
             topology.update_allocation(numa_node, size_bytes, true);
         }
 
@@ -568,7 +569,7 @@ impl<A: BackendAllocator> BackendAllocator for NumaAllocator<A> {
     ) -> std::result::Result<(), Self::Error> {
         // Check if this is a NUMA handle
         if let Some(numa_data) = handle.backend_data.downcast_ref::<NumaMetadata>() {
-            let mut topology = self.topology.write().expect("lock should not be poisoned");
+            let mut topology = self.topology.write_or_recover();
             topology.update_allocation(numa_data.node, handle.size_bytes, false);
         }
 
@@ -579,7 +580,7 @@ impl<A: BackendAllocator> BackendAllocator for NumaAllocator<A> {
         // Aggregate memory info across all NUMA nodes
         let mut info = self.inner.memory_info(device)?;
 
-        let topology = self.topology.read().expect("lock should not be poisoned");
+        let topology = self.topology.read_or_recover();
         info.total_memory = topology.memory_per_node.iter().sum();
         info.free_memory = topology.available_memory.iter().sum();
         info.used_memory = info.total_memory - info.free_memory;
@@ -956,7 +957,7 @@ mod tests {
 
         // Test topology access
         let topology_ref = numa_allocator.topology();
-        let topology_guard = topology_ref.read().expect("lock should not be poisoned");
+        let topology_guard = topology_ref.read_or_recover();
         assert_eq!(topology_guard.node_count, 1);
         drop(topology_guard);
 

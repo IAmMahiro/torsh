@@ -267,7 +267,10 @@ impl YellowFin {
 
         // Update parameters
         // θ_t = θ_{t-1} - lr * m̂_t
-        *param_write = param_write.sub(&corrected_momentum.mul_scalar(tuned_lr)?)?;
+        crate::param_update::sub_assign(
+            &mut param_write,
+            &corrected_momentum.mul_scalar(tuned_lr)?,
+        )?;
 
         // Store updated momentum
         param_state.insert(momentum_key, new_momentum);

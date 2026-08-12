@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use torsh_core::error::{Result, TorshError};
+use torsh_core::sync::MutexExt;
 use torsh_core::Shape;
 
 /// Error types specific to broadcasting operations
@@ -217,7 +218,15 @@ impl BroadcastOps {
     }
 
     /// Convert flat index to multi-dimensional index
+    ///
+    /// A shape containing a zero-sized dimension addresses no elements at all,
+    /// so there is no valid flat index to decompose: the all-zero index is
+    /// returned instead of dividing by the empty extent.
     pub fn flat_to_multi_index(flat_index: usize, shape: &[usize]) -> Vec<usize> {
+        if shape.contains(&0) {
+            return vec![0; shape.len()];
+        }
+
         let mut multi_index = Vec::with_capacity(shape.len());
         let mut remaining = flat_index;
 
@@ -293,7 +302,20 @@ impl BroadcastOps {
     }
 
     /// Get detailed broadcasting information for debugging
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TorshError::InvalidShape`] when either shape contains a
+    /// zero-sized dimension: such a tensor holds no elements, so the expansion
+    /// factor it would be measured by is undefined (the element counts it is
+    /// divided by are zero).
     pub fn get_broadcast_info(shape1: &[usize], shape2: &[usize]) -> Result<BroadcastInfo> {
+        if shape1.contains(&0) || shape2.contains(&0) {
+            return Err(TorshError::InvalidShape(format!(
+                "Cannot describe broadcasting for zero-sized shapes {shape1:?} and {shape2:?}"
+            )));
+        }
+
         let broadcast_shape = Self::compute_broadcast_shape(shape1, shape2)?;
         let expansion_factor1 =
             broadcast_shape.iter().product::<usize>() / shape1.iter().product::<usize>();
@@ -607,7 +629,7 @@ impl BroadcastCache {
             shape2: shape2.to_vec(),
         };
 
-        let mut cache = BROADCAST_CACHE.lock().expect("lock should not be poisoned");
+        let mut cache = BROADCAST_CACHE.lock_or_recover();
 
         // Check if entry exists and is not expired
         if let Some(entry) = cache.get_mut(&key) {
@@ -670,13 +692,13 @@ impl BroadcastCache {
 
     /// Clear the cache
     pub fn clear() {
-        let mut cache = BROADCAST_CACHE.lock().expect("lock should not be poisoned");
+        let mut cache = BROADCAST_CACHE.lock_or_recover();
         cache.clear();
     }
 
     /// Get cache statistics
     pub fn get_stats() -> BroadcastCacheStats {
-        let cache = BROADCAST_CACHE.lock().expect("lock should not be poisoned");
+        let cache = BROADCAST_CACHE.lock_or_recover();
         let total_accesses: usize = cache.values().map(|entry| entry.access_count).sum();
 
         BroadcastCacheStats {

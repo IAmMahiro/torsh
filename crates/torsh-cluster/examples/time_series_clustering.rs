@@ -15,7 +15,7 @@ use torsh_cluster::{
         kmeans::KMeans,
     },
     evaluation::metrics::silhouette_score,
-    traits::{ClusteringResult, Fit},
+    traits::Fit,
     utils::preprocessing::standardize_features,
 };
 use torsh_tensor::Tensor;

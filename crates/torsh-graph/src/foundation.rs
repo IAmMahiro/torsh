@@ -2,6 +2,9 @@
 //!
 //! This module implements state-of-the-art foundation models for graphs,
 //! including self-supervised pre-training, contrastive learning, and transfer learning.
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
 
 use crate::GraphData;
 use std::collections::{HashMap, HashSet};
@@ -465,14 +468,7 @@ impl GraphFoundationModel {
             FoundationModelError::TensorError(format!("Failed to create noise tensor: {:?}", e))
         })?;
 
-        let noisy_features = graph
-            .x
-            .add(
-                &noise
-                    .mul_scalar(noise_level)
-                    .expect("operation should succeed"),
-            )
-            .expect("operation should succeed");
+        let noisy_features = graph.x.add(&noise.mul_scalar(noise_level)?)?;
 
         Ok(GraphData::new(noisy_features, graph.edge_index.clone()))
     }
@@ -526,8 +522,8 @@ impl GraphFoundationModel {
         targets: &Tensor,
     ) -> Result<f32, FoundationModelError> {
         // Mean squared error loss (simplified)
-        let diff = predictions.sub(targets).expect("operation should succeed");
-        let squared = diff.mul(&diff).expect("operation should succeed");
+        let diff = predictions.sub(targets)?;
+        let squared = diff.mul(&diff)?;
         let mean_loss = squared.mean(None, false).map_err(|e| {
             FoundationModelError::TensorError(format!("Failed to compute mean: {:?}", e))
         })?;
@@ -566,15 +562,13 @@ impl GraphFoundationModel {
 
     fn cosine_similarity(&self, a: &Tensor, b: &Tensor) -> Result<f32, FoundationModelError> {
         // Simplified cosine similarity
-        let dot_product = a
-            .dot(b)
-            .expect("cosine similarity dot product should succeed");
-        let norm_a = a.norm().expect("cosine similarity norm_a should succeed");
-        let norm_b = b.norm().expect("cosine similarity norm_b should succeed");
+        let dot_product = a.dot(b)?;
+        let norm_a = a.norm()?;
+        let norm_b = b.norm()?;
 
-        let dot_data = dot_product.to_vec().expect("conversion should succeed");
-        let norm_a_data = norm_a.to_vec().expect("conversion should succeed");
-        let norm_b_data = norm_b.to_vec().expect("conversion should succeed");
+        let dot_data = dot_product.to_vec()?;
+        let norm_a_data = norm_a.to_vec()?;
+        let norm_b_data = norm_b.to_vec()?;
 
         Ok(dot_data[0] / (norm_a_data[0] * norm_b_data[0]))
     }
@@ -584,10 +578,7 @@ impl GraphFoundationModel {
         graph: &GraphData,
     ) -> Result<Vec<(usize, usize)>, FoundationModelError> {
         // Create positive pairs based on graph structure
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
         let num_edges = edge_data.len() / 2;
 
         let mut pairs = Vec::new();
@@ -863,12 +854,8 @@ impl TaskHead for GraphClassificationHead {
         let pooled = embeddings.mean(Some(&[0]), true).map_err(|e| {
             FoundationModelError::TensorError(format!("Failed to compute mean: {:?}", e))
         })?;
-        let transformed = pooled
-            .matmul(&self.pooling_layer)
-            .expect("pooling layer matmul should succeed");
-        let logits = transformed
-            .matmul(&self.classifier)
-            .expect("classifier matmul should succeed");
+        let transformed = pooled.matmul(&self.pooling_layer)?;
+        let logits = transformed.matmul(&self.classifier)?;
         logits
             .add(&self.bias)
             .map_err(|e| FoundationModelError::TensorError(format!("Failed to add bias: {:?}", e)))
@@ -937,9 +924,7 @@ impl TaskHead for GraphRegressionHead {
         let pooled = embeddings.mean(Some(&[0]), true).map_err(|e| {
             FoundationModelError::TensorError(format!("Failed to compute mean: {:?}", e))
         })?;
-        let output = pooled
-            .matmul(&self.regressor)
-            .expect("regressor matmul should succeed");
+        let output = pooled.matmul(&self.regressor)?;
         output
             .add(&self.bias)
             .map_err(|e| FoundationModelError::TensorError(format!("Failed to add bias: {:?}", e)))
@@ -1049,10 +1034,7 @@ impl GraphTokenizer {
         let mut tokens = vec![self.special_tokens.cls_token];
 
         // Tokenize each edge
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
         let num_edges = edge_data.len() / 2;
 
         for i in 0..num_edges {
@@ -1119,26 +1101,21 @@ impl GraphTokenizer {
 impl PretrainingHead {
     pub fn new(config: &FoundationModelConfig) -> Result<Self, FoundationModelError> {
         let mlm_head = MLMHead {
-            output_projection: randn(&[config.model_dim, config.vocab_size])
-                .expect("failed to create MLM output_projection tensor"),
-            bias: zeros(&[config.vocab_size]).expect("failed to create MLM bias tensor"),
-            mask_token: randn(&[config.model_dim]).expect("failed to create MLM mask_token tensor"),
+            output_projection: randn(&[config.model_dim, config.vocab_size])?,
+            bias: zeros(&[config.vocab_size])?,
+            mask_token: randn(&[config.model_dim])?,
         };
 
         let contrastive_head = ContrastiveHead {
-            projection: randn(&[config.model_dim, config.model_dim])
-                .expect("failed to create contrastive projection tensor"),
+            projection: randn(&[config.model_dim, config.model_dim])?,
             temperature: 0.1,
             embed_dim: config.model_dim,
         };
 
         let structure_head = StructurePredictionHead {
-            edge_predictor: randn(&[config.model_dim * 2, 1])
-                .expect("failed to create edge_predictor tensor"),
-            motif_predictor: randn(&[config.model_dim, 10])
-                .expect("failed to create motif_predictor tensor"),
-            property_predictor: randn(&[config.model_dim, 1])
-                .expect("failed to create property_predictor tensor"),
+            edge_predictor: randn(&[config.model_dim * 2, 1])?,
+            motif_predictor: randn(&[config.model_dim, 10])?,
+            property_predictor: randn(&[config.model_dim, 1])?,
         };
 
         Ok(Self {

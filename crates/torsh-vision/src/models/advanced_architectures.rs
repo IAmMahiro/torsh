@@ -389,7 +389,15 @@ impl Module for TransformerBlock {
     }
 }
 
-/// Flash Multi-Head Attention for efficient training
+/// Multi-head attention used by the ViT blocks
+///
+/// # Naming caveat
+///
+/// Despite the name this does **not** implement Flash Attention's tiled, fused,
+/// never-materialised kernel. The attention matrix is materialised per
+/// `(batch, head)` pair in a plain Rust loop, so memory traffic is O(B * H * N^2)
+/// and the `use_flash` flag does not change the algorithm. Treat it as a
+/// reference multi-head attention implementation.
 #[derive(Debug)]
 pub struct FlashMultiHeadAttention {
     num_heads: usize,
@@ -753,7 +761,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "KNOWN ISSUE: TransformerBlock tensor slicing - FlashMultiHeadAttention uses complex 5D tensor reshaping with narrow/squeeze operations that fail in batch scenarios. Deferred to v0.2.0 for attention mechanism refactor. See: TODO.md"]
     fn test_vit_forward() {
         let vit = AdvancedViT::vit_tiny().expect("Advanced Vi T should succeed");
         let input = randn::<f32>(&[1, 3, 224, 224]).expect("operation should succeed");
@@ -774,7 +781,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "KNOWN ISSUE: TransformerBlock tensor slicing - FlashMultiHeadAttention uses complex 5D tensor reshaping (qkv [3,B,H,N,D] -> narrow/squeeze pattern) that fails due to shape tracking inconsistencies. Root cause: Lines 443-448 with multiple squeeze operations on narrowed tensors. Requires attention mechanism refactor with improved tensor slicing API. Deferred to v0.2.0. See: TODO.md"]
     fn test_transformer_block() {
         let block = TransformerBlock::new(192, 3, 4.0, 0.1, 0.0, false)
             .expect("Transformer Block should succeed");

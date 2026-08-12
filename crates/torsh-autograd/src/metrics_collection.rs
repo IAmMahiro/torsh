@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use torsh_core::dtype::TensorElement;
 use torsh_core::error::TorshError;
+use torsh_core::sync::{MutexExt, RwLockExt};
 
 /// Configuration for metrics collection
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,10 +518,7 @@ impl MetricsCollector {
         let gradient_norm = stats.l2_norm;
         let sparsity = stats.zero_elements as f64 / stats.num_elements as f64;
 
-        let mut metrics_store = self
-            .gradient_metrics
-            .write()
-            .expect("lock should not be poisoned");
+        let mut metrics_store = self.gradient_metrics.write_or_recover();
         metrics_store.current_step += 1;
 
         let snapshot = GradientSnapshot {
@@ -575,10 +573,7 @@ impl MetricsCollector {
             memory_bandwidth,
         };
 
-        let mut perf_store = self
-            .performance_metrics
-            .write()
-            .expect("lock should not be poisoned");
+        let mut perf_store = self.performance_metrics.write_or_recover();
         perf_store.throughput_history.push_back(snapshot.clone());
 
         // Maintain history size
@@ -607,10 +602,7 @@ impl MetricsCollector {
             + memory_breakdown.buffer_memory
             + memory_breakdown.overhead_memory;
 
-        let mut memory_store = self
-            .memory_metrics
-            .write()
-            .expect("lock should not be poisoned");
+        let mut memory_store = self.memory_metrics.write_or_recover();
         memory_store.peak_memory = memory_store.peak_memory.max(total_memory);
 
         let efficiency_score = self.compute_memory_efficiency(&memory_breakdown);
@@ -645,10 +637,7 @@ impl MetricsCollector {
             return Ok(());
         }
 
-        let mut timing_store = self
-            .timing_metrics
-            .write()
-            .expect("lock should not be poisoned");
+        let mut timing_store = self.timing_metrics.write_or_recover();
 
         // Store timing sample
         let timings = timing_store
@@ -671,37 +660,25 @@ impl MetricsCollector {
 
     /// Get gradient metrics for a parameter
     pub fn get_gradient_metrics(&self, parameter_name: &str) -> Option<AggregatedGradientStats> {
-        let metrics_store = self
-            .gradient_metrics
-            .read()
-            .expect("lock should not be poisoned");
+        let metrics_store = self.gradient_metrics.read_or_recover();
         metrics_store.aggregated_stats.get(parameter_name).cloned()
     }
 
     /// Get current performance metrics
     pub fn get_performance_metrics(&self) -> BottleneckAnalysis {
-        let perf_store = self
-            .performance_metrics
-            .read()
-            .expect("lock should not be poisoned");
+        let perf_store = self.performance_metrics.read_or_recover();
         perf_store.bottleneck_analysis.clone()
     }
 
     /// Get memory efficiency metrics
     pub fn get_memory_metrics(&self) -> MemoryEfficiencyMetrics {
-        let memory_store = self
-            .memory_metrics
-            .read()
-            .expect("lock should not be poisoned");
+        let memory_store = self.memory_metrics.read_or_recover();
         memory_store.efficiency_metrics.clone()
     }
 
     /// Get timing statistics for an operation
     pub fn get_timing_statistics(&self, operation_name: &str) -> Option<TimingStatistics> {
-        let timing_store = self
-            .timing_metrics
-            .read()
-            .expect("lock should not be poisoned");
+        let timing_store = self.timing_metrics.read_or_recover();
         timing_store.cumulative_stats.get(operation_name).cloned()
     }
 
@@ -717,19 +694,13 @@ impl MetricsCollector {
 
     /// Add an event handler
     pub fn add_event_handler(&self, handler: Box<dyn MetricsEventHandler + Send + Sync>) {
-        let mut handlers = self
-            .event_handlers
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut handlers = self.event_handlers.lock_or_recover();
         handlers.push(handler);
     }
 
     /// Start a new metrics session
     pub fn start_session(&self, session_id: Option<String>) -> Result<String> {
-        let mut session = self
-            .current_session
-            .write()
-            .expect("lock should not be poisoned");
+        let mut session = self.current_session.write_or_recover();
 
         let id = session_id.unwrap_or_else(|| {
             format!(
@@ -753,10 +724,7 @@ impl MetricsCollector {
 
     /// Pause the current session
     pub fn pause_session(&self) -> Result<()> {
-        let mut session = self
-            .current_session
-            .write()
-            .expect("lock should not be poisoned");
+        let mut session = self.current_session.write_or_recover();
         if session.status == SessionStatus::Active {
             session.status = SessionStatus::Paused;
             self.notify_session_event(SessionEvent::SessionPaused(session.session_id.clone()));
@@ -766,10 +734,7 @@ impl MetricsCollector {
 
     /// Resume the current session
     pub fn resume_session(&self) -> Result<()> {
-        let mut session = self
-            .current_session
-            .write()
-            .expect("lock should not be poisoned");
+        let mut session = self.current_session.write_or_recover();
         if session.status == SessionStatus::Paused {
             session.status = SessionStatus::Active;
             self.notify_session_event(SessionEvent::SessionResumed(session.session_id.clone()));
@@ -779,10 +744,7 @@ impl MetricsCollector {
 
     /// Stop the current session
     pub fn stop_session(&self) -> Result<()> {
-        let mut session = self
-            .current_session
-            .write()
-            .expect("lock should not be poisoned");
+        let mut session = self.current_session.write_or_recover();
         session.status = SessionStatus::Stopped;
         self.notify_session_event(SessionEvent::SessionStopped(session.session_id.clone()));
         Ok(())
@@ -790,10 +752,7 @@ impl MetricsCollector {
 
     /// Get current session information
     pub fn get_session_info(&self) -> String {
-        let session = self
-            .current_session
-            .read()
-            .expect("lock should not be poisoned");
+        let session = self.current_session.read_or_recover();
         session.session_id.clone()
     }
 
@@ -1073,22 +1032,10 @@ impl MetricsCollector {
     // Export methods
 
     fn export_json(&self) -> Result<String> {
-        let gradient_metrics = self
-            .gradient_metrics
-            .read()
-            .expect("lock should not be poisoned");
-        let performance_metrics = self
-            .performance_metrics
-            .read()
-            .expect("lock should not be poisoned");
-        let memory_metrics = self
-            .memory_metrics
-            .read()
-            .expect("lock should not be poisoned");
-        let timing_metrics = self
-            .timing_metrics
-            .read()
-            .expect("lock should not be poisoned");
+        let gradient_metrics = self.gradient_metrics.read_or_recover();
+        let performance_metrics = self.performance_metrics.read_or_recover();
+        let memory_metrics = self.memory_metrics.read_or_recover();
+        let timing_metrics = self.timing_metrics.read_or_recover();
 
         let export_data = serde_json::json!({
             "gradient_metrics": gradient_metrics.aggregated_stats,

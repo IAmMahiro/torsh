@@ -1185,10 +1185,26 @@ mod tests {
 
     #[test]
     fn test_uncertainty_decomposition_high_aleatoric() {
-        // Create MC predictions with high entropy but low disagreement (high aleatoric)
-        let pred1 = from_vec(vec![0.33, 0.33, 0.34, 0.5, 0.5], &[2, 2], DeviceType::Cpu).unwrap();
-        let pred2 = from_vec(vec![0.34, 0.33, 0.33, 0.5, 0.5], &[2, 2], DeviceType::Cpu).unwrap();
-        let pred3 = from_vec(vec![0.33, 0.34, 0.33, 0.5, 0.5], &[2, 2], DeviceType::Cpu).unwrap();
+        // Create MC predictions with high entropy but low disagreement (high aleatoric):
+        // two near-uniform 3-class rows, permuted only slightly between models.
+        let pred1 = from_vec(
+            vec![0.33, 0.33, 0.34, 0.34, 0.33, 0.33],
+            &[2, 3],
+            DeviceType::Cpu,
+        )
+        .unwrap();
+        let pred2 = from_vec(
+            vec![0.34, 0.33, 0.33, 0.33, 0.34, 0.33],
+            &[2, 3],
+            DeviceType::Cpu,
+        )
+        .unwrap();
+        let pred3 = from_vec(
+            vec![0.33, 0.34, 0.33, 0.33, 0.33, 0.34],
+            &[2, 3],
+            DeviceType::Cpu,
+        )
+        .unwrap();
 
         let mc_predictions = vec![pred1, pred2, pred3];
 

@@ -84,7 +84,7 @@ impl Optimizer for OnlineGradientDescent {
 
             // Update parameters
             let update = effective_grad.mul_scalar(adaptive_lr)?;
-            *param = param.sub(&update)?;
+            crate::param_update::sub_assign(&mut param, &update)?;
         }
 
         Ok(())
@@ -249,7 +249,7 @@ impl SVRG {
 
             // Update parameters
             let update = variance_reduced_grad.mul_scalar(self.lr)?;
-            *param = param.sub(&update)?;
+            crate::param_update::sub_assign(&mut param, &update)?;
         }
 
         self.epoch_step += 1;
@@ -283,7 +283,7 @@ impl Optimizer for SVRG {
                 .ok_or_else(|| TorshError::AutogradError("No gradient available".to_string()))?;
 
             let update = grad.mul_scalar(self.lr)?;
-            *param = param.sub(&update)?;
+            crate::param_update::sub_assign(&mut param, &update)?;
         }
 
         Ok(())
@@ -473,7 +473,7 @@ impl SAGA {
 
             // Update parameters
             let update = saga_grad.mul_scalar(self.lr)?;
-            *param = param.sub(&update)?;
+            crate::param_update::sub_assign(&mut param, &update)?;
 
             // Update gradient sum
             self.gradient_sum[i] = self.gradient_sum[i]
@@ -518,7 +518,7 @@ impl Optimizer for SAGA {
                 .ok_or_else(|| TorshError::AutogradError("No gradient available".to_string()))?;
 
             let update = grad.mul_scalar(self.lr)?;
-            *param = param.sub(&update)?;
+            crate::param_update::sub_assign(&mut param, &update)?;
         }
 
         Ok(())
@@ -566,18 +566,32 @@ impl Optimizer for SAGA {
             param_count: self.params.len(),
         };
 
-        // NOTE: Gradient table serialization deferred to v0.2.0
-        // Enhancement: Full gradient table persistence for checkpoint/restore
-        // Current: Basic state only (lr, num_data_points, is_initialized)
-        // Future: Serialize gradient_table and gradient_sum for complete state recovery
-        // Impact: Currently requires gradient table reinitialization after load_state_dict
-        // See ROADMAP.md for full persistence implementation plan
+        // Serialize the full gradient table and the running gradient sum, so a
+        // restored optimizer resumes with the variance-reduction state it had
+        // rather than restarting from zeros.
+        //
+        // Layout: the per-data-point gradients live under
+        // `"data_<index>"` -> `"param_<slot>"`, and the running sum under
+        // `"gradient_sum"` -> `"param_<slot>"`.
+        let mut state: HashMap<String, HashMap<String, Tensor>> = HashMap::new();
+        for (data_index, gradients) in &self.gradient_table {
+            let entry = state.entry(format!("data_{data_index}")).or_default();
+            for (slot, gradient) in gradients.iter().enumerate() {
+                entry.insert(format!("param_{slot}"), gradient.clone());
+            }
+        }
+        if !self.gradient_sum.is_empty() {
+            let entry = state.entry("gradient_sum".to_string()).or_default();
+            for (slot, gradient) in self.gradient_sum.iter().enumerate() {
+                entry.insert(format!("param_{slot}"), gradient.clone());
+            }
+        }
 
         Ok(OptimizerState {
             optimizer_type: "SAGA".to_string(),
             version: "0.1.0".to_string(),
             param_groups: vec![param_group],
-            state: HashMap::new(), // Gradient table persistence deferred to v0.2.0
+            state,
             global_state: HashMap::new(),
         })
     }
@@ -617,8 +631,38 @@ impl Optimizer for SAGA {
             ));
         }
 
-        // Note: Gradient table and gradient sum state restoration would be implemented
-        // when the state_dict method is enhanced to include the gradient table
+        // Restore the gradient table and the running gradient sum written by
+        // `state_dict`. Entries are keyed `data_<index>` / `gradient_sum`, each
+        // holding one tensor per parameter slot (`param_<slot>`).
+        self.gradient_table.clear();
+        self.gradient_sum.clear();
+        let slot_count = self.params.len();
+        for (key, entry) in &state.state {
+            let mut gradients = Vec::with_capacity(slot_count);
+            for slot in 0..slot_count {
+                let tensor = entry.get(&format!("param_{slot}")).ok_or_else(|| {
+                    crate::OptimizerError::StateError(format!(
+                        "SAGA state entry `{key}` is missing parameter slot {slot}"
+                    ))
+                })?;
+                gradients.push(tensor.clone());
+            }
+
+            if key == "gradient_sum" {
+                self.gradient_sum = gradients;
+            } else if let Some(index) = key.strip_prefix("data_") {
+                let index: usize = index.parse().map_err(|_| {
+                    crate::OptimizerError::StateError(format!(
+                        "SAGA state entry `{key}` does not carry a numeric data index"
+                    ))
+                })?;
+                self.gradient_table.insert(index, gradients);
+            } else {
+                return Err(crate::OptimizerError::StateError(format!(
+                    "Unrecognized SAGA state entry `{key}`"
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -772,7 +816,7 @@ impl Optimizer for ProximalGradient {
 
             // Apply proximal operator
             let proximal_result = self.apply_proximal_operator(&grad_step)?;
-            *param = proximal_result;
+            crate::param_update::assign(&mut param, &proximal_result)?;
         }
 
         Ok(())

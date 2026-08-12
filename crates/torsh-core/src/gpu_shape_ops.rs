@@ -1,43 +1,30 @@
-//! GPU-Accelerated Shape Operations for Very Large Tensors
+//! Shape Operations with GPU-Availability-Aware Statistics
 //!
-//! This module provides GPU-accelerated implementations of shape operations
-//! that benefit from parallel execution on large tensors. It uses intelligent
-//! thresholding to decide when GPU acceleration is beneficial over CPU execution.
+//! This module provides shape operations (broadcasting, reshape, batch
+//! validation, stride computation) instrumented with usage statistics.
 //!
-//! # Design Principles
+//! # Honesty Note (no real GPU dispatch here)
 //!
-//! 1. **Automatic Threshold Detection**: Operations automatically select GPU or CPU
-//!    based on tensor size and operation complexity
-//! 2. **Zero-Copy When Possible**: Minimize data transfer between CPU and GPU
-//! 3. **Batched Operations**: Support batching multiple shape operations for efficiency
-//! 4. **Fallback Support**: Graceful fallback to CPU when GPU is unavailable
-//!
-//! # Performance Benefits
-//!
-//! GPU acceleration provides significant benefits for:
-//! - Broadcasting operations on tensors with >10M elements
-//! - Complex reshape operations with non-trivial strides
-//! - Batch validation of many shapes simultaneously
-//! - Stride computation for very high-dimensional tensors (>10 dimensions)
-//!
-//! # SciRS2 POLICY Compliance
-//!
-//! This module strictly follows the SciRS2 POLICY by:
-//! - Using `scirs2_core::gpu` for all GPU operations (NO direct CUDA/Metal)
-//! - Using `scirs2_core::ndarray` for array operations (NO direct ndarray)
-//! - Only using Rust standard library beyond scirs2-core
+//! torsh-core is the foundation crate that every other ToRSh crate depends
+//! on, so it cannot depend on `torsh-tensor` (that would be a circular
+//! dependency) and has no direct CUDA/Metal/wgpu bindings of its own. GPU
+//! compute for ToRSh tensors is provided by oxicuda via `torsh-tensor`'s
+//! `gpu_dispatch` module. Every operation in this module therefore always
+//! executes on the CPU; [`AcceleratorStats::gpu_operations`] and
+//! [`AcceleratorStats::gpu_fallback_count`] exist for API stability and
+//! forward compatibility but stay at zero rather than being incremented for
+//! work that was actually done on the CPU. [`GpuShapeAccelerator::is_gpu_available`]
+//! reports [`crate::gpu::is_gpu_available`]'s (currently always `false`)
+//! answer purely as information; it does not change which code path runs.
 //!
 //! # Example
 //!
 //! ```rust,ignore
 //! use torsh_core::gpu_shape_ops::{GpuShapeAccelerator, AcceleratorConfig};
 //!
-//! // Create GPU accelerator with custom thresholds
-//! let config = AcceleratorConfig::default()
-//!     .with_broadcast_threshold(10_000_000);
+//! let config = AcceleratorConfig::default();
 //! let accelerator = GpuShapeAccelerator::new(config)?;
 //!
-//! // Automatically use GPU for large tensors, CPU for small ones
 //! let shape1 = Shape::from_dims(vec![1000, 1000, 100])?;
 //! let shape2 = Shape::from_dims(vec![1, 1000, 100])?;
 //! let result = accelerator.broadcast(&shape1, &shape2)?;
@@ -45,6 +32,7 @@
 
 use crate::error::{Result, TorshError};
 use crate::shape::Shape;
+use crate::sync::MutexExt;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -56,19 +44,26 @@ use std::sync::Arc;
 
 /// Configuration for GPU shape accelerator
 ///
-/// Controls when GPU acceleration is used vs CPU fallback.
+/// Retained for API stability and forward compatibility with a future real
+/// GPU dispatch path. Since [`GpuShapeAccelerator`] currently always executes
+/// on the CPU (see the module docs), these thresholds are not read by any
+/// operation today -- setting them has no observable effect yet.
 #[derive(Debug, Clone)]
 pub struct AcceleratorConfig {
-    /// Minimum number of elements to use GPU for broadcasting (default: 10M)
+    /// Threshold that would select GPU for broadcasting once a real GPU
+    /// dispatch path exists (default: 10M). Not currently read.
     pub broadcast_threshold: usize,
 
-    /// Minimum number of elements to use GPU for reshape (default: 5M)
+    /// Threshold that would select GPU for reshape once a real GPU dispatch
+    /// path exists (default: 5M). Not currently read.
     pub reshape_threshold: usize,
 
-    /// Minimum number of dimensions to use GPU for stride computation (default: 10)
+    /// Threshold that would select GPU for stride computation once a real
+    /// GPU dispatch path exists (default: 10). Not currently read.
     pub stride_dimension_threshold: usize,
 
-    /// Minimum batch size to use GPU for batch validation (default: 100)
+    /// Threshold that would select GPU for batch validation once a real GPU
+    /// dispatch path exists (default: 100). Not currently read.
     pub batch_validation_threshold: usize,
 
     /// Enable automatic threshold tuning based on GPU performance (default: false)
@@ -170,25 +165,28 @@ impl AcceleratorConfig {
     }
 }
 
-/// Performance statistics for GPU operations
+/// Usage statistics for [`GpuShapeAccelerator`] operations
 #[derive(Debug, Clone, Default)]
 pub struct AcceleratorStats {
     /// Total number of operations
     pub total_operations: usize,
 
-    /// Number of operations executed on GPU
+    /// Number of operations genuinely executed on a GPU. Always `0` today:
+    /// see the module docs -- torsh-core has no real GPU dispatch path, so
+    /// this is never incremented for CPU work.
     pub gpu_operations: usize,
 
-    /// Number of operations executed on CPU
+    /// Number of operations executed on the CPU (currently: all of them)
     pub cpu_operations: usize,
 
-    /// Total time spent on GPU operations (microseconds)
+    /// Total time spent on GPU operations (microseconds). Always `0` today.
     pub gpu_time_us: u64,
 
     /// Total time spent on CPU operations (microseconds)
     pub cpu_time_us: u64,
 
-    /// Number of GPU fallback failures
+    /// Number of times a GPU attempt failed and fell back to CPU. Always `0`
+    /// today, since no GPU attempt is ever made.
     pub gpu_fallback_count: usize,
 }
 
@@ -281,90 +279,40 @@ impl GpuShapeAccelerator {
 
     /// Get current statistics
     pub fn stats(&self) -> AcceleratorStats {
-        self.stats
-            .lock()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.stats.lock_or_recover().clone()
     }
 
     /// Reset statistics
     pub fn reset_stats(&self) {
-        self.stats
-            .lock()
-            .expect("lock should not be poisoned")
-            .reset();
+        self.stats.lock_or_recover().reset();
     }
 
-    /// GPU-accelerated broadcasting for very large tensors
+    /// Broadcast two shapes together
     ///
-    /// Automatically uses GPU if tensor size exceeds threshold, otherwise uses CPU.
+    /// torsh-core has no real GPU backend to dispatch shape operations to:
+    /// GPU compute for ToRSh is provided by oxicuda via torsh-tensor's
+    /// `gpu_dispatch`, which this foundation crate cannot depend on without
+    /// creating a circular dependency. Every call here always actually runs
+    /// on the CPU, and `AcceleratorStats` reports that honestly (previously,
+    /// this counted large-enough operations as `gpu_operations` even though
+    /// they were CPU work end to end).
     pub fn broadcast(&self, shape1: &Shape, shape2: &Shape) -> Result<Shape> {
-        let numel1 = shape1.numel();
-        let numel2 = shape2.numel();
-        let total_elements = numel1.max(numel2);
-
-        // Record operation start
-        let mut stats = self.stats.lock().expect("lock should not be poisoned");
+        let mut stats = self.stats.lock_or_recover();
         stats.total_operations += 1;
-
-        // Decide whether to use GPU
-        let use_gpu = self.gpu_available && total_elements >= self.config.broadcast_threshold;
-
-        if use_gpu {
-            stats.gpu_operations += 1;
-            drop(stats); // Release lock before GPU operation
-
-            // GPU-accelerated broadcast
-            match self.broadcast_gpu(shape1, shape2) {
-                Ok(result) => Ok(result),
-                Err(_) => {
-                    // Fallback to CPU
-                    let mut stats = self.stats.lock().expect("lock should not be poisoned");
-                    stats.gpu_fallback_count += 1;
-                    stats.gpu_operations -= 1;
-                    stats.cpu_operations += 1;
-                    drop(stats);
-                    self.broadcast_cpu(shape1, shape2)
-                }
-            }
-        } else {
-            stats.cpu_operations += 1;
-            drop(stats);
-            self.broadcast_cpu(shape1, shape2)
-        }
+        stats.cpu_operations += 1;
+        drop(stats);
+        self.broadcast_cpu(shape1, shape2)
     }
 
-    /// CPU fallback for broadcasting
+    /// CPU implementation of broadcasting
     fn broadcast_cpu(&self, shape1: &Shape, shape2: &Shape) -> Result<Shape> {
         shape1.broadcast_with(shape2)
     }
 
-    /// GPU-accelerated broadcasting implementation
-    #[cfg(feature = "gpu")]
-    fn broadcast_gpu(&self, shape1: &Shape, shape2: &Shape) -> Result<Shape> {
-        // This would use scirs2_core::gpu for actual GPU computation
-        // For now, we implement the logic and prepare for GPU integration
-
-        // Note: Actual GPU implementation would:
-        // 1. Transfer shape data to GPU
-        // 2. Execute broadcasting kernel in parallel
-        // 3. Transfer result back to CPU
-        //
-        // For production use, this requires scirs2-core GPU support to be available
-
-        // Fallback to CPU for now
-        self.broadcast_cpu(shape1, shape2)
-    }
-
-    #[cfg(not(feature = "gpu"))]
-    fn broadcast_gpu(&self, shape1: &Shape, shape2: &Shape) -> Result<Shape> {
-        // GPU not available, fallback to CPU
-        self.broadcast_cpu(shape1, shape2)
-    }
-
-    /// GPU-accelerated reshape for very large tensors
+    /// Reshape a tensor to `new_dims`, validating that the element count matches
     ///
-    /// Validates reshape is possible and computes new strides efficiently on GPU.
+    /// See [`Self::broadcast`] for why this always executes on the CPU and
+    /// why `AcceleratorStats` no longer distinguishes a GPU path here.
     pub fn reshape(&self, shape: &Shape, new_dims: &[usize]) -> Result<Shape> {
         let numel = shape.numel();
 
@@ -381,82 +329,31 @@ impl GpuShapeAccelerator {
         }
 
         // Record operation
-        let mut stats = self.stats.lock().expect("lock should not be poisoned");
+        let mut stats = self.stats.lock_or_recover();
         stats.total_operations += 1;
-
-        let use_gpu = self.gpu_available && numel >= self.config.reshape_threshold;
-
-        if use_gpu {
-            stats.gpu_operations += 1;
-            drop(stats);
-
-            match self.reshape_gpu(shape, new_dims) {
-                Ok(result) => Ok(result),
-                Err(_) => {
-                    let mut stats = self.stats.lock().expect("lock should not be poisoned");
-                    stats.gpu_fallback_count += 1;
-                    stats.gpu_operations -= 1;
-                    stats.cpu_operations += 1;
-                    drop(stats);
-                    self.reshape_cpu(new_dims)
-                }
-            }
-        } else {
-            stats.cpu_operations += 1;
-            drop(stats);
-            self.reshape_cpu(new_dims)
-        }
+        stats.cpu_operations += 1;
+        drop(stats);
+        self.reshape_cpu(new_dims)
     }
 
-    /// CPU fallback for reshape
+    /// CPU implementation of reshape
     fn reshape_cpu(&self, new_dims: &[usize]) -> Result<Shape> {
         Shape::from_dims(new_dims.to_vec())
     }
 
-    /// GPU-accelerated reshape implementation
-    #[cfg(feature = "gpu")]
-    fn reshape_gpu(&self, _shape: &Shape, new_dims: &[usize]) -> Result<Shape> {
-        // GPU implementation would compute strides in parallel
-        self.reshape_cpu(new_dims)
-    }
-
-    #[cfg(not(feature = "gpu"))]
-    fn reshape_gpu(&self, _shape: &Shape, new_dims: &[usize]) -> Result<Shape> {
-        self.reshape_cpu(new_dims)
-    }
-
-    /// Batch validate multiple shapes efficiently
+    /// Batch validate multiple shapes
     ///
-    /// Validates a batch of shapes for validity in parallel on GPU.
+    /// See [`Self::broadcast`] for why this always executes on the CPU and
+    /// why `AcceleratorStats` no longer distinguishes a GPU path here.
     pub fn batch_validate(&self, shapes: &[Vec<usize>]) -> Result<Vec<bool>> {
-        let mut stats = self.stats.lock().expect("lock should not be poisoned");
+        let mut stats = self.stats.lock_or_recover();
         stats.total_operations += 1;
-
-        let use_gpu = self.gpu_available && shapes.len() >= self.config.batch_validation_threshold;
-
-        if use_gpu {
-            stats.gpu_operations += 1;
-            drop(stats);
-
-            match self.batch_validate_gpu(shapes) {
-                Ok(result) => Ok(result),
-                Err(_) => {
-                    let mut stats = self.stats.lock().expect("lock should not be poisoned");
-                    stats.gpu_fallback_count += 1;
-                    stats.gpu_operations -= 1;
-                    stats.cpu_operations += 1;
-                    drop(stats);
-                    self.batch_validate_cpu(shapes)
-                }
-            }
-        } else {
-            stats.cpu_operations += 1;
-            drop(stats);
-            self.batch_validate_cpu(shapes)
-        }
+        stats.cpu_operations += 1;
+        drop(stats);
+        self.batch_validate_cpu(shapes)
     }
 
-    /// CPU fallback for batch validation
+    /// CPU implementation of batch validation
     fn batch_validate_cpu(&self, shapes: &[Vec<usize>]) -> Result<Vec<bool>> {
         Ok(shapes
             .iter()
@@ -467,50 +364,19 @@ impl GpuShapeAccelerator {
             .collect())
     }
 
-    /// GPU-accelerated batch validation
-    #[cfg(feature = "gpu")]
-    fn batch_validate_gpu(&self, shapes: &[Vec<usize>]) -> Result<Vec<bool>> {
-        // GPU implementation would validate all shapes in parallel
-        self.batch_validate_cpu(shapes)
-    }
-
-    #[cfg(not(feature = "gpu"))]
-    fn batch_validate_gpu(&self, shapes: &[Vec<usize>]) -> Result<Vec<bool>> {
-        self.batch_validate_cpu(shapes)
-    }
-
-    /// Compute strides for high-dimensional shapes
+    /// Compute strides for a shape's dimensions
     ///
-    /// Uses GPU acceleration for shapes with many dimensions.
+    /// See [`Self::broadcast`] for why this always executes on the CPU and
+    /// why `AcceleratorStats` no longer distinguishes a GPU path here.
     pub fn compute_strides(&self, dims: &[usize]) -> Result<Vec<usize>> {
-        let mut stats = self.stats.lock().expect("lock should not be poisoned");
+        let mut stats = self.stats.lock_or_recover();
         stats.total_operations += 1;
-
-        let use_gpu = self.gpu_available && dims.len() >= self.config.stride_dimension_threshold;
-
-        if use_gpu {
-            stats.gpu_operations += 1;
-            drop(stats);
-
-            match self.compute_strides_gpu(dims) {
-                Ok(result) => Ok(result),
-                Err(_) => {
-                    let mut stats = self.stats.lock().expect("lock should not be poisoned");
-                    stats.gpu_fallback_count += 1;
-                    stats.gpu_operations -= 1;
-                    stats.cpu_operations += 1;
-                    drop(stats);
-                    self.compute_strides_cpu(dims)
-                }
-            }
-        } else {
-            stats.cpu_operations += 1;
-            drop(stats);
-            self.compute_strides_cpu(dims)
-        }
+        stats.cpu_operations += 1;
+        drop(stats);
+        self.compute_strides_cpu(dims)
     }
 
-    /// CPU fallback for stride computation
+    /// CPU implementation of stride computation
     fn compute_strides_cpu(&self, dims: &[usize]) -> Result<Vec<usize>> {
         if dims.is_empty() {
             return Ok(Vec::new());
@@ -525,18 +391,6 @@ impl GpuShapeAccelerator {
         }
 
         Ok(strides)
-    }
-
-    /// GPU-accelerated stride computation
-    #[cfg(feature = "gpu")]
-    fn compute_strides_gpu(&self, dims: &[usize]) -> Result<Vec<usize>> {
-        // GPU implementation would compute strides in parallel using prefix scan
-        self.compute_strides_cpu(dims)
-    }
-
-    #[cfg(not(feature = "gpu"))]
-    fn compute_strides_gpu(&self, dims: &[usize]) -> Result<Vec<usize>> {
-        self.compute_strides_cpu(dims)
     }
 
     /// Get current configuration
@@ -595,6 +449,40 @@ impl GpuShapeAccelerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F296 regression test: `AcceleratorStats::gpu_operations` must only ever
+    /// count operations that were genuinely executed on a GPU. torsh-core has
+    /// no real GPU dispatch to route shape operations through (GPU compute
+    /// for ToRSh is provided by oxicuda via torsh-tensor's `gpu_dispatch`,
+    /// which this foundation crate cannot depend on), so every shape
+    /// operation always actually runs on the CPU. This constructs the
+    /// accelerator directly (bypassing `new()`, which today always sets
+    /// `gpu_available: false`) to simulate what happens once
+    /// `crate::gpu::is_gpu_available()` starts reporting real hardware, so
+    /// the accounting cannot silently start lying at that point either.
+    #[test]
+    fn test_gpu_stats_never_lie_about_unavailable_gpu_backend() {
+        let accelerator = GpuShapeAccelerator {
+            config: AcceleratorConfig::new().with_broadcast_threshold(1),
+            stats: Arc::new(std::sync::Mutex::new(AcceleratorStats::new())),
+            gpu_available: true,
+        };
+
+        let shape1 = Shape::from_dims(vec![4, 4]).expect("shape creation should succeed");
+        let shape2 = Shape::from_dims(vec![4, 4]).expect("shape creation should succeed");
+        accelerator
+            .broadcast(&shape1, &shape2)
+            .expect("broadcast should succeed");
+
+        let stats = accelerator.stats();
+        // No genuine GPU kernel exists in torsh-core; every operation is
+        // actually executed on the CPU, so it must be counted as CPU work.
+        assert_eq!(
+            stats.gpu_operations, 0,
+            "no real GPU work was performed, so gpu_operations must stay 0"
+        );
+        assert_eq!(stats.cpu_operations, 1);
+    }
 
     #[test]
     fn test_accelerator_config_default() {

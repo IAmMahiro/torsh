@@ -186,14 +186,16 @@ pub fn compare_quantization_configs(
         let start = std::time::Instant::now();
 
         // Quantize the tensor
-        let quantize_result = crate::algorithms::quantize_with_config(tensor, config);
+        // Use the parameter-preserving API so per-channel / group-wise schemes
+        // are dequantized with their own parameters instead of channel 0's.
+        let quantize_result = crate::algorithms::quantize_with_config_full(tensor, config);
 
         let duration = start.elapsed().as_secs_f64();
 
         match quantize_result {
-            Ok((quantized, scale, zero_point)) => {
+            Ok(quantized) => {
                 // Dequantize back to original precision
-                let dequantized = crate::algorithms::dequantize(&quantized, scale, zero_point)?;
+                let dequantized = quantized.dequantize()?;
 
                 // Calculate metrics
                 let original_bits = match tensor.dtype() {

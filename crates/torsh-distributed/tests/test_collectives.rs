@@ -1,4 +1,15 @@
-//! Tests for collective operations
+//! Tests for collective operations.
+//!
+//! These exercise the `world_size == 1` path, where every collective is a
+//! correct identity (no network I/O). REAL multi-rank collectives (genuine
+//! cross-rank reductions over TCP) are covered by `hardening_distributed.rs`.
+//!
+//! Historically these tests ran against a mock backend with `world_size = 4`
+//! and asserted that tensors were left UNCHANGED — i.e. they asserted the
+//! fabricated no-op. With honest collectives, a single-process `world_size > 1`
+//! collective returns an error instead of silently succeeding, so these tests
+//! use `world_size = 1`, where the same "unchanged" assertions hold for a real
+//! reason (a single-rank reduction is genuinely the identity).
 
 use torsh_core::Result;
 use torsh_distributed::{
@@ -11,21 +22,14 @@ use torsh_tensor::creation::{eye, full, ones, zeros};
 use torsh_tensor::Tensor;
 
 #[tokio::test]
-async fn test_all_reduce() -> Result<()> {
-    // Create a mock process group
-    let pg = init_process_group(BackendType::Gloo, 0, 4, "127.0.0.1", 29500).await?;
+async fn test_all_reduce_single_rank_identity() -> Result<()> {
+    let pg = init_process_group(BackendType::Gloo, 0, 1, "127.0.0.1", 29520).await?;
 
-    // Create a tensor
     let mut tensor = ones::<f32>(&[2, 3])?;
-
-    // Perform all-reduce
     all_reduce(&mut tensor, ReduceOp::Sum, &pg).await?;
 
-    // With mock backend, tensor remains unchanged (mock doesn't implement actual reduction)
-    // In a real distributed setup, this would sum values across all ranks
+    // Single-rank sum is the identity (correct, not fabricated).
     let expected = ones::<f32>(&[2, 3])?;
-
-    // Compare tensors element-wise
     let data = tensor.to_vec()?;
     let expected_data = expected.to_vec()?;
     assert_eq!(data.len(), expected_data.len());
@@ -37,21 +41,15 @@ async fn test_all_reduce() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_broadcast() -> Result<()> {
-    let pg = init_process_group(BackendType::Gloo, 1, 4, "127.0.0.1", 29500).await?;
+async fn test_broadcast_single_rank() -> Result<()> {
+    let pg = init_process_group(BackendType::Gloo, 0, 1, "127.0.0.1", 29521).await?;
 
-    // Create a tensor with rank-specific values
     let rank = pg.rank() as f32;
     let mut tensor = full::<f32>(&[3, 3], rank)?;
-
-    // Broadcast from rank 0
     broadcast(&mut tensor, 0, &pg).await?;
 
-    // With mock backend, tensor remains unchanged
-    // In real implementation, all ranks would have rank 0's tensor
+    // Root's own tensor is unchanged.
     let expected = full::<f32>(&[3, 3], rank)?;
-
-    // Compare tensors
     let data = tensor.to_vec()?;
     let expected_data = expected.to_vec()?;
     assert_eq!(data, expected_data);
@@ -60,44 +58,32 @@ async fn test_broadcast() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_all_gather() -> Result<()> {
-    let pg = init_process_group(BackendType::Gloo, 2, 4, "127.0.0.1", 29500).await?;
+async fn test_all_gather_single_rank() -> Result<()> {
+    let pg = init_process_group(BackendType::Gloo, 0, 1, "127.0.0.1", 29522).await?;
 
-    // Create input tensor
     let input = eye::<f32>(3)?;
     let mut output = Vec::new();
-
-    // Perform all-gather
     all_gather(&mut output, &input, &pg).await?;
 
-    // Should have one tensor per rank
-    assert_eq!(output.len(), 4);
-
-    // With mock backend, all tensors are copies of input
+    // One rank -> one gathered tensor, equal to the input.
+    assert_eq!(output.len(), 1);
     let input_data = input.to_vec()?;
     for tensor in &output {
-        let tensor_data = tensor.to_vec()?;
-        assert_eq!(tensor_data, input_data);
+        assert_eq!(tensor.to_vec()?, input_data);
     }
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_reduce() -> Result<()> {
-    let pg = init_process_group(BackendType::Gloo, 0, 4, "127.0.0.1", 29500).await?;
+async fn test_reduce_single_rank_identity() -> Result<()> {
+    let pg = init_process_group(BackendType::Gloo, 0, 1, "127.0.0.1", 29523).await?;
 
-    // Create tensor
     let mut tensor = full::<f32>(&[2, 2], 2.0)?;
-
-    // Reduce to rank 0
     reduce(&mut tensor, 0, ReduceOp::Sum, &pg).await?;
 
-    // With mock backend, tensor remains unchanged (mock doesn't implement actual reduction)
-    // In a real distributed setup, this would sum values from all ranks
+    // Single-rank reduce leaves the destination holding its own values.
     let expected = full::<f32>(&[2, 2], 2.0)?;
-
-    // Compare tensors
     let data: Vec<f32> = tensor.to_vec()?;
     let expected_data = expected.to_vec()?;
     for (a, b) in data.iter().zip(expected_data.iter()) {
@@ -113,43 +99,29 @@ async fn test_reduce() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_scatter() -> Result<()> {
-    let pg = init_process_group(BackendType::Gloo, 0, 4, "127.0.0.1", 29500).await?;
+async fn test_scatter_single_rank() -> Result<()> {
+    let pg = init_process_group(BackendType::Gloo, 0, 1, "127.0.0.1", 29524).await?;
 
-    // Create tensors to scatter
-    let tensors: Vec<Tensor<f32>> = (0..4)
-        .map(|i| full(&[2, 2], i as f32))
-        .collect::<Result<Vec<_>>>()?;
-
+    // One rank -> exactly one chunk.
+    let tensors: Vec<Tensor<f32>> = vec![full(&[2, 2], 0.0)?];
     let mut output = zeros::<f32>(&[2, 2])?;
-
-    // Scatter from rank 0
     scatter(&mut output, Some(&tensors), 0, &pg).await?;
 
-    // Rank 0 should get tensor[0]
     let expected = zeros::<f32>(&[2, 2])?;
-
-    // Compare tensors
-    let data = output.to_vec()?;
-    let expected_data = expected.to_vec()?;
-    assert_eq!(data, expected_data);
+    assert_eq!(output.to_vec()?, expected.to_vec()?);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_barrier() -> Result<()> {
-    let pg = init_process_group(BackendType::Gloo, 0, 4, "127.0.0.1", 29500).await?;
-
-    // Barrier should succeed without error
+async fn test_barrier_single_rank() -> Result<()> {
+    let pg = init_process_group(BackendType::Gloo, 0, 1, "127.0.0.1", 29525).await?;
     barrier(&pg).await?;
-
     Ok(())
 }
 
 #[test]
 fn test_reduce_ops() {
-    // Test that reduce operations are properly defined
     let ops = vec![
         ReduceOp::Sum,
         ReduceOp::Product,
@@ -161,7 +133,6 @@ fn test_reduce_ops() {
     ];
 
     for op in ops {
-        // Just verify they can be created and compared
         assert_eq!(op, op);
     }
 }
@@ -170,17 +141,14 @@ fn test_reduce_ops() {
 fn test_backend_availability() {
     use torsh_distributed::{is_available, is_mpi_available, is_nccl_available};
 
-    // At least one backend should be available (mock backend)
     assert!(is_available());
 
-    // Check individual backends based on features
     #[cfg(feature = "mpi")]
     assert!(is_mpi_available());
 
     #[cfg(not(feature = "mpi"))]
     assert!(!is_mpi_available());
 
-    // Note: NCCL is currently a mock backend without actual CUDA dependency
     #[cfg(feature = "nccl")]
     assert!(is_nccl_available());
 

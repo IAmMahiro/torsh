@@ -1216,7 +1216,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduled_all_reduce() {
-        let pg = init_process_group(BackendType::Nccl, 0, 1, "127.0.0.1", 29500)
+        let pg = init_process_group(BackendType::Gloo, 0, 1, "127.0.0.1", 29500)
             .await
             .unwrap();
         let scheduler = NcclScheduler::new(0, 2);
@@ -1234,7 +1234,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fused_operations() {
-        let pg = init_process_group(BackendType::Nccl, 0, 1, "127.0.0.1", 29500)
+        let pg = init_process_group(BackendType::Gloo, 0, 1, "127.0.0.1", 29500)
             .await
             .unwrap();
         let scheduler = NcclScheduler::new(0, 2);

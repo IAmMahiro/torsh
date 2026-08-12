@@ -1,6 +1,7 @@
 //! Graph utilities and algorithms
 
 use torsh_core::device::DeviceType;
+use torsh_core::error::{Result, TorshError};
 use torsh_tensor::{
     creation::{from_vec, zeros},
     Tensor,
@@ -9,15 +10,20 @@ use torsh_tensor::{
 
 /// Helper function to convert tensor to 2D Vec format
 /// Assumes tensor is of shape \[rows, cols\] and returns `Vec<Vec<T>>`
+///
+/// # Errors
+/// Returns [`TorshError::InvalidArgument`] when the tensor is not 2-dimensional.
 pub fn tensor_to_vec2<T: Clone + torsh_core::TensorElement>(
     tensor: &Tensor<T>,
-) -> Result<Vec<Vec<T>>, Box<dyn std::error::Error>> {
+) -> Result<Vec<Vec<T>>> {
     let data = tensor.to_vec()?;
     let tensor_shape = tensor.shape();
     let shape = tensor_shape.dims();
 
     if shape.len() != 2 {
-        return Err("Tensor must be 2D".into());
+        return Err(TorshError::InvalidArgument(format!(
+            "tensor_to_vec2 requires a 2D tensor, got {shape:?}"
+        )));
     }
 
     let rows = shape[0];
@@ -33,109 +39,170 @@ pub fn tensor_to_vec2<T: Clone + torsh_core::TensorElement>(
     Ok(result)
 }
 
-/// Compute graph Laplacian
-pub fn graph_laplacian(edge_index: &Tensor, num_nodes: usize, normalized: bool) -> Tensor {
-    // Simplified graph Laplacian implementation for compilation compatibility
-    let edge_data = tensor_to_vec2::<f32>(edge_index).expect("conversion should succeed");
+/// Extract the `(source, target)` rows of an edge index tensor.
+///
+/// The tensor must have shape `[2, num_edges]`; anything else is a hard error
+/// rather than a panic, because `edge_index` is usually caller-supplied data.
+pub(crate) fn edge_rows(edge_index: &Tensor) -> Result<(Vec<f32>, Vec<f32>)> {
+    let edge_data = tensor_to_vec2::<f32>(edge_index)?;
+    if edge_data.len() < 2 {
+        return Err(TorshError::InvalidArgument(format!(
+            "edge_index must have shape [2, num_edges], got {:?}",
+            edge_index.shape().dims()
+        )));
+    }
+    let src = edge_data[0].clone();
+    let dst = edge_data[1].clone();
+    Ok((src, dst))
+}
 
-    // Build adjacency matrix manually with proper indexing
-    let mut adjacency_data = vec![0.0; num_nodes * num_nodes];
-    let mut degrees = vec![0.0; num_nodes];
+/// Build a dense, symmetric, de-duplicated adjacency matrix together with the
+/// degree vector obtained as the **row sums of that matrix**.
+///
+/// Deriving degrees from the finished adjacency matrix (instead of counting
+/// `edge_index` columns) makes the result identical whether the caller lists
+/// each undirected edge once or in both directions, which is the convention
+/// PyTorch-Geometric-style `edge_index` tensors use.
+///
+/// `add_self_loops` adds the identity before the row sums are taken, which is
+/// exactly the renormalization trick of Kipf & Welling.
+fn dense_adjacency(
+    edge_index: &Tensor,
+    num_nodes: usize,
+    add_self_loops: bool,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let (src_row, dst_row) = edge_rows(edge_index)?;
 
-    // Build adjacency matrix and count degrees
-    for j in 0..edge_data[0].len() {
-        let src = edge_data[0][j] as usize;
-        let dst = edge_data[1][j] as usize;
-
+    let mut adjacency = vec![0.0f32; num_nodes * num_nodes];
+    for (&src, &dst) in src_row.iter().zip(dst_row.iter()) {
+        if src < 0.0 || dst < 0.0 {
+            return Err(TorshError::InvalidArgument(format!(
+                "edge_index contains a negative node id ({src}, {dst})"
+            )));
+        }
+        let src = src as usize;
+        let dst = dst as usize;
         if src < num_nodes && dst < num_nodes {
-            // Set A[src][dst] = 1 (and A[dst][src] = 1 for undirected graphs)
-            adjacency_data[src * num_nodes + dst] = 1.0;
-            adjacency_data[dst * num_nodes + src] = 1.0;
-            degrees[src] += 1.0;
-            degrees[dst] += 1.0;
+            adjacency[src * num_nodes + dst] = 1.0;
+            adjacency[dst * num_nodes + src] = 1.0;
         }
     }
 
-    // Create tensors
-    let _adjacency = from_vec(
-        adjacency_data.clone(),
-        &[num_nodes, num_nodes],
-        DeviceType::Cpu,
-    )
-    .expect("adjacency matrix creation should succeed");
+    if add_self_loops {
+        for i in 0..num_nodes {
+            adjacency[i * num_nodes + i] = 1.0;
+        }
+    }
+
+    let mut degrees = vec![0.0f32; num_nodes];
+    for (i, degree) in degrees.iter_mut().enumerate() {
+        *degree = adjacency[i * num_nodes..(i + 1) * num_nodes].iter().sum();
+    }
+
+    Ok((adjacency, degrees))
+}
+
+/// Compute graph Laplacian
+///
+/// * `normalized == false` returns the combinatorial Laplacian `L = D - A`.
+/// * `normalized == true` returns `L = I - D^(-1/2) A D^(-1/2)`.
+///
+/// Degrees are the row sums of the symmetrized, de-duplicated adjacency matrix,
+/// so listing an undirected edge once or in both directions yields the same
+/// operator.
+///
+/// # Errors
+/// Returns an error when `edge_index` is not a `[2, num_edges]` tensor or
+/// contains negative node ids.
+pub fn graph_laplacian(edge_index: &Tensor, num_nodes: usize, normalized: bool) -> Result<Tensor> {
+    let (adjacency, degrees) = dense_adjacency(edge_index, num_nodes, false)?;
+    let mut laplacian_data = vec![0.0f32; num_nodes * num_nodes];
 
     if normalized {
         // Normalized Laplacian: L = I - D^(-1/2) @ A @ D^(-1/2)
-        let mut laplacian_data = vec![0.0; num_nodes * num_nodes];
-
-        // Compute normalized laplacian manually
         for i in 0..num_nodes {
             for j in 0..num_nodes {
+                let a_ij = adjacency[i * num_nodes + j];
                 if i == j {
-                    laplacian_data[i * num_nodes + j] = 1.0; // Identity diagonal
-                    if degrees[i] > 0.0 {
-                        // Subtract normalized adjacency
-                        laplacian_data[i * num_nodes + j] -=
-                            adjacency_data[i * num_nodes + j] / (degrees[i] as f32).sqrt();
-                    }
-                } else if adjacency_data[i * num_nodes + j] > 0.0 {
-                    // Off-diagonal normalized elements
-                    if degrees[i] > 0.0 && degrees[j] > 0.0 {
-                        laplacian_data[i * num_nodes + j] =
-                            -1.0 / ((degrees[i] as f32).sqrt() * (degrees[j] as f32).sqrt());
-                    }
+                    // Identity diagonal minus the (possible) normalized self-loop.
+                    // The normalized self-loop term is A[i][i] / d_i, not
+                    // A[i][i] / sqrt(d_i).
+                    laplacian_data[i * num_nodes + j] = if degrees[i] > 0.0 {
+                        1.0 - a_ij / degrees[i]
+                    } else {
+                        1.0
+                    };
+                } else if a_ij > 0.0 && degrees[i] > 0.0 && degrees[j] > 0.0 {
+                    laplacian_data[i * num_nodes + j] =
+                        -a_ij / (degrees[i].sqrt() * degrees[j].sqrt());
                 }
             }
         }
-
-        from_vec(laplacian_data, &[num_nodes, num_nodes], DeviceType::Cpu)
-            .expect("laplacian matrix creation should succeed")
     } else {
-        // Unnormalized Laplacian: L = D - A
-        let mut laplacian_data = vec![0.0; num_nodes * num_nodes];
-
+        // Unnormalized Laplacian: L = D - A (row sums are exactly zero)
         for i in 0..num_nodes {
             for j in 0..num_nodes {
-                if i == j {
-                    laplacian_data[i * num_nodes + j] = degrees[i]; // Degree on diagonal
-                } else {
-                    laplacian_data[i * num_nodes + j] = -adjacency_data[i * num_nodes + j];
-                    // -A off diagonal
-                }
+                let diagonal = if i == j { degrees[i] } else { 0.0 };
+                laplacian_data[i * num_nodes + j] = diagonal - adjacency[i * num_nodes + j];
             }
         }
-
-        from_vec(laplacian_data, &[num_nodes, num_nodes], DeviceType::Cpu)
-            .expect("laplacian matrix creation should succeed")
     }
+
+    Ok(from_vec(
+        laplacian_data,
+        &[num_nodes, num_nodes],
+        DeviceType::Cpu,
+    )?)
+}
+
+/// Compute the Kipf & Welling GCN propagation operator
+/// `A_hat = D~^(-1/2) (A + I) D~^(-1/2)`.
+///
+/// This is the operator a graph convolution propagates with; it is **not** the
+/// Laplacian. Self-loops are added before the degrees are computed (the
+/// "renormalization trick"), so `A_hat` has non-negative entries and spectral
+/// radius at most one.
+///
+/// # Errors
+/// Returns an error when `edge_index` is not a `[2, num_edges]` tensor or
+/// contains negative node ids.
+pub fn gcn_norm(edge_index: &Tensor, num_nodes: usize) -> Result<Tensor> {
+    let (adjacency, degrees) = dense_adjacency(edge_index, num_nodes, true)?;
+    let mut normalized = vec![0.0f32; num_nodes * num_nodes];
+
+    for i in 0..num_nodes {
+        for j in 0..num_nodes {
+            let a_ij = adjacency[i * num_nodes + j];
+            if a_ij > 0.0 && degrees[i] > 0.0 && degrees[j] > 0.0 {
+                normalized[i * num_nodes + j] = a_ij / (degrees[i].sqrt() * degrees[j].sqrt());
+            }
+        }
+    }
+
+    Ok(from_vec(
+        normalized,
+        &[num_nodes, num_nodes],
+        DeviceType::Cpu,
+    )?)
 }
 
 /// Compute degree matrix
-pub fn degree_matrix(edge_index: &Tensor, num_nodes: usize) -> Tensor {
-    // Count degrees for each node
-    let mut degrees = vec![0.0; num_nodes];
-    let edge_data = tensor_to_vec2::<f32>(edge_index).expect("conversion should succeed");
-
-    // Count edges (both directions for undirected graphs)
-    for j in 0..edge_data[0].len() {
-        let src = edge_data[0][j] as usize;
-        let dst = edge_data[1][j] as usize;
-
-        degrees[src] += 1.0;
-        degrees[dst] += 1.0;
-    }
+///
+/// The diagonal holds the row sums of the symmetrized, de-duplicated adjacency
+/// matrix, matching [`graph_laplacian`].
+///
+/// # Errors
+/// Returns an error when `edge_index` is malformed.
+pub fn degree_matrix(edge_index: &Tensor, num_nodes: usize) -> Result<Tensor> {
+    let (_, degrees) = dense_adjacency(edge_index, num_nodes, false)?;
 
     // Create diagonal degree matrix
-    let mut degree_matrix =
-        zeros(&[num_nodes, num_nodes]).expect("degree matrix creation should succeed");
-    for i in 0..num_nodes {
-        // Set diagonal element to degree value
-        degree_matrix
-            .set_item(&[i, i], degrees[i])
-            .expect("setting degree matrix diagonal should succeed");
+    let mut degree_matrix = zeros(&[num_nodes, num_nodes])?;
+    for (i, &degree) in degrees.iter().enumerate() {
+        degree_matrix.set_item(&[i, i], degree)?;
     }
 
-    degree_matrix
+    Ok(degree_matrix)
 }
 
 /// Graph connectivity utilities
@@ -144,13 +211,13 @@ pub mod connectivity {
     use std::collections::VecDeque;
 
     /// Check if graph is connected
-    pub fn is_connected(edge_index: &Tensor, num_nodes: usize) -> bool {
+    pub fn is_connected(edge_index: &Tensor, num_nodes: usize) -> Result<bool> {
         if num_nodes <= 1 {
-            return true;
+            return Ok(true);
         }
 
         // Build adjacency list
-        let adjacency_list = build_adjacency_list(edge_index, num_nodes);
+        let adjacency_list = build_adjacency_list(edge_index, num_nodes)?;
 
         // Perform BFS from node 0
         let mut visited = vec![false; num_nodes];
@@ -169,12 +236,12 @@ pub mod connectivity {
             }
         }
 
-        visited_count == num_nodes
+        Ok(visited_count == num_nodes)
     }
 
     /// Get connected components using DFS
-    pub fn connected_components(edge_index: &Tensor, num_nodes: usize) -> Vec<Vec<usize>> {
-        let adjacency_list = build_adjacency_list(edge_index, num_nodes);
+    pub fn connected_components(edge_index: &Tensor, num_nodes: usize) -> Result<Vec<Vec<usize>>> {
+        let adjacency_list = build_adjacency_list(edge_index, num_nodes)?;
         let mut visited = vec![false; num_nodes];
         let mut components = Vec::new();
 
@@ -200,26 +267,32 @@ pub mod connectivity {
             }
         }
 
-        components
+        Ok(components)
     }
 
     /// Get largest connected component
-    pub fn largest_component(edge_index: &Tensor, num_nodes: usize) -> Vec<usize> {
-        let components = connected_components(edge_index, num_nodes);
-        components
+    pub fn largest_component(edge_index: &Tensor, num_nodes: usize) -> Result<Vec<usize>> {
+        let components = connected_components(edge_index, num_nodes)?;
+        Ok(components
             .into_iter()
             .max_by_key(|component| component.len())
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     /// Build adjacency list from edge index
-    pub(crate) fn build_adjacency_list(edge_index: &Tensor, num_nodes: usize) -> Vec<Vec<usize>> {
+    pub(crate) fn build_adjacency_list(
+        edge_index: &Tensor,
+        num_nodes: usize,
+    ) -> Result<Vec<Vec<usize>>> {
         let mut adjacency_list = vec![Vec::new(); num_nodes];
-        let edge_data = tensor_to_vec2::<f32>(edge_index).expect("conversion should succeed");
+        let (src_row, dst_row) = super::edge_rows(edge_index)?;
 
-        for j in 0..edge_data[0].len() {
-            let src = edge_data[0][j] as usize;
-            let dst = edge_data[1][j] as usize;
+        for (&src, &dst) in src_row.iter().zip(dst_row.iter()) {
+            if src < 0.0 || dst < 0.0 {
+                continue;
+            }
+            let src = src as usize;
+            let dst = dst as usize;
 
             if src < num_nodes && dst < num_nodes {
                 adjacency_list[src].push(dst);
@@ -233,7 +306,7 @@ pub mod connectivity {
             neighbors.dedup();
         }
 
-        adjacency_list
+        Ok(adjacency_list)
     }
 }
 
@@ -243,8 +316,8 @@ pub mod metrics {
     use std::collections::VecDeque;
 
     /// Compute node centrality measures
-    pub fn node_centrality(edge_index: &Tensor, num_nodes: usize) -> CentralityMeasures {
-        let adjacency_list = super::connectivity::build_adjacency_list(edge_index, num_nodes);
+    pub fn node_centrality(edge_index: &Tensor, num_nodes: usize) -> Result<CentralityMeasures> {
+        let adjacency_list = super::connectivity::build_adjacency_list(edge_index, num_nodes)?;
 
         // Degree centrality
         let degree_values: Vec<f64> = adjacency_list
@@ -252,33 +325,29 @@ pub mod metrics {
             .map(|neighbors| neighbors.len() as f64)
             .collect();
         let degree_f32: Vec<f32> = degree_values.into_iter().map(|x| x as f32).collect();
-        let degree = from_vec(degree_f32, &[num_nodes], DeviceType::Cpu)
-            .expect("degree tensor creation should succeed");
+        let degree = from_vec(degree_f32, &[num_nodes], DeviceType::Cpu)?;
 
         // Betweenness centrality (simplified implementation)
         let betweenness_values = compute_betweenness_centrality(&adjacency_list, num_nodes);
         let betweenness_f32: Vec<f32> = betweenness_values.into_iter().map(|x| x as f32).collect();
-        let betweenness = from_vec(betweenness_f32, &[num_nodes], DeviceType::Cpu)
-            .expect("betweenness tensor creation should succeed");
+        let betweenness = from_vec(betweenness_f32, &[num_nodes], DeviceType::Cpu)?;
 
         // Closeness centrality
         let closeness_values = compute_closeness_centrality(&adjacency_list, num_nodes);
         let closeness_f32: Vec<f32> = closeness_values.into_iter().map(|x| x as f32).collect();
-        let closeness = from_vec(closeness_f32, &[num_nodes], DeviceType::Cpu)
-            .expect("closeness tensor creation should succeed");
+        let closeness = from_vec(closeness_f32, &[num_nodes], DeviceType::Cpu)?;
 
         // Eigenvector centrality (power iteration approximation)
         let eigenvector_values = compute_eigenvector_centrality(&adjacency_list, num_nodes);
         let eigenvector_f32: Vec<f32> = eigenvector_values.into_iter().map(|x| x as f32).collect();
-        let eigenvector = from_vec(eigenvector_f32, &[num_nodes], DeviceType::Cpu)
-            .expect("eigenvector tensor creation should succeed");
+        let eigenvector = from_vec(eigenvector_f32, &[num_nodes], DeviceType::Cpu)?;
 
-        CentralityMeasures {
+        Ok(CentralityMeasures {
             degree,
             betweenness,
             closeness,
             eigenvector,
-        }
+        })
     }
 
     /// Centrality measures container
@@ -290,8 +359,8 @@ pub mod metrics {
     }
 
     /// Compute clustering coefficient
-    pub fn clustering_coefficient(edge_index: &Tensor, num_nodes: usize) -> Tensor {
-        let adjacency_list = super::connectivity::build_adjacency_list(edge_index, num_nodes);
+    pub fn clustering_coefficient(edge_index: &Tensor, num_nodes: usize) -> Result<Tensor> {
+        let adjacency_list = super::connectivity::build_adjacency_list(edge_index, num_nodes)?;
         let mut clustering_coeffs = Vec::with_capacity(num_nodes);
 
         for node in 0..num_nodes {
@@ -329,13 +398,12 @@ pub mod metrics {
         }
 
         let coeffs_f32: Vec<f32> = clustering_coeffs.into_iter().map(|x| x as f32).collect();
-        from_vec(coeffs_f32, &[num_nodes], DeviceType::Cpu)
-            .expect("clustering coefficients tensor creation should succeed")
+        Ok(from_vec(coeffs_f32, &[num_nodes], DeviceType::Cpu)?)
     }
 
     /// Compute graph diameter
-    pub fn graph_diameter(edge_index: &Tensor, num_nodes: usize) -> usize {
-        let adjacency_list = super::connectivity::build_adjacency_list(edge_index, num_nodes);
+    pub fn graph_diameter(edge_index: &Tensor, num_nodes: usize) -> Result<usize> {
+        let adjacency_list = super::connectivity::build_adjacency_list(edge_index, num_nodes)?;
         let mut max_distance = 0;
 
         for start_node in 0..num_nodes {
@@ -347,7 +415,7 @@ pub mod metrics {
             }
         }
 
-        max_distance
+        Ok(max_distance)
     }
 
     /// Compute betweenness centrality using Brandes' algorithm (simplified)
@@ -507,9 +575,9 @@ pub mod sampling {
         edge_index: &Tensor,
         node_idx: &[usize],
         num_neighbors: usize,
-    ) -> Vec<Vec<usize>> {
+    ) -> Result<Vec<Vec<usize>>> {
         let num_nodes = node_idx.iter().max().unwrap_or(&0) + 1;
-        let adjacency_list = super::connectivity::build_adjacency_list(edge_index, num_nodes);
+        let adjacency_list = super::connectivity::build_adjacency_list(edge_index, num_nodes)?;
         let mut rng = Random::seed(42);
         let mut sampled_neighbors = Vec::with_capacity(node_idx.len());
 
@@ -538,7 +606,7 @@ pub mod sampling {
             }
         }
 
-        sampled_neighbors
+        Ok(sampled_neighbors)
     }
 
     /// Random walk sampling
@@ -546,9 +614,9 @@ pub mod sampling {
         edge_index: &Tensor,
         start_nodes: &[usize],
         walk_length: usize,
-    ) -> Vec<Vec<usize>> {
+    ) -> Result<Vec<Vec<usize>>> {
         let num_nodes = start_nodes.iter().max().unwrap_or(&0) + 1;
-        let adjacency_list = super::connectivity::build_adjacency_list(edge_index, num_nodes);
+        let adjacency_list = super::connectivity::build_adjacency_list(edge_index, num_nodes)?;
         let mut rng = Random::seed(42);
         let mut walks = Vec::with_capacity(start_nodes.len());
 
@@ -572,7 +640,7 @@ pub mod sampling {
             walks.push(walk);
         }
 
-        walks
+        Ok(walks)
     }
 
     /// Subgraph sampling using random node sampling
@@ -580,7 +648,7 @@ pub mod sampling {
         edge_index: &Tensor,
         num_nodes: usize,
         sample_size: usize,
-    ) -> (Tensor, Vec<usize>) {
+    ) -> Result<(Tensor, Vec<usize>)> {
         let mut rng = Random::seed(42);
 
         // Sample nodes randomly
@@ -601,12 +669,15 @@ pub mod sampling {
         }
 
         // Extract subgraph edges
-        let edge_data = tensor_to_vec2::<f32>(edge_index).expect("conversion should succeed");
+        let (src_row, dst_row) = super::edge_rows(edge_index)?;
         let mut subgraph_edges = Vec::new();
 
-        for j in 0..edge_data[0].len() {
-            let src = edge_data[0][j] as usize;
-            let dst = edge_data[1][j] as usize;
+        for (&src, &dst) in src_row.iter().zip(dst_row.iter()) {
+            if src < 0.0 || dst < 0.0 {
+                continue;
+            }
+            let src = src as usize;
+            let dst = dst as usize;
 
             // Include edge if both nodes are in the sampled set
             if let (Some(&new_src), Some(&new_dst)) = (node_map.get(&src), node_map.get(&dst)) {
@@ -616,7 +687,7 @@ pub mod sampling {
 
         // Create edge tensor
         let subgraph_edge_index = if subgraph_edges.is_empty() {
-            zeros(&[2, 0]).expect("empty edge tensor creation should succeed")
+            zeros(&[2, 0])?
         } else {
             let num_edges = subgraph_edges.len();
             let mut edge_vec = Vec::with_capacity(2 * num_edges);
@@ -628,11 +699,10 @@ pub mod sampling {
                 edge_vec.push(edge[1] as f32);
             }
 
-            from_vec(edge_vec, &[2, num_edges], DeviceType::Cpu)
-                .expect("edge tensor creation should succeed")
+            from_vec(edge_vec, &[2, num_edges], DeviceType::Cpu)?
         };
 
-        (subgraph_edge_index, sampled_nodes)
+        Ok((subgraph_edge_index, sampled_nodes))
     }
 
     /// FastGCN sampling for efficient graph convolution
@@ -640,9 +710,9 @@ pub mod sampling {
         edge_index: &Tensor,
         layer_sizes: &[usize],
         num_nodes: usize,
-    ) -> Vec<Vec<usize>> {
+    ) -> Result<Vec<Vec<usize>>> {
         let mut rng = Random::seed(42);
-        let adjacency_list = super::connectivity::build_adjacency_list(edge_index, num_nodes);
+        let adjacency_list = super::connectivity::build_adjacency_list(edge_index, num_nodes)?;
 
         // Compute importance sampling probabilities based on node degrees
         let degrees: Vec<f64> = adjacency_list
@@ -677,7 +747,7 @@ pub mod sampling {
             sampled_layers.push(sampled_nodes);
         }
 
-        sampled_layers
+        Ok(sampled_layers)
     }
 }
 

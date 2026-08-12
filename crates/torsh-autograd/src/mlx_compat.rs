@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use torsh_core::dtype::TensorElement;
 use torsh_core::error::{Result, TorshError};
+use torsh_core::sync::MutexExt;
 
 /// MLX-compatible array type wrapper
 pub trait MLXArray<T: TensorElement> {
@@ -122,19 +123,12 @@ pub mod mlx {
 
     /// Set the default device for MLX operations
     pub fn set_default_device(device: MLXDevice) {
-        DEFAULT_DEVICE
-            .lock()
-            .expect("lock should not be poisoned")
-            .replace(device);
+        DEFAULT_DEVICE.lock_or_recover().replace(device);
     }
 
     /// Get the current default device
     pub fn default_device() -> MLXDevice {
-        DEFAULT_DEVICE
-            .lock()
-            .expect("lock should not be poisoned")
-            .clone()
-            .unwrap_or_default()
+        DEFAULT_DEVICE.lock_or_recover().clone().unwrap_or_default()
     }
 
     /// Enable or disable gradient computation globally
@@ -322,7 +316,7 @@ where
     }
 
     fn compile_if_needed(&self) -> Result<()> {
-        let mut compiled = self.compiled.lock().expect("lock should not be poisoned");
+        let mut compiled = self.compiled.lock_or_recover();
         if !*compiled {
             tracing::info!("Compiling function: {}", self.inner.name());
             // Placeholder compilation

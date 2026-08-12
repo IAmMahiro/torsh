@@ -28,6 +28,7 @@ pub struct PyRMSprop {
 #[pymethods]
 impl PyRMSprop {
     #[new]
+    #[pyo3(signature = (params, lr=None, alpha=None, eps=None, weight_decay=None, momentum=None, centered=None))]
     fn new(
         params: Vec<PyTensor>,
         lr: Option<f32>,

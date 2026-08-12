@@ -157,37 +157,55 @@ impl PackageImporter {
                 println!("Reading resource: {}", name);
             }
 
-            // Determine resource type from path
-            let resource_type = self.determine_resource_type(&name);
-
             // Read resource data
             let data = archive
                 .extract(&entry)
                 .map_err(|e| TorshError::IoError(format!("Failed to extract {}: {}", name, e)))?;
 
-            // Extract resource name from path
-            let resource_name = Path::new(&name)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&name)
-                .to_string();
+            // Recover the resource's original identifier by stripping the
+            // type-classification directory that
+            // `PackageExporter::write_resource` (see exporter.rs) prepends
+            // to every archive entry. This preserves any subdirectories the
+            // caller's own resource name/map-key contained, so two
+            // differently-typed resources that happen to share a basename
+            // no longer collapse into each other, and it recovers exactly
+            // the original map key rather than just the file's basename.
+            let resource_name = Self::strip_type_classification_prefix(&name);
 
-            // Create resource
-            let mut resource = Resource::new(resource_name.clone(), resource_type, data);
-
-            // Read metadata if exists
+            // Read metadata if it exists (keyed by the *unstripped* archive
+            // path, matching how `metadata_entries` above was populated),
+            // BEFORE determining the resource type: a well-formed
+            // `.metadata` side-file written by the current exporter carries
+            // an authoritative `ResourceType` under the reserved
+            // `RESOURCE_TYPE_METADATA_KEY` (F240 fix), which must win over
+            // re-deriving the type from the path prefix / file extension.
+            // That reserved key is stripped back out so it never leaks into
+            // the resource's user-visible metadata map.
+            let mut metadata: HashMap<String, String> = HashMap::new();
             if let Some(metadata_entry) = metadata_entries.get(&name) {
                 let metadata_data = archive.extract(metadata_entry).map_err(|e| {
                     TorshError::IoError(format!("Failed to extract metadata: {}", e))
                 })?;
                 let metadata_json = String::from_utf8_lossy(&metadata_data);
 
-                if let Ok(metadata) =
-                    serde_json::from_str::<HashMap<String, String>>(&metadata_json)
+                if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(&metadata_json)
                 {
-                    resource.metadata = metadata;
+                    metadata = parsed;
                 }
             }
+
+            // Prefer the authoritative type recorded in `.metadata`; fall
+            // back to path-prefix/extension classification only for
+            // archives that predate this fix (no `.metadata` file, or one
+            // without the reserved key).
+            let resource_type = metadata
+                .remove(crate::resources::RESOURCE_TYPE_METADATA_KEY)
+                .and_then(|tag| ResourceType::from_tag(&tag))
+                .unwrap_or_else(|| self.determine_resource_type(&name));
+
+            // Create resource
+            let mut resource = Resource::new(resource_name.clone(), resource_type, data);
+            resource.metadata = metadata;
 
             package.resources.insert(resource_name, resource);
         }
@@ -217,6 +235,34 @@ impl PackageImporter {
         }
     }
 
+    /// Strip the type-classification directory that
+    /// [`crate::exporter::PackageExporter::write_resource`] prepends to
+    /// every archive entry (`models/`, `src/`, `data/`, `config/`,
+    /// `docs/`, or the `resources/` fallback used for types with no
+    /// dedicated directory), recovering the resource's original name/map
+    /// key.
+    ///
+    /// This must stay in sync with the prefix list `write_resource` writes
+    /// and with [`Self::determine_resource_type`]'s classification
+    /// prefixes. Keeping this the exact inverse of the exporter's
+    /// transformation is what fixes F240 (package export/import roundtrip
+    /// losing resource paths): two resources whose original map keys
+    /// differ only in an inner subdirectory (e.g. `"models/config.json"`
+    /// and `"config/other/config.json"`) previously collapsed to the same
+    /// basename (`"config.json"`) on import and silently overwrote each
+    /// other in `package.resources`; recovering the *full* original key
+    /// keeps them distinct.
+    fn strip_type_classification_prefix(archive_path: &str) -> String {
+        const TYPE_PREFIXES: &[&str] =
+            &["models/", "src/", "data/", "config/", "docs/", "resources/"];
+        for prefix in TYPE_PREFIXES {
+            if let Some(rest) = archive_path.strip_prefix(prefix) {
+                return rest.to_string();
+            }
+        }
+        archive_path.to_string()
+    }
+
     /// Extract package to directory
     pub fn extract_package<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
@@ -238,7 +284,9 @@ impl PackageImporter {
         let entries: Vec<_> = archive.entries().to_vec();
 
         for entry in entries {
-            let outpath = output_dir.join(&entry.name);
+            // Reject entries that would escape `output_dir` ("zip-slip"):
+            // an absolute name or one containing a `..` component.
+            let outpath = crate::utils::sanitize_archive_entry_path(output_dir, &entry.name)?;
 
             if entry.name.ends_with('/') {
                 // Create directory

@@ -780,7 +780,7 @@ fn collect_system_metrics_for_alerts() -> TorshResult<SystemMetrics> {
         load_average: 0.0,
         available_memory_mb: 0.0,
         disk_usage_percent: 0.0,
-        network_io_mbps: 0.0,
+        network_io_mbps: None,
     })
 }
 
@@ -896,7 +896,7 @@ mod tests {
                 load_average: 1.0,
                 available_memory_mb: 1024.0,
                 disk_usage_percent: 70.0,
-                network_io_mbps: 10.0,
+                network_io_mbps: Some(10.0),
             },
         };
 
@@ -947,7 +947,7 @@ mod tests {
                     load_average: 1.0,
                     available_memory_mb: 1024.0,
                     disk_usage_percent: 70.0,
-                    network_io_mbps: 10.0,
+                    network_io_mbps: Some(10.0),
                 },
             };
 

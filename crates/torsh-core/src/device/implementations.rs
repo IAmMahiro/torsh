@@ -6,6 +6,8 @@
 use crate::device::core::DeviceContext;
 use crate::device::{Device, DeviceCapabilities, DeviceType};
 use crate::error::Result;
+#[cfg(feature = "cuda")]
+use crate::sync::MutexExt;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -336,10 +338,7 @@ impl CudaDevice {
     pub fn create_stream(&self) -> Result<u32> {
         #[cfg(feature = "cuda")]
         {
-            let mut manager = self
-                .stream_manager
-                .lock()
-                .expect("lock should not be poisoned");
+            let mut manager = self.stream_manager.lock_or_recover();
             let stream_id = manager.next_stream_id;
             manager.next_stream_id += 1;
 
@@ -378,25 +377,44 @@ impl CudaDevice {
         }
     }
 
+    /// Initialize a CUDA context for `device_index`
+    ///
+    /// torsh-core has no direct CUDA driver bindings: real context
+    /// initialization (`cudaSetDevice`, context creation, property queries)
+    /// is only available through `torsh-tensor`'s oxicuda-backed
+    /// `cuda_backend`, which this foundation crate cannot depend on without
+    /// a circular dependency. This used to return a fabricated
+    /// `context_handle: 0x12345678` and `compute_capability: (8, 6)` as if
+    /// they had been queried; a non-zero fabricated handle is worse than no
+    /// handle at all, since downstream code could mistake it for proof of a
+    /// valid device. It now honestly reports that no context can be created.
     #[cfg(feature = "cuda")]
     fn initialize_cuda_context(device_index: usize) -> Result<CudaContext> {
-        // Mock CUDA context initialization
-        // In a real implementation, this would:
-        // 1. Call cudaSetDevice(device_index)
-        // 2. Create CUDA context
-        // 3. Query device properties
-        Ok(CudaContext {
-            device_handle: device_index as u32,
-            context_handle: 0x12345678, // Mock handle
-            compute_capability: (8, 6), // Mock compute capability
-        })
+        Err(crate::error::TorshError::General(
+            crate::error::GeneralError::DeviceError(format!(
+                "CUDA device {} context cannot be honestly initialized: torsh-core has no \
+                 direct CUDA driver access (use torsh-tensor's oxicuda-backed cuda_backend for \
+                 real CUDA context management)",
+                device_index
+            )),
+        ))
     }
 
+    /// Create a CUDA stream handle
+    ///
+    /// See [`Self::initialize_cuda_context`]: torsh-core has no real CUDA
+    /// stream creation to call, so this reports the honest failure rather
+    /// than a fabricated non-zero handle. In practice this is unreachable,
+    /// since [`CudaDevice::new`] already fails at context initialization.
     #[cfg(feature = "cuda")]
     fn create_cuda_stream_handle(&self) -> Result<u64> {
-        // Mock stream creation
-        // In a real implementation, this would call cudaStreamCreate()
-        Ok(0x87654321) // Mock stream handle
+        Err(crate::error::TorshError::General(
+            crate::error::GeneralError::DeviceError(
+                "CUDA stream cannot be honestly created: torsh-core has no direct CUDA driver \
+                 access"
+                    .to_string(),
+            ),
+        ))
     }
 }
 
@@ -446,10 +464,7 @@ impl Device for CudaDevice {
         #[cfg(feature = "cuda")]
         {
             // Reset CUDA context
-            let mut manager = self
-                .stream_manager
-                .lock()
-                .expect("lock should not be poisoned");
+            let mut manager = self.stream_manager.lock_or_recover();
             manager.streams.clear();
             manager.next_stream_id = 1;
         }
@@ -488,14 +503,14 @@ struct MetalDeviceHandle {
     #[allow(dead_code)] // Metal device handle - future feature
     device_id: u64,
     name: String,
-    #[allow(dead_code)] // Metal device handle - future feature
-    registry_id: u64,
 }
 
 #[derive(Debug)]
 struct MetalCommandQueue {
-    #[allow(dead_code)] // Metal command queue ID - future implementation
-    queue_id: u64,
+    /// Self-imposed limit on outstanding command buffers. NOT a
+    /// hardware-queried value -- Metal has no fixed universal "max command
+    /// buffers" figure -- this is simply the cap this crate chooses to
+    /// enforce once command-buffer submission is implemented.
     #[allow(dead_code)] // Maximum command buffers per queue - future implementation
     max_command_buffers: usize,
 }
@@ -548,41 +563,40 @@ impl MetalDevice {
     }
 
     /// Execute Metal compute shader
+    ///
+    /// Real Metal shader compilation and dispatch (compile shader source,
+    /// create a compute pipeline, dispatch compute threads) is not
+    /// implemented in torsh-core on any platform. This used to silently
+    /// return `Ok(())` on macOS without running the shader at all, which
+    /// would make a caller believe their shader executed; it now honestly
+    /// reports `NotImplemented` everywhere, matching the (already-correct)
+    /// non-macOS behavior.
     pub fn execute_compute_shader(&self, _shader_source: &str) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        {
-            // Mock shader execution
-            // In a real implementation, this would:
-            // 1. Compile shader source
-            // 2. Create compute pipeline
-            // 3. Dispatch compute threads
-            Ok(())
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            Err(crate::error::TorshError::NotImplemented(
-                "Metal compute shaders not available".to_string(),
-            ))
-        }
+        Err(crate::error::TorshError::NotImplemented(
+            "Metal compute shader execution is not implemented".to_string(),
+        ))
     }
 
+    /// Create the Metal device handle for `device_index`
+    ///
+    /// torsh-core has no Metal framework bindings, so it cannot obtain a
+    /// real `MTLDevice`/IOKit registry handle. It queries the real chip name
+    /// from the OS (see [`crate::device::capabilities::macos_hw`]) rather
+    /// than the synthesized `"Apple GPU {index}"` string this used to
+    /// return, and no longer invents a `registry_id` -- a fabricated
+    /// non-zero "registry ID" is worse than none at all, since downstream
+    /// code could mistake it for proof of a real IOKit handle.
     #[cfg(target_os = "macos")]
     fn create_metal_device(device_index: usize) -> Result<MetalDeviceHandle> {
-        // Mock Metal device creation
-        // In a real implementation, this would use Metal-rs or similar
         Ok(MetalDeviceHandle {
             device_id: device_index as u64,
-            name: format!("Apple GPU {}", device_index),
-            registry_id: 0x1000 + device_index as u64,
+            name: crate::device::capabilities::macos_hw::chip_name(),
         })
     }
 
     #[cfg(target_os = "macos")]
     fn create_command_queue(_device: &MetalDeviceHandle) -> Result<MetalCommandQueue> {
-        // Mock command queue creation
         Ok(MetalCommandQueue {
-            queue_id: 0x2000,
             max_command_buffers: 64,
         })
     }
@@ -792,28 +806,26 @@ impl WgpuDevice {
         }
     }
 
+    /// Initialize a WebGPU device/adapter for `device_index`
+    ///
+    /// torsh-core's `wgpu` feature here is only a marker flag -- there is no
+    /// `dep:wgpu` wired into this crate to create a real
+    /// `wgpu::Instance`/`Adapter`/`Device` from. This used to fabricate a
+    /// `WgpuAdapterInfo` with `vendor: "Unknown"`, a guessed
+    /// `WgpuDeviceType::DiscreteGpu`, and a guessed `WgpuBackend::Vulkan`
+    /// (wrong on any non-Vulkan platform, e.g. this would claim Vulkan on
+    /// macOS, which uses Metal) as if they were queried. Consistent with
+    /// [`DeviceCapabilities::detect`]'s honest treatment of WebGPU
+    /// capabilities, this now reports the real failure instead.
     #[cfg(feature = "wgpu")]
     fn initialize_wgpu(device_index: usize) -> Result<(WgpuDeviceHandle, WgpuAdapterInfo)> {
-        // Mock WebGPU initialization
-        // In a real implementation, this would use wgpu-rs
-        let device = WgpuDeviceHandle {
-            device_id: device_index as u64,
-            limits: WgpuLimits {
-                max_bind_groups: 4,
-                max_uniform_buffer_binding_size: 16384,
-                max_storage_buffer_binding_size: 134217728,
-            },
-            features: vec!["compute-shaders".to_string()],
-        };
-
-        let adapter_info = WgpuAdapterInfo {
-            name: format!("WebGPU Adapter {}", device_index),
-            vendor: "Unknown".to_string(),
-            device_type: WgpuDeviceType::DiscreteGpu,
-            backend: WgpuBackend::Vulkan,
-        };
-
-        Ok((device, adapter_info))
+        Err(crate::error::TorshError::General(
+            crate::error::GeneralError::DeviceError(format!(
+                "WebGPU device {} cannot be honestly initialized: torsh-core's wgpu feature has \
+                 no wgpu::Instance/Adapter wired up to create a real device from",
+                device_index
+            )),
+        ))
     }
 }
 

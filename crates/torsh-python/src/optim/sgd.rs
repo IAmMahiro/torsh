@@ -26,6 +26,7 @@ pub struct PySGD {
 #[pymethods]
 impl PySGD {
     #[new]
+    #[pyo3(signature = (params, lr, momentum=None, dampening=None, weight_decay=None, nesterov=None))]
     fn new(
         params: Vec<PyTensor>,
         lr: f32,

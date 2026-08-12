@@ -190,6 +190,9 @@ pub mod model_zoo;
 #[cfg(feature = "tensorboard")]
 pub mod tensorboard;
 
+#[cfg(feature = "reqwest")]
+mod tls;
+
 /// Re-export commonly used items for convenience.
 ///
 /// This module provides quick access to the most frequently used types and functions

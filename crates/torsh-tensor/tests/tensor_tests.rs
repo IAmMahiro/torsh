@@ -199,8 +199,6 @@ fn test_shape_errors() {
     assert!(a.matmul(&c).is_err()); // [1,3] @ [2,2] should fail
 }
 
-// TODO: Implement normal_ in-place function
-/*
 #[test]
 fn test_normal_inplace() {
     let mut t = zeros::<f32>(&[10, 10]).unwrap();
@@ -227,10 +225,7 @@ fn test_normal_inplace() {
         "Mean should be roughly around 5.0"
     );
 }
-*/
 
-// TODO: Implement multinomial sampling function
-/*
 #[test]
 fn test_multinomial() {
     use torsh_tensor::Tensor;
@@ -245,7 +240,7 @@ fn test_multinomial() {
     // Check all samples are valid indices
     let sample_data = samples.to_vec().unwrap();
     for &sample in &sample_data {
-        assert!(sample >= 0 && sample < 4, "Sample index out of bounds");
+        assert!((0i64..4).contains(&sample), "Sample index out of bounds");
     }
 
     // Test without replacement (should fail for num_samples > num_categories)
@@ -258,7 +253,7 @@ fn test_multinomial() {
     // Check all samples are unique when sampling without replacement
     let sample_data = samples.to_vec().unwrap();
     let mut unique_samples = sample_data.clone();
-    unique_samples.sort();
+    unique_samples.sort_unstable();
     unique_samples.dedup();
     assert_eq!(
         unique_samples.len(),
@@ -270,7 +265,6 @@ fn test_multinomial() {
     let zero_weights = tensor![0.0f32, 0.0, 0.0, 0.0].unwrap();
     assert!(Tensor::multinomial(&zero_weights, 1, true).is_err());
 }
-*/
 
 #[test]
 fn test_is_contiguous_fresh_tensor() {

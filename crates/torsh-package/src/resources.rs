@@ -71,7 +71,63 @@ impl ResourceType {
             _ => ResourceType::Data,
         }
     }
+
+    /// Canonical, stable string tag for this resource type.
+    ///
+    /// Used by [`crate::exporter::PackageExporter`] to record a resource's
+    /// exact type in its `.metadata` side-file (see
+    /// [`RESOURCE_TYPE_METADATA_KEY`]), so [`crate::importer::PackageImporter`]
+    /// can recover it authoritatively on import instead of re-deriving it
+    /// from the archive path prefix or file extension — both of which are
+    /// ambiguous (every type other than Model/Source/Data/Config/Documentation
+    /// shares the same `resources/` archive prefix, and file extensions are
+    /// not a 1:1 mapping back to a single [`ResourceType`]). See
+    /// [`Self::from_tag`] for the inverse.
+    pub fn as_tag(&self) -> &'static str {
+        match self {
+            ResourceType::Model => "model",
+            ResourceType::Source => "source",
+            ResourceType::Data => "data",
+            ResourceType::Config => "config",
+            ResourceType::Documentation => "documentation",
+            ResourceType::License => "license",
+            ResourceType::Binary => "binary",
+            ResourceType::Text => "text",
+            ResourceType::Metadata => "metadata",
+        }
+    }
+
+    /// Parse a tag produced by [`Self::as_tag`].
+    ///
+    /// Returns `None` for an unrecognized tag (e.g. a package written by a
+    /// version of this crate that used a different tag set), so callers can
+    /// fall back to prefix/extension-based classification rather than
+    /// failing the import outright.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "model" => Some(ResourceType::Model),
+            "source" => Some(ResourceType::Source),
+            "data" => Some(ResourceType::Data),
+            "config" => Some(ResourceType::Config),
+            "documentation" => Some(ResourceType::Documentation),
+            "license" => Some(ResourceType::License),
+            "binary" => Some(ResourceType::Binary),
+            "text" => Some(ResourceType::Text),
+            "metadata" => Some(ResourceType::Metadata),
+            _ => None,
+        }
+    }
 }
+
+/// Reserved [`Resource::metadata`] key used to persist a resource's exact
+/// [`ResourceType`] in its `.metadata` archive side-file across an
+/// export/import roundtrip (F240).
+///
+/// Chosen to be extremely unlikely to collide with a caller-supplied
+/// metadata key. [`crate::importer::PackageImporter`] strips this key back
+/// out of the metadata map it exposes on the imported [`Resource`], so it
+/// never leaks into user-visible metadata.
+pub(crate) const RESOURCE_TYPE_METADATA_KEY: &str = "__torsh_resource_type";
 
 /// A resource in the package
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -9,6 +9,44 @@ use crate::registry::{ModelHandle, ModelSource};
 use crate::{ModelError, ModelResult};
 use sha2::Digest;
 
+/// Pure-Rust TLS wiring for the download client.
+///
+/// The workspace builds `reqwest` with `rustls-no-provider`, so no `aws-lc-rs`
+/// (BoringSSL / C) backend is linked. This installs the RustCrypto crypto
+/// provider (idempotent, process-wide) and hands `reqwest` a pre-configured
+/// `rustls::ClientConfig` with the Mozilla `webpki-roots` trust anchors, keeping
+/// certificate verification real. Without it, building a `reqwest` client under
+/// `rustls-no-provider` panics when it looks up the absent default provider.
+#[cfg(feature = "download")]
+fn tls_client_builder() -> reqwest::ClientBuilder {
+    use std::sync::{Arc, Once};
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = oxitls_rustcrypto_provider::provider().install_default();
+    });
+
+    let builder =
+        reqwest::Client::builder().user_agent(concat!("torsh-models/", env!("CARGO_PKG_VERSION")));
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    match rustls::ClientConfig::builder_with_provider(Arc::new(
+        oxitls_rustcrypto_provider::provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    {
+        Ok(cfg) => {
+            let mut config = cfg.with_root_certificates(roots).with_no_client_auth();
+            config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            builder.use_preconfigured_tls(config)
+        }
+        // The process-wide provider install above is the safety net if the
+        // explicit config cannot be built.
+        Err(_) => builder,
+    }
+}
+
 /// Download progress information
 #[derive(Debug, Clone)]
 pub struct DownloadProgress {
@@ -114,11 +152,11 @@ impl ModelDownloader {
     /// Create new model downloader
     pub fn new() -> Self {
         Self {
+            // Build the client on the pure-Rust TLS stack; fall back to a
+            // provider-installed default client if the customized builder fails
+            // (rare TLS-backend init failure) instead of panicking.
             #[cfg(feature = "download")]
-            client: reqwest::Client::builder()
-                .user_agent("torsh-models/0.1.0-alpha.2")
-                .build()
-                .expect("Failed to create HTTP client"),
+            client: tls_client_builder().build().unwrap_or_default(),
             timeout_seconds: 300, // 5 minutes default
         }
     }
@@ -259,12 +297,20 @@ impl ModelDownloader {
         })
     }
 
-    /// Verify downloaded model checksum
+    /// Verify a downloaded model's checksum.
+    ///
+    /// An empty `expected_checksum` means no checksum is available: verification
+    /// is skipped and the file is accepted (with a warning). A non-empty value
+    /// is compared against the file's real SHA-256.
     pub async fn verify_checksum(
         &self,
         file_path: &Path,
         expected_checksum: &str,
     ) -> ModelResult<bool> {
+        if expected_checksum.is_empty() {
+            tracing::warn!("no checksum provided; skipping integrity verification");
+            return Ok(true);
+        }
         let data = std::fs::read(file_path)?;
         let hash = sha2::Sha256::digest(&data);
         let hex_hash = hex::encode(hash);
@@ -272,7 +318,11 @@ impl ModelDownloader {
         Ok(hex_hash == expected_checksum)
     }
 
-    /// Download model if not already cached
+    /// Download model if not already cached.
+    ///
+    /// A cached file that fails a (non-empty) checksum is re-downloaded exactly
+    /// once; if the freshly downloaded file still fails, this returns a hard
+    /// error rather than looping forever re-fetching the same file.
     pub async fn ensure_model_available(
         &self,
         handle: &ModelHandle,
@@ -284,12 +334,27 @@ impl ModelDownloader {
             if handle.validate_checksum()? {
                 return Ok(handle.local_path.clone());
             } else {
-                tracing::warn!("Model checksum validation failed, re-downloading");
+                tracing::warn!("Model checksum validation failed, re-downloading once");
             }
         }
 
         // Download the model
-        self.download_model(handle, callback).await
+        let path = self.download_model(handle, callback).await?;
+
+        // Verify the freshly downloaded artifact. An empty registered checksum
+        // skips verification (handled by validate_checksum); a non-empty one
+        // that still mismatches is a hard error (corrupt or tampered source).
+        if !handle.validate_checksum()? {
+            return Err(ModelError::DownloadFailed {
+                reason: format!(
+                    "checksum verification failed for model '{}' after download; \
+                     the source may be corrupt or tampered",
+                    handle.info.name
+                ),
+            });
+        }
+
+        Ok(path)
     }
 }
 
@@ -308,7 +373,7 @@ pub async fn download_model_by_name(
 ) -> ModelResult<PathBuf> {
     use crate::registry::get_global_registry;
 
-    let registry = get_global_registry();
+    let registry = get_global_registry()?;
     let handle = if let Some(cache_dir) = cache_dir {
         // Create temporary registry with custom cache dir
         let temp_registry = crate::registry::ModelRegistry::new(cache_dir)?;

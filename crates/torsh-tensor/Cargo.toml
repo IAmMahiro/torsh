@@ -21,7 +21,9 @@ workspace = true
 # Core dependencies
 torsh-core = { workspace = true }
 # torsh-autograd = { workspace = true, optional = true }
-torsh-backend = { workspace = true, optional = true }
+# torsh-backend REMOVED: 0 Rust references in torsh-tensor/src after the Wave-3
+# dead-code deletion. The `simd` path is scirs2-core/simd; `gpu` is the oxicuda
+# stack below. (torsh-backend is still used directly by torsh-jit / torsh-functional.)
 # GPU compute backend (replaces scirs2-core GPU). Pure-Rust CUDA stack; the trait
 # crate is dependency-free and builds on CPU-only CI (no CUDA SDK at build time).
 oxicuda-backend = { workspace = true, optional = true }
@@ -71,7 +73,7 @@ once_cell = { workspace = true }
 # rand_distr = "0.5"     # REMOVED: Use scirs2_core::random::prelude instead
 
 # Mathematical functions
-libm = "0.2"
+libm = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
@@ -85,23 +87,23 @@ dhat = "0.3.3"
 default = ["std", "simd", "parallel"]
 std = ["torsh-core/std"]
 autograd = []
-async = ["tokio"]
-simd = ["torsh-backend", "torsh-backend/simd", "scirs2-core/simd"]
+async = ["dep:tokio"]
+simd = ["scirs2-core/simd"]
 # GPU dispatch via oxicuda's ComputeBackend trait (see src/gpu_dispatch.rs).
-gpu = ["torsh-backend", "dep:oxicuda-backend"]
+gpu = ["dep:oxicuda-backend"]
 # Real CUDA backend via ToRSh's own thin CudaBackend (src/cuda_backend) over the
 # oxicuda leaf crates. No CUDA SDK needed at build time (runtime driver load).
 cuda = ["gpu", "dep:oxicuda-driver", "dep:oxicuda-launch", "dep:oxicuda-ptx"]
 profiling = []
 memory_efficient = ["scirs2-core/memory_efficient"]
 # ndarray-interop = ["ndarray"]  # REMOVED: Use scirs2_core::ndarray instead (SciRS2 POLICY)
-serialize = ["serde", "serde_json", "oxicode", "oxiarc-deflate", "oxiarc-zstd", "torsh-core/serialize"]
-serialize-hdf5 = ["serialize", "hdf5"]
-serialize-arrow = ["serialize", "arrow", "parquet"]
+serialize = ["dep:serde", "dep:serde_json", "dep:oxicode", "dep:oxiarc-deflate", "dep:oxiarc-zstd", "torsh-core/serialize"]
+serialize-hdf5 = ["serialize", "dep:hdf5"]
+serialize-arrow = ["serialize", "dep:arrow", "dep:parquet"]
 serialize-onnx = ["serialize"]  # DEPRECATED: Stub feature for backwards compatibility. ONNX serialization disabled due to security vulnerabilities (RUSTSEC-2024-0437, RUSTSEC-2023-0018)
 serialize-all = ["serialize", "serialize-hdf5", "serialize-arrow"]  # Note: serialize-onnx excluded due to security issues
-operation-logging = ["serde", "serde_json", "chrono"]
-memory-profiling = ["serde", "serde_json"]
+operation-logging = ["dep:serde", "dep:serde_json", "dep:chrono"]
+memory-profiling = ["dep:serde", "dep:serde_json"]
 debug = []
 trace = []
 bench = []

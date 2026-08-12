@@ -21,6 +21,54 @@ use torsh_core::{
 
 use crate::{core_ops::Tensor, storage::TensorStorage};
 
+/// Element count above which a full-tensor sum is folded in parallel chunks.
+const PARALLEL_SUM_THRESHOLD: usize = 65_536;
+
+/// Element count above which the `f32` sum uses the SIMD reduction.
+#[cfg(feature = "simd")]
+const SIMD_SUM_THRESHOLD: usize = 1_024;
+
+/// Sum a contiguous slice, dispatching to SIMD (`f32`) and to threaded chunks
+/// for large inputs, with a scalar fold as the fallback.
+fn sum_slice<T>(data: &[T]) -> T
+where
+    T: TensorElement + Copy + std::ops::Add<Output = T> + num_traits::Zero,
+{
+    let zero = <T as num_traits::Zero>::zero();
+
+    #[cfg(feature = "simd")]
+    {
+        if data.len() >= SIMD_SUM_THRESHOLD
+            && std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>()
+        {
+            use scirs2_core::simd_ops::SimdUnifiedOps;
+            // Safety: TypeId confirmed T == f32, so the slices have identical layout.
+            let as_f32: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len()) };
+            let total =
+                <f32 as SimdUnifiedOps>::simd_sum(&scirs2_core::ndarray::ArrayView1::from(as_f32));
+            // f32 -> f64 -> T is exact for T == f32; fall through if a type ever
+            // reports f32's TypeId without being convertible.
+            if let Some(value) = <T as TensorElement>::from_f64(f64::from(total)) {
+                return value;
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    {
+        if data.len() >= PARALLEL_SUM_THRESHOLD {
+            use scirs2_core::parallel_ops::*;
+            return data
+                .par_chunks(16_384)
+                .map(|chunk| chunk.iter().fold(zero, |acc, &x| acc + x))
+                .reduce(|| zero, |a, b| a + b);
+        }
+    }
+
+    data.iter().fold(zero, |acc, &x| acc + x)
+}
+
 // Float-specific operations
 impl<T: FloatElement + Copy> Tensor<T> {
     /// Create a 0-dimensional tensor (scalar) from a single value
@@ -46,177 +94,6 @@ impl<T: FloatElement + Copy> Tensor<T> {
         let shape = array.shape().to_vec();
         let (data, _offset) = array.into_raw_vec_and_offset();
         Self::from_data(data, shape, device)
-    }
-
-    /// Maximum element in tensor
-    pub fn max(&self, dim: Option<usize>, keepdim: bool) -> Result<Self> {
-        match dim {
-            None => {
-                // Global maximum
-                let data = self.to_vec()?;
-                let max_val =
-                    data.into_iter()
-                        .fold(<T as FloatElement>::neg_infinity(), |acc, x| {
-                            if x > acc {
-                                x
-                            } else {
-                                acc
-                            }
-                        });
-                if keepdim {
-                    let shape = vec![1; self.shape().dims().len()];
-                    Self::from_data(vec![max_val], shape, self.device)
-                } else {
-                    Self::scalar(max_val)
-                }
-            }
-            Some(axis) => {
-                // Maximum along specific dimension
-                let shape_binding = self.shape();
-                let input_shape = shape_binding.dims();
-
-                if axis >= input_shape.len() {
-                    return Err(TorshError::InvalidOperation(format!(
-                        "Axis {} out of bounds for {}-dimensional tensor",
-                        axis,
-                        input_shape.len()
-                    )));
-                }
-
-                // Calculate output shape
-                let mut output_shape = input_shape.to_vec();
-                if keepdim {
-                    output_shape[axis] = 1;
-                } else {
-                    output_shape.remove(axis);
-                }
-
-                let data = self.data()?;
-                let outer_size: usize = input_shape[..axis].iter().product();
-                let axis_size = input_shape[axis];
-                let inner_size: usize = input_shape[axis + 1..].iter().product();
-
-                let output_size = outer_size * inner_size;
-                let mut result_data = vec![<T as FloatElement>::neg_infinity(); output_size];
-
-                for outer in 0..outer_size {
-                    for inner in 0..inner_size {
-                        let mut max_val = <T as FloatElement>::neg_infinity();
-                        for a in 0..axis_size {
-                            let input_idx = outer * axis_size * inner_size + a * inner_size + inner;
-                            let val = data[input_idx];
-                            if val > max_val {
-                                max_val = val;
-                            }
-                        }
-                        let output_idx = outer * inner_size + inner;
-                        result_data[output_idx] = max_val;
-                    }
-                }
-
-                Self::from_data(result_data, output_shape, self.device)
-            }
-        }
-    }
-
-    /// Maximum along specified dimension
-    pub fn max_dim(&self, dim: i32, keepdim: bool) -> Result<Self> {
-        let shape_binding = self.shape();
-        let input_shape = shape_binding.dims();
-
-        let actual_dim = if dim < 0 {
-            (input_shape.len() as i32 + dim) as usize
-        } else {
-            dim as usize
-        };
-
-        if actual_dim >= input_shape.len() {
-            return Err(TorshError::InvalidOperation(format!(
-                "Dimension {} out of range for {}-dimensional tensor",
-                actual_dim,
-                input_shape.len()
-            )));
-        }
-
-        // Calculate output shape
-        let mut output_shape = input_shape.to_vec();
-        if keepdim {
-            output_shape[actual_dim] = 1;
-        } else {
-            output_shape.remove(actual_dim);
-        }
-
-        let data = self.data()?;
-        let outer_size: usize = input_shape[..actual_dim].iter().product();
-        let dim_size = input_shape[actual_dim];
-        let inner_size: usize = input_shape[actual_dim + 1..].iter().product();
-
-        let output_size = outer_size * inner_size;
-        let mut result_data = vec![<T as FloatElement>::neg_infinity(); output_size];
-
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut max_val = <T as FloatElement>::neg_infinity();
-                for d in 0..dim_size {
-                    let input_idx = outer * dim_size * inner_size + d * inner_size + inner;
-                    let val = data[input_idx];
-                    if val > max_val {
-                        max_val = val;
-                    }
-                }
-                let output_idx = outer * inner_size + inner;
-                result_data[output_idx] = max_val;
-            }
-        }
-
-        Self::from_data(result_data, output_shape, self.device)
-    }
-
-    /// Minimum along specified dimension
-    pub fn min_dim(&self, dim: i32, keepdim: bool) -> Result<Self> {
-        use scirs2_core::ndarray::Axis;
-
-        let normalized_dim = if dim < 0 {
-            (self.shape().len() as i32 + dim) as usize
-        } else {
-            dim as usize
-        };
-
-        if normalized_dim >= self.shape().len() {
-            return Err(torsh_core::error::TorshError::InvalidDimension {
-                dim: normalized_dim,
-                ndim: self.shape().len(),
-            });
-        }
-
-        let array = self.as_ndarray()?;
-        let result = array.map_axis(Axis(normalized_dim), |view| {
-            view.iter()
-                .copied()
-                .fold(<T as FloatElement>::infinity(), |acc, x| {
-                    if x < acc {
-                        x
-                    } else {
-                        acc
-                    }
-                })
-        });
-
-        let result_shape = if keepdim {
-            let mut shape = self.shape().to_vec();
-            shape[normalized_dim] = 1;
-            shape
-        } else {
-            result.shape().to_vec()
-        };
-
-        Self::from_ndarray(
-            result
-                .to_shape(result_shape)
-                .map_err(|e| TorshError::InvalidShape(format!("Shape conversion failed: {}", e)))?
-                .to_owned(),
-            self.device(),
-        )
     }
 }
 
@@ -343,18 +220,18 @@ where
 // General tensor operations
 impl<T: TensorElement + Copy> Tensor<T> {
     /// Compute sum of all elements
+    ///
+    /// Reads the storage in place (no intermediate copy) and, for large
+    /// tensors, folds chunks in parallel through `scirs2_core::parallel_ops`.
     pub fn sum(&self) -> Result<Self>
     where
         T: std::ops::Add<Output = T> + num_traits::Zero,
     {
-        let data = self.data()?;
-        let sum_value = data
-            .iter()
-            .fold(<T as num_traits::Zero>::zero(), |acc, &x| acc + x);
+        let sum_value = self.with_contiguous_data(|data| Ok(sum_slice(data)))?;
         let mut result = Tensor::from_data(vec![sum_value], vec![], self.device())?;
 
         // Record the sum operation for autograd: d(sum)/dx_i = 1 for every element.
-        if self.requires_grad {
+        if crate::should_record_grad(self.requires_grad) {
             result.requires_grad = true;
             result.operation = crate::core_ops::Operation::Sum {
                 input: Arc::new(self.clone()),
@@ -364,226 +241,26 @@ impl<T: TensorElement + Copy> Tensor<T> {
         Ok(result)
     }
 
-    /// Compute sum along specified dimensions
-    pub fn sum_dim(&self, dims: &[i32], keepdim: bool) -> Result<Self>
-    where
-        T: std::ops::Add<Output = T> + num_traits::Zero,
-    {
-        if dims.is_empty() {
-            return self.sum();
-        }
-
-        let shape_binding = self.shape();
-        let input_shape = shape_binding.dims();
-
-        // Handle single dimension case (most common)
-        if dims.len() == 1 {
-            let dim = dims[0];
-            let actual_dim = if dim < 0 {
-                (input_shape.len() as i32 + dim) as usize
-            } else {
-                dim as usize
-            };
-
-            if actual_dim >= input_shape.len() {
-                return Err(TorshError::InvalidOperation(format!(
-                    "Dimension {} out of range for {}-dimensional tensor",
-                    actual_dim,
-                    input_shape.len()
-                )));
-            }
-
-            // Calculate output shape
-            let mut output_shape = input_shape.to_vec();
-            if keepdim {
-                output_shape[actual_dim] = 1;
-            } else {
-                output_shape.remove(actual_dim);
-            }
-
-            let data = self.data()?;
-            let outer_size: usize = input_shape[..actual_dim].iter().product();
-            let dim_size = input_shape[actual_dim];
-            let inner_size: usize = input_shape[actual_dim + 1..].iter().product();
-
-            let output_size = outer_size * inner_size;
-            let mut result_data = vec![num_traits::Zero::zero(); output_size];
-
-            for outer in 0..outer_size {
-                for inner in 0..inner_size {
-                    let mut sum = num_traits::Zero::zero();
-                    for d in 0..dim_size {
-                        let input_idx = outer * dim_size * inner_size + d * inner_size + inner;
-                        sum = sum + data[input_idx];
-                    }
-                    let output_idx = outer * inner_size + inner;
-                    result_data[output_idx] = sum;
-                }
-            }
-
-            Self::from_data(result_data, output_shape, self.device)
-        } else {
-            // For multiple dimensions, fall back to full sum for now
-            self.sum()
-        }
-    }
-
-    /// Compute mean along specified dimensions
-    pub fn mean(&self, dims: Option<&[usize]>, keepdim: bool) -> Result<Self>
-    where
-        T: std::ops::Add<Output = T>
-            + std::ops::Div<Output = T>
-            + num_traits::Zero
-            + num_traits::One
-            + num_traits::FromPrimitive,
-    {
-        let sum = if let Some(dims) = dims {
-            self.sum_dim(&dims.iter().map(|&d| d as i32).collect::<Vec<_>>(), keepdim)?
-        } else {
-            let scalar_sum = self.sum()?;
-            if keepdim {
-                // Reshape scalar to tensor with same ndim as original, all dims = 1
-                let keepdim_shape = vec![1; self.shape().ndim()];
-                scalar_sum.view(&keepdim_shape)?
-            } else {
-                scalar_sum
-            }
-        };
-
-        let count = if let Some(dims) = dims {
-            dims.iter()
-                .map(|&d| self.shape().dims()[d])
-                .product::<usize>() as f64
-        } else {
-            self.numel() as f64
-        };
-
-        let mut result = sum.div_scalar(
-            <T as num_traits::FromPrimitive>::from_f64(count)
-                .unwrap_or_else(|| <T as num_traits::One>::one()),
-        )?;
-
-        // Propagate requires_grad and record operation for autograd
-        if self.requires_grad {
-            result.requires_grad = true;
-            result.operation = crate::core_ops::Operation::Mean {
-                input: Arc::new(self.clone()),
-                count,
-            };
-        }
-
-        Ok(result)
-    }
-
-    /// Compute cumulative product along specified dimension
-    pub fn cumprod(&self, dim: i32) -> Result<Self>
-    where
-        T: std::ops::Mul<Output = T> + num_traits::One + Copy,
-    {
-        let normalized_dim = if dim < 0 {
-            (self.shape().len() as i32 + dim) as usize
-        } else {
-            dim as usize
-        };
-
-        if normalized_dim >= self.shape().len() {
-            return Err(torsh_core::error::TorshError::InvalidDimension {
-                dim: normalized_dim,
-                ndim: self.shape().len(),
-            });
-        }
-
-        let shape = self.shape().clone();
-        let input_shape = shape.dims();
-        let data = self.data()?;
-        let mut result_data = data.to_vec();
-
-        let outer_size: usize = input_shape[..normalized_dim].iter().product();
-        let dim_size = input_shape[normalized_dim];
-        let inner_size: usize = input_shape[normalized_dim + 1..].iter().product();
-
-        for outer_idx in 0..outer_size {
-            for inner_idx in 0..inner_size {
-                let mut running_product = <T as num_traits::One>::one();
-                for dim_idx in 0..dim_size {
-                    let index =
-                        outer_idx * (dim_size * inner_size) + dim_idx * inner_size + inner_idx;
-                    running_product = running_product * result_data[index];
-                    result_data[index] = running_product;
-                }
-            }
-        }
-
-        Self::from_data(result_data, input_shape.to_vec(), self.device())
-    }
-
-    /// Matrix multiplication
-    pub fn matmul(&self, other: &Self) -> Result<Self>
-    where
-        T: num_traits::Float + std::iter::Sum,
-    {
-        let mut result = self.basic_matmul(other)?;
-        // Record the matmul operation for autograd (2-D). Backward computes
-        // dL/dlhs = grad @ rhsᵀ and dL/drhs = lhsᵀ @ grad.
-        if self.requires_grad || other.requires_grad {
-            result.requires_grad = true;
-            result.operation = crate::core_ops::Operation::MatMul {
-                lhs: Arc::new(self.clone()),
-                rhs: Arc::new(other.clone()),
-            };
-        }
-        Ok(result)
-    }
-
-    /// Sort tensor along specified dimension
-    pub fn sort(&self, _dim: Option<i32>, _descending: bool) -> Result<(Self, Self)>
-    where
-        T: PartialOrd + num_traits::Zero + num_traits::FromPrimitive,
-    {
-        // Simple implementation - sort entire tensor as 1D
-        let data = self.to_vec()?;
-        let mut indexed_data: Vec<(usize, T)> =
-            data.iter().enumerate().map(|(i, &val)| (i, val)).collect();
-
-        // Sort by value
-        indexed_data.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Extract sorted data and indices
-        let sorted_data: Vec<T> = indexed_data.iter().map(|(_, val)| *val).collect();
-        let indices: Vec<T> = indexed_data
-            .iter()
-            .map(|(i, _)| {
-                <T as num_traits::FromPrimitive>::from_usize(*i)
-                    .unwrap_or_else(|| <T as num_traits::Zero>::zero())
-            })
-            .collect();
-
-        let sorted_tensor =
-            Self::from_data(sorted_data, self.shape().dims().to_vec(), self.device())?;
-        let indices_tensor = Self::from_data(indices, self.shape().dims().to_vec(), self.device())?;
-
-        Ok((sorted_tensor, indices_tensor))
-    }
-
-    /// Min reduction method without trait bounds (for Iterator compatibility)
+    /// Global minimum of the tensor (see [`Tensor::amin`] for the dimension-aware
+    /// form, and [`Tensor::min_dim`] for a single axis).
     pub fn min(&self) -> Result<Self>
     where
         T: std::cmp::PartialOrd + Copy,
     {
-        let data = self.data()?;
-        if data.is_empty() {
-            return Err(TorshError::InvalidOperation(
-                "Cannot compute min of empty tensor".to_string(),
-            ));
-        }
-
-        let min_val = data
-            .iter()
-            .fold(data[0], |acc, &x| if x < acc { x } else { acc });
+        let min_val = self.with_contiguous_data(|data| {
+            let mut iter = data.iter().copied();
+            let first = iter.next().ok_or_else(|| {
+                TorshError::InvalidOperation("Cannot compute min of empty tensor".to_string())
+            })?;
+            Ok(iter.fold(first, |acc, x| if x < acc { x } else { acc }))
+        })?;
         Self::from_data(vec![min_val], vec![], self.device)
     }
 
     /// Transpose operation (2D tensor)
+    ///
+    /// Uses a cache-blocked copy so that both the read and the write stream stay
+    /// inside one cache tile, which matters for the matmul operands this feeds.
     pub fn t(&self) -> Result<Self>
     where
         T: Copy + num_traits::Zero,
@@ -598,14 +275,23 @@ impl<T: TensorElement + Copy> Tensor<T> {
         }
 
         let (rows, cols) = (dims[0], dims[1]);
-        let data = self.data()?;
-        let mut transposed_data = vec![num_traits::Zero::zero(); data.len()];
+        const TILE: usize = 32;
 
-        for i in 0..rows {
-            for j in 0..cols {
-                transposed_data[j * rows + i] = data[i * cols + j];
+        let transposed_data = self.with_contiguous_data(|data| {
+            let mut out = vec![num_traits::Zero::zero(); data.len()];
+            for row_block in (0..rows).step_by(TILE) {
+                let row_end = (row_block + TILE).min(rows);
+                for col_block in (0..cols).step_by(TILE) {
+                    let col_end = (col_block + TILE).min(cols);
+                    for i in row_block..row_end {
+                        for j in col_block..col_end {
+                            out[j * rows + i] = data[i * cols + j];
+                        }
+                    }
+                }
             }
-        }
+            Ok(out)
+        })?;
 
         Self::from_data(transposed_data, vec![cols, rows], self.device)
     }
@@ -628,52 +314,95 @@ impl<T: TensorElement + Copy> Tensor<T> {
         self.to_vec()
     }
 
+    /// Run `f` against a contiguous, view-ordered slice of this tensor's data.
+    ///
+    /// Base tensors hand the storage slice straight to the closure (zero copy).
+    /// Strided views are materialised in view order first, so callers can always
+    /// index the slice with plain row-major arithmetic.
+    pub(crate) fn with_contiguous_data<R, F>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&[T]) -> Result<R>,
+        T: Copy,
+    {
+        let numel = self.numel();
+        if self.is_view() || self.strides.is_some() || self.storage_offset != 0 {
+            let data = self.to_vec()?;
+            return f(&data);
+        }
+
+        self.storage.with_slice(|slice| {
+            if slice.len() < numel {
+                return Err(TorshError::InvalidOperation(format!(
+                    "storage holds {} elements but the tensor shape needs {}",
+                    slice.len(),
+                    numel
+                )));
+            }
+            f(&slice[..numel])
+        })
+    }
+
+    /// Materialise this tensor as a contiguous, uniquely owned, *mutable* base
+    /// tensor.
+    ///
+    /// This is the single entry point used by every in-place operation. It
+    /// compacts strided views into view order **and** resets the view metadata
+    /// (`strides`, `storage_offset`, `base_tensor`), which is what keeps later
+    /// reads from applying the permutation a second time.
+    ///
+    /// Note that a view detaches from its base here: subsequent writes are no
+    /// longer visible through the original tensor.
+    pub(crate) fn materialize_contiguous(&mut self) -> Result<()>
+    where
+        T: Copy,
+    {
+        let data_vec = self.to_vec()?;
+        self.storage = Self::mutable_storage(data_vec)?;
+        self.strides = None;
+        self.storage_offset = 0;
+        self.base_tensor = None;
+        Ok(())
+    }
+
+    /// Build storage that supports `with_slice_mut` (i.e. never `SimdOptimized`).
+    fn mutable_storage(data: Vec<T>) -> Result<TensorStorage<T>> {
+        #[cfg(feature = "simd")]
+        {
+            // Aligned storage keeps SIMD-friendly alignment while staying mutable.
+            const MEMORY_MAPPING_BYTES: usize = 1024 * 1024 * 1024;
+            if data.len() * std::mem::size_of::<T>() < MEMORY_MAPPING_BYTES {
+                return TensorStorage::aligned(data);
+            }
+        }
+        TensorStorage::create_optimal(data)
+    }
+
     /// Apply a function to all elements in-place using direct storage access
     pub fn data_mut_apply<F>(&mut self, mut func: F) -> Result<()>
     where
         F: FnMut(&mut T),
         T: Copy,
     {
-        self.ensure_exclusive_data()?;
+        self.prepare_for_inplace()?;
 
-        match &mut self.storage {
-            TensorStorage::InMemory(data) => {
-                let mut data_guard = data.write().expect("lock should not be poisoned");
-                for item in data_guard.iter_mut() {
-                    func(item);
-                }
-                Ok(())
-            }
+        match &self.storage {
             TensorStorage::MemoryMapped(_) => {
-                // For memory-mapped storage, we need to read-modify-write
-                let data = self.to_vec()?;
-                let mut new_data = data;
-                for item in new_data.iter_mut() {
-                    func(item);
-                }
-                // Write back the data
-                self.storage = TensorStorage::create_optimal(new_data)?;
-                Ok(())
-            }
-            #[cfg(feature = "simd")]
-            TensorStorage::Aligned(data) => {
-                let mut data_guard = data.write().expect("lock should not be poisoned");
-                for item in data_guard.as_mut_slice().iter_mut() {
-                    func(item);
-                }
-                Ok(())
-            }
-            #[cfg(feature = "simd")]
-            TensorStorage::SimdOptimized(_) => {
-                // SimdOptimized should have been converted by ensure_exclusive_data()
-                // If we reach here, something went wrong - convert to optimal storage and retry
-                let data = self.to_vec()?;
-                let mut new_data = data;
+                // Memory-mapped storage has no mutable slice access: read, modify, write back.
+                let mut new_data = self.to_vec()?;
                 for item in new_data.iter_mut() {
                     func(item);
                 }
                 self.storage = TensorStorage::create_optimal(new_data)?;
                 Ok(())
+            }
+            _ => {
+                let numel = self.numel();
+                self.storage.with_slice_mut(|slice| {
+                    for item in slice.iter_mut().take(numel) {
+                        func(item);
+                    }
+                    Ok(())
+                })
             }
         }
     }
@@ -691,13 +420,22 @@ impl<T: TensorElement + Copy> Tensor<T> {
     }
 
     /// Ensure tensor has unique data (copy-on-write semantics)
+    ///
+    /// Strided views are compacted *and* detached (see
+    /// [`Tensor::materialize_contiguous`]); base tensors are copied only when
+    /// their storage is actually shared — including `SimdOptimized` storage,
+    /// which implements copy-on-write internally and therefore needs no eager
+    /// promotion when this tensor is its only owner.
     pub fn make_unique(&mut self) -> Result<()> {
-        // For storage-based approach, create new storage if shared
+        if self.is_view() || self.strides.is_some() || self.storage_offset != 0 {
+            return self.materialize_contiguous();
+        }
+
         match &self.storage {
             TensorStorage::InMemory(data) => {
                 if Arc::strong_count(data) > 1 {
                     let data_vec = self.to_vec()?;
-                    self.storage = TensorStorage::create_optimal(data_vec)?;
+                    self.storage = Self::mutable_storage(data_vec)?;
                 }
             }
             TensorStorage::MemoryMapped(storage) => {
@@ -710,46 +448,83 @@ impl<T: TensorElement + Copy> Tensor<T> {
             TensorStorage::Aligned(data) => {
                 if Arc::strong_count(data) > 1 {
                     let data_vec = self.to_vec()?;
-                    self.storage = TensorStorage::create_optimal(data_vec)?;
+                    self.storage = Self::mutable_storage(data_vec)?;
                 }
             }
             #[cfg(feature = "simd")]
-            TensorStorage::SimdOptimized(_storage) => {
-                // SimdOptimized storage is immutable by design (optimized for read-heavy workloads)
-                // Always convert to Aligned storage which supports both SIMD and mutation
-                let data_vec = self.to_vec()?;
-                self.storage = TensorStorage::aligned(data_vec)?;
+            TensorStorage::SimdOptimized(storage) => {
+                // `SimdStorage` is read-optimised: it never releases its
+                // `original` buffer, so writing through its copy-on-write path
+                // would leave every mutated tensor holding two full buffers for
+                // the rest of its life. Promote to `Aligned` instead, which is a
+                // single resident buffer that `with_slice_mut` can mutate in
+                // place from then on.
+                //
+                // The promotion copies the data straight out of the SIMD
+                // storage: the previous `to_vec()` + `aligned()` pair allocated
+                // and copied the whole tensor twice.
+                let promoted = storage.with_slice(TensorStorage::aligned_from_slice)?;
+                self.storage = promoted;
             }
         }
         Ok(())
     }
 
+    /// Prepare this tensor for an in-place write: contiguous, uniquely owned and
+    /// backed by mutable storage.
+    pub(crate) fn prepare_for_inplace(&mut self) -> Result<()>
+    where
+        T: Copy,
+    {
+        self.make_unique()
+    }
+
     /// Apply function in-place
+    ///
+    /// Mutates the storage buffer directly - no temporary buffer is allocated
+    /// for base tensors that are already uniquely owned.
     pub fn apply_<F>(&mut self, func: F) -> Result<()>
     where
         F: Fn(T) -> T,
         T: Copy,
     {
-        let data = self.to_vec()?;
-        let new_data: Vec<T> = data.into_iter().map(func).collect();
+        self.prepare_for_inplace()?;
 
-        // Update storage with new data
-        self.storage = TensorStorage::create_optimal(new_data)?;
-        Ok(())
+        if matches!(self.storage, TensorStorage::MemoryMapped(_)) {
+            // Memory-mapped storage cannot expose a mutable slice.
+            let data = self.to_vec()?;
+            let new_data: Vec<T> = data.into_iter().map(func).collect();
+            self.storage = TensorStorage::create_optimal(new_data)?;
+            return Ok(());
+        }
+
+        let numel = self.numel();
+        self.storage.with_slice_mut(|slice| {
+            for value in slice.iter_mut().take(numel) {
+                *value = func(*value);
+            }
+            Ok(())
+        })
     }
 
     /// Apply function element-wise to create new tensor
+    ///
+    /// Allocates exactly one output buffer and fills it from a borrowed view of
+    /// the input.
     pub fn map<F>(&self, func: F) -> Result<Self>
     where
         F: Fn(T) -> T,
         T: Copy,
     {
-        let data = self.to_vec()?;
-        let new_data: Vec<T> = data.into_iter().map(func).collect();
+        let new_data = self.with_contiguous_data(|data| {
+            let mut out = Vec::with_capacity(data.len());
+            out.extend(data.iter().map(|&x| func(x)));
+            Ok(out)
+        })?;
         let mut result = Self::from_data(new_data, self.shape().dims().to_vec(), self.device)?;
 
         // Preserve gradient tracking flag from original tensor
-        result.requires_grad = self.requires_grad;
+        result.requires_grad = crate::should_record_grad(self.requires_grad);
 
         Ok(result)
     }
@@ -834,67 +609,40 @@ impl<T: TensorElement + Copy> Tensor<T> {
         let total_numel: usize = result_shape.iter().product();
         let mut result_data = Vec::with_capacity(total_numel);
 
+        // Materialise every input exactly once (previously this happened once per
+        // (outer, tensor) pair, i.e. `outer_size` full copies of every input).
+        let sources: Vec<Vec<T>> = tensors
+            .iter()
+            .map(|tensor| tensor.to_vec())
+            .collect::<Result<Vec<_>>>()?;
+        let cat_sizes: Vec<usize> = tensors
+            .iter()
+            .map(|tensor| tensor.shape().dims()[actual_dim])
+            .collect();
+
         for outer in 0..outer_size {
-            for tensor in tensors {
-                let tensor_shape_binding = tensor.shape();
-                let tensor_shape = tensor_shape_binding.dims();
-                let cat_size = tensor_shape[actual_dim];
-                let tensor_data = tensor.data()?;
-
-                for cat_idx in 0..cat_size {
-                    for inner in 0..inner_size {
-                        let src_idx = outer * cat_size * inner_size + cat_idx * inner_size + inner;
-                        result_data.push(tensor_data[src_idx]);
-                    }
-                }
+            for (source, &cat_size) in sources.iter().zip(cat_sizes.iter()) {
+                // One contiguous run per (outer, tensor) pair.
+                let run = cat_size * inner_size;
+                let start = outer * run;
+                result_data.extend_from_slice(&source[start..start + run]);
             }
         }
 
-        Self::from_data(result_data, result_shape, tensors[0].device)
-    }
+        let mut result = Self::from_data(result_data, result_shape, tensors[0].device)?;
 
-    /// Ensure exclusive ownership of data using copy-on-write semantics
-    /// If the data is shared (Arc has multiple strong references), clone it
-    fn ensure_exclusive_data(&mut self) -> Result<()> {
-        match &self.storage {
-            TensorStorage::InMemory(data) => {
-                if Arc::strong_count(data) > 1 {
-                    // Data is shared, need to clone it to get exclusive access
-                    let cloned_data = {
-                        let data_guard = data.read().expect("lock should not be poisoned");
-                        data_guard.clone()
-                    };
-                    self.storage = TensorStorage::in_memory(cloned_data);
-                }
-            }
-            TensorStorage::MemoryMapped(storage) => {
-                if Arc::strong_count(storage) > 1 {
-                    // Clone memory-mapped storage by converting to vec and back
-                    let data_vec = self.storage.to_vec()?;
-                    self.storage = TensorStorage::create_optimal(data_vec)?;
-                }
-            }
-            #[cfg(feature = "simd")]
-            TensorStorage::Aligned(data) => {
-                if Arc::strong_count(data) > 1 {
-                    // Data is shared, need to clone it to get exclusive access
-                    let vec_data = {
-                        let data_guard = data.read().expect("lock should not be poisoned");
-                        data_guard.as_slice().to_vec()
-                    };
-                    self.storage = TensorStorage::aligned(vec_data)?;
-                }
-            }
-            #[cfg(feature = "simd")]
-            TensorStorage::SimdOptimized(storage) => {
-                if Arc::strong_count(storage) > 1 || storage.is_shared() {
-                    // SimdOptimized uses COW - copy the data to get exclusive access
-                    let vec_data = storage.to_vec();
-                    self.storage = TensorStorage::simd_optimized(vec_data)?;
-                }
-            }
+        // Record the concatenation so gradients split back to each input along
+        // `actual_dim`. Only recorded when at least one input tracks gradients.
+        let any_requires_grad = tensors.iter().any(|t| t.requires_grad);
+        if crate::should_record_grad(any_requires_grad) {
+            result.requires_grad = true;
+            result.operation = crate::core_ops::Operation::Concat {
+                inputs: tensors.iter().map(|t| Arc::new((*t).clone())).collect(),
+                dim: actual_dim,
+            };
         }
-        Ok(())
+
+        Ok(result)
     }
 }
 
@@ -1180,50 +928,6 @@ impl<T: TensorElement + Copy> Tensor<T> {
         self.map(|x| x.tanh())
     }
 
-    /// Basic matrix multiplication implementation
-    fn basic_matmul(&self, other: &Self) -> Result<Self>
-    where
-        T: num_traits::Float + std::iter::Sum,
-    {
-        let self_binding = self.shape();
-        let self_shape = self_binding.dims();
-        let other_binding = other.shape();
-        let other_shape = other_binding.dims();
-
-        // Check dimensions for matrix multiplication
-        if self_shape.len() != 2 || other_shape.len() != 2 {
-            return Err(TorshError::InvalidArgument(
-                "Matrix multiplication requires 2D tensors".to_string(),
-            ));
-        }
-
-        if self_shape[1] != other_shape[0] {
-            return Err(TorshError::ShapeMismatch {
-                expected: vec![self_shape[0], other_shape[1]],
-                got: vec![self_shape[1], other_shape[0]],
-            });
-        }
-
-        let (m, k) = (self_shape[0], self_shape[1]);
-        let n = other_shape[1];
-
-        let self_data = self.data()?;
-        let other_data = other.data()?;
-        let mut result_data = vec![num_traits::Zero::zero(); m * n];
-
-        // Basic matrix multiplication
-        for i in 0..m {
-            for j in 0..n {
-                let mut sum = num_traits::Zero::zero();
-                for k_idx in 0..k {
-                    sum = sum + self_data[i * k + k_idx] * other_data[k_idx * n + j];
-                }
-                result_data[i * n + j] = sum;
-            }
-        }
-
-        Self::from_data(result_data, vec![m, n], self.device)
-    }
     /// Softmax activation along specified dimension
     /// Computes softmax(x_i) = exp(x_i) / sum(exp(x_j)) for all j
     pub fn softmax(&self, dim: i32) -> Result<Self>
@@ -1273,25 +977,29 @@ impl<T: TensorElement + Copy> Tensor<T> {
         exp_tensor.div(&expanded_sum)
     }
 
-    /// Log softmax activation along specified dimension
-    /// Computes log_softmax(x_i) = log(softmax(x_i))
+    /// Log softmax activation along specified dimension.
+    ///
+    /// Computed with the log-sum-exp identity
+    /// `log_softmax(x) = (x - max) - log(sum(exp(x - max)))` rather than as
+    /// `log(softmax(x))`. The naive form underflows: once a logit sits about 90
+    /// (`f32`) below the row maximum, `exp` rounds it to exactly `0` and the
+    /// following `log` returns `-inf`, which then poisons every downstream loss
+    /// (this is why cross-entropy over sharply scaled logits used to be `inf`).
+    /// Here the sum is at least `1` — the maximum contributes `exp(0)` — so the
+    /// logarithm never sees zero and every output stays finite.
     pub fn log_softmax(&self, dim: i32) -> Result<Self>
     where
         T: torsh_core::dtype::FloatElement + Copy + std::ops::Sub<Output = T>,
     {
-        let softmax_result = self.softmax(dim)?;
-        softmax_result.log()
-    }
-
-    /// Computes cumulative sum along a dimension
-    pub fn cumsum(&self, dim: i32) -> Result<Self>
-    where
-        T: std::ops::Add<Output = T> + num_traits::Zero + Copy,
-    {
         let shape_binding = self.shape();
-        let shape = shape_binding.dims();
+        let shape = shape_binding.dims().to_vec();
 
-        // Handle negative dimension
+        if shape.is_empty() {
+            return Err(TorshError::InvalidOperation(
+                "Cannot compute log_softmax on empty tensor".to_string(),
+            ));
+        }
+
         let actual_dim = if dim < 0 {
             (shape.len() as i32 + dim) as usize
         } else {
@@ -1306,130 +1014,31 @@ impl<T: TensorElement + Copy> Tensor<T> {
             )));
         }
 
-        let data = self.data()?;
-        let mut result_data = data.clone();
+        // Shift by the per-slice maximum so the largest exponent is exp(0) = 1.
+        let max_tensor = self.max(Some(actual_dim), true)?;
+        let expanded_max = max_tensor.expand(&shape)?;
+        let shifted = self.sub(&expanded_max)?;
 
-        // Simplified cumsum implementation for now
-        // This is a basic implementation that works along the flattened array
-        if actual_dim == shape.len() - 1 || shape.len() == 1 {
-            let mut cumulative = <T as num_traits::Zero>::zero();
-            for i in 0..result_data.len() {
-                cumulative = cumulative + result_data[i];
-                result_data[i] = cumulative;
-            }
+        // log(sum(exp(shifted))) is finite: the sum is bounded below by 1.
+        let sum_exp = shifted.exp()?.sum_dim(&[actual_dim as i32], true)?;
+        let log_sum_exp = sum_exp.log()?;
+        let expanded_log_sum = log_sum_exp.expand(&shape)?;
+
+        let mut result = shifted.sub(&expanded_log_sum)?;
+
+        // Record the exact, stable log-softmax Jacobian instead of the composed
+        // (partly detaching) sub/exp/sum/log graph. Overwriting the operation
+        // discards those throwaway intermediates. This is what makes
+        // cross-entropy differentiable end-to-end.
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = crate::core_ops::Operation::LogSoftmax {
+                input: Arc::new(self.clone()),
+                dim: actual_dim,
+            };
         }
 
-        Self::from_data(result_data, shape.to_vec(), self.device)
-    }
-
-    /// Find the indices of minimum values along a dimension
-    pub fn argmin(&self, dim: Option<i32>) -> Result<Tensor<i64>>
-    where
-        T: std::cmp::PartialOrd + Copy,
-    {
-        let data = self.data()?;
-        let shape_binding = self.shape();
-        let shape = shape_binding.dims();
-
-        if shape.is_empty() {
-            return Err(TorshError::InvalidOperation(
-                "Cannot compute argmin on empty tensor".to_string(),
-            ));
-        }
-
-        match dim {
-            Some(d) => {
-                // Handle negative dimension
-                let actual_dim = if d < 0 {
-                    (shape.len() as i32 + d) as usize
-                } else {
-                    d as usize
-                };
-
-                if actual_dim >= shape.len() {
-                    return Err(TorshError::InvalidOperation(format!(
-                        "Dimension {} out of range for {}-dimensional tensor",
-                        actual_dim,
-                        shape.len()
-                    )));
-                }
-
-                // For simplicity, return the first minimum index found
-                // This is a basic implementation - real argmin would handle the specified dimension properly
-                let min_val = data
-                    .iter()
-                    .fold(data[0], |acc, &x| if x < acc { x } else { acc });
-                let min_idx = data.iter().position(|&x| x == min_val).unwrap_or(0);
-
-                let result_data = vec![min_idx as i64];
-                Tensor::<i64>::from_data(result_data, vec![1], self.device)
-            }
-            None => {
-                // Find argmin over the entire flattened tensor
-                let min_val = data
-                    .iter()
-                    .fold(data[0], |acc, &x| if x < acc { x } else { acc });
-                let min_idx = data.iter().position(|&x| x == min_val).unwrap_or(0);
-
-                let result_data = vec![min_idx as i64];
-                Tensor::<i64>::from_data(result_data, vec![], self.device)
-            }
-        }
-    }
-
-    /// Find the indices of maximum values along a dimension
-    pub fn argmax(&self, dim: Option<i32>) -> Result<Tensor<i64>>
-    where
-        T: std::cmp::PartialOrd + Copy,
-    {
-        let data = self.data()?;
-        let shape_binding = self.shape();
-        let shape = shape_binding.dims();
-
-        if shape.is_empty() {
-            return Err(TorshError::InvalidOperation(
-                "Cannot compute argmax on empty tensor".to_string(),
-            ));
-        }
-
-        match dim {
-            Some(d) => {
-                // Handle negative dimension
-                let actual_dim = if d < 0 {
-                    (shape.len() as i32 + d) as usize
-                } else {
-                    d as usize
-                };
-
-                if actual_dim >= shape.len() {
-                    return Err(TorshError::InvalidOperation(format!(
-                        "Dimension {} out of range for {}-dimensional tensor",
-                        actual_dim,
-                        shape.len()
-                    )));
-                }
-
-                // For simplicity, return the first maximum index found
-                // This is a basic implementation - real argmax would handle the specified dimension properly
-                let max_val = data
-                    .iter()
-                    .fold(data[0], |acc, &x| if x > acc { x } else { acc });
-                let max_idx = data.iter().position(|&x| x == max_val).unwrap_or(0);
-
-                let result_data = vec![max_idx as i64];
-                Tensor::<i64>::from_data(result_data, vec![1], self.device)
-            }
-            None => {
-                // Find argmax over the entire flattened tensor
-                let max_val = data
-                    .iter()
-                    .fold(data[0], |acc, &x| if x > acc { x } else { acc });
-                let max_idx = data.iter().position(|&x| x == max_val).unwrap_or(0);
-
-                let result_data = vec![max_idx as i64];
-                Tensor::<i64>::from_data(result_data, vec![], self.device)
-            }
-        }
+        Ok(result)
     }
 
     /// Returns the k largest elements along a dimension
@@ -1554,6 +1163,71 @@ impl<T: TensorElement + Copy> Tensor<T> {
 mod tests {
     use super::*;
     use torsh_core::device::DeviceType;
+
+    /// Promoting `SimdOptimized` storage must produce a private buffer, so a
+    /// write through one handle is never visible through a sibling clone.
+    ///
+    /// The promotion now copies straight out of the SIMD storage instead of
+    /// going through an intermediate `Vec`; this test pins the isolation that
+    /// the shortcut must not lose.
+    #[cfg(feature = "simd")]
+    #[test]
+    fn make_unique_isolates_shared_simd_storage() {
+        // 4096 f32 = 16 KiB, above the 10 KiB SimdOptimized threshold.
+        let mut tensor = Tensor::from_data(vec![1.0f32; 4096], vec![4096], DeviceType::Cpu)
+            .expect("tensor creation should succeed");
+        assert!(
+            matches!(tensor.storage, TensorStorage::SimdOptimized(_)),
+            "precondition: a 16 KiB tensor uses lock-free SIMD storage"
+        );
+        let sibling = tensor.clone();
+
+        tensor.make_unique().expect("make_unique should succeed");
+        assert!(
+            !matches!(tensor.storage, TensorStorage::SimdOptimized(_)),
+            "SimdOptimized storage must be promoted to single-buffer mutable storage"
+        );
+
+        tensor.apply_(|value| value + 1.0).expect("apply_");
+        assert_eq!(
+            tensor.to_vec().expect("to_vec")[0],
+            2.0,
+            "the writer must see its own update"
+        );
+        assert_eq!(
+            sibling.to_vec().expect("to_vec")[0],
+            1.0,
+            "the sibling must not observe the write"
+        );
+    }
+
+    /// The single-copy promotion must reproduce the data exactly, including for
+    /// storage that had already been written through its copy-on-write path.
+    #[cfg(feature = "simd")]
+    #[test]
+    fn make_unique_preserves_mutated_simd_contents() {
+        let source = Tensor::from_data(
+            (0..4096).map(|i| i as f32).collect::<Vec<_>>(),
+            vec![4096],
+            DeviceType::Cpu,
+        )
+        .expect("tensor creation should succeed");
+
+        // Write through the SIMD storage's copy-on-write path first.
+        source
+            .storage
+            .with_slice_mut(|slice| {
+                slice[0] = -1.0;
+                Ok(())
+            })
+            .expect("copy-on-write write should succeed");
+
+        let mut promoted = source.clone();
+        promoted.make_unique().expect("make_unique should succeed");
+        let data = promoted.to_vec().expect("to_vec");
+        assert_eq!(data[0], -1.0, "the promotion must copy the CoW buffer");
+        assert_eq!(data[4095], 4095.0);
+    }
 
     #[test]
     fn test_scalar_creation() {
@@ -1692,6 +1366,88 @@ mod tests {
         // After make_unique, they should not share storage
         tensor1.make_unique().expect("make_unique should succeed");
         assert!(!tensor1.shares_storage(&tensor2));
+    }
+
+    /// F171: `make_unique` on an unshared tensor must not keep reallocating.
+    ///
+    /// `create_optimal` hands every f32 tensor >= 2560 elements the *immutable*
+    /// `SimdOptimized` storage, so the first call has to convert it once to
+    /// mutable `Aligned` storage. Every later call must be free.
+    #[test]
+    fn test_make_unique_does_not_realloc_unshared_storage() {
+        let mut tensor = Tensor::<f32>::from_data(vec![1.0; 4096], vec![4096], DeviceType::Cpu)
+            .expect("tensor creation should succeed");
+        assert_eq!(
+            tensor.storage_type(),
+            "simd_optimized",
+            "precondition: large f32 tensors start out immutable"
+        );
+
+        tensor.make_unique().expect("make_unique should succeed");
+        assert_eq!(tensor.storage_type(), "aligned_simd");
+        let ptr_after_first = tensor
+            .storage
+            .with_slice(|s| Ok(s.as_ptr() as usize))
+            .expect("with_slice should succeed");
+
+        tensor.make_unique().expect("make_unique should succeed");
+        let ptr_after_second = tensor
+            .storage
+            .with_slice(|s| Ok(s.as_ptr() as usize))
+            .expect("with_slice should succeed");
+
+        assert_eq!(
+            ptr_after_first, ptr_after_second,
+            "make_unique must not copy storage that is already unique and mutable"
+        );
+    }
+
+    /// F171: the copy-on-write copy must stay *mutable*.
+    ///
+    /// `create_optimal` would hand a large f32 tensor immutable `SimdOptimized`
+    /// storage again, so every in-place op after a CoW split would fail.
+    #[test]
+    fn test_make_unique_cow_copy_stays_mutable() {
+        let mut tensor = Tensor::<f32>::from_data(vec![1.0; 4096], vec![4096], DeviceType::Cpu)
+            .expect("tensor creation should succeed");
+        tensor.make_unique().expect("make_unique should succeed");
+        assert_eq!(tensor.storage_type(), "aligned_simd");
+
+        let shared = tensor.clone();
+        tensor.make_unique().expect("make_unique should succeed");
+        assert_eq!(
+            tensor.storage_type(),
+            "aligned_simd",
+            "a copy-on-write split must not fall back to immutable storage"
+        );
+        tensor.apply_(|x| x + 1.0).expect("apply_ should succeed");
+        assert_eq!(tensor.to_vec().expect("to_vec")[0], 2.0);
+        assert_eq!(
+            shared.to_vec().expect("to_vec")[0],
+            1.0,
+            "the shared tensor must be unaffected"
+        );
+    }
+
+    /// F058/F168: `apply_` mutates the existing buffer instead of replacing it.
+    #[test]
+    fn test_apply_mutates_storage_in_place() {
+        let mut tensor = Tensor::<f32>::from_data(vec![2.0; 4096], vec![4096], DeviceType::Cpu)
+            .expect("tensor creation should succeed");
+        tensor.make_unique().expect("make_unique should succeed");
+        let ptr_before = tensor
+            .storage
+            .with_slice(|s| Ok(s.as_ptr() as usize))
+            .expect("with_slice should succeed");
+
+        tensor.apply_(|x| x * 3.0).expect("apply_ should succeed");
+
+        let ptr_after = tensor
+            .storage
+            .with_slice(|s| Ok(s.as_ptr() as usize))
+            .expect("with_slice should succeed");
+        assert_eq!(ptr_before, ptr_after, "apply_ must not reallocate storage");
+        assert_eq!(tensor.to_vec().expect("to_vec")[0], 6.0);
     }
 
     #[test]

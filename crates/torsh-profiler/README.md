@@ -45,6 +45,14 @@ let (count, total_duration_us, _, min_us, max_us) = profiler.get_stats();
 println!("{count} events, {total_duration_us}us total (min {min_us}us, max {max_us}us)");
 ```
 
+> **Note.** The three sections below (**Detailed Operation Profiling**, **Memory
+> Profiling**, **FLOPS Counting**) illustrate a *planned* builder-style API and
+> do **not** compile against this release — the fluent methods
+> (`activities`/`step`/`export_chrome_trace`, `MemoryProfiler::track_allocations`/
+> `snapshot`/`find_leaks`, `FlopCounter`) are not yet implemented. The working
+> API today is the **Basic Profiling** section above (`profile_block!`, the core
+> `Profiler`, `profile_memory()`, and `export_chrome_trace_format(...)`).
+
 ### Detailed Operation Profiling
 
 ```rust

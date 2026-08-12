@@ -159,11 +159,36 @@ impl<T: 'static> ReusedBuffer<T> {
     ///
     /// The `Vec` now owns the memory and will free it on drop; it is NOT returned
     /// to the pool.
-    pub fn into_vec(self, len: usize) -> Vec<T> {
+    ///
+    /// # Custom alignment
+    /// A `Vec<T>` always deallocates with `Layout::array::<T>()`, i.e. alignment
+    /// `align_of::<T>()`. A buffer acquired through
+    /// [`GlobalMemoryPool::acquire_uninit_aligned`] with a larger alignment
+    /// therefore cannot hand its allocation to a `Vec` — that would be a
+    /// mismatched-`Layout` deallocation (undefined behaviour). Such buffers are
+    /// copied into a fresh `Vec` instead and the over-aligned allocation is
+    /// returned to the pool, where it can still be reused.
+    pub fn into_vec(self, len: usize) -> Vec<T>
+    where
+        T: Copy,
+    {
         debug_assert!(len <= self.capacity, "len must not exceed capacity");
+
+        if self.layout.align() != std::mem::align_of::<T>() {
+            // SAFETY: the caller guarantees the first `len` elements are
+            // initialized and `len <= capacity`.
+            let initialized =
+                unsafe { std::slice::from_raw_parts(self.ptr.as_ptr() as *const T, len) };
+            let copy = initialized.to_vec();
+            // `self` drops here → the over-aligned allocation goes back to the
+            // pool with its original layout intact.
+            return copy;
+        }
+
         // Wrap self in ManuallyDrop so our Drop impl does not run.
         let md = ManuallyDrop::new(self);
-        // SAFETY: ptr was allocated with the global allocator for `md.capacity` elements.
+        // SAFETY: ptr was allocated with the global allocator for `md.capacity` elements
+        // with `Layout::array::<T>()`-compatible alignment (checked above).
         // `len` elements are initialized (caller contract). capacity matches.
         unsafe { Vec::from_raw_parts(md.ptr.as_ptr(), len, md.capacity) }
     }
@@ -262,8 +287,12 @@ pub struct GlobalMemoryPool {
     config: PoolConfig,
     /// ✅ SciRS2 Global Buffer Pool integration
     scirs2_pool: GlobalBufferPool,
-    /// ✅ SciRS2 Memory leak detector
-    leak_detector: LeakDetector,
+    /// ✅ SciRS2 Memory leak detector.
+    ///
+    /// Purely a diagnostic aid: if it fails to initialize the pool degrades to
+    /// running without leak detection instead of making tensor allocation
+    /// impossible.
+    leak_detector: Option<LeakDetector>,
     /// Weak self-reference used to hand out pool handles to `ReusedBuffer`.
     self_weak: Option<Weak<Mutex<GlobalMemoryPool>>>,
     // ✅ SciRS2 Memory metrics collector (requires memory_efficient feature)
@@ -387,8 +416,9 @@ impl GlobalMemoryPool {
             config: PoolConfig::default(),
             // ✅ SciRS2 Memory Management Integration
             scirs2_pool: GlobalBufferPool::new(),
-            leak_detector: LeakDetector::new(Default::default())
-                .unwrap_or_else(|_| panic!("Failed to initialize leak detector")),
+            // A diagnostic subsystem must never be able to prevent the core
+            // allocator from being constructed: degrade gracefully instead.
+            leak_detector: LeakDetector::new(Default::default()).ok(),
             self_weak: None,
             // metrics_collector: MemoryMetricsCollector::new(),
             // adaptive_chunking: AdaptiveChunking::new(),
@@ -752,7 +782,10 @@ impl std::fmt::Debug for GlobalMemoryPool {
             .field("stats", &self.stats)
             .field("config", &self.config)
             .field("scirs2_pool", &"<GlobalBufferPool>")
-            .field("leak_detector", &"<LeakDetector>")
+            .field(
+                "leak_detector",
+                &self.leak_detector.as_ref().map(|_| "<LeakDetector>"),
+            )
             .finish()
     }
 }
@@ -914,19 +947,23 @@ impl<T: TensorElement> Tensor<T> {
         Self::from_data(data, shape.to_vec(), device)
     }
 
-    /// ✅ SciRS2 Disk-Backed Tensor for datasets larger than RAM
+    /// Disk-backed tensor for datasets larger than RAM
     ///
-    /// Creates a tensor that can be backed by disk storage for large datasets.
-    /// This is useful when working with datasets larger than available RAM.
+    /// The tensor's elements live in a file, not in the process heap: the
+    /// backing file is filled in bounded chunks and every read goes through
+    /// [`crate::storage::MemoryMappedStorage`], so creating the tensor costs a
+    /// fixed amount of RAM regardless of its size.
     ///
     /// # Arguments
     /// * `shape` - The shape of the tensor
     /// * `device` - Device to allocate the tensor on
-    /// * `file_path` - Optional file path for persistent storage. If None, uses temporary file.
+    /// * `file_path` - Optional file path for persistent storage. If `None`, a
+    ///   unique temporary file is used and deleted when the tensor is dropped.
     ///
     /// # Note
-    /// Current implementation creates an in-memory tensor. Full memory-mapped file support
-    /// requires the `mmap-support` feature and will be used automatically when available.
+    /// Element and slice reads stream from the file, but whole-tensor
+    /// materialisation (`to_vec`, `data`) still builds an in-memory copy — that
+    /// call is what a dataset larger than RAM must avoid.
     pub fn disk_backed(shape: &[usize], device: DeviceType, file_path: Option<&str>) -> Result<Self>
     where
         T: Clone + Default,
@@ -937,35 +974,16 @@ impl<T: TensorElement> Tensor<T> {
         }
         let total_elements: usize = shape.iter().product();
 
-        // Determine backing file path
-        let backing_path = if let Some(path) = file_path {
-            // Use provided path
-            std::path::PathBuf::from(path)
-        } else {
-            // Generate temporary file path
-            let temp_dir = std::env::temp_dir();
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            temp_dir.join(format!(
-                "torsh_tensor_{}_{}.bin",
-                timestamp,
-                std::process::id()
-            ))
-        };
+        // `None` lets the storage pick a unique temporary path (and delete it on
+        // drop); an explicit path is persistent and is never removed.
+        let backing_path = file_path.map(std::path::PathBuf::from);
 
-        // Log intent for disk backing (actual implementation depends on features)
-        let _ = (total_elements, &backing_path); // Use parameters
+        let storage =
+            TensorStorage::memory_mapped_filled(total_elements, T::default(), backing_path)?;
 
-        // Create the tensor data in memory
-        // TODO: When mmap-support feature is enabled, use memory-mapped file at backing_path
-        let data = vec![T::default(); total_elements];
-
-        // Store metadata about disk backing for future use
-        // This allows the tensor to track its backing store even if not currently memory-mapped
-        let tensor = Self::from_data(data, shape.to_vec(), device)?;
-
+        let mut tensor = Self::from_data(Vec::new(), Vec::new(), device)?;
+        tensor.storage = storage;
+        tensor.shape = torsh_core::shape::Shape::new(shape.to_vec());
         Ok(tensor)
     }
 

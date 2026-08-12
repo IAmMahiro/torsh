@@ -24,7 +24,8 @@ torsh-data = { workspace = true }
 
 # Vision processing
 image = { workspace = true }
-imageproc = "0.27"
+# NOTE: `imageproc` was removed: it was entirely unused here and pulled the
+# banned `rustfft` crate (via `rustdct`) into the default dependency graph.
 
 # Scientific computing - comprehensive SciRS2 vision integration
 scirs2-core = { workspace = true }
@@ -44,20 +45,21 @@ anyhow = { workspace = true }
 # Utilities
 reqwest = { workspace = true, features = ["blocking"], optional = true }
 oxiarc-archive = { workspace = true, optional = true }
-dirs = "6.0"
 parking_lot = { workspace = true }
 # rusttype = "0.9"  # REMOVED: Unmaintained (RUSTSEC-2021-0140), not used in code
 # Use SciRS2 random instead of direct rand dependency (SciRS2 Policy)
 # rand = "0.8"  # Removed in favor of scirs2_core::random
 memmap2 = { workspace = true }
-glob = "0.3"
+glob = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-default = ["pretrained"]
+# Pure-Rust by default: `pretrained` (network downloads via reqwest, which pulls
+# a rustls TLS provider) is opt-in so a default build stays C/asm-free.
+default = []
 pretrained = ["reqwest", "oxiarc-archive"]
 # Feature flag to exclude examples that need API updates
 _disabled = []

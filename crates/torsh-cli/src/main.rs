@@ -12,6 +12,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod commands;
 mod config;
+mod tls;
 mod utils;
 
 use commands::*;

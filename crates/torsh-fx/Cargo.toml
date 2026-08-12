@@ -21,6 +21,7 @@ torsh-core = { workspace = true }
 torsh-tensor = { workspace = true }
 # torsh-nn = { path = "../torsh-nn" }  # Temporarily commented out
 petgraph = { workspace = true }
+log = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

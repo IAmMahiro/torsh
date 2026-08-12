@@ -306,9 +306,12 @@ pub enum BufferHandle {
     #[cfg(feature = "webgpu")]
     WebGpu { buffer_ptr: u64, size: usize },
 
-    /// Generic handle for custom backends
+    /// Generic handle for custom backends.
+    ///
+    /// Uses `Arc` (not `Box`) so the handle is cheaply and infallibly
+    /// clonable — a `Clone` impl that can panic is worse than no `Clone`.
     Generic {
-        handle: Box<dyn std::any::Any + Send + Sync>,
+        handle: std::sync::Arc<dyn std::any::Any + Send + Sync>,
         size: usize,
     },
 }
@@ -335,12 +338,10 @@ impl Clone for BufferHandle {
                 buffer_ptr: *buffer_ptr,
                 size: *size,
             },
-            BufferHandle::Generic { .. } => {
-                // For Generic handles, we can't actually clone the Box<dyn Any>
-                // This is a limitation - in practice, backends should avoid using Generic handles
-                // for buffers that need to be cloned
-                panic!("Cannot clone Generic buffer handles")
-            }
+            BufferHandle::Generic { handle, size } => BufferHandle::Generic {
+                handle: std::sync::Arc::clone(handle),
+                size: *size,
+            },
         }
     }
 }

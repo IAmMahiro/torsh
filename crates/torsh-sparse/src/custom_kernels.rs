@@ -203,8 +203,10 @@ impl FormatConversionKernels {
             return CsrTensor::empty(shape.clone());
         }
 
-        // Sort triplets by row, then column (using counting sort for rows if beneficial)
-        let mut sorted_triplets = triplets.clone();
+        // Sort triplets by row, then column (using counting sort for rows if
+        // beneficial). Duplicate coordinates are summed first so the resulting
+        // CSR satisfies the strictly-increasing column invariant.
+        let mut sorted_triplets = coo.coalesced().triplets();
 
         if rows <= 10000 {
             // Use counting sort for small row counts
@@ -248,8 +250,9 @@ impl FormatConversionKernels {
             return CscTensor::empty(shape.clone());
         }
 
-        // Sort by column, then row
-        let mut sorted_triplets = triplets.clone();
+        // Sort by column, then row. Duplicate coordinates are summed first so
+        // the resulting CSC satisfies the strictly-increasing row invariant.
+        let mut sorted_triplets = coo.coalesced().triplets();
 
         if cols <= 10000 {
             // Use counting sort for small column counts

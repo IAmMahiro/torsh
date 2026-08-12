@@ -97,7 +97,11 @@ pub async fn download_files_parallel(
                     );
                 }
 
-                let result = download_file_parallel(&url, &dest_path, config, false).await;
+                // No per-file checksum is available in this batch API's
+                // (url, dest_path) tuple shape, so integrity verification is
+                // not requested here. See `crate::model_info::ModelInfo::download_files`
+                // for a checksum-verified download path.
+                let result = download_file_parallel(&url, &dest_path, config, false, None).await;
 
                 if progress {
                     match &result {
@@ -195,7 +199,7 @@ pub async fn download_file_streaming(
     }
 
     // Create HTTP client
-    let client = Client::builder()
+    let client = crate::tls::client_builder()?
         .user_agent("torsh-hub/0.1.0-alpha.2")
         .timeout(Duration::from_secs(config.timeout_seconds))
         .build()
@@ -296,7 +300,7 @@ impl CdnManager {
     /// * `Ok(CdnManager)` - Successfully created manager
     /// * `Err(TorshError)` - If HTTP client creation fails
     pub fn new(config: CdnConfig) -> Result<Self> {
-        let client = Client::builder()
+        let client = crate::tls::client_builder()?
             .user_agent("torsh-hub/0.1.0-alpha.2")
             .timeout(config.endpoint_timeout)
             .build()
@@ -577,8 +581,10 @@ pub fn download_github_repo(
         println!("Downloading repository {}/{}@{}", owner, repo, branch);
     }
 
-    // Download archive
-    super::core::download_file(&url, &archive_path, verbose)?;
+    // Download archive. GitHub does not publish a stable content hash for
+    // branch/tag tarballs (they are regenerated on demand), so there is no
+    // checksum to verify against here.
+    super::core::download_file(&url, &archive_path, verbose, None)?;
 
     // Extract archive
     extract_tarball(&archive_path, dest_dir)?;
@@ -631,7 +637,10 @@ fn extract_tarball(archive_path: &Path, dest_dir: &Path) -> Result<()> {
         .next_entry()
         .map_err(|e| TorshError::IoError(format!("Failed to read tar entry: {}", e)))?
     {
-        let dest = base_dir.join(&entry.header.name);
+        // Reject entries that would escape `base_dir` ("tar-slip"): an
+        // absolute name or one containing a `..` component. See
+        // `crate::utils::sanitize_archive_entry_path` for the exact rules.
+        let dest = crate::utils::sanitize_archive_entry_path(base_dir, &entry.header.name)?;
         match entry.header.entry_type() {
             EntryType::Directory => {
                 fs::create_dir_all(&dest)
@@ -771,5 +780,173 @@ mod tests {
         let dest_path = std::env::temp_dir().join("test.txt");
         let temp_path = dest_path.with_extension("tmp");
         assert_eq!(temp_path, std::env::temp_dir().join("test.tmp"));
+    }
+
+    /// Build a `.tar.gz` byte stream containing a single entry named
+    /// `entry_name` with the given `data`, using the same TarWriter +
+    /// gzip_compress machinery `download_github_repo` downloads in
+    /// production (just constructed locally instead of over HTTP).
+    fn build_malicious_tar_gz(entry_name: &str, data: &[u8]) -> Vec<u8> {
+        use oxiarc_archive::TarWriter;
+
+        let mut tar_bytes = Vec::new();
+        {
+            let mut writer = TarWriter::new(&mut tar_bytes);
+            writer
+                .add_file(entry_name, data)
+                .expect("crafting a malicious tar entry must itself succeed (writer does not sanitise names)");
+            writer.finish().expect("tar finish should succeed");
+        }
+        oxiarc_deflate::gzip_compress(&tar_bytes, 6).expect("gzip compression should succeed")
+    }
+
+    /// F022 (tar-slip site 1): a tar entry named with a `..`-escaping
+    /// relative path must not be able to write outside the extraction
+    /// directory via `extract_tarball`.
+    #[test]
+    fn f022_extract_tarball_rejects_parent_dir_traversal() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let archive_path = temp_dir.path().join("evil.tar.gz");
+        let dest_dir = temp_dir.path().join("extract_here");
+        std::fs::create_dir_all(&dest_dir).expect("create dest dir");
+
+        // Escapes dest_dir *and* its parent (temp_dir) to land right next to
+        // the destination, so the outcome is trivial to check for.
+        let payload = b"pwned-by-tar-slip";
+        let archive_bytes = build_malicious_tar_gz("../../evil_outside.txt", payload);
+        std::fs::write(&archive_path, &archive_bytes).expect("write archive");
+
+        let result = extract_tarball(&archive_path, &dest_dir);
+        assert!(
+            result.is_err(),
+            "extract_tarball must reject a '..'-escaping entry name"
+        );
+
+        // The escape target must never have been created anywhere near the
+        // destination tree.
+        assert!(!temp_dir.path().join("evil_outside.txt").exists());
+        assert!(!dest_dir.join("../evil_outside.txt").exists());
+    }
+
+    /// F022 (tar-slip site 1): an absolute tar entry path must not be
+    /// extracted verbatim (which would discard `dest_dir` entirely via
+    /// `Path::join`'s absolute-path semantics). Uses a short, fixed
+    /// absolute name (rather than one derived from the temp dir) so the
+    /// entry name always fits in a plain UStar header regardless of how
+    /// long the sandbox's temp path happens to be.
+    #[test]
+    fn f022_extract_tarball_rejects_absolute_path() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let archive_path = temp_dir.path().join("evil_abs.tar.gz");
+        let dest_dir = temp_dir.path().join("extract_here");
+        std::fs::create_dir_all(&dest_dir).expect("create dest dir");
+
+        let absolute_name = "/torsh_hardening_test_absolute_evil.txt";
+        let archive_bytes = build_malicious_tar_gz(absolute_name, b"pwned-by-absolute-path");
+        std::fs::write(&archive_path, &archive_bytes).expect("write archive");
+
+        let result = extract_tarball(&archive_path, &dest_dir);
+        assert!(
+            result.is_err(),
+            "extract_tarball must reject an absolute entry path"
+        );
+        // The rejection must happen before any write is attempted, so the
+        // absolute path must never have been created.
+        assert!(!Path::new(absolute_name).exists());
+    }
+
+    /// Control case: a well-behaved relative entry must still extract
+    /// normally after the sanitisation fix. `extract_tarball` extracts
+    /// relative to `dest_dir.parent()` (matching GitHub's tarball layout,
+    /// which embeds a top-level `repo-branch/` folder that
+    /// `download_github_repo` renames to `dest_dir` afterward), so the
+    /// benign entry lands under `temp_dir.path()`, not `dest_dir` itself.
+    #[test]
+    fn f022_extract_tarball_accepts_benign_relative_path() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let archive_path = temp_dir.path().join("benign.tar.gz");
+        let dest_dir = temp_dir.path().join("extract_here");
+        std::fs::create_dir_all(&dest_dir).expect("create dest dir");
+
+        let archive_bytes = build_malicious_tar_gz("sub/model.bin", b"legit-content");
+        std::fs::write(&archive_path, &archive_bytes).expect("write archive");
+
+        extract_tarball(&archive_path, &dest_dir).expect("benign entry should extract cleanly");
+
+        let extracted = temp_dir.path().join("sub").join("model.bin");
+        assert!(extracted.exists());
+        assert_eq!(
+            std::fs::read(&extracted).expect("read extracted file"),
+            b"legit-content"
+        );
+    }
+
+    /// F022 (tar-slip, symlink case): a `Symlink` tar entry must never be
+    /// materialised on disk, so a later entry naming a path "through" it
+    /// (as if the symlink existed and pointed outside the destination
+    /// tree) cannot use it to escape `base_dir`. `extract_tarball` only
+    /// creates filesystem entries for `EntryType::Directory` and
+    /// `EntryType::File` (every other entry type, including `Symlink` and
+    /// `Hardlink`, falls into its `_ => {}` no-op arm), so this test
+    /// proves that property end-to-end rather than merely asserting it —
+    /// a lexically-clean entry *name* (which `sanitize_archive_entry_path`
+    /// alone would accept) combined with a malicious symlink *target* is
+    /// exactly the case a path-only guard would miss.
+    #[test]
+    fn f022_extract_tarball_never_materialises_symlink_entries() {
+        use oxiarc_archive::TarWriter;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let archive_path = temp_dir.path().join("symlink_evil.tar.gz");
+        let dest_dir = temp_dir.path().join("extract_here");
+        std::fs::create_dir_all(&dest_dir).expect("create dest dir");
+
+        let mut tar_bytes = Vec::new();
+        {
+            let mut writer = TarWriter::new(&mut tar_bytes);
+            // A symlink entry whose *name* is perfectly clean but whose
+            // *target* escapes the extraction root entirely.
+            writer
+                .add_symlink("escape_link", "../../../../../../../../tmp")
+                .expect("writing a symlink entry must itself succeed");
+            // A follow-up entry that would write "through" the symlink
+            // above, were it ever materialised on disk.
+            writer
+                .add_file("escape_link/pwned.txt", b"pwned-via-symlink")
+                .expect("writing the follow-up file entry must itself succeed");
+            writer.finish().expect("tar finish should succeed");
+        }
+        let archive_bytes =
+            oxiarc_deflate::gzip_compress(&tar_bytes, 6).expect("gzip compression should succeed");
+        std::fs::write(&archive_path, &archive_bytes).expect("write archive");
+
+        extract_tarball(&archive_path, &dest_dir).expect(
+            "a Symlink entry must be silently skipped (not rejected), so extraction of the \
+             remaining benign entries still succeeds",
+        );
+
+        let escape_link_path = temp_dir.path().join("escape_link");
+        // `symlink_metadata` does not follow links, so this would still
+        // observe a real filesystem symlink had one been created.
+        if let Ok(meta) = std::fs::symlink_metadata(&escape_link_path) {
+            assert!(
+                !meta.file_type().is_symlink(),
+                "a tar Symlink entry must never be materialised as a real filesystem symlink"
+            );
+        }
+
+        // The follow-up "escape_link/pwned.txt" entry must land as an
+        // ordinary nested file under `base_dir`, never through wherever
+        // the (never created) symlink would have pointed.
+        let nested_file = escape_link_path.join("pwned.txt");
+        assert!(nested_file.exists());
+        assert_eq!(
+            std::fs::read(&nested_file).expect("read nested file"),
+            b"pwned-via-symlink"
+        );
+        assert!(
+            nested_file.starts_with(temp_dir.path()),
+            "the nested file must stay under the extraction root, not escape through a symlink"
+        );
     }
 }

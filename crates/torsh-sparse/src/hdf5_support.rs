@@ -577,7 +577,8 @@ impl Hdf5SparseIO {
         let col_indices_vec: Vec<usize> = col_indices.iter().map(|&x| x as usize).collect();
         let values_vec: Vec<f32> = values.iter().map(|&x| x as f32).collect();
 
-        let csr = CsrTensor::from_raw_parts(row_ptr_vec, col_indices_vec, values_vec, shape)?;
+        // File contents are untrusted: normalise rather than assert.
+        let csr = CsrTensor::from_unsorted_parts(row_ptr_vec, col_indices_vec, values_vec, shape)?;
         Ok(Box::new(csr))
     }
 
@@ -652,7 +653,8 @@ impl Hdf5SparseIO {
         let row_indices_vec: Vec<usize> = row_indices.iter().map(|&x| x as usize).collect();
         let values_vec: Vec<f32> = values.iter().map(|&x| x as f32).collect();
 
-        let csc = CscTensor::from_raw_parts(col_ptr_vec, row_indices_vec, values_vec, shape)?;
+        // File contents are untrusted: normalise rather than assert.
+        let csc = CscTensor::from_unsorted_parts(col_ptr_vec, row_indices_vec, values_vec, shape)?;
         Ok(Box::new(csc))
     }
 

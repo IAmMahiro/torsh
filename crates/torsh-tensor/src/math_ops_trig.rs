@@ -18,7 +18,8 @@ where
 {
     /// Square root of all elements
     pub fn sqrt(&self) -> Result<Self> {
-        self.map(|x| x.sqrt())
+        let result = self.map(|x| x.sqrt())?;
+        Ok(self.record_unary(result, UnaryKind::Sqrt))
     }
 
     /// Square of all elements
@@ -38,12 +39,14 @@ where
 
     /// Exponential of all elements
     pub fn exp(&self) -> Result<Self> {
-        self.map(|x| x.exp())
+        let result = self.map(|x| x.exp())?;
+        Ok(self.record_unary(result, UnaryKind::Exp))
     }
 
     /// Natural logarithm of all elements
     pub fn ln(&self) -> Result<Self> {
-        self.map(|x| x.ln())
+        let result = self.map(|x| x.ln())?;
+        Ok(self.record_unary(result, UnaryKind::Ln))
     }
 
     /// Logarithm base 10 of all elements
@@ -58,17 +61,20 @@ where
 
     /// Natural logarithm of all elements
     pub fn log(&self) -> Result<Self> {
-        self.map(|x| x.ln())
+        let result = self.map(|x| x.ln())?;
+        Ok(self.record_unary(result, UnaryKind::Ln))
     }
 
     /// Sine of all elements
     pub fn sin(&self) -> Result<Self> {
-        self.map(|x| x.sin())
+        let result = self.map(|x| x.sin())?;
+        Ok(self.record_unary(result, UnaryKind::Sin))
     }
 
     /// Cosine of all elements
     pub fn cos(&self) -> Result<Self> {
-        self.map(|x| x.cos())
+        let result = self.map(|x| x.cos())?;
+        Ok(self.record_unary(result, UnaryKind::Cos))
     }
 
     /// Tangent of all elements
@@ -192,6 +198,13 @@ where
 
     /// Hyperbolic tangent of all elements
     pub fn tanh(&self) -> Result<Self> {
+        let result = self.tanh_forward()?;
+        Ok(self.record_unary(result, UnaryKind::Tanh))
+    }
+
+    /// Forward-only tanh (GPU or scalar path); autograd is recorded by the
+    /// public [`Tensor::tanh`] wrapper.
+    fn tanh_forward(&self) -> Result<Self> {
         // GPU fast path: f32 CUDA tensors dispatch to oxicuda's ComputeBackend.
         // Declines to None (CPU fallback) unless a GPU backend is active.
         #[cfg(feature = "gpu")]
@@ -215,7 +228,7 @@ where
         let mut result = self.map(|x| x.powf(exponent))?;
 
         // Set up gradient computation if needed
-        if self.requires_grad {
+        if crate::should_record_grad(self.requires_grad) {
             result.requires_grad = true;
             result.operation = Operation::Power {
                 input: Arc::new(self.clone()),

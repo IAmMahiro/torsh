@@ -92,29 +92,84 @@ pub fn global_kernel_registry() -> &'static CudaKernelRegistry {
 pub struct CudaNeuralOps;
 
 impl CudaNeuralOps {
-    /// Fused convolution + batch norm + ReLU operation
+    /// Convolution followed by inference-mode batch normalisation and ReLU.
+    ///
+    /// This is the *sequential reference path*: no fused CUDA kernel exists yet,
+    /// so the three stages are executed one after another on the active backend.
+    /// Every stage is applied — in particular the batch-norm affine transform
+    /// `y = bn_weight * (x - bn_mean) / sqrt(bn_var + eps) + bn_bias` is really
+    /// computed rather than skipped.
+    ///
+    /// `bn_weight`, `bn_bias`, `bn_mean` and `bn_var` are per-output-channel
+    /// vectors of length `out_channels`; running statistics are used as-is
+    /// (inference semantics), matching a folded-BN inference kernel.
+    #[allow(clippy::too_many_arguments)]
     pub fn fused_conv_bn_relu(
         input: &Tensor,
         weight: &Tensor,
         bias: Option<&Tensor>,
-        _bn_weight: &Tensor,
-        _bn_bias: &Tensor,
-        _bn_mean: &Tensor,
-        _bn_var: &Tensor,
-        _eps: f32,
+        bn_weight: &Tensor,
+        bn_bias: &Tensor,
+        bn_mean: &Tensor,
+        bn_var: &Tensor,
+        eps: f32,
         stride: (usize, usize),
         padding: (usize, usize),
     ) -> Result<Tensor> {
-        // This would implement a fused kernel that combines convolution, batch norm, and ReLU
-        // For now, we'll fall back to sequential operations through scirs2
-
-        // Placeholder implementation - would use actual CUDA kernels
         let conv_output = input.conv2d(weight, bias, stride, padding, (1, 1), 1)?;
-        // Batch norm and ReLU would be custom CUDA kernels
-        conv_output.relu()
+
+        let out_channels = conv_output.shape().dims()[1];
+        for (name, tensor) in [
+            ("bn_weight", bn_weight),
+            ("bn_bias", bn_bias),
+            ("bn_mean", bn_mean),
+            ("bn_var", bn_var),
+        ] {
+            if tensor.shape().numel() != out_channels {
+                return Err(torsh_core::TorshError::InvalidShape(format!(
+                    "fused_conv_bn_relu: {name} has {} elements, expected {} (one per output channel)",
+                    tensor.shape().numel(),
+                    out_channels
+                )));
+            }
+        }
+
+        // Fold the batch-norm statistics into a per-channel scale and shift and
+        // broadcast them over [batch, channel, height, width].
+        let variance = bn_var.to_vec()?;
+        let gamma = bn_weight.to_vec()?;
+        let beta = bn_bias.to_vec()?;
+        let mean = bn_mean.to_vec()?;
+
+        let mut scale_data = Vec::with_capacity(out_channels);
+        let mut shift_data = Vec::with_capacity(out_channels);
+        for channel in 0..out_channels {
+            let denom = (variance[channel] + eps).sqrt();
+            if !denom.is_finite() || denom == 0.0 {
+                return Err(torsh_core::TorshError::InvalidArgument(format!(
+                    "fused_conv_bn_relu: channel {channel} has a non-positive variance ({}) for eps {eps}",
+                    variance[channel]
+                )));
+            }
+            let scale = gamma[channel] / denom;
+            scale_data.push(scale);
+            shift_data.push(beta[channel] - mean[channel] * scale);
+        }
+
+        let scale = Tensor::from_vec(scale_data, &[1, out_channels, 1, 1])?;
+        let shift = Tensor::from_vec(shift_data, &[1, out_channels, 1, 1])?;
+
+        conv_output.mul_op(&scale)?.add_op(&shift)?.relu()
     }
 
-    /// Flash Attention kernel implementation
+    /// Attention over `[batch, seq, head_dim]` inputs.
+    ///
+    /// # Reference implementation
+    ///
+    /// This is a straightforward (non-blocked) scaled dot-product attention, not
+    /// a memory-efficient FlashAttention kernel: the full `[seq, seq]` score
+    /// matrix is materialised. It is kept as the portable reference path until a
+    /// real tiled kernel lands; `block_size` is therefore accepted but unused.
     pub fn flash_attention(
         query: &Tensor,
         key: &Tensor,
@@ -123,16 +178,8 @@ impl CudaNeuralOps {
         scale: f32,
         _block_size: usize,
     ) -> Result<Tensor> {
-        // Flash attention with memory-efficient block-wise computation
-        // This would use a custom CUDA kernel for optimal performance
-
-        let _batch_size = query.shape().dims()[0];
-        let _seq_len = query.shape().dims()[1];
-        let _head_dim = query.shape().dims()[2];
-
-        // For now, implement a simplified version
-        // In practice, this would use block-wise computation
-        let scores = query.matmul(&key.transpose(0, 2)?)?; // Transpose key
+        // Scores are computed over the feature axis: [.., seq, dim] @ [.., dim, seq].
+        let scores = query.matmul(&key.transpose(-2, -1)?)?;
         let scaled_scores = scores.mul_scalar(scale)?;
 
         let attention_weights = if let Some(mask) = mask {

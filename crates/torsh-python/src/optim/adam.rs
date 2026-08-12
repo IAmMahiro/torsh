@@ -27,6 +27,7 @@ pub struct PyAdam {
 #[pymethods]
 impl PyAdam {
     #[new]
+    #[pyo3(signature = (params, lr=None, betas=None, eps=None, weight_decay=None, amsgrad=None))]
     fn new(
         params: Vec<PyTensor>,
         lr: Option<f32>,
@@ -451,6 +452,7 @@ pub struct PyAdamW {
 #[pymethods]
 impl PyAdamW {
     #[new]
+    #[pyo3(signature = (params, lr=None, betas=None, eps=None, weight_decay=None, amsgrad=None))]
     fn new(
         params: Vec<PyTensor>,
         lr: Option<f32>,

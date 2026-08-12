@@ -16,6 +16,7 @@ pub struct PySequential {
 #[pymethods]
 impl PySequential {
     #[new]
+    #[pyo3(signature = (modules=None))]
     fn new(modules: Option<Vec<Py<PyAny>>>) -> PyClassInitializer<Self> {
         let modules = modules.unwrap_or_default();
         (
@@ -174,6 +175,7 @@ pub struct PyModuleList {
 #[pymethods]
 impl PyModuleList {
     #[new]
+    #[pyo3(signature = (modules=None))]
     fn new(modules: Option<Vec<Py<PyAny>>>) -> PyClassInitializer<Self> {
         let modules = modules.unwrap_or_default();
         (

@@ -26,6 +26,7 @@ pub struct PyConv2d {
 #[pymethods]
 impl PyConv2d {
     #[new]
+    #[pyo3(signature = (in_channels, out_channels, kernel_size, stride=None, padding=None, dilation=None, groups=None, bias=None))]
     fn new(
         in_channels: usize,
         out_channels: usize,
@@ -244,6 +245,7 @@ pub struct PyConv1d {
 #[pymethods]
 impl PyConv1d {
     #[new]
+    #[pyo3(signature = (in_channels, out_channels, kernel_size, stride=None, padding=None, dilation=None, groups=None, bias=None))]
     fn new(
         in_channels: usize,
         out_channels: usize,

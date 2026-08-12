@@ -14,6 +14,7 @@
 
 use scirs2_core::numeric::Float;
 use std::sync::Arc;
+use torsh_core::sync::RwLockExt;
 use torsh_core::{
     dtype::{ComplexElement, TensorElement},
     error::{Result, TorshError},
@@ -30,10 +31,10 @@ impl<T: ComplexElement + Copy> Tensor<T> {
         let data = self.to_vec()?;
         let conj_data: Vec<T> = data.iter().map(|&z| z.conj()).collect();
         let mut result = Self::from_data(conj_data, self.shape().dims().to_vec(), self.device)?;
-        result.requires_grad = self.requires_grad;
+        result.requires_grad = crate::should_record_grad(self.requires_grad);
 
         // Set up operation tracking for autograd
-        if self.requires_grad {
+        if crate::should_record_grad(self.requires_grad) {
             result.operation = Operation::Custom(
                 "complex_conj".to_string(),
                 vec![Arc::downgrade(&Arc::new(self.clone()))],
@@ -190,7 +191,7 @@ impl<T: ComplexElement + Copy> Tensor<T> {
         match &self.operation {
             Operation::Leaf => {
                 // Accumulate gradient for leaf nodes
-                let mut grad_lock = self.grad.write().expect("lock should not be poisoned");
+                let mut grad_lock = self.grad.write_or_recover();
                 if let Some(existing_grad) = grad_lock.as_ref() {
                     // Add gradients if they exist
                     let new_grad = existing_grad.add_op(grad_output)?;
@@ -325,7 +326,7 @@ impl<T: ComplexElement + Copy> Tensor<T> {
         let mut result = Self::from_data(result_data, self.shape().dims().to_vec(), self.device)?;
 
         // Set up gradient tracking
-        if self.requires_grad || other.requires_grad {
+        if crate::should_record_grad(self.requires_grad || other.requires_grad) {
             result.requires_grad = true;
             result.operation = Operation::Mul {
                 lhs: Arc::new(self.clone()),
@@ -360,7 +361,7 @@ impl<T: ComplexElement + Copy> Tensor<T> {
         let mut result = Self::from_data(result_data, self.shape().dims().to_vec(), self.device)?;
 
         // Set up gradient tracking
-        if self.requires_grad || other.requires_grad {
+        if crate::should_record_grad(self.requires_grad || other.requires_grad) {
             result.requires_grad = true;
             result.operation = Operation::Add {
                 lhs: Arc::new(self.clone()),

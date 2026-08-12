@@ -10,6 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use torsh_core::sync::{MutexExt, RwLockExt};
 
 /// Buffer size categories for efficient pooling
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -384,8 +385,7 @@ impl OptimizedBufferAllocator {
         match self.strategy {
             AllocationStrategy::Pooled => {
                 if let Some(ref pool) = self.pool {
-                    pool.lock()
-                        .expect("lock should not be poisoned")
+                    pool.lock_or_recover()
                         .get_buffer(optimized_size, optimized_alignment, location)
                 } else {
                     TempBuffer::new(optimized_size, optimized_alignment, location)
@@ -404,9 +404,11 @@ impl OptimizedBufferAllocator {
                 ) {
                     // Use pool for smaller buffers
                     if let Some(ref pool) = self.pool {
-                        pool.lock()
-                            .expect("lock should not be poisoned")
-                            .get_buffer(optimized_size, optimized_alignment, location)
+                        pool.lock_or_recover().get_buffer(
+                            optimized_size,
+                            optimized_alignment,
+                            location,
+                        )
                     } else {
                         TempBuffer::new(optimized_size, optimized_alignment, location)
                     }
@@ -436,9 +438,7 @@ impl OptimizedBufferAllocator {
         match self.strategy {
             AllocationStrategy::Pooled | AllocationStrategy::Hybrid => {
                 if let Some(ref pool) = self.pool {
-                    pool.lock()
-                        .expect("lock should not be poisoned")
-                        .return_buffer(buffer);
+                    pool.lock_or_recover().return_buffer(buffer);
                 }
                 // If no pool, buffer will be dropped automatically
             }
@@ -450,11 +450,9 @@ impl OptimizedBufferAllocator {
 
     /// Get allocation statistics
     pub fn get_allocation_stats(&self) -> Option<AllocationStats> {
-        self.pool.as_ref().map(|pool| {
-            pool.lock()
-                .expect("lock should not be poisoned")
-                .get_stats()
-        })
+        self.pool
+            .as_ref()
+            .map(|pool| pool.lock_or_recover().get_stats())
     }
 
     /// Get allocation pattern analysis
@@ -465,9 +463,7 @@ impl OptimizedBufferAllocator {
     /// Perform maintenance (cleanup, optimization)
     pub fn perform_maintenance(&mut self) {
         if let Some(ref pool) = self.pool {
-            pool.lock()
-                .expect("lock should not be poisoned")
-                .cleanup_idle_buffers();
+            pool.lock_or_recover().cleanup_idle_buffers();
         }
         self.allocation_patterns.analyze_patterns();
         self.cache_optimization
@@ -699,29 +695,23 @@ pub fn allocate_temp_buffer(
     location: &str,
 ) -> AutogradResult<TempBuffer> {
     get_global_allocator()
-        .write()
-        .expect("lock should not be poisoned")
+        .write_or_recover()
         .allocate(size, alignment, location)
 }
 
 pub fn deallocate_temp_buffer(buffer: TempBuffer) {
-    get_global_allocator()
-        .write()
-        .expect("lock should not be poisoned")
-        .deallocate(buffer);
+    get_global_allocator().write_or_recover().deallocate(buffer);
 }
 
 pub fn get_global_allocation_stats() -> Option<AllocationStats> {
     get_global_allocator()
-        .read()
-        .expect("lock should not be poisoned")
+        .read_or_recover()
         .get_allocation_stats()
 }
 
 pub fn perform_global_maintenance() {
     get_global_allocator()
-        .write()
-        .expect("lock should not be poisoned")
+        .write_or_recover()
         .perform_maintenance();
 }
 

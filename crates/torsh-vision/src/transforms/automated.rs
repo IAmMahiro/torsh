@@ -58,6 +58,12 @@ impl AutoAugment {
     /// # Arguments
     ///
     /// * `policies` - Vector of policies, where each policy is a vector of (transform_name, probability) pairs
+    ///
+    /// # Panics
+    ///
+    /// Panics if `policies` is empty, if any policy is empty, or if any
+    /// probability is outside `[0.0, 1.0]`. Use [`Self::try_with_policies`]
+    /// to get an error instead.
     pub fn with_policies(policies: Vec<Vec<(String, f32)>>) -> Self {
         assert!(!policies.is_empty(), "Policies cannot be empty");
         for policy in &policies {
@@ -73,6 +79,32 @@ impl AutoAugment {
             }
         }
         Self { policies }
+    }
+
+    /// Fallible variant of [`Self::with_policies`]
+    pub fn try_with_policies(policies: Vec<Vec<(String, f32)>>) -> Result<Self> {
+        if policies.is_empty() {
+            return Err(VisionError::InvalidArgument(
+                "AutoAugment: policies cannot be empty".to_string(),
+            ));
+        }
+        for (i, policy) in policies.iter().enumerate() {
+            if policy.is_empty() {
+                return Err(VisionError::InvalidArgument(format!(
+                    "AutoAugment: policy {} must have at least one transform",
+                    i
+                )));
+            }
+            for (name, prob) in policy {
+                if !(0.0..=1.0).contains(prob) {
+                    return Err(VisionError::InvalidArgument(format!(
+                        "AutoAugment: probability for '{}' in policy {} must be between 0.0 and 1.0, got {}",
+                        name, i, prob
+                    )));
+                }
+            }
+        }
+        Ok(Self { policies })
     }
 
     /// Get the number of policies
@@ -194,6 +226,10 @@ impl RandAugment {
     ///
     /// * `n` - Number of transformations to apply (typically 1-3)
     /// * `magnitude` - Magnitude of transformations (0.0-10.0)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` is zero. Use [`Self::try_new`] to get an error instead.
     pub fn new(n: usize, magnitude: f32) -> Self {
         assert!(n > 0, "Number of transformations must be positive");
 
@@ -222,6 +258,11 @@ impl RandAugment {
     /// * `n` - Number of transformations to apply
     /// * `magnitude` - Magnitude of transformations
     /// * `transforms` - Available transforms to choose from
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` is zero or `transforms` is empty. Use
+    /// [`Self::try_with_transforms`] to get an error instead.
     pub fn with_transforms(n: usize, magnitude: f32, transforms: Vec<String>) -> Self {
         assert!(n > 0, "Number of transformations must be positive");
         assert!(!transforms.is_empty(), "Transform list cannot be empty");
@@ -234,6 +275,33 @@ impl RandAugment {
             magnitude,
             available_transforms: transforms,
         }
+    }
+
+    /// Fallible variant of [`Self::new`]
+    pub fn try_new(n: usize, magnitude: f32) -> Result<Self> {
+        if n == 0 {
+            return Err(VisionError::InvalidArgument(
+                "RandAugment: n (number of transformations) must be positive".to_string(),
+            ));
+        }
+        crate::transforms::augmentation::validate_in_range(magnitude, 0.0, 10.0, "magnitude")?;
+        Ok(Self::new(n, magnitude))
+    }
+
+    /// Fallible variant of [`Self::with_transforms`]
+    pub fn try_with_transforms(n: usize, magnitude: f32, transforms: Vec<String>) -> Result<Self> {
+        if n == 0 {
+            return Err(VisionError::InvalidArgument(
+                "RandAugment: n (number of transformations) must be positive".to_string(),
+            ));
+        }
+        if transforms.is_empty() {
+            return Err(VisionError::InvalidArgument(
+                "RandAugment: transform list cannot be empty".to_string(),
+            ));
+        }
+        crate::transforms::augmentation::validate_in_range(magnitude, 0.0, 10.0, "magnitude")?;
+        Ok(Self::with_transforms(n, magnitude, transforms))
     }
 
     /// Get the number of transformations

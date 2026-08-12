@@ -11,9 +11,12 @@
 //! - Advanced pooling and coarsening operations
 //! - Spectral hypergraph methods
 //! - Dynamic hypergraph construction
-
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
+
 use crate::parameter::Parameter;
 use crate::{GraphData, GraphLayer};
 use torsh_tensor::{
@@ -44,21 +47,17 @@ pub struct HypergraphData {
 
 impl HypergraphData {
     /// Create a new hypergraph from node features and incidence matrix
-    pub fn new(x: Tensor, incidence_matrix: Tensor) -> Self {
+    pub fn new(x: Tensor, incidence_matrix: Tensor) -> Result<Self> {
         let num_nodes = x.shape().dims()[0];
         let num_hyperedges = incidence_matrix.shape().dims()[1];
 
         // Compute node degrees (sum over hyperedges - axis 1)
-        let node_degrees = incidence_matrix
-            .sum_dim(&[1], false)
-            .expect("sum_dim node_degrees should succeed");
+        let node_degrees = incidence_matrix.sum_dim(&[1], false)?;
 
         // Compute hyperedge cardinalities (sum over nodes - axis 0)
-        let hyperedge_cardinalities = incidence_matrix
-            .sum_dim(&[0], false)
-            .expect("sum_dim hyperedge_cardinalities should succeed");
+        let hyperedge_cardinalities = incidence_matrix.sum_dim(&[0], false)?;
 
-        Self {
+        Ok(Self {
             x,
             incidence_matrix,
             hyperedge_weights: None,
@@ -67,7 +66,7 @@ impl HypergraphData {
             hyperedge_cardinalities,
             num_nodes,
             num_hyperedges,
-        }
+        })
     }
 
     /// Add hyperedge weights
@@ -83,11 +82,8 @@ impl HypergraphData {
     }
 
     /// Convert to regular graph using clique expansion
-    pub fn to_graph_clique_expansion(&self) -> GraphData {
-        let incidence_data = self
-            .incidence_matrix
-            .to_vec()
-            .expect("conversion should succeed");
+    pub fn to_graph_clique_expansion(&self) -> Result<GraphData> {
+        let incidence_data = self.incidence_matrix.to_vec()?;
         let mut edges = Vec::new();
 
         // For each hyperedge, create clique (all pairs of nodes)
@@ -112,22 +108,18 @@ impl HypergraphData {
         }
 
         let edge_index = if edges.is_empty() {
-            zeros(&[2, 0]).expect("zeros empty edge_index should succeed")
+            zeros(&[2, 0])?
         } else {
             let num_edges = edges.len() / 2;
-            from_vec(edges, &[2, num_edges], torsh_core::device::DeviceType::Cpu)
-                .expect("from_vec edge_index should succeed")
+            from_vec(edges, &[2, num_edges], torsh_core::device::DeviceType::Cpu)?
         };
 
-        GraphData::new(self.x.clone(), edge_index)
+        Ok(GraphData::new(self.x.clone(), edge_index))
     }
 
     /// Convert to regular graph using star expansion
-    pub fn to_graph_star_expansion(&self) -> GraphData {
-        let incidence_data = self
-            .incidence_matrix
-            .to_vec()
-            .expect("conversion should succeed");
+    pub fn to_graph_star_expansion(&self) -> Result<GraphData> {
+        let incidence_data = self.incidence_matrix.to_vec()?;
         let mut edges = Vec::new();
 
         // For each hyperedge, create a star with center at virtual node
@@ -148,21 +140,17 @@ impl HypergraphData {
         }
 
         let edge_index = if edges.is_empty() {
-            zeros(&[2, 0]).expect("zeros empty edge_index should succeed")
+            zeros(&[2, 0])?
         } else {
             let num_edges = edges.len() / 2;
-            from_vec(edges, &[2, num_edges], torsh_core::device::DeviceType::Cpu)
-                .expect("from_vec edge_index should succeed")
+            from_vec(edges, &[2, num_edges], torsh_core::device::DeviceType::Cpu)?
         };
 
         // Extend node features with virtual nodes
-        let virtual_features: Tensor = randn(&[self.num_hyperedges, self.x.shape().dims()[1]])
-            .expect("randn virtual_features should succeed");
+        let virtual_features: Tensor = randn(&[self.num_hyperedges, self.x.shape().dims()[1]])?;
         // Concatenate original and virtual node features
-        let node_data = self.x.to_vec().expect("conversion should succeed");
-        let virtual_data = virtual_features
-            .to_vec()
-            .expect("conversion should succeed");
+        let node_data = self.x.to_vec()?;
+        let virtual_data = virtual_features.to_vec()?;
         let mut extended_data = node_data;
         extended_data.extend(virtual_data);
 
@@ -172,10 +160,9 @@ impl HypergraphData {
             extended_data,
             &[total_nodes, features_dim],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec extended_x should succeed");
+        )?;
 
-        GraphData::new(extended_x, edge_index)
+        Ok(GraphData::new(extended_x, edge_index))
     }
 }
 
@@ -199,27 +186,21 @@ impl HGCNConv {
         bias: bool,
         use_attention: bool,
         dropout: f32,
-    ) -> Self {
-        let weight = Parameter::new(
-            randn(&[in_features, out_features]).expect("randn weight should succeed"),
-        );
+    ) -> Result<Self> {
+        let weight = Parameter::new(randn(&[in_features, out_features])?);
         let bias = if bias {
-            Some(Parameter::new(
-                zeros(&[out_features]).expect("zeros bias should succeed"),
-            ))
+            Some(Parameter::new(zeros(&[out_features])?))
         } else {
             None
         };
 
         let attention_weight = if use_attention {
-            Some(Parameter::new(
-                randn(&[out_features]).expect("randn attention_weight should succeed"),
-            ))
+            Some(Parameter::new(randn(&[out_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             weight,
@@ -227,29 +208,24 @@ impl HGCNConv {
             use_attention,
             attention_weight,
             dropout,
-        }
+        })
     }
 
     /// Forward pass through HGCN layer
-    pub fn forward(&self, hypergraph: &HypergraphData) -> HypergraphData {
+    pub fn forward(&self, hypergraph: &HypergraphData) -> Result<HypergraphData> {
         // Simplified implementation for API compatibility
         // Step 1: Transform node features
-        let node_features_transformed = hypergraph
-            .x
-            .matmul(&self.weight.clone_data())
-            .expect("operation should succeed");
+        let node_features_transformed = hypergraph.x.matmul(&self.weight.clone_data())?;
 
         // Step 2: Simplified hypergraph convolution (skip complex aggregation for now)
         let output_features = if let Some(ref bias) = self.bias {
-            node_features_transformed
-                .add(&bias.clone_data())
-                .expect("operation should succeed")
+            node_features_transformed.add(&bias.clone_data())?
         } else {
             node_features_transformed
         };
 
         // Create output hypergraph with updated node features
-        HypergraphData {
+        Ok(HypergraphData {
             x: output_features,
             incidence_matrix: hypergraph.incidence_matrix.clone(),
             hyperedge_weights: hypergraph.hyperedge_weights.clone(),
@@ -258,68 +234,58 @@ impl HGCNConv {
             hyperedge_cardinalities: hypergraph.hyperedge_cardinalities.clone(),
             num_nodes: hypergraph.num_nodes,
             num_hyperedges: hypergraph.num_hyperedges,
-        }
+        })
     }
 
     /// Apply attention mechanism to hyperedge features
-    fn apply_attention(&self, hyperedge_features: &Tensor, _hypergraph: &HypergraphData) -> Tensor {
+    fn apply_attention(
+        &self,
+        hyperedge_features: &Tensor,
+        _hypergraph: &HypergraphData,
+    ) -> Result<Tensor> {
         if let Some(ref attention_weight) = self.attention_weight {
             // Compute attention scores
-            let attention_scores = hyperedge_features
-                .matmul(&attention_weight.clone_data())
-                .expect("operation should succeed");
-            let attention_probs = attention_scores
-                .softmax(-1)
-                .expect("softmax should succeed");
+            let attention_scores = hyperedge_features.matmul(&attention_weight.clone_data())?;
+            let attention_probs = attention_scores.softmax(-1)?;
 
             // Apply attention to features
-            let attention_expanded = attention_probs
-                .unsqueeze(-1)
-                .expect("unsqueeze should succeed");
-            hyperedge_features
-                .mul(&attention_expanded)
-                .expect("operation should succeed")
+            let attention_expanded = attention_probs.unsqueeze(-1)?;
+            Ok(hyperedge_features.mul(&attention_expanded)?)
         } else {
-            hyperedge_features.clone()
+            Ok(hyperedge_features.clone())
         }
     }
 
     /// Normalize aggregated features by node degrees
-    fn normalize_by_degrees(&self, features: &Tensor, hypergraph: &HypergraphData) -> Tensor {
+    fn normalize_by_degrees(
+        &self,
+        features: &Tensor,
+        hypergraph: &HypergraphData,
+    ) -> Result<Tensor> {
         let degrees = &hypergraph.node_degrees;
         let epsilon = 1e-8;
 
         // Add epsilon to prevent division by zero
-        let safe_degrees = degrees
-            .add_scalar(epsilon)
-            .expect("add_scalar should succeed");
-        let inv_degrees = safe_degrees
-            .reciprocal()
-            .expect("reciprocal should succeed");
+        let safe_degrees = degrees.add_scalar(epsilon)?;
+        let inv_degrees = safe_degrees.reciprocal()?;
 
         // Expand inverse degrees to match feature dimensions
         // First squeeze to ensure we have shape [num_nodes] rather than [num_nodes, 1]
         let inv_degrees_squeezed = if inv_degrees.shape().dims().len() > 1 {
-            inv_degrees
-                .squeeze_tensor(1)
-                .expect("squeeze_tensor should succeed")
+            inv_degrees.squeeze_tensor(1)?
         } else {
             inv_degrees
         };
-        let inv_degrees_expanded = inv_degrees_squeezed
-            .unsqueeze(-1)
-            .expect("unsqueeze should succeed");
-        features
-            .mul(&inv_degrees_expanded)
-            .expect("operation should succeed")
+        let inv_degrees_expanded = inv_degrees_squeezed.unsqueeze(-1)?;
+        Ok(features.mul(&inv_degrees_expanded)?)
     }
 }
 
 impl GraphLayer for HGCNConv {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         // Convert regular graph to hypergraph and back for compatibility
-        let hypergraph = graph_to_hypergraph(graph);
-        let output_hypergraph = self.forward(&hypergraph);
+        let hypergraph = graph_to_hypergraph(graph)?;
+        let output_hypergraph = HGCNConv::forward(self, &hypergraph)?;
         output_hypergraph.to_graph_clique_expansion()
     }
 
@@ -358,34 +324,22 @@ impl HyperGATConv {
         heads: usize,
         dropout: f32,
         bias: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let head_dim = out_features / heads;
 
-        let query_weight = Parameter::new(
-            randn(&[in_features, out_features]).expect("randn query_weight should succeed"),
-        );
-        let key_weight = Parameter::new(
-            randn(&[in_features, out_features]).expect("randn key_weight should succeed"),
-        );
-        let value_weight = Parameter::new(
-            randn(&[in_features, out_features]).expect("randn value_weight should succeed"),
-        );
-        let hyperedge_attention = Parameter::new(
-            randn(&[heads, 2 * head_dim]).expect("randn hyperedge_attention should succeed"),
-        );
-        let output_weight = Parameter::new(
-            randn(&[out_features, out_features]).expect("randn output_weight should succeed"),
-        );
+        let query_weight = Parameter::new(randn(&[in_features, out_features])?);
+        let key_weight = Parameter::new(randn(&[in_features, out_features])?);
+        let value_weight = Parameter::new(randn(&[in_features, out_features])?);
+        let hyperedge_attention = Parameter::new(randn(&[heads, 2 * head_dim])?);
+        let output_weight = Parameter::new(randn(&[out_features, out_features])?);
 
         let bias = if bias {
-            Some(Parameter::new(
-                zeros(&[out_features]).expect("zeros bias should succeed"),
-            ))
+            Some(Parameter::new(zeros(&[out_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             heads,
@@ -396,59 +350,39 @@ impl HyperGATConv {
             output_weight,
             bias,
             dropout,
-        }
+        })
     }
 
     /// Forward pass through HyperGAT layer
-    pub fn forward(&self, hypergraph: &HypergraphData) -> HypergraphData {
+    pub fn forward(&self, hypergraph: &HypergraphData) -> Result<HypergraphData> {
         let num_nodes = hypergraph.num_nodes;
         let head_dim = self.out_features / self.heads;
 
         // Linear transformations
-        let queries = hypergraph
-            .x
-            .matmul(&self.query_weight.clone_data())
-            .expect("operation should succeed");
-        let keys = hypergraph
-            .x
-            .matmul(&self.key_weight.clone_data())
-            .expect("operation should succeed");
-        let values = hypergraph
-            .x
-            .matmul(&self.value_weight.clone_data())
-            .expect("operation should succeed");
+        let queries = hypergraph.x.matmul(&self.query_weight.clone_data())?;
+        let keys = hypergraph.x.matmul(&self.key_weight.clone_data())?;
+        let values = hypergraph.x.matmul(&self.value_weight.clone_data())?;
 
         // Reshape for multi-head attention
-        let q = queries
-            .view(&[num_nodes as i32, self.heads as i32, head_dim as i32])
-            .expect("view should succeed");
-        let k = keys
-            .view(&[num_nodes as i32, self.heads as i32, head_dim as i32])
-            .expect("view should succeed");
-        let v = values
-            .view(&[num_nodes as i32, self.heads as i32, head_dim as i32])
-            .expect("view should succeed");
+        let q = queries.view(&[num_nodes as i32, self.heads as i32, head_dim as i32])?;
+        let k = keys.view(&[num_nodes as i32, self.heads as i32, head_dim as i32])?;
+        let v = values.view(&[num_nodes as i32, self.heads as i32, head_dim as i32])?;
 
         // Perform hyperedge-based attention
         let attended_features = self.hyperedge_attention_mechanism(&q, &k, &v, hypergraph);
 
         // Reshape back and apply output transformation
-        let concatenated = attended_features
-            .view(&[num_nodes as i32, self.out_features as i32])
-            .expect("view should succeed");
-        let mut output = concatenated
-            .matmul(&self.output_weight.clone_data())
-            .expect("operation should succeed");
+        let concatenated =
+            attended_features?.view(&[num_nodes as i32, self.out_features as i32])?;
+        let mut output = concatenated.matmul(&self.output_weight.clone_data())?;
 
         // Add bias if present
         if let Some(ref bias) = self.bias {
-            output = output
-                .add(&bias.clone_data())
-                .expect("operation should succeed");
+            output = output.add(&bias.clone_data())?;
         }
 
         // Create output hypergraph
-        HypergraphData {
+        Ok(HypergraphData {
             x: output,
             incidence_matrix: hypergraph.incidence_matrix.clone(),
             hyperedge_weights: hypergraph.hyperedge_weights.clone(),
@@ -457,7 +391,7 @@ impl HyperGATConv {
             hyperedge_cardinalities: hypergraph.hyperedge_cardinalities.clone(),
             num_nodes: hypergraph.num_nodes,
             num_hyperedges: hypergraph.num_hyperedges,
-        }
+        })
     }
 
     /// Hyperedge-based attention mechanism
@@ -467,18 +401,14 @@ impl HyperGATConv {
         k: &Tensor,
         v: &Tensor,
         hypergraph: &HypergraphData,
-    ) -> Tensor {
+    ) -> Result<Tensor> {
         let num_nodes = hypergraph.num_nodes;
         let head_dim = self.out_features / self.heads;
 
         // Initialize output
-        let mut output =
-            zeros(&[num_nodes, self.heads, head_dim]).expect("zeros output should succeed");
+        let mut output = zeros(&[num_nodes, self.heads, head_dim])?;
 
-        let incidence_data = hypergraph
-            .incidence_matrix
-            .to_vec()
-            .expect("conversion should succeed");
+        let incidence_data = hypergraph.incidence_matrix.to_vec()?;
 
         // Process each hyperedge separately
         for e in 0..hypergraph.num_hyperedges {
@@ -498,11 +428,11 @@ impl HyperGATConv {
 
             // Compute attention within hyperedge for each head
             for head in 0..self.heads {
-                self.compute_hyperedge_attention(head, &nodes_in_hyperedge, q, k, v, &mut output);
+                self.compute_hyperedge_attention(head, &nodes_in_hyperedge, q, k, v, &mut output)?;
             }
         }
 
-        output
+        Ok(output)
     }
 
     /// Compute attention for a specific hyperedge and head
@@ -514,92 +444,68 @@ impl HyperGATConv {
         k: &Tensor,
         v: &Tensor,
         output: &mut Tensor,
-    ) {
+    ) -> Result<()> {
         let head_dim = self.out_features / self.heads;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         // For simplicity, use mean pooling within hyperedge
         // In practice, this would use more sophisticated attention
         for &node_i in nodes {
-            let mut aggregated = zeros(&[head_dim]).expect("zeros aggregated should succeed");
+            let mut aggregated = zeros(&[head_dim])?;
             let mut total_weight = 0.0;
 
             for &node_j in nodes {
                 if node_i != node_j {
                     // Get query and key for these nodes and head
                     let q_i = q
-                        .slice_tensor(0, node_i, node_i + 1)
-                        .expect("slice_tensor q_i should succeed")
-                        .slice_tensor(1, head, head + 1)
-                        .expect("slice_tensor q_i head should succeed")
-                        .squeeze_tensor(0)
-                        .expect("squeeze_tensor should succeed")
-                        .squeeze_tensor(0)
-                        .expect("squeeze_tensor should succeed");
+                        .slice_tensor(0, node_i, node_i + 1)?
+                        .slice_tensor(1, head, head + 1)?
+                        .squeeze_tensor(0)?
+                        .squeeze_tensor(0)?;
 
                     let k_j = k
-                        .slice_tensor(0, node_j, node_j + 1)
-                        .expect("slice_tensor k_j should succeed")
-                        .slice_tensor(1, head, head + 1)
-                        .expect("slice_tensor k_j head should succeed")
-                        .squeeze_tensor(0)
-                        .expect("squeeze_tensor should succeed")
-                        .squeeze_tensor(0)
-                        .expect("squeeze_tensor should succeed");
+                        .slice_tensor(0, node_j, node_j + 1)?
+                        .slice_tensor(1, head, head + 1)?
+                        .squeeze_tensor(0)?
+                        .squeeze_tensor(0)?;
 
                     let v_j = v
-                        .slice_tensor(0, node_j, node_j + 1)
-                        .expect("slice_tensor v_j should succeed")
-                        .slice_tensor(1, head, head + 1)
-                        .expect("slice_tensor v_j head should succeed")
-                        .squeeze_tensor(0)
-                        .expect("squeeze_tensor should succeed")
-                        .squeeze_tensor(0)
-                        .expect("squeeze_tensor should succeed");
+                        .slice_tensor(0, node_j, node_j + 1)?
+                        .slice_tensor(1, head, head + 1)?
+                        .squeeze_tensor(0)?
+                        .squeeze_tensor(0)?;
 
                     // Compute attention weight (simplified)
-                    let attention_score = q_i
-                        .dot(&k_j)
-                        .expect("dot should succeed")
-                        .mul_scalar(scale)
-                        .expect("mul_scalar should succeed");
-                    let weight = attention_score
-                        .exp()
-                        .expect("exp should succeed")
-                        .item()
-                        .expect("tensor should have single item");
+                    let attention_score = q_i.dot(&k_j)?.mul_scalar(scale)?;
+                    let weight = attention_score.exp()?.item()?;
 
                     // Aggregate values
-                    let weighted_value = v_j.mul_scalar(weight).expect("mul_scalar should succeed");
-                    aggregated = aggregated
-                        .add(&weighted_value)
-                        .expect("operation should succeed");
+                    let weighted_value = v_j.mul_scalar(weight)?;
+                    aggregated = aggregated.add(&weighted_value)?;
                     total_weight += weight;
                 }
             }
 
             // Normalize and update output
             if total_weight > 0.0 {
-                aggregated = aggregated
-                    .div_scalar(total_weight)
-                    .expect("div_scalar should succeed");
+                aggregated = aggregated.div_scalar(total_weight)?;
 
                 // Update output tensor (simplified assignment)
-                let aggregated_data = aggregated.to_vec().expect("conversion should succeed");
+                let aggregated_data = aggregated.to_vec()?;
                 for (j, &val) in aggregated_data.iter().enumerate() {
-                    output
-                        .set_item(&[node_i, head, j], val)
-                        .expect("set_item should succeed");
+                    output.set_item(&[node_i, head, j], val)?;
                 }
             }
         }
+
+        Ok(())
     }
 }
 
 impl GraphLayer for HyperGATConv {
-    fn forward(&self, graph: &GraphData) -> GraphData {
-        let hypergraph = graph_to_hypergraph(graph);
-        let output_hypergraph = self.forward(&hypergraph);
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
+        let hypergraph = graph_to_hypergraph(graph)?;
+        let output_hypergraph = HyperGATConv::forward(self, &hypergraph)?;
         output_hypergraph.to_graph_clique_expansion()
     }
 
@@ -632,34 +538,32 @@ pub struct HGNNConv {
 
 impl HGNNConv {
     /// Create a new HGNN layer
-    pub fn new(in_features: usize, out_features: usize, bias: bool, use_spectral: bool) -> Self {
-        let weight = Parameter::new(
-            randn(&[in_features, out_features]).expect("randn weight should succeed"),
-        );
+    pub fn new(
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+        use_spectral: bool,
+    ) -> Result<Self> {
+        let weight = Parameter::new(randn(&[in_features, out_features])?);
         let bias = if bias {
-            Some(Parameter::new(
-                zeros(&[out_features]).expect("zeros bias should succeed"),
-            ))
+            Some(Parameter::new(zeros(&[out_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             weight,
             bias,
             use_spectral,
-        }
+        })
     }
 
     /// Forward pass through HGNN layer
-    pub fn forward(&self, hypergraph: &HypergraphData) -> HypergraphData {
+    pub fn forward(&self, hypergraph: &HypergraphData) -> Result<HypergraphData> {
         // Transform node features
-        let x_transformed = hypergraph
-            .x
-            .matmul(&self.weight.clone_data())
-            .expect("operation should succeed");
+        let x_transformed = hypergraph.x.matmul(&self.weight.clone_data())?;
 
         // Compute hypergraph Laplacian and apply convolution
         let output_features = if self.use_spectral {
@@ -669,15 +573,14 @@ impl HGNNConv {
         };
 
         // Add bias if present
+        let output_features = output_features?;
         let final_features = if let Some(ref bias) = self.bias {
-            output_features
-                .add(&bias.clone_data())
-                .expect("operation should succeed")
+            output_features.add(&bias.clone_data())?
         } else {
             output_features
         };
 
-        HypergraphData {
+        Ok(HypergraphData {
             x: final_features,
             incidence_matrix: hypergraph.incidence_matrix.clone(),
             hyperedge_weights: hypergraph.hyperedge_weights.clone(),
@@ -686,129 +589,102 @@ impl HGNNConv {
             hyperedge_cardinalities: hypergraph.hyperedge_cardinalities.clone(),
             num_nodes: hypergraph.num_nodes,
             num_hyperedges: hypergraph.num_hyperedges,
-        }
+        })
     }
 
     /// Spectral convolution using hypergraph Laplacian
-    fn spectral_convolution(&self, features: &Tensor, hypergraph: &HypergraphData) -> Tensor {
+    fn spectral_convolution(
+        &self,
+        features: &Tensor,
+        hypergraph: &HypergraphData,
+    ) -> Result<Tensor> {
         // Compute normalized hypergraph Laplacian
         let laplacian = self.compute_hypergraph_laplacian(hypergraph);
 
         // Apply Laplacian: L @ X
-        laplacian
-            .matmul(features)
-            .expect("operation should succeed")
+        Ok(laplacian?.matmul(features)?)
     }
 
     /// Spatial convolution using incidence matrix
-    fn spatial_convolution(&self, features: &Tensor, hypergraph: &HypergraphData) -> Tensor {
+    fn spatial_convolution(
+        &self,
+        features: &Tensor,
+        hypergraph: &HypergraphData,
+    ) -> Result<Tensor> {
         // Node-to-hyperedge aggregation
-        let incidence_t = hypergraph
-            .incidence_matrix
-            .transpose(0, 1)
-            .expect("transpose should succeed");
-        let hyperedge_features = incidence_t
-            .matmul(features)
-            .expect("operation should succeed");
+        let incidence_t = hypergraph.incidence_matrix.transpose(0, 1)?;
+        let hyperedge_features = incidence_t.matmul(features)?;
 
         // Hyperedge-to-node aggregation
-        let aggregated = hypergraph
-            .incidence_matrix
-            .matmul(&hyperedge_features)
-            .expect("operation should succeed");
+        let aggregated = hypergraph.incidence_matrix.matmul(&hyperedge_features)?;
 
         // Normalize by node degrees
         self.normalize_by_degrees(&aggregated, hypergraph)
     }
 
     /// Compute normalized hypergraph Laplacian
-    fn compute_hypergraph_laplacian(&self, hypergraph: &HypergraphData) -> Tensor {
+    fn compute_hypergraph_laplacian(&self, hypergraph: &HypergraphData) -> Result<Tensor> {
         let h = &hypergraph.incidence_matrix;
         let num_nodes = hypergraph.num_nodes;
 
         // Compute degree matrices
-        let node_degrees = h
-            .sum_dim(&[1], false)
-            .expect("sum_dim node_degrees should succeed");
-        let hyperedge_degrees = h
-            .sum_dim(&[0], false)
-            .expect("sum_dim hyperedge_degrees should succeed");
+        let node_degrees = h.sum_dim(&[1], false)?;
+        let hyperedge_degrees = h.sum_dim(&[0], false)?;
 
         // Create diagonal degree matrices (simplified)
-        let mut d_v = zeros(&[num_nodes, num_nodes]).expect("zeros d_v should succeed");
-        let mut d_e = zeros(&[hypergraph.num_hyperedges, hypergraph.num_hyperedges])
-            .expect("zeros d_e should succeed");
+        let mut d_v = zeros(&[num_nodes, num_nodes])?;
+        let mut d_e = zeros(&[hypergraph.num_hyperedges, hypergraph.num_hyperedges])?;
 
-        let node_deg_data = node_degrees.to_vec().expect("conversion should succeed");
-        let hyperedge_deg_data = hyperedge_degrees
-            .to_vec()
-            .expect("conversion should succeed");
+        let node_deg_data = node_degrees.to_vec()?;
+        let hyperedge_deg_data = hyperedge_degrees.to_vec()?;
 
         // Fill diagonal matrices
         for i in 0..num_nodes {
             let degree = node_deg_data[i].max(1e-8); // Avoid division by zero
-            d_v.set_item(&[i, i], degree.powf(-0.5))
-                .expect("set_item d_v should succeed");
+            d_v.set_item(&[i, i], degree.powf(-0.5))?;
         }
 
         for i in 0..hypergraph.num_hyperedges {
             let degree = hyperedge_deg_data[i].max(1e-8);
-            d_e.set_item(&[i, i], degree.recip())
-                .expect("set_item d_e should succeed");
+            d_e.set_item(&[i, i], degree.recip())?;
         }
 
         // Compute normalized Laplacian: I - D_v^{-1/2} H D_e H^T D_v^{-1/2}
-        let h_t = h.transpose(0, 1).expect("transpose should succeed");
-        let intermediate = d_v
-            .matmul(h)
-            .expect("operation should succeed")
-            .matmul(&d_e)
-            .expect("operation should succeed")
-            .matmul(&h_t)
-            .expect("operation should succeed")
-            .matmul(&d_v)
-            .expect("operation should succeed");
+        let h_t = h.transpose(0, 1)?;
+        let intermediate = d_v.matmul(h)?.matmul(&d_e)?.matmul(&h_t)?.matmul(&d_v)?;
 
         let identity = eye(num_nodes);
-        identity
-            .sub(&intermediate)
-            .expect("operation should succeed")
+        Ok(identity?.sub(&intermediate)?)
     }
 
     /// Normalize features by node degrees
-    fn normalize_by_degrees(&self, features: &Tensor, hypergraph: &HypergraphData) -> Tensor {
+    fn normalize_by_degrees(
+        &self,
+        features: &Tensor,
+        hypergraph: &HypergraphData,
+    ) -> Result<Tensor> {
         let degrees = &hypergraph.node_degrees;
         let epsilon = 1e-8;
 
-        let safe_degrees = degrees
-            .add_scalar(epsilon)
-            .expect("add_scalar should succeed");
-        let inv_sqrt_degrees = safe_degrees
-            .pow_scalar(-0.5)
-            .expect("pow_scalar should succeed");
+        let safe_degrees = degrees.add_scalar(epsilon)?;
+        let inv_sqrt_degrees = safe_degrees.pow_scalar(-0.5)?;
 
         // First squeeze to ensure we have shape [num_nodes] rather than [num_nodes, 1]
         let inv_degrees_squeezed = if inv_sqrt_degrees.shape().dims().len() > 1 {
-            inv_sqrt_degrees
-                .squeeze_tensor(1)
-                .expect("squeeze_tensor should succeed")
+            inv_sqrt_degrees.squeeze_tensor(1)?
         } else {
             inv_sqrt_degrees
         };
-        let inv_degrees_expanded = inv_degrees_squeezed
-            .unsqueeze(-1)
-            .expect("unsqueeze should succeed");
+        let inv_degrees_expanded = inv_degrees_squeezed.unsqueeze(-1)?;
 
-        features
-            .mul(&inv_degrees_expanded)
-            .expect("operation should succeed")
+        Ok(features.mul(&inv_degrees_expanded)?)
     }
 }
 
 impl GraphLayer for HGNNConv {
-    fn forward(&self, graph: &GraphData) -> GraphData {
-        let hypergraph = graph_to_hypergraph(graph);
-        let output_hypergraph = self.forward(&hypergraph);
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
+        let hypergraph = graph_to_hypergraph(graph)?;
+        let output_hypergraph = HGNNConv::forward(self, &hypergraph)?;
         output_hypergraph.to_graph_clique_expansion()
     }
 
@@ -826,56 +702,35 @@ pub mod pooling {
     use super::*;
 
     /// Global hypergraph pooling
-    pub fn global_hypergraph_pool(hypergraph: &HypergraphData, method: PoolingMethod) -> Tensor {
+    pub fn global_hypergraph_pool(
+        hypergraph: &HypergraphData,
+        method: PoolingMethod,
+    ) -> Result<Tensor> {
         match method {
-            PoolingMethod::Mean => hypergraph
-                .x
-                .mean(Some(&[0]), false)
-                .expect("mean pooling should succeed"),
-            PoolingMethod::Max => hypergraph
-                .x
-                .max(Some(0), false)
-                .expect("max pooling should succeed"),
-            PoolingMethod::Sum => hypergraph
-                .x
-                .sum_dim(&[0], false)
-                .expect("sum pooling should succeed"),
+            PoolingMethod::Mean => Ok(hypergraph.x.mean(Some(&[0]), false)?),
+            PoolingMethod::Max => Ok(hypergraph.x.max(Some(0), false)?),
+            PoolingMethod::Sum => Ok(hypergraph.x.sum_dim(&[0], false)?),
             PoolingMethod::Attention => attention_pool(hypergraph),
         }
     }
 
     /// Hyperedge-aware pooling
-    pub fn hyperedge_pool(hypergraph: &HypergraphData, method: PoolingMethod) -> Tensor {
-        let incidence_t = hypergraph
-            .incidence_matrix
-            .transpose(0, 1)
-            .expect("transpose should succeed");
+    pub fn hyperedge_pool(hypergraph: &HypergraphData, method: PoolingMethod) -> Result<Tensor> {
+        let incidence_t = hypergraph.incidence_matrix.transpose(0, 1)?;
 
         match method {
             PoolingMethod::Mean => {
                 // Average pooling over hyperedges
-                let hyperedge_features = incidence_t
-                    .matmul(&hypergraph.x)
-                    .expect("operation should succeed");
-                hyperedge_features
-                    .mean(Some(&[0]), false)
-                    .expect("mean pooling should succeed")
+                let hyperedge_features = incidence_t.matmul(&hypergraph.x)?;
+                Ok(hyperedge_features.mean(Some(&[0]), false)?)
             }
             PoolingMethod::Max => {
-                let hyperedge_features = incidence_t
-                    .matmul(&hypergraph.x)
-                    .expect("operation should succeed");
-                hyperedge_features
-                    .max(Some(0), false)
-                    .expect("max pooling should succeed")
+                let hyperedge_features = incidence_t.matmul(&hypergraph.x)?;
+                Ok(hyperedge_features.max(Some(0), false)?)
             }
             PoolingMethod::Sum => {
-                let hyperedge_features = incidence_t
-                    .matmul(&hypergraph.x)
-                    .expect("operation should succeed");
-                hyperedge_features
-                    .sum_dim(&[0], false)
-                    .expect("sum pooling should succeed")
+                let hyperedge_features = incidence_t.matmul(&hypergraph.x)?;
+                Ok(hyperedge_features.sum_dim(&[0], false)?)
             }
             PoolingMethod::Attention => {
                 // Attention over hyperedges
@@ -888,31 +743,21 @@ pub mod pooling {
     pub fn hierarchical_hypergraph_pool(
         hypergraph: &HypergraphData,
         num_clusters: usize,
-    ) -> HypergraphData {
+    ) -> Result<HypergraphData> {
         // Simplified clustering-based pooling
         let cluster_assignments = cluster_nodes(hypergraph, num_clusters);
         coarsen_hypergraph(hypergraph, &cluster_assignments)
     }
 
     /// Attention-based pooling
-    fn attention_pool(hypergraph: &HypergraphData) -> Tensor {
+    fn attention_pool(hypergraph: &HypergraphData) -> Result<Tensor> {
         // Simplified attention pooling
-        let attention_scores = hypergraph
-            .x
-            .sum_dim(&[1], false)
-            .expect("sum_dim should succeed");
-        let attention_weights = attention_scores.softmax(0).expect("softmax should succeed");
-        let attention_expanded = attention_weights
-            .unsqueeze(-1)
-            .expect("unsqueeze should succeed");
+        let attention_scores = hypergraph.x.sum_dim(&[1], false)?;
+        let attention_weights = attention_scores.softmax(0)?;
+        let attention_expanded = attention_weights.unsqueeze(-1)?;
 
-        let weighted_features = hypergraph
-            .x
-            .mul(&attention_expanded)
-            .expect("operation should succeed");
-        weighted_features
-            .sum_dim(&[0], false)
-            .expect("sum_dim should succeed")
+        let weighted_features = hypergraph.x.mul(&attention_expanded)?;
+        Ok(weighted_features.sum_dim(&[0], false)?)
     }
 
     /// Simple node clustering for hierarchical pooling
@@ -932,19 +777,15 @@ pub mod pooling {
     fn coarsen_hypergraph(
         hypergraph: &HypergraphData,
         cluster_assignments: &[usize],
-    ) -> HypergraphData {
-        let num_clusters = cluster_assignments
-            .iter()
-            .max()
-            .expect("reduction should succeed")
-            + 1;
+    ) -> Result<HypergraphData> {
+        let num_clusters = cluster_assignments.iter().max().copied().unwrap_or(0) + 1;
         let original_features = hypergraph.x.shape().dims()[1];
 
         // Average node features within clusters (simplified implementation)
         let mut coarse_features_data = vec![0.0; num_clusters * original_features];
         let mut cluster_counts = vec![0; num_clusters];
 
-        let node_data = hypergraph.x.to_vec().expect("conversion should succeed");
+        let node_data = hypergraph.x.to_vec()?;
 
         for (node, &cluster) in cluster_assignments.iter().enumerate() {
             cluster_counts[cluster] += 1;
@@ -969,12 +810,10 @@ pub mod pooling {
             coarse_features_data,
             &[num_clusters, original_features],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec coarse_features should succeed");
+        )?;
 
         // Create coarse incidence matrix (simplified)
-        let coarse_incidence = zeros(&[num_clusters, hypergraph.num_hyperedges])
-            .expect("zeros coarse_incidence should succeed");
+        let coarse_incidence = zeros(&[num_clusters, hypergraph.num_hyperedges])?;
 
         HypergraphData::new(coarse_features, coarse_incidence)
     }
@@ -997,7 +836,7 @@ pub mod utils {
     pub fn edge_list_to_hypergraph(
         edges: &[(Vec<usize>, f32)],
         num_nodes: usize,
-    ) -> HypergraphData {
+    ) -> Result<HypergraphData> {
         let num_hyperedges = edges.len();
         let mut incidence_data = vec![0.0; num_nodes * num_hyperedges];
         let mut weights = Vec::new();
@@ -1011,22 +850,21 @@ pub mod utils {
             }
         }
 
-        let features = randn(&[num_nodes, 16]).expect("randn features should succeed"); // Default features
+        let features = randn(&[num_nodes, 16])?; // Default features
         let incidence_matrix = from_vec(
             incidence_data,
             &[num_nodes, num_hyperedges],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec incidence_matrix should succeed");
+        )?;
 
         let hyperedge_weights = from_vec(
             weights,
             &[num_hyperedges],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec hyperedge_weights should succeed");
+        )?;
 
-        HypergraphData::new(features, incidence_matrix).with_hyperedge_weights(hyperedge_weights)
+        Ok(HypergraphData::new(features, incidence_matrix)?
+            .with_hyperedge_weights(hyperedge_weights))
     }
 
     /// Generate random hypergraph
@@ -1035,7 +873,7 @@ pub mod utils {
         num_hyperedges: usize,
         edge_prob: f32,
         features_dim: usize,
-    ) -> HypergraphData {
+    ) -> Result<HypergraphData> {
         let mut rng = scirs2_core::random::thread_rng();
         let mut incidence_data = vec![0.0; num_nodes * num_hyperedges];
 
@@ -1048,27 +886,20 @@ pub mod utils {
             }
         }
 
-        let features = randn(&[num_nodes, features_dim]).expect("randn features should succeed");
+        let features = randn(&[num_nodes, features_dim])?;
         let incidence_matrix = from_vec(
             incidence_data,
             &[num_nodes, num_hyperedges],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec incidence_matrix should succeed");
+        )?;
 
         HypergraphData::new(features, incidence_matrix)
     }
 
     /// Hypergraph metrics
-    pub fn hypergraph_metrics(hypergraph: &HypergraphData) -> HypergraphMetrics {
-        let node_degrees = hypergraph
-            .node_degrees
-            .to_vec()
-            .expect("conversion should succeed");
-        let hyperedge_cardinalities = hypergraph
-            .hyperedge_cardinalities
-            .to_vec()
-            .expect("conversion should succeed");
+    pub fn hypergraph_metrics(hypergraph: &HypergraphData) -> Result<HypergraphMetrics> {
+        let node_degrees = hypergraph.node_degrees.to_vec()?;
+        let hyperedge_cardinalities = hypergraph.hyperedge_cardinalities.to_vec()?;
 
         let avg_node_degree = node_degrees.iter().sum::<f32>() / node_degrees.len() as f32;
         let avg_hyperedge_size =
@@ -1077,13 +908,13 @@ pub mod utils {
         let density = node_degrees.iter().sum::<f32>()
             / (hypergraph.num_nodes * hypergraph.num_hyperedges) as f32;
 
-        HypergraphMetrics {
+        Ok(HypergraphMetrics {
             avg_node_degree,
             avg_hyperedge_size,
             density,
             num_nodes: hypergraph.num_nodes,
             num_hyperedges: hypergraph.num_hyperedges,
-        }
+        })
     }
 
     /// Hypergraph statistics
@@ -1098,9 +929,8 @@ pub mod utils {
 }
 
 /// Convert regular graph to hypergraph (each edge becomes a hyperedge)
-pub fn graph_to_hypergraph(graph: &GraphData) -> HypergraphData {
-    let edge_data = crate::utils::tensor_to_vec2::<f32>(&graph.edge_index)
-        .expect("tensor_to_vec2 should succeed");
+pub fn graph_to_hypergraph(graph: &GraphData) -> Result<HypergraphData> {
+    let edge_data = crate::utils::tensor_to_vec2::<f32>(&graph.edge_index)?;
     let num_edges = edge_data[0].len();
     let num_nodes = graph.num_nodes;
 
@@ -1121,20 +951,22 @@ pub fn graph_to_hypergraph(graph: &GraphData) -> HypergraphData {
         incidence_data,
         &[num_nodes, num_edges],
         torsh_core::device::DeviceType::Cpu,
-    )
-    .expect("from_vec incidence_matrix should succeed");
+    )?;
 
     HypergraphData::new(graph.x.clone(), incidence_matrix)
 }
 
 /// Create identity matrix
-fn eye(n: usize) -> Tensor {
+fn eye(n: usize) -> Result<Tensor> {
     let mut data = vec![0.0; n * n];
     for i in 0..n {
         data[i * n + i] = 1.0;
     }
-    from_vec(data, &[n, n], torsh_core::device::DeviceType::Cpu)
-        .expect("from_vec eye should succeed")
+    Ok(from_vec(
+        data,
+        &[n, n],
+        torsh_core::device::DeviceType::Cpu,
+    )?)
 }
 
 #[cfg(test)]
@@ -1153,7 +985,8 @@ mod tests {
         ];
         let incidence_matrix = from_vec(incidence_data, &[4, 3], DeviceType::Cpu).unwrap();
 
-        let hypergraph = HypergraphData::new(features, incidence_matrix);
+        let hypergraph =
+            HypergraphData::new(features, incidence_matrix).expect("operation should succeed");
 
         assert_eq!(hypergraph.num_nodes, 4);
         assert_eq!(hypergraph.num_hyperedges, 3);
@@ -1166,10 +999,14 @@ mod tests {
         let features = randn(&[3, 4]).unwrap();
         let incidence_matrix =
             from_vec(vec![1.0, 0.0, 1.0, 1.0, 0.0, 1.0], &[3, 2], DeviceType::Cpu).unwrap();
-        let hypergraph = HypergraphData::new(features, incidence_matrix);
+        let hypergraph =
+            HypergraphData::new(features, incidence_matrix).expect("operation should succeed");
 
         let hgcn = HGCNConv::new(4, 8, true, false, 0.1);
-        let output = hgcn.forward(&hypergraph);
+        let output = hgcn
+            .expect("operation should succeed")
+            .forward(&hypergraph)
+            .expect("operation should succeed");
 
         assert_eq!(output.x.shape().dims(), &[3, 8]);
         assert_eq!(output.num_nodes, 3);
@@ -1181,12 +1018,17 @@ mod tests {
         let features = randn(&[3, 4]).unwrap();
         let incidence_matrix =
             from_vec(vec![1.0, 0.0, 1.0, 1.0, 0.0, 1.0], &[3, 2], DeviceType::Cpu).unwrap();
-        let hypergraph = HypergraphData::new(features, incidence_matrix);
+        let hypergraph =
+            HypergraphData::new(features, incidence_matrix).expect("operation should succeed");
 
-        let graph = hypergraph.to_graph_clique_expansion();
+        let graph = hypergraph
+            .to_graph_clique_expansion()
+            .expect("operation should succeed");
         assert_eq!(graph.num_nodes, 3);
 
-        let star_graph = hypergraph.to_graph_star_expansion();
+        let star_graph = hypergraph
+            .to_graph_star_expansion()
+            .expect("operation should succeed");
         assert_eq!(star_graph.num_nodes, 5); // 3 original + 2 virtual nodes
     }
 
@@ -1199,14 +1041,24 @@ mod tests {
             DeviceType::Cpu,
         )
         .unwrap();
-        let hypergraph = HypergraphData::new(features, incidence_matrix);
+        let hypergraph =
+            HypergraphData::new(features, incidence_matrix).expect("operation should succeed");
 
         let pooled_mean =
             pooling::global_hypergraph_pool(&hypergraph, pooling::PoolingMethod::Mean);
-        assert_eq!(pooled_mean.shape().dims(), &[6]);
+        assert_eq!(
+            pooled_mean
+                .expect("operation should succeed")
+                .shape()
+                .dims(),
+            &[6]
+        );
 
         let pooled_max = pooling::global_hypergraph_pool(&hypergraph, pooling::PoolingMethod::Max);
-        assert_eq!(pooled_max.shape().dims(), &[6]);
+        assert_eq!(
+            pooled_max.expect("operation should succeed").shape().dims(),
+            &[6]
+        );
     }
 
     #[test]
@@ -1217,18 +1069,19 @@ mod tests {
             (vec![0, 2, 3], 1.2),
         ];
 
-        let hypergraph = utils::edge_list_to_hypergraph(&edges, 4);
+        let hypergraph =
+            utils::edge_list_to_hypergraph(&edges, 4).expect("operation should succeed");
         assert_eq!(hypergraph.num_nodes, 4);
         assert_eq!(hypergraph.num_hyperedges, 3);
 
-        let metrics = utils::hypergraph_metrics(&hypergraph);
+        let metrics = utils::hypergraph_metrics(&hypergraph).expect("operation should succeed");
         assert!(metrics.avg_node_degree > 0.0);
         assert!(metrics.avg_hyperedge_size > 0.0);
     }
 
     #[test]
     fn test_random_hypergraph_generation() {
-        let hypergraph = utils::random_hypergraph(5, 3, 0.6, 8);
+        let hypergraph = utils::random_hypergraph(5, 3, 0.6, 8).expect("operation should succeed");
         assert_eq!(hypergraph.num_nodes, 5);
         assert_eq!(hypergraph.num_hyperedges, 3);
         assert_eq!(hypergraph.x.shape().dims(), &[5, 8]);
@@ -1243,10 +1096,14 @@ mod tests {
             DeviceType::Cpu,
         )
         .unwrap();
-        let hypergraph = HypergraphData::new(features, incidence_matrix);
+        let hypergraph =
+            HypergraphData::new(features, incidence_matrix).expect("operation should succeed");
 
         let hypergat = HyperGATConv::new(6, 12, 3, 0.1, true);
-        let output = hypergat.forward(&hypergraph);
+        let output = hypergat
+            .expect("operation should succeed")
+            .forward(&hypergraph)
+            .expect("operation should succeed");
 
         assert_eq!(output.x.shape().dims(), &[4, 12]);
         assert_eq!(output.num_nodes, 4);

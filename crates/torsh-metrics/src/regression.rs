@@ -216,11 +216,19 @@ impl Metric for SMAPE {
 
 /// Implementation functions for regression metrics
 
+// Every function below returns `f64::NAN` -- never a plausible-looking
+// `0.0` -- when the input shapes are empty, mismatched, or the tensor data
+// cannot be read. `Metric::compute` is infallible by trait signature (see
+// the crate-wide note in classification.rs), so NaN is the honest way to
+// signal "this input was invalid" through that boundary: it is visibly
+// wrong and fails downstream comparisons, unlike `0.0`, which reads as a
+// perfect model (see F226).
+
 fn compute_mse(predictions: &Tensor, targets: &Tensor) -> f64 {
     match (predictions.to_vec(), targets.to_vec()) {
         (Ok(pred_vec), Ok(target_vec)) => {
             if pred_vec.len() != target_vec.len() || pred_vec.is_empty() {
-                return 0.0;
+                return f64::NAN;
             }
 
             let mut sum_squared_error = 0.0;
@@ -231,7 +239,7 @@ fn compute_mse(predictions: &Tensor, targets: &Tensor) -> f64 {
 
             sum_squared_error / pred_vec.len() as f64
         }
-        _ => 0.0,
+        _ => f64::NAN,
     }
 }
 
@@ -239,7 +247,7 @@ fn compute_mae(predictions: &Tensor, targets: &Tensor) -> f64 {
     match (predictions.to_vec(), targets.to_vec()) {
         (Ok(pred_vec), Ok(target_vec)) => {
             if pred_vec.len() != target_vec.len() || pred_vec.is_empty() {
-                return 0.0;
+                return f64::NAN;
             }
 
             let mut sum_abs_error = 0.0;
@@ -249,7 +257,7 @@ fn compute_mae(predictions: &Tensor, targets: &Tensor) -> f64 {
 
             sum_abs_error / pred_vec.len() as f64
         }
-        _ => 0.0,
+        _ => f64::NAN,
     }
 }
 
@@ -257,7 +265,7 @@ fn compute_mape(predictions: &Tensor, targets: &Tensor, epsilon: f64) -> f64 {
     match (predictions.to_vec(), targets.to_vec()) {
         (Ok(pred_vec), Ok(target_vec)) => {
             if pred_vec.len() != target_vec.len() || pred_vec.is_empty() {
-                return 0.0;
+                return f64::NAN;
             }
 
             let mut sum_percentage_error = 0.0;
@@ -278,10 +286,13 @@ fn compute_mape(predictions: &Tensor, targets: &Tensor, epsilon: f64) -> f64 {
             if count > 0 {
                 (sum_percentage_error / count as f64) * 100.0
             } else {
-                0.0
+                // Every target was within `epsilon` of zero, so the
+                // percentage error is undefined for all samples -- not a
+                // measured 0% error.
+                f64::NAN
             }
         }
-        _ => 0.0,
+        _ => f64::NAN,
     }
 }
 
@@ -293,7 +304,7 @@ fn compute_r2_score(
     match (predictions.to_vec(), targets.to_vec()) {
         (Ok(pred_vec), Ok(target_vec)) => {
             if pred_vec.len() != target_vec.len() || pred_vec.is_empty() {
-                return 0.0;
+                return f64::NAN;
             }
 
             // Calculate mean of targets
@@ -312,14 +323,21 @@ fn compute_r2_score(
                 rss += (target_val - pred_val).powi(2);
             }
 
-            // R² = 1 - (RSS / TSS)
+            // R² = 1 - (RSS / TSS). When the target has zero variance
+            // (TSS = 0) that ratio is undefined; follow scikit-learn's
+            // `force_finite` convention: a perfect prediction (RSS also 0)
+            // scores 1.0, otherwise 0.0 (rather than the arguably more
+            // "correct" NaN, matching the established, tested convention
+            // scikit-learn users expect from this metric).
             if tss > 0.0 {
                 1.0 - (rss / tss)
+            } else if rss == 0.0 {
+                1.0
             } else {
                 0.0
             }
         }
-        _ => 0.0,
+        _ => f64::NAN,
     }
 }
 
@@ -331,7 +349,7 @@ fn compute_explained_variance(
     match (predictions.to_vec(), targets.to_vec()) {
         (Ok(pred_vec), Ok(target_vec)) => {
             if pred_vec.len() != target_vec.len() || pred_vec.is_empty() {
-                return 0.0;
+                return f64::NAN;
             }
 
             let n = pred_vec.len() as f64;
@@ -358,11 +376,13 @@ fn compute_explained_variance(
             // Explained variance = 1 - (residual_var / target_var)
             if target_var > 0.0 {
                 1.0 - (residual_var / target_var)
+            } else if residual_var == 0.0 {
+                1.0
             } else {
                 0.0
             }
         }
-        _ => 0.0,
+        _ => f64::NAN,
     }
 }
 
@@ -370,7 +390,7 @@ fn compute_huber_loss(predictions: &Tensor, targets: &Tensor, delta: f64) -> f64
     match (predictions.to_vec(), targets.to_vec()) {
         (Ok(pred_vec), Ok(target_vec)) => {
             if pred_vec.len() != target_vec.len() || pred_vec.is_empty() {
-                return 0.0;
+                return f64::NAN;
             }
 
             let mut sum_loss = 0.0;
@@ -389,7 +409,7 @@ fn compute_huber_loss(predictions: &Tensor, targets: &Tensor, delta: f64) -> f64
 
             sum_loss / pred_vec.len() as f64
         }
-        _ => 0.0,
+        _ => f64::NAN,
     }
 }
 
@@ -397,7 +417,7 @@ fn compute_log_cosh_loss(predictions: &Tensor, targets: &Tensor) -> f64 {
     match (predictions.to_vec(), targets.to_vec()) {
         (Ok(pred_vec), Ok(target_vec)) => {
             if pred_vec.len() != target_vec.len() || pred_vec.is_empty() {
-                return 0.0;
+                return f64::NAN;
             }
 
             let mut sum_loss = 0.0;
@@ -409,7 +429,7 @@ fn compute_log_cosh_loss(predictions: &Tensor, targets: &Tensor) -> f64 {
 
             sum_loss / pred_vec.len() as f64
         }
-        _ => 0.0,
+        _ => f64::NAN,
     }
 }
 
@@ -417,7 +437,7 @@ fn compute_quantile_loss(predictions: &Tensor, targets: &Tensor, quantile: f64) 
     match (predictions.to_vec(), targets.to_vec()) {
         (Ok(pred_vec), Ok(target_vec)) => {
             if pred_vec.len() != target_vec.len() || pred_vec.is_empty() {
-                return 0.0;
+                return f64::NAN;
             }
 
             let mut sum_loss = 0.0;
@@ -433,7 +453,7 @@ fn compute_quantile_loss(predictions: &Tensor, targets: &Tensor, quantile: f64) 
 
             sum_loss / pred_vec.len() as f64
         }
-        _ => 0.0,
+        _ => f64::NAN,
     }
 }
 
@@ -441,7 +461,7 @@ fn compute_smape(predictions: &Tensor, targets: &Tensor, epsilon: f64) -> f64 {
     match (predictions.to_vec(), targets.to_vec()) {
         (Ok(pred_vec), Ok(target_vec)) => {
             if pred_vec.len() != target_vec.len() || pred_vec.is_empty() {
-                return 0.0;
+                return f64::NAN;
             }
 
             let mut sum_percentage_error = 0.0;
@@ -463,9 +483,12 @@ fn compute_smape(predictions: &Tensor, targets: &Tensor, epsilon: f64) -> f64 {
             if count > 0 {
                 (sum_percentage_error / count as f64) * 100.0
             } else {
-                0.0
+                // Every sample had both prediction and target within
+                // `epsilon` of zero, so the percentage error is undefined,
+                // not a measured 0%.
+                f64::NAN
             }
         }
-        _ => 0.0,
+        _ => f64::NAN,
     }
 }

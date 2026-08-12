@@ -11,9 +11,9 @@ use wide::f32x8;
 #[cfg(feature = "simd")]
 pub fn simd_matmul_f32(a: &[f32], b: &[f32], result: &mut [f32], m: usize, n: usize, k: usize) {
     // A is m x k, B is k x n, result is m x n
-    assert_eq!(a.len(), m * k);
-    assert_eq!(b.len(), k * n);
-    assert_eq!(result.len(), m * n);
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(b.len(), k * n);
+    debug_assert_eq!(result.len(), m * n);
 
     // Initialize result to zero
     result.fill(0.0);

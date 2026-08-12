@@ -55,9 +55,20 @@ pub struct DBSCANResult {
     pub noise_points: Vec<usize>,
 }
 
-impl ClusteringResult for DBSCANResult {
-    fn labels(&self) -> &Tensor {
+impl DBSCANResult {
+    /// Get cluster labels for each data point (-1 for noise points).
+    ///
+    /// DBSCAN always produces labels, so this concrete accessor is
+    /// infallible; see [`ClusteringResult::labels`] for the fallible,
+    /// trait-object-safe equivalent.
+    pub fn labels(&self) -> &Tensor {
         &self.labels
+    }
+}
+
+impl ClusteringResult for DBSCANResult {
+    fn labels(&self) -> Option<&Tensor> {
+        Some(&self.labels)
     }
 
     fn n_clusters(&self) -> usize {
@@ -599,9 +610,20 @@ pub struct HDBSCANResult {
     pub noise_points: Vec<usize>,
 }
 
-impl ClusteringResult for HDBSCANResult {
-    fn labels(&self) -> &Tensor {
+impl HDBSCANResult {
+    /// Get cluster labels for each data point (-1 for noise points).
+    ///
+    /// HDBSCAN always produces labels, so this concrete accessor is
+    /// infallible; see [`ClusteringResult::labels`] for the fallible,
+    /// trait-object-safe equivalent.
+    pub fn labels(&self) -> &Tensor {
         &self.labels
+    }
+}
+
+impl ClusteringResult for HDBSCANResult {
+    fn labels(&self) -> Option<&Tensor> {
+        Some(&self.labels)
     }
 
     fn n_clusters(&self) -> usize {

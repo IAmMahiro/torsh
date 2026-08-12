@@ -222,7 +222,7 @@ impl AsyncSGD {
 
         // Update parameters
         let update = effective_grad.mul_scalar(adaptive_lr)?;
-        *param = param.sub(&update)?;
+        crate::param_update::sub_assign(&mut param, &update)?;
 
         // Record the update
         self.staleness_tracker.record_update(param_id);
@@ -269,7 +269,7 @@ impl AsyncSGD {
                 .mul_scalar(1.0 - mixing_ratio)?
                 .add(&other_param.mul_scalar(mixing_ratio)?)?;
 
-            *param = mixed;
+            crate::param_update::assign(&mut param, &mixed)?;
         }
 
         Ok(())
@@ -548,7 +548,7 @@ pub mod utils {
                 for worker in workers.iter_mut() {
                     if param_idx < worker.params.len() {
                         let mut param = worker.params[param_idx].write();
-                        *param = average.clone();
+                        crate::param_update::assign(&mut param, &average)?;
                     }
                 }
             }

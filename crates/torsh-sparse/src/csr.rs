@@ -61,6 +61,43 @@ impl CsrTensor {
             }
         }
 
+        // Validate the CSR invariants the readers rely on: `row_ptr` must be
+        // non-decreasing, start at 0 and end at nnz, and the column indices of
+        // every row must be strictly increasing. `get()` breaks out of its scan
+        // on the sortedness assumption and the two-pointer sparse matmul
+        // silently drops products when it does not hold.
+        if row_ptr[0] != 0 {
+            return Err(TorshError::InvalidArgument(format!(
+                "Row pointer must start at 0, got {}",
+                row_ptr[0]
+            )));
+        }
+        if row_ptr[rows] != values.len() {
+            return Err(TorshError::InvalidArgument(format!(
+                "Row pointer must end at nnz ({}), got {}",
+                values.len(),
+                row_ptr[rows]
+            )));
+        }
+        for row in 0..rows {
+            let (start, end) = (row_ptr[row], row_ptr[row + 1]);
+            if start > end {
+                return Err(TorshError::InvalidArgument(format!(
+                    "Row pointer must be non-decreasing, got {start} > {end} at row {row}"
+                )));
+            }
+            for i in (start + 1)..end {
+                if col_indices[i - 1] >= col_indices[i] {
+                    return Err(TorshError::InvalidArgument(format!(
+                        "Column indices of row {row} must be strictly increasing, \
+                         got {} then {} (coalesce the COO tensor first)",
+                        col_indices[i - 1],
+                        col_indices[i]
+                    )));
+                }
+            }
+        }
+
         Ok(Self {
             row_ptr,
             col_indices,
@@ -79,6 +116,63 @@ impl CsrTensor {
         shape: Shape,
     ) -> TorshResult<Self> {
         Self::new(row_ptr, col_indices, values, shape)
+    }
+
+    /// Create a CSR tensor from arrays that may be unsorted or hold duplicate
+    /// coordinates
+    ///
+    /// [`CsrTensor::new`] asserts the CSR invariants (sorted, duplicate-free
+    /// column indices per row); this constructor *establishes* them by expanding
+    /// the arrays to coordinates, sorting them and summing duplicates. Use it
+    /// for data coming from outside the crate — SciPy, HDF5, MATLAB — where the
+    /// ordering is not guaranteed.
+    pub fn from_unsorted_parts(
+        row_ptr: Vec<usize>,
+        col_indices: Vec<usize>,
+        values: Vec<f32>,
+        shape: Shape,
+    ) -> TorshResult<Self> {
+        if shape.ndim() != 2 {
+            return Err(TorshError::InvalidArgument(
+                "CSR format currently only supports 2D tensors".to_string(),
+            ));
+        }
+        let rows = shape.dims()[0];
+        if row_ptr.len() != rows + 1 {
+            return Err(TorshError::InvalidArgument(format!(
+                "Row pointer length must be rows + 1, got {} for {} rows",
+                row_ptr.len(),
+                rows
+            )));
+        }
+        if col_indices.len() != values.len() {
+            return Err(TorshError::InvalidArgument(
+                "Column indices and values must have the same length".to_string(),
+            ));
+        }
+
+        let mut row_expanded = Vec::with_capacity(col_indices.len());
+        for row in 0..rows {
+            let (start, end) = (row_ptr[row], row_ptr[row + 1]);
+            if start > end || end > col_indices.len() {
+                return Err(TorshError::InvalidArgument(format!(
+                    "Row pointer range [{start}, {end}) at row {row} is invalid for {} entries",
+                    col_indices.len()
+                )));
+            }
+            for _ in start..end {
+                row_expanded.push(row);
+            }
+        }
+
+        let used = row_ptr[rows];
+        let coo = CooTensor::new(
+            row_expanded,
+            col_indices[..used].to_vec(),
+            values[..used].to_vec(),
+            shape,
+        )?;
+        Self::from_coo(&coo)
     }
 
     /// Create an empty CSR tensor with given shape
@@ -111,14 +205,16 @@ impl CsrTensor {
     }
 
     /// Create from COO tensor
+    ///
+    /// The COO input is coalesced first, so duplicate coordinates are summed
+    /// (PyTorch semantics) instead of being copied through as repeated column
+    /// indices inside a row.
     pub fn from_coo(coo: &CooTensor) -> TorshResult<Self> {
         let shape = coo.shape().clone();
         let rows = shape.dims()[0];
 
-        // Get sorted triplets
-        let mut coo_sorted = coo.clone();
-        coo_sorted.sort_indices();
-        let triplets = coo_sorted.triplets();
+        // Coalesced triplets: sorted by (row, col) with duplicates summed.
+        let triplets = coo.coalesced().triplets();
 
         // Build CSR format
         let mut row_ptr = vec![0];
@@ -268,40 +364,19 @@ impl CsrTensor {
         let rows = shape[0];
         let cols = shape[1];
 
-        // Build CSR format from triplets
-        let mut row_ptr = vec![0; rows + 1];
-
-        // Count non-zeros per row
         for &row in &row_indices {
             if row >= rows {
                 return Err(TorshError::InvalidArgument(format!(
-                    "Row index {} out of bounds for {} rows",
-                    row, rows
+                    "Row index {row} out of bounds for {rows} rows"
                 )));
             }
-            row_ptr[row + 1] += 1;
         }
 
-        // Convert counts to offsets
-        for i in 1..=rows {
-            row_ptr[i] += row_ptr[i - 1];
-        }
-
-        // Sort entries by row, then by column
-        let mut triplets: Vec<(usize, usize, f32)> = row_indices
-            .into_iter()
-            .zip(col_indices.into_iter())
-            .zip(values.into_iter())
-            .map(|((r, c), v)| (r, c, v))
-            .collect();
-
-        triplets.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-        let sorted_col_indices: Vec<usize> = triplets.iter().map(|(_, c, _)| *c).collect();
-        let sorted_values: Vec<f32> = triplets.iter().map(|(_, _, v)| *v).collect();
-
+        // Going through COO sorts the entries by (row, col) and sums duplicate
+        // coordinates, which is what the CSR invariants require.
         let shape = Shape::new(vec![rows, cols]);
-        Self::new(row_ptr, sorted_col_indices, sorted_values, shape)
+        let coo = CooTensor::new(row_indices, col_indices, values, shape)?;
+        Self::from_coo(&coo)
     }
 
     /// Convert CSR tensor to dense tensor

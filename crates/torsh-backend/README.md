@@ -7,7 +7,7 @@ Unified backend implementation for ToRSh with PyTorch-compatible API, leveraging
 This crate provides a unified backend system with feature-gated compute backends:
 
 - **CPU Backend**: Optimized CPU operations with SIMD and parallelism, via scirs2-core (oxiblas-backed)
-- **CUDA Backend**: NVIDIA GPU acceleration via the `cust`/`cuda-sys` crates directly (device/memory/stream/graph management is implemented; core tensor kernels such as conv2d/pooling/batchnorm/softmax/reductions and tensor-core GEMM/conv are still no-op stubs — see TODO.md)
+- **CUDA Backend**: torsh-backend does **not** provide its own CUDA compute stack. The `cuda` feature only selects a pure-Rust honest-fallback API (every device op returns an error or delegates to the CPU). Real NVIDIA GPU acceleration lives in `torsh-tensor`'s oxicuda-based `GpuDispatch` (runtime driver load, no CUDA SDK at build time).
 - **Metal Backend**: Apple GPU acceleration via the `metal`/`objc2` crates directly
 - **ROCm Backend**: AMD GPU acceleration (feature flag reserved; no HIP/ROCm bindings implemented yet)
 - **WebGPU Backend**: Cross-platform GPU support implemented natively in this crate via `wgpu` (not via scirs2-core)
@@ -31,12 +31,12 @@ let backend = Backend::new(BackendType::Metal)?; // Explicit Metal
 
 ```toml
 [dependencies]
-torsh-backend = { version = "0.1.3", features = ["cuda", "metal"] }
+torsh-backend = { version = "0.2.0", features = ["cuda", "metal"] }
 
 # Available features:
 # - "cpu" (default): CPU backend with SIMD optimizations (scirs2-core parallel/simd, oxiblas-backed)
-# - "cuda": NVIDIA GPU backend via the cust/cuda-sys crates (x86_64 Linux/Windows only; core
-#           tensor kernels are still stubbed pending an oxicuda-based rewrite, see TODO.md)
+# - "cuda": pure-Rust honest-fallback CUDA API only (ops error or route to CPU); real GPU
+#           compute lives in torsh-tensor's oxicuda GpuDispatch, not here
 # - "metal": Apple GPU backend via the metal/objc2 crates
 # - "rocm": AMD GPU backend (feature flag reserved; not yet implemented)
 # - "webgpu": WebGPU backend via the wgpu crate, implemented natively in this crate
@@ -84,23 +84,13 @@ let cpu_backend = Backend::cpu()
 let result = cpu_backend.gemm(&a, &b, 1.0, &c, 0.0)?;
 ```
 
-### CUDA Backend  
+### CUDA Backend
 
-```rust
-#[cfg(feature = "cuda")]
-{
-    // CUDA backend via scirs2-core's CUDA kernels
-    let cuda_backend = Backend::cuda()
-        .device(0)
-        .enable_cudnn(true)
-        .enable_tensor_cores(true)
-        .build()?;
-    
-    // Async execution with streams
-    let stream = cuda_backend.create_stream()?;
-    cuda_backend.matmul_async(&a, &b, &stream).await?;
-}
-```
+torsh-backend's `cuda` feature exposes only a pure-Rust honest-fallback API:
+`Backend::cuda()` never yields a working device here (it returns an error), and
+`torsh_backend::cuda::is_available()` is always `false`. For real GPU compute,
+use `torsh-tensor`'s oxicuda-based path, which loads the CUDA driver at runtime
+without a build-time SDK.
 
 ### Metal Backend
 
@@ -196,14 +186,6 @@ let backend = backend.enable_mixed_precision(MixedPrecisionConfig {
     scale_factor: 65536.0,
 })?;
 
-// Graph optimization (when using CUDA)
-#[cfg(feature = "cuda")]
-let graph = backend.capture_graph(|| {
-    let x = backend.matmul(&a, &b)?;
-    let y = backend.relu(&x)?;
-    backend.matmul(&y, &c)
-})?;
-let result = backend.launch_graph(&graph, &inputs)?;
 ```
 
 ## Integration with SciRS2
@@ -215,14 +197,14 @@ This crate uses scirs2-core for CPU (parallel/SIMD, oxiblas) and integrates its 
 | Backend | Implementation | Features |
 |---------|----------------|----------|
 | CPU | ✅ scirs2-core (`parallel`, `simd` features; oxiblas-backed) | SIMD, Rayon/scirs2 parallelism, auto-tuning |
-| CUDA | ⚠️ Direct via `cust`/`cuda-sys` (feature `cuda`, x86_64 Linux/Windows only) | Device/memory/stream/graph management implemented; core tensor kernels (conv2d, pooling, batch norm, softmax, reductions) and tensor-core GEMM/conv are still no-op stubs — see TODO.md |
+| CUDA | ➡️ Delegated to `torsh-tensor` (oxicuda). torsh-backend's `cuda` feature is a pure-Rust honest fallback only (ops error or route to CPU) | Real GPU compute via `torsh-tensor`'s runtime-loaded oxicuda `GpuDispatch` — no CUDA SDK at build time |
 | Metal | ✅ Direct via `metal`/`objc2` (feature `metal`) | Metal Performance Shaders, Neural Engine hooks, unified memory |
 | ROCm | 🚧 Not implemented | `rocm` feature flag reserved (`rocm = []`); no HIP/ROCm bindings yet |
 | WebGPU | ✅ Direct via `wgpu`, implemented natively in this crate (feature `webgpu`) | Device/buffer/pipeline/multi-device management with real cross-device buffer copies |
 
 ### Implementation Notes
 
-- **GPU Kernels**: CPU ops route through scirs2-core (oxiblas-backed); CUDA, Metal, and WebGPU backends are implemented directly against their native crates (`cust`/`cuda-sys`, `metal`/`objc2`, `wgpu`) rather than through scirs2-core
+- **GPU Kernels**: CPU ops route through scirs2-core (oxiblas-backed); Metal and WebGPU backends are implemented directly against their native crates (`metal`/`objc2`, `wgpu`). CUDA compute is delegated to `torsh-tensor`'s oxicuda path rather than duplicated here
 - **Auto-tuning**: Kernel selection via this crate's own auto-tuning system (`cpu/autotuning.rs`)
 - **Memory Management**: Backend-specific memory pools plus a unified memory pool implemented in this crate
 - **Async Execution**: WebGPU and CUDA async APIs implemented natively in this crate
@@ -237,14 +219,14 @@ The previous separate backend crates (`torsh-backend-cpu`, `torsh-backend-cuda`,
 torsh-backend-cuda = "0.1.3"
 
 # New (unified)
-torsh-backend = { version = "0.1.3", features = ["cuda"] }
+torsh-backend = { version = "0.2.0", features = ["cuda"] }
 ```
 
 ## Dependencies
 
 Key dependency versions used by this crate:
 
-- `wgpu 29.x` — WebGPU compute backend (cross-platform GPU support)
+- `wgpu 30.x` — WebGPU compute backend (cross-platform GPU support)
 
 ## License
 

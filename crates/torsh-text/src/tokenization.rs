@@ -58,8 +58,14 @@ impl WhitespaceTokenizer {
         }
     }
 
+    /// Build a vocabulary from a corpus.
+    ///
+    /// Token IDs are assigned deterministically: words are ordered by
+    /// descending corpus frequency with the token string as tiebreak, so the
+    /// same corpus always yields the same word-to-ID mapping (checkpoints and
+    /// serialised ID sequences stay valid across runs).
     pub fn from_texts(texts: &[String], min_freq: usize) -> Self {
-        let mut word_counts = HashMap::new();
+        let mut word_counts: HashMap<String, usize> = HashMap::new();
 
         for text in texts {
             for word in text.split_whitespace() {
@@ -73,9 +79,16 @@ impl WhitespaceTokenizer {
         vocab.insert("<bos>".to_string(), 2);
         vocab.insert("<eos>".to_string(), 3);
 
+        // Deterministic ordering: most frequent first, ties broken lexicographically.
+        let mut ordered: Vec<(String, usize)> = word_counts
+            .into_iter()
+            .filter(|(_, count)| *count >= min_freq)
+            .collect();
+        ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
         let mut idx = 4;
-        for (word, count) in word_counts {
-            if count >= min_freq {
+        for (word, _) in ordered {
+            if !vocab.contains_key(&word) {
                 vocab.insert(word, idx);
                 idx += 1;
             }
@@ -291,6 +304,55 @@ impl Tokenizer for SubwordTokenizer {
     }
 }
 
+/// Replace every occurrence of the adjacent pair `(left, right)` in `tokens`
+/// with the concatenated token, scanning left to right.
+fn merge_token_pair(tokens: &mut Vec<String>, left: &str, right: &str) {
+    if tokens.len() < 2 {
+        return;
+    }
+
+    let mut merged = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        if i + 1 < tokens.len() && tokens[i] == left && tokens[i + 1] == right {
+            merged.push(format!("{}{}", left, right));
+            i += 2;
+        } else {
+            merged.push(tokens[i].clone());
+            i += 1;
+        }
+    }
+
+    *tokens = merged;
+}
+
+/// Count adjacent token pairs across frequency-weighted token sequences.
+fn count_token_pairs(sequences: &[(Vec<String>, usize)]) -> HashMap<(String, String), usize> {
+    let mut pair_counts: HashMap<(String, String), usize> = HashMap::new();
+
+    for (tokens, freq) in sequences {
+        for window in tokens.windows(2) {
+            if let [left, right] = window {
+                *pair_counts
+                    .entry((left.clone(), right.clone()))
+                    .or_insert(0) += *freq;
+            }
+        }
+    }
+
+    pair_counts
+}
+
+/// Pick the pair to merge next: highest count, ties broken by the
+/// lexicographically smallest pair so that training is reproducible.
+fn select_best_pair(
+    pair_counts: HashMap<(String, String), usize>,
+) -> Option<((String, String), usize)> {
+    let mut ranked: Vec<((String, String), usize)> = pair_counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.into_iter().next()
+}
+
 /// Byte Pair Encoding (BPE) tokenizer
 pub struct BPETokenizer {
     vocab: HashMap<String, u32>,
@@ -322,13 +384,40 @@ impl BPETokenizer {
         }
     }
 
-    /// Train BPE from texts
+    /// Default minimum number of occurrences a pair must have to be merged.
+    pub const DEFAULT_MIN_PAIR_FREQUENCY: usize = 2;
+
+    /// Train BPE from texts.
+    ///
+    /// Uses [`Self::DEFAULT_MIN_PAIR_FREQUENCY`] as the minimum pair frequency;
+    /// see [`BPETokenizer::from_texts_with_min_frequency`] for details.
     pub fn from_texts(texts: &[String], vocab_size: usize) -> Result<Self> {
+        Self::from_texts_with_min_frequency(texts, vocab_size, Self::DEFAULT_MIN_PAIR_FREQUENCY)
+    }
+
+    /// Train BPE from texts with an explicit minimum pair frequency.
+    ///
+    /// This is the standard byte-pair-encoding training loop: every unique word
+    /// is split into characters once, and on each iteration the most frequent
+    /// adjacent pair is merged *in the working token sequences* so that the next
+    /// iteration counts pairs over the already-merged tokens. Training stops as
+    /// soon as the vocabulary budget is reached, no pair is left, or the best
+    /// remaining pair occurs fewer than `min_pair_frequency` times.
+    ///
+    /// Ordering is fully deterministic — characters are seeded by descending
+    /// frequency with the token string as tiebreak, and the best pair is chosen
+    /// by descending count with the pair itself as tiebreak — so repeated runs
+    /// on the same corpus produce byte-identical vocabularies and merge lists.
+    pub fn from_texts_with_min_frequency(
+        texts: &[String],
+        vocab_size: usize,
+        min_pair_frequency: usize,
+    ) -> Result<Self> {
         let mut tokenizer = Self::new();
 
-        // Count character frequencies
-        let mut char_counts = HashMap::new();
-        let mut word_counts = HashMap::new();
+        // Count character and word frequencies
+        let mut char_counts: HashMap<String, usize> = HashMap::new();
+        let mut word_counts: HashMap<String, usize> = HashMap::new();
 
         for text in texts {
             for word in text.split_whitespace() {
@@ -339,9 +428,15 @@ impl BPETokenizer {
             }
         }
 
-        // Add characters to vocabulary
-        let mut current_id = 4;
-        for (ch, _) in char_counts {
+        // Seed the vocabulary with single characters in a deterministic order.
+        let mut ordered_chars: Vec<(String, usize)> = char_counts.into_iter().collect();
+        ordered_chars.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut current_id = tokenizer.vocab.len() as u32;
+        for (ch, _) in ordered_chars {
+            if tokenizer.vocab.len() >= vocab_size {
+                break;
+            }
             if !tokenizer.vocab.contains_key(&ch) {
                 tokenizer.vocab.insert(ch.clone(), current_id);
                 tokenizer.reverse_vocab.insert(current_id, ch);
@@ -349,28 +444,48 @@ impl BPETokenizer {
             }
         }
 
-        // Learn BPE merges
-        while tokenizer.vocab.len() < vocab_size {
-            let mut pair_counts = HashMap::new();
+        // Working token sequences, carried (and merged) across iterations.
+        let mut ordered_words: Vec<(String, usize)> = word_counts.into_iter().collect();
+        ordered_words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut word_tokens: Vec<(Vec<String>, usize)> = ordered_words
+            .into_iter()
+            .map(|(word, freq)| (Self::get_word_tokens(&word), freq))
+            .collect();
 
-            for (word, freq) in &word_counts {
-                let tokens = Self::get_word_tokens(word);
-                for i in 0..tokens.len().saturating_sub(1) {
-                    let pair = (tokens[i].clone(), tokens[i + 1].clone());
-                    *pair_counts.entry(pair).or_insert(0) += freq;
-                }
+        // Hard cap: at most one new token per iteration, so the budget bounds
+        // the number of iterations even if a merge produces an existing token.
+        let max_merges = vocab_size.saturating_sub(tokenizer.vocab.len());
+
+        for _ in 0..max_merges {
+            if tokenizer.vocab.len() >= vocab_size {
+                break;
             }
 
-            if let Some((best_pair, _)) = pair_counts.iter().max_by_key(|(_, &count)| count) {
-                let new_token = best_pair.0.clone() + &best_pair.1;
+            // Recount pairs over the CURRENT (already merged) token sequences.
+            let pair_counts = count_token_pairs(&word_tokens);
+
+            let (best_pair, best_count) = match select_best_pair(pair_counts) {
+                Some(entry) => entry,
+                None => break,
+            };
+
+            if best_count < min_pair_frequency {
+                break;
+            }
+
+            let new_token = format!("{}{}", best_pair.0, best_pair.1);
+            if !tokenizer.vocab.contains_key(&new_token) {
                 tokenizer.vocab.insert(new_token.clone(), current_id);
                 tokenizer.reverse_vocab.insert(current_id, new_token);
-                tokenizer
-                    .merges
-                    .push((best_pair.0.clone(), best_pair.1.clone()));
                 current_id += 1;
-            } else {
-                break;
+            }
+            tokenizer
+                .merges
+                .push((best_pair.0.clone(), best_pair.1.clone()));
+
+            // Apply the merge to every working sequence.
+            for (tokens, _) in word_tokens.iter_mut() {
+                merge_token_pair(tokens, &best_pair.0, &best_pair.1);
             }
         }
 
@@ -381,20 +496,10 @@ impl BPETokenizer {
     fn apply_bpe(&self, word: &str) -> Vec<String> {
         let mut tokens = Self::get_word_tokens(word);
 
+        // Merges are replayed in the order they were learned, which is exactly
+        // how they were applied during training.
         for (left, right) in &self.merges {
-            let mut new_tokens = Vec::new();
-            let mut i = 0;
-
-            while i < tokens.len() {
-                if i < tokens.len() - 1 && tokens[i] == *left && tokens[i + 1] == *right {
-                    new_tokens.push(left.to_string() + right);
-                    i += 2;
-                } else {
-                    new_tokens.push(tokens[i].clone());
-                    i += 1;
-                }
-            }
-            tokens = new_tokens;
+            merge_token_pair(&mut tokens, left, right);
         }
 
         tokens
@@ -588,14 +693,47 @@ pub mod advanced {
             self
         }
 
-        /// Train byte-level BPE from texts
+        /// Train byte-level BPE from texts.
+        ///
+        /// Uses [`super::BPETokenizer::DEFAULT_MIN_PAIR_FREQUENCY`] as the
+        /// minimum pair frequency; see
+        /// [`ByteLevelBPETokenizer::from_texts_with_min_frequency`].
         pub fn from_texts(texts: &[String], vocab_size: usize) -> Result<Self> {
+            Self::from_texts_with_min_frequency(
+                texts,
+                vocab_size,
+                super::BPETokenizer::DEFAULT_MIN_PAIR_FREQUENCY,
+            )
+        }
+
+        /// Train byte-level BPE from texts with an explicit minimum pair frequency.
+        ///
+        /// The full byte alphabet is always seeded (byte-level BPE must stay
+        /// lossless), then merges are learned with the standard BPE loop: the
+        /// most frequent adjacent pair is merged *in the working byte sequences*
+        /// so that the next iteration counts pairs over already-merged tokens.
+        /// Pair selection is deterministic (highest count, lexicographically
+        /// smallest pair as tiebreak), so training is reproducible.
+        ///
+        /// The corpus is pre-tokenized into maximal whitespace / non-whitespace
+        /// runs and deduplicated into a chunk-frequency table before training,
+        /// so the per-iteration pair count is proportional to the number of
+        /// *unique* chunks rather than to the corpus length, and merges never
+        /// span a word boundary. Overall cost is
+        /// `O(unique_chunk_tokens x (vocab_size - 259))`.
+        pub fn from_texts_with_min_frequency(
+            texts: &[String],
+            vocab_size: usize,
+            min_pair_frequency: usize,
+        ) -> Result<Self> {
             let mut tokenizer = Self::new();
 
-            // Initialize vocabulary with all bytes
-            let mut current_id = 3;
-            for i in 0..256 {
-                let byte_char = tokenizer.byte_encoder[&(i as u8)];
+            // Initialize vocabulary with the complete byte alphabet
+            let mut current_id = tokenizer.vocab.len() as u32;
+            for i in 0..=255u8 {
+                let byte_char = tokenizer.byte_encoder.get(&i).copied().ok_or_else(|| {
+                    TextError::TokenizationError(format!("byte {i} missing from byte encoder"))
+                })?;
                 let token = byte_char.to_string();
                 if !tokenizer.vocab.contains_key(&token) {
                     tokenizer.vocab.insert(token.clone(), current_id);
@@ -604,44 +742,98 @@ pub mod advanced {
                 }
             }
 
-            // Count byte pair frequencies
-            let mut pair_counts = HashMap::new();
+            // Pre-tokenize into chunks and deduplicate, so the working set stays
+            // proportional to the number of distinct chunks in the corpus.
+            let mut chunk_counts: HashMap<String, usize> = HashMap::new();
             for text in texts {
-                let byte_tokens = tokenizer.text_to_bytes(text);
-                for window in byte_tokens.windows(2) {
-                    if let [a, b] = window {
-                        let pair = (a.clone(), b.clone());
-                        *pair_counts.entry(pair).or_insert(0) += 1;
-                    }
+                for chunk in Self::split_into_chunks(text) {
+                    *chunk_counts.entry(chunk).or_insert(0) += 1;
                 }
             }
 
-            // Learn merges
-            while tokenizer.vocab.len() < vocab_size {
-                if let Some((best_pair, _)) = pair_counts.iter().max_by_key(|(_, &count)| count) {
-                    let best_pair = best_pair.clone(); // Clone to avoid borrow checker issues
-                    let new_token = best_pair.0.clone() + &best_pair.1;
+            let mut ordered_chunks: Vec<(String, usize)> = chunk_counts.into_iter().collect();
+            ordered_chunks.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+            // Working byte sequences, merged in place on every iteration.
+            let mut sequences: Vec<(Vec<String>, usize)> = ordered_chunks
+                .into_iter()
+                .map(|(chunk, freq)| Ok((tokenizer.text_to_bytes(&chunk)?, freq)))
+                .collect::<Result<Vec<_>>>()?;
+
+            let max_merges = vocab_size.saturating_sub(tokenizer.vocab.len());
+
+            for _ in 0..max_merges {
+                if tokenizer.vocab.len() >= vocab_size {
+                    break;
+                }
+
+                let pair_counts = super::count_token_pairs(&sequences);
+                let (best_pair, best_count) = match super::select_best_pair(pair_counts) {
+                    Some(entry) => entry,
+                    None => break,
+                };
+
+                if best_count < min_pair_frequency {
+                    break;
+                }
+
+                let new_token = format!("{}{}", best_pair.0, best_pair.1);
+                if !tokenizer.vocab.contains_key(&new_token) {
                     tokenizer.vocab.insert(new_token.clone(), current_id);
                     tokenizer.reverse_vocab.insert(current_id, new_token);
-                    tokenizer
-                        .merges
-                        .push((best_pair.0.clone(), best_pair.1.clone()));
                     current_id += 1;
+                }
+                tokenizer
+                    .merges
+                    .push((best_pair.0.clone(), best_pair.1.clone()));
 
-                    // Update pair counts for next iteration
-                    pair_counts.remove(&best_pair);
-                } else {
-                    break;
+                for (tokens, _) in sequences.iter_mut() {
+                    super::merge_token_pair(tokens, &best_pair.0, &best_pair.1);
                 }
             }
 
             Ok(tokenizer)
         }
 
+        /// Split text into maximal runs of whitespace / non-whitespace.
+        ///
+        /// This is the training-time pre-tokenization step: merges are learned
+        /// within a chunk, never across a word boundary, and identical chunks
+        /// are counted once instead of being re-scanned for every occurrence.
+        fn split_into_chunks(text: &str) -> Vec<String> {
+            let mut chunks: Vec<String> = Vec::new();
+            let mut current = String::new();
+            let mut current_is_whitespace: Option<bool> = None;
+
+            for ch in text.chars() {
+                let is_whitespace = ch.is_whitespace();
+                if current_is_whitespace != Some(is_whitespace) && !current.is_empty() {
+                    chunks.push(std::mem::take(&mut current));
+                }
+                current_is_whitespace = Some(is_whitespace);
+                current.push(ch);
+            }
+
+            if !current.is_empty() {
+                chunks.push(current);
+            }
+
+            chunks
+        }
+
         /// Convert text to byte tokens
-        fn text_to_bytes(&self, text: &str) -> Vec<String> {
+        fn text_to_bytes(&self, text: &str) -> Result<Vec<String>> {
             text.bytes()
-                .map(|b| self.byte_encoder[&b].to_string())
+                .map(|b| {
+                    self.byte_encoder
+                        .get(&b)
+                        .map(|ch| ch.to_string())
+                        .ok_or_else(|| {
+                            TextError::TokenizationError(format!(
+                                "byte {b} missing from byte encoder"
+                            ))
+                        })
+                })
                 .collect()
         }
 
@@ -655,22 +847,7 @@ pub mod advanced {
 
             let mut current_tokens = tokens;
             for (left, right) in merges {
-                let mut new_tokens = Vec::new();
-                let mut i = 0;
-
-                while i < current_tokens.len() {
-                    if i < current_tokens.len() - 1
-                        && current_tokens[i] == left
-                        && current_tokens[i + 1] == right
-                    {
-                        new_tokens.push(left.to_string() + &right);
-                        i += 2;
-                    } else {
-                        new_tokens.push(current_tokens[i].clone());
-                        i += 1;
-                    }
-                }
-                current_tokens = new_tokens;
+                super::merge_token_pair(&mut current_tokens, &left, &right);
             }
 
             current_tokens
@@ -705,7 +882,7 @@ pub mod advanced {
 
     impl Tokenizer for ByteLevelBPETokenizer {
         fn tokenize(&self, text: &str) -> Result<Vec<String>> {
-            let byte_tokens = self.text_to_bytes(text);
+            let byte_tokens = self.text_to_bytes(text)?;
             Ok(self.apply_bpe(byte_tokens))
         }
 
@@ -834,8 +1011,12 @@ pub mod advanced {
                 }
             }
 
+            // Deterministic ordering: most frequent first, ties broken lexicographically.
+            let mut ordered_chars: Vec<(String, usize)> = char_counts.into_iter().collect();
+            ordered_chars.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
             let mut current_id = 3;
-            for (ch, count) in char_counts {
+            for (ch, count) in ordered_chars {
                 let prob = (count as f32 / total_chars as f32).ln();
                 tokenizer.vocab.insert(ch.clone(), prob);
                 tokenizer.token_to_id.insert(ch.clone(), current_id);
@@ -1627,5 +1808,25 @@ pub mod unified {
         fn default() -> Self {
             Self::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod pure_rust_regex_tests {
+    use super::*;
+
+    /// F073: the `onig` (Oniguruma, C) backend is disabled in favour of the
+    /// pure-Rust `fancy-regex` engine. `cargo check` only proves the swap
+    /// compiles — the GPT-2 split pattern (which uses a negative lookahead) is
+    /// compiled and executed lazily by the byte-level pre-tokenizer, so this
+    /// test exercises it at runtime.
+    #[test]
+    fn byte_level_pre_tokenizer_runs_on_pure_rust_regex() {
+        use tokenizers::tokenizer::{PreTokenizedString, PreTokenizer};
+
+        let mut pretokenized = PreTokenizedString::from("Hello, world! 123 don't");
+        ByteLevel::default()
+            .pre_tokenize(&mut pretokenized)
+            .expect("byte-level pre-tokenization must succeed with the fancy-regex backend");
     }
 }

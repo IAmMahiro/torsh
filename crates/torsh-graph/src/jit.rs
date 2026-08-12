@@ -2,9 +2,12 @@
 //!
 //! This module provides JIT compilation capabilities for graph neural network
 //! operations, enabling runtime optimization and kernel fusion for better performance.
-
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
+
 use crate::{GraphData, GraphLayer};
 use std::collections::HashMap;
 use std::fmt;
@@ -736,7 +739,7 @@ impl JITGraphLayer {
 }
 
 impl GraphLayer for JITGraphLayer {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         if self.jit_enabled {
             // Try to use JIT-compiled operations
             // This is a simplified implementation

@@ -54,6 +54,11 @@ Documentation = "https://docs.torsh.rs"
 "Bug Tracker" = "https://github.com/cool-japan/torsh/issues"
 
 [tool.maturin]
+# The workspace root is a virtual manifest, so point maturin at the real crate
+# that carries the `#[pymodule(name = "_C")]` extension (its init symbol is
+# `PyInit__C`, matching `module-name = "rstorch._C"`). The pure-Python package
+# lives under `python/rstorch/` and wraps `rstorch._C`.
+manifest-path = "crates/torsh-python/Cargo.toml"
 python-source = "python"
 module-name = "rstorch._C"
 features = ["pyo3/extension-module"]

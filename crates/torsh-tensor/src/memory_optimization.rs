@@ -20,6 +20,7 @@ use std::mem::{align_of, size_of};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use torsh_core::sync::{MutexExt, RwLockExt};
 
 // SciRS2 Parallel Operations for memory-optimized processing
 use torsh_core::{
@@ -158,10 +159,7 @@ impl<T: TensorElement> AdvancedMemoryPool<T> {
 
         // Add to appropriate size class pool if there's space
         if self.should_cache_allocation(aligned_size) {
-            let mut pools = self
-                .size_class_pools
-                .write()
-                .expect("lock should not be poisoned");
+            let mut pools = self.size_class_pools.write_or_recover();
             let pool = pools.entry(aligned_size).or_insert_with(VecDeque::new);
 
             if pool.len() < self.config.max_cached_per_size {
@@ -182,10 +180,7 @@ impl<T: TensorElement> AdvancedMemoryPool<T> {
             return Ok(None);
         }
 
-        let mut pools = self
-            .size_class_pools
-            .write()
-            .expect("lock should not be poisoned");
+        let mut pools = self.size_class_pools.write_or_recover();
 
         // Try exact size match first
         if let Some(pool) = pools.get_mut(&size) {
@@ -228,7 +223,7 @@ impl<T: TensorElement> AdvancedMemoryPool<T> {
         if self.config.enable_numa_awareness && !self.numa_allocators.is_empty() {
             let numa_node = self.select_numa_node();
             let allocator = &self.numa_allocators[numa_node];
-            let mut allocator = allocator.lock().expect("lock should not be poisoned");
+            let mut allocator = allocator.lock_or_recover();
             return allocator.allocate(layout);
         }
 
@@ -271,7 +266,7 @@ impl<T: TensorElement> AdvancedMemoryPool<T> {
 
     /// Predictive allocation based on historical patterns
     fn maybe_predictive_allocate(&self, size: usize) -> Result<()> {
-        let mut predictor_guard = self.predictor.lock().expect("lock should not be poisoned");
+        let mut predictor_guard = self.predictor.lock_or_recover();
 
         if predictor_guard.is_none() {
             *predictor_guard = Some(AllocationPredictor::new());
@@ -308,7 +303,7 @@ impl<T: TensorElement> AdvancedMemoryPool<T> {
     /// Check if system is under memory pressure
     fn is_memory_pressure_high(&self) -> bool {
         // Simple heuristic - could be enhanced with actual system memory monitoring
-        let stats = self.stats.read().expect("lock should not be poisoned");
+        let stats = self.stats.read_or_recover();
         let total_allocations = stats.pool_hits + stats.pool_misses + stats.direct_allocations;
 
         if total_allocations == 0 {
@@ -335,7 +330,7 @@ impl<T: TensorElement> AdvancedMemoryPool<T> {
     /// Select optimal NUMA node for allocation
     fn select_numa_node(&self) -> usize {
         // Simple round-robin for now - could be enhanced with CPU affinity
-        let stats = self.stats.read().expect("lock should not be poisoned");
+        let stats = self.stats.read_or_recover();
         (stats.total_allocations % self.numa_allocators.len()) as usize
     }
 
@@ -347,10 +342,7 @@ impl<T: TensorElement> AdvancedMemoryPool<T> {
             was_reused,
         };
 
-        let mut history = self
-            .allocation_history
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut history = self.allocation_history.lock_or_recover();
         history.push_back(record);
 
         // Keep history bounded
@@ -373,16 +365,13 @@ impl<T: TensorElement> AdvancedMemoryPool<T> {
     where
         F: FnOnce(&mut MemoryStats),
     {
-        let mut stats = self.stats.write().expect("lock should not be poisoned");
+        let mut stats = self.stats.write_or_recover();
         f(&mut *stats);
     }
 
     /// Get memory pool statistics
     pub fn get_stats(&self) -> MemoryStats {
-        self.stats
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.stats.read_or_recover().clone()
     }
 
     /// Trigger garbage collection and defragmentation
@@ -396,10 +385,7 @@ impl<T: TensorElement> AdvancedMemoryPool<T> {
 
         // Clean up empty pools
         {
-            let mut pools = self
-                .size_class_pools
-                .write()
-                .expect("lock should not be poisoned");
+            let mut pools = self.size_class_pools.write_or_recover();
             let initial_pools = pools.len();
             pools.retain(|_, pool| !pool.is_empty());
             report.pools_cleaned = initial_pools - pools.len();
@@ -420,7 +406,7 @@ impl<T: TensorElement> AdvancedMemoryPool<T> {
     /// Estimate memory freed during defragmentation
     fn estimate_memory_freed(&self) -> usize {
         // Simplified estimation - could be enhanced with actual tracking
-        let stats = self.stats.read().expect("lock should not be poisoned");
+        let stats = self.stats.read_or_recover();
         stats
             .total_allocations
             .saturating_sub(stats.reused_allocations)
@@ -556,8 +542,7 @@ impl CompressionManager {
             };
 
             self.compressed_allocations
-                .write()
-                .expect("rwlock should not be poisoned")
+                .write_or_recover()
                 .insert(ptr as usize, allocation);
             Ok(NonNull::new_unchecked(ptr as *mut T))
         }
@@ -565,17 +550,13 @@ impl CompressionManager {
 
     fn is_compressed<T: TensorElement>(&self, ptr: NonNull<T>) -> bool {
         self.compressed_allocations
-            .read()
-            .expect("rwlock should not be poisoned")
+            .read_or_recover()
             .contains_key(&(ptr.as_ptr() as usize))
     }
 
     fn deallocate<T: TensorElement>(&self, ptr: NonNull<T>) -> Result<()> {
         let ptr_key = ptr.as_ptr() as usize;
-        let mut allocations = self
-            .compressed_allocations
-            .write()
-            .expect("lock should not be poisoned");
+        let mut allocations = self.compressed_allocations.write_or_recover();
 
         if let Some(allocation) = allocations.remove(&ptr_key) {
             let layout = Layout::from_size_align(allocation.compressed_size, align_of::<T>())

@@ -114,28 +114,67 @@ impl<
     }
 
     /// Compute variance along specified dimensions
+    ///
+    /// With `dims = Some(..)` the mean is computed per reduced slice (keepdim)
+    /// and broadcast back over the input, so multi-element reductions work; with
+    /// `dims = None` the whole tensor is reduced. `StatMode::Sample` applies
+    /// Bessel's correction and reports an error when the correction would leave
+    /// zero degrees of freedom.
     pub fn var(&self, dims: Option<&[usize]>, keepdim: bool, mode: StatMode) -> Result<Self> {
-        let mean = self.mean(dims, false)?; // Always get scalar mean for broadcasting
-        let mean_value = mean.item()?; // Extract scalar value
-        let diff = self.sub_scalar(mean_value)?;
-        let squared_diff = diff.mul_op(&diff)?;
-        let sum_sq = if let Some(dims) = dims {
-            squared_diff.sum_dim(&dims.iter().map(|&d| d as i32).collect::<Vec<_>>(), keepdim)?
-        } else {
-            squared_diff.sum()?
+        let shape_binding = self.shape();
+        let input_shape = shape_binding.dims().to_vec();
+        let ndim = input_shape.len();
+
+        // Validate and normalise the requested dimensions up front.
+        let reduce_dims: Option<Vec<usize>> = match dims {
+            Some(requested) => {
+                for &dim in requested {
+                    if dim >= ndim {
+                        return Err(TorshError::InvalidArgument(format!(
+                            "Dimension {} out of range for {}-dimensional tensor",
+                            dim, ndim
+                        )));
+                    }
+                }
+                let mut normalized = requested.to_vec();
+                normalized.sort_unstable();
+                normalized.dedup();
+                Some(normalized)
+            }
+            None => None,
         };
 
-        let count = if let Some(dims) = dims {
-            dims.iter()
-                .map(|&d| self.shape().dims()[d])
-                .product::<usize>()
-        } else {
-            self.numel()
+        // Center the data against a mean of matching rank, broadcasting the
+        // dimension-wise mean instead of extracting a scalar with `item()`.
+        let diff = match &reduce_dims {
+            Some(reduce) => {
+                let mean = self.mean(Some(reduce), true)?;
+                let expanded = mean.expand(&input_shape)?;
+                self.sub(&expanded)?
+            }
+            None => {
+                let mean_value = self.mean(None, false)?.item()?;
+                self.sub_scalar(mean_value)?
+            }
+        };
+
+        let squared_diff = diff.mul_op(&diff)?;
+        let sum_sq = match &reduce_dims {
+            Some(reduce) => squared_diff.sum_dim(
+                &reduce.iter().map(|&d| d as i32).collect::<Vec<_>>(),
+                keepdim,
+            )?,
+            None => squared_diff.sum()?,
+        };
+
+        let count = match &reduce_dims {
+            Some(reduce) => reduce.iter().map(|&d| input_shape[d]).product::<usize>(),
+            None => self.numel(),
         };
 
         let divisor = match mode {
             StatMode::Population => count,
-            StatMode::Sample => count - 1,
+            StatMode::Sample => count.checked_sub(1).unwrap_or(0),
         };
 
         if divisor == 0 {
@@ -157,7 +196,9 @@ impl<
     }
 
     /// Compute percentile along the last dimension
-    pub fn percentile(&self, q: f64, dim: Option<usize>, _keepdim: bool) -> Result<Self> {
+    ///
+    /// `keepdim` keeps the reduced dimension with extent `1`, like PyTorch.
+    pub fn percentile(&self, q: f64, dim: Option<usize>, keepdim: bool) -> Result<Self> {
         if !(0.0..=100.0).contains(&q) {
             return Err(TorshError::InvalidArgument(format!(
                 "Percentile must be between 0 and 100, got {q}"
@@ -187,9 +228,9 @@ impl<
         let upper_idx = (pos.ceil() as usize).min(size - 1);
         let weight = pos - pos.floor();
 
-        if lower_idx == upper_idx {
+        let reduced = if lower_idx == upper_idx {
             // Exact index
-            sorted.select(dim as i32, lower_idx as i64)
+            sorted.select(dim as i32, lower_idx as i64)?
         } else {
             // Interpolate between two values
             let lower = sorted.select(dim as i32, lower_idx as i64)?;
@@ -198,7 +239,13 @@ impl<
             let weight_scalar = <T as TensorElement>::from_f64(weight)
                 .unwrap_or_else(|| <T as TensorElement>::from_f64(0.0).unwrap_or_default());
             let weighted_diff = diff.mul_scalar(weight_scalar)?;
-            lower.add_op(&weighted_diff)
+            lower.add_op(&weighted_diff)?
+        };
+
+        if keepdim {
+            reduced.unsqueeze(dim as i32)
+        } else {
+            Ok(reduced)
         }
     }
 

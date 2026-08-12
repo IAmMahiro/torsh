@@ -8,8 +8,12 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::type_complexity)]
 #![allow(clippy::missing_safety_doc)]
-// Allow forward-looking cfg conditions for future scirs2-core integration
-#![allow(unexpected_cfgs)]
+// NOTE: `#![allow(unexpected_cfgs)]` used to live here to silence warnings
+// about phantom `scirs2_*_available` cfg flags that no `build.rs` in this
+// workspace ever set (so all such branches were permanently dead code, some
+// referencing types that no longer exist). Those phantom cfgs have been
+// removed; the blanket allow is intentionally NOT restored so future
+// phantom cfgs are caught by the compiler instead of accumulating silently.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -34,6 +38,8 @@ pub mod examples;
 pub mod federated;
 pub mod ffi;
 pub mod gpu_shape_ops; // GPU-accelerated shape operations for very large tensors (NEW)
+/// Global gradient-recording mode shared by `torsh-tensor` and `torsh-autograd`
+pub mod grad_mode;
 pub mod hdf5_metadata;
 pub mod health;
 pub mod ieee754_compliance;
@@ -64,6 +70,9 @@ pub mod simd_arm;
 pub mod sparse;
 pub mod storage;
 pub mod symbolic_shape;
+/// Poison-recovery helpers for `std::sync::{Mutex, RwLock}` (NEW)
+#[cfg(feature = "std")]
+pub mod sync;
 pub mod telemetry;
 pub mod tensor_expr; // Tensor expression templates for compile-time optimization (NEW)
 pub mod tensor_network; // Tensor network representations for quantum computing (NEW)
@@ -133,6 +142,9 @@ pub use ffi::{TorshDType, TorshDevice, TorshErrorCode, TorshShape};
 #[cfg(feature = "std")]
 pub use gpu_shape_ops::GpuShapeAccelerator;
 pub use gpu_shape_ops::{AcceleratorConfig, AcceleratorStats};
+pub use grad_mode::{
+    is_grad_enabled, pop_grad_enabled, push_grad_enabled, set_grad_enabled, with_grad_mode,
+};
 pub use hdf5_metadata::{
     BloscCompressor, BloscShuffle, Hdf5AttributeValue, Hdf5ByteOrder, Hdf5Chunking,
     Hdf5DatasetMetadata, Hdf5Datatype, Hdf5DimensionScale, Hdf5FileMetadata, Hdf5Filter,
@@ -226,6 +238,8 @@ pub use storage::{
 pub use symbolic_shape::{
     DimExpression, ShapeInference, SymbolId, SymbolRegistry, SymbolicDim, SymbolicShape,
 };
+#[cfg(feature = "std")]
+pub use sync::{lock_or_recover, read_or_recover, recover, write_or_recover, MutexExt, RwLockExt};
 #[cfg(feature = "std")]
 pub use telemetry::{init_telemetry, telemetry, Span, SpanEvent, SpanMetrics, TelemetrySystem};
 pub use telemetry::{ErrorCode, LogEvent, LogLevel, TelemetryConfig};

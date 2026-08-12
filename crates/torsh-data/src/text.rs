@@ -601,9 +601,19 @@ pub mod transforms {
     }
 
     impl NGrams {
+        /// # Panics
+        ///
+        /// Panics if `n` is 0. See [`Self::try_new`] for a non-panicking variant.
         pub fn new(n: usize) -> Self {
             assert!(n > 0, "n must be positive");
             Self { n }
+        }
+
+        /// Fallible variant of [`Self::new`] that returns an error instead of
+        /// panicking when `n` is 0.
+        pub fn try_new(n: usize) -> Result<Self> {
+            crate::utils::validate_positive(n, "n")?;
+            Ok(Self { n })
         }
     }
 
@@ -683,11 +693,15 @@ pub mod transforms {
 pub mod datasets {
     use super::*;
 
-    /// IMDB movie reviews dataset (simplified)
+    /// IMDB movie reviews dataset
+    ///
+    /// Parses the standard Stanford aclImdb layout:
+    /// `<root>/<split>/pos/*.txt` (label 1, positive) and
+    /// `<root>/<split>/neg/*.txt` (label 0, negative). Download and extract
+    /// the corpus from <https://ai.stanford.edu/~amaas/data/sentiment/> and
+    /// pass the extracted `aclImdb` directory as `root`.
     pub struct IMDB {
-        #[allow(dead_code)]
         root: PathBuf,
-        #[allow(dead_code)]
         split: String,
         vocabulary: Vocabulary,
         samples: Vec<(String, usize)>, // (text, label)
@@ -695,22 +709,57 @@ pub mod datasets {
     }
 
     impl IMDB {
-        /// Create IMDB dataset
+        /// Create IMDB dataset by reading the real aclImdb directory layout.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if `<root>/<split>` doesn't exist, or if neither a
+        /// `pos` nor a `neg` subdirectory contains any `.txt` review files.
+        /// This loader never fabricates review text: a dataset that silently
+        /// yields synthetic samples is worse than one that fails loudly,
+        /// because it produces a training run that looks like it worked.
         pub fn new<P: AsRef<Path>>(root: P, split: &str) -> Result<Self> {
             let root = root.as_ref().to_path_buf();
+            let split_dir = root.join(split);
 
-            // In a real implementation, you would:
-            // 1. Download IMDB dataset from official source
-            // 2. Parse the data files
-            // 3. Load reviews and sentiment labels
+            if !split_dir.is_dir() {
+                return Err(TorshError::IoError(format!(
+                    "IMDB: split directory not found: {split_dir:?} (expected aclImdb layout \
+                     <root>/<split>/{{pos,neg}}/*.txt)"
+                )));
+            }
 
-            // For now, create dummy data
-            let samples = vec![
-                ("This movie is great!".to_string(), 1),          // positive
-                ("Terrible film, waste of time.".to_string(), 0), // negative
-                ("Amazing cinematography and acting.".to_string(), 1),
-                ("Boring and predictable plot.".to_string(), 0),
-            ];
+            let mut samples: Vec<(String, usize)> = Vec::new();
+            for (class_dir_name, label) in [("pos", 1usize), ("neg", 0usize)] {
+                let class_dir = split_dir.join(class_dir_name);
+                if !class_dir.is_dir() {
+                    // Some splits (e.g. the official "unsup" split) only ship
+                    // one polarity, or none - that's not an error on its own.
+                    continue;
+                }
+
+                let mut review_paths: Vec<PathBuf> = std::fs::read_dir(&class_dir)
+                    .map_err(|e| TorshError::IoError(format!("Failed to read {class_dir:?}: {e}")))?
+                    .filter_map(|entry| entry.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("txt"))
+                    .collect();
+                // Deterministic order across platforms/filesystems.
+                review_paths.sort();
+
+                for path in review_paths {
+                    let text = std::fs::read_to_string(&path).map_err(|e| {
+                        TorshError::IoError(format!("Failed to read {path:?}: {e}"))
+                    })?;
+                    samples.push((text, label));
+                }
+            }
+
+            if samples.is_empty() {
+                return Err(TorshError::IoError(format!(
+                    "IMDB: no .txt review files found under {split_dir:?}/{{pos,neg}}; \
+                     download the aclImdb corpus and point `root` at its extracted directory"
+                )));
+            }
 
             let texts: Vec<String> = samples.iter().map(|(text, _)| text.clone()).collect();
             let mut vocabulary = Vocabulary::new();
@@ -723,6 +772,16 @@ pub mod datasets {
                 samples,
                 transform: None,
             })
+        }
+
+        /// Get the root directory this dataset was loaded from
+        pub fn root(&self) -> &Path {
+            &self.root
+        }
+
+        /// Get the split name ("train", "test", ...) this dataset was loaded with
+        pub fn split(&self) -> &str {
+            &self.split
         }
 
         /// Set transform
@@ -895,12 +954,51 @@ mod tests {
     fn test_imdb_dataset() {
         use datasets::*;
 
-        let dataset = IMDB::new("/tmp", "train").unwrap();
-        assert_eq!(dataset.len(), 4);
+        // F102: IMDB::new now parses the real aclImdb-style directory layout
+        // instead of fabricating 4 hardcoded reviews, so this test builds a
+        // real (self-cleaning) fixture on disk rather than pointing at "/tmp".
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let train_dir = tmp.path().join("train");
+        let pos_dir = train_dir.join("pos");
+        let neg_dir = train_dir.join("neg");
+        std::fs::create_dir_all(&pos_dir).expect("create pos dir");
+        std::fs::create_dir_all(&neg_dir).expect("create neg dir");
 
+        std::fs::write(pos_dir.join("0_9.txt"), "This movie is great!").expect("write pos review");
+        std::fs::write(
+            pos_dir.join("1_10.txt"),
+            "Amazing cinematography and acting.",
+        )
+        .expect("write pos review");
+        std::fs::write(neg_dir.join("0_1.txt"), "Terrible film, waste of time.")
+            .expect("write neg review");
+        std::fs::write(neg_dir.join("1_2.txt"), "Boring and predictable plot.")
+            .expect("write neg review");
+
+        let dataset = IMDB::new(tmp.path(), "train").unwrap();
+        assert_eq!(dataset.len(), 4);
+        assert_eq!(dataset.root(), tmp.path());
+        assert_eq!(dataset.split(), "train");
+
+        // pos/*.txt is enumerated before neg/*.txt, so index 0 is positive.
         let (tensor, label) = dataset.get(0).unwrap();
         assert_eq!(label, 1); // positive
         assert!(tensor.ndim() > 0);
+
+        // The last sample must be from the negative class.
+        let (_, last_label) = dataset.get(dataset.len() - 1).unwrap();
+        assert_eq!(last_label, 0);
+    }
+
+    #[test]
+    fn test_imdb_dataset_missing_layout_errors() {
+        use datasets::*;
+
+        // F102: a directory that doesn't contain the aclImdb pos/neg layout
+        // must fail loudly instead of returning fabricated reviews.
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let result = IMDB::new(tmp.path(), "train");
+        assert!(result.is_err());
     }
 
     #[test]

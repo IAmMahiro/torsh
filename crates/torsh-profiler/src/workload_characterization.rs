@@ -40,14 +40,27 @@ pub struct WorkloadSample {
     pub operation_name: String,
     pub category: String,
     pub duration_ms: f64,
-    pub cpu_utilization: f64,
+    /// CPU utilization (0.0 to 1.0) during this sample, when it can be
+    /// measured from the system. `None` if unmeasured -- in particular,
+    /// [`WorkloadCharacterizer::add_samples_from_events`] builds samples
+    /// from [`ProfileEvent`]s, which carry no CPU utilization reading at
+    /// all, so it always leaves this `None` rather than inventing a value.
+    pub cpu_utilization: Option<f64>,
     pub memory_mb: f64,
-    pub cache_miss_rate: f64,
-    pub io_ops_per_sec: f64,
-    pub parallel_threads: u32,
+    /// Cache miss rate (0.0 to 1.0), when it can be measured from hardware
+    /// performance counters. `None` if unmeasured.
+    pub cache_miss_rate: Option<f64>,
+    /// I/O operations per second, when it can be measured from I/O
+    /// monitoring. `None` if unmeasured.
+    pub io_ops_per_sec: Option<f64>,
+    /// Number of parallel threads active during this sample, when it can
+    /// be detected from threading analysis. `None` if unmeasured.
+    pub parallel_threads: Option<u32>,
     pub flops: u64,
     pub bytes_accessed: u64,
-    pub energy_joules: f64,
+    /// Energy consumed during this sample, when it can be measured from
+    /// power monitoring. `None` if unmeasured.
+    pub energy_joules: Option<f64>,
 }
 
 /// Complete workload analysis results
@@ -97,20 +110,25 @@ pub enum WorkloadType {
 /// Resource utilization patterns
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourcePatterns {
-    /// Average CPU utilization (0.0 to 1.0)
-    pub avg_cpu_utilization: f64,
-    /// CPU utilization variance
-    pub cpu_utilization_variance: f64,
+    /// Average CPU utilization (0.0 to 1.0) across samples that measured
+    /// it. `None` if no sample carried a measured value.
+    pub avg_cpu_utilization: Option<f64>,
+    /// CPU utilization variance across samples that measured it. `None`
+    /// if no sample carried a measured value.
+    pub cpu_utilization_variance: Option<f64>,
     /// Average memory usage (MB)
     pub avg_memory_usage_mb: f64,
     /// Memory usage peak factor
     pub memory_peak_factor: f64,
-    /// Memory access locality score (0.0 to 1.0)
-    pub memory_locality_score: f64,
-    /// Cache efficiency score (0.0 to 1.0)
-    pub cache_efficiency_score: f64,
-    /// I/O throughput (MB/s)
-    pub io_throughput_mbps: f64,
+    /// Memory access locality score (0.0 to 1.0), when it can be
+    /// calculated from real access-pattern data. `None` if unmeasured.
+    pub memory_locality_score: Option<f64>,
+    /// Cache efficiency score (0.0 to 1.0), derived from sample cache miss
+    /// rates. `None` if no sample measured a cache miss rate.
+    pub cache_efficiency_score: Option<f64>,
+    /// I/O throughput (MB/s), averaged from samples that measured it.
+    /// `None` if no sample carried a measured value.
+    pub io_throughput_mbps: Option<f64>,
     /// Network utilization (0.0 to 1.0)
     pub network_utilization: f64,
 }
@@ -120,16 +138,21 @@ pub struct ResourcePatterns {
 pub struct ComputeCharacteristics {
     /// Arithmetic intensity (FLOPS per byte accessed)
     pub arithmetic_intensity: f64,
-    /// Vectorization efficiency (0.0 to 1.0)
-    pub vectorization_efficiency: f64,
-    /// Instruction level parallelism score
-    pub ilp_score: f64,
-    /// Branch prediction efficiency (0.0 to 1.0)
-    pub branch_prediction_efficiency: f64,
+    /// Vectorization efficiency (0.0 to 1.0), when it can be measured from
+    /// instruction-level analysis. `None` if unmeasured.
+    pub vectorization_efficiency: Option<f64>,
+    /// Instruction level parallelism score, when it can be calculated from
+    /// instruction dependency analysis. `None` if unmeasured.
+    pub ilp_score: Option<f64>,
+    /// Branch prediction efficiency (0.0 to 1.0), when it can be measured
+    /// from hardware performance counters. `None` if unmeasured.
+    pub branch_prediction_efficiency: Option<f64>,
     /// Compute to memory ratio
     pub compute_to_memory_ratio: f64,
-    /// Dominant operation types
-    pub dominant_operations: Vec<OperationType>,
+    /// Dominant operation types, when they can be determined from
+    /// instruction-level analysis. `None` if unmeasured (this crate does
+    /// not perform instruction-level analysis).
+    pub dominant_operations: Option<Vec<OperationType>>,
 }
 
 /// Types of operations in the workload
@@ -156,8 +179,9 @@ pub enum OperationType {
 /// Memory access patterns
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryPatterns {
-    /// Sequential access percentage (0.0 to 1.0)
-    pub sequential_access_ratio: f64,
+    /// Sequential access percentage (0.0 to 1.0), when it can be
+    /// calculated from real access-pattern analysis. `None` if unmeasured.
+    pub sequential_access_ratio: Option<f64>,
     /// Random access percentage (0.0 to 1.0)
     pub random_access_ratio: f64,
     /// Stride access patterns
@@ -186,8 +210,9 @@ pub struct StridePattern {
 /// I/O access patterns
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IOPatterns {
-    /// Read to write ratio
-    pub read_write_ratio: f64,
+    /// Read to write ratio, when it can be calculated from real I/O trace
+    /// analysis. `None` if unmeasured.
+    pub read_write_ratio: Option<f64>,
     /// Sequential I/O percentage (0.0 to 1.0)
     pub sequential_io_ratio: f64,
     /// Average I/O request size (bytes)
@@ -346,8 +371,9 @@ pub enum OptimizationType {
 pub struct StabilityMetrics {
     /// Performance variance coefficient
     pub performance_variance: f64,
-    /// Resource usage stability score (0.0 to 1.0)
-    pub resource_stability: f64,
+    /// Resource usage stability score (0.0 to 1.0), when it can be
+    /// calculated from real resource usage variance. `None` if unmeasured.
+    pub resource_stability: Option<f64>,
     /// Predictability score (0.0 to 1.0)
     pub predictability_score: f64,
     /// Phase change detection
@@ -386,6 +412,31 @@ impl Default for WorkloadCharacterizer {
     }
 }
 
+/// Average of a per-sample optional metric across all samples that
+/// actually measured it, ignoring samples where it is `None`.
+///
+/// Returns `None` (rather than treating missing samples as `0.0`, which
+/// would silently pull the average down) when *no* sample has a measured
+/// value for this metric at all.
+fn avg_known(
+    samples: &[WorkloadSample],
+    extract: impl Fn(&WorkloadSample) -> Option<f64>,
+) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for sample in samples {
+        if let Some(value) = extract(sample) {
+            sum += value;
+            count += 1;
+        }
+    }
+    if count > 0 {
+        Some(sum / count as f64)
+    } else {
+        None
+    }
+}
+
 impl WorkloadCharacterizer {
     /// Create a new workload characterizer
     pub fn new() -> Self {
@@ -411,7 +462,14 @@ impl WorkloadCharacterizer {
         Ok(())
     }
 
-    /// Add samples from profile events
+    /// Add samples from profile events.
+    ///
+    /// [`ProfileEvent`] carries no CPU utilization, cache miss rate, I/O
+    /// rate, thread count, or energy reading -- only name/category/timing
+    /// and optional flops/bytes. Those fields are therefore left `None`
+    /// (unmeasured) rather than filled with invented placeholder values;
+    /// only `memory_mb`/`flops`/`bytes_accessed`, which really do derive
+    /// from the event, are populated.
     pub fn add_samples_from_events(&mut self, events: &[ProfileEvent]) -> TorshResult<()> {
         for event in events {
             let sample = WorkloadSample {
@@ -419,14 +477,14 @@ impl WorkloadCharacterizer {
                 operation_name: event.name.clone(),
                 category: event.category.clone(),
                 duration_ms: event.duration_us as f64 / 1000.0,
-                cpu_utilization: 0.7, // Would be measured from system
+                cpu_utilization: None,
                 memory_mb: event.bytes_transferred.unwrap_or(0) as f64 / (1024.0 * 1024.0),
-                cache_miss_rate: 0.05, // Would be measured from performance counters
-                io_ops_per_sec: 0.0,   // Would be measured from I/O monitoring
-                parallel_threads: 1,   // Would be detected from threading analysis
+                cache_miss_rate: None,
+                io_ops_per_sec: None,
+                parallel_threads: None,
                 flops: event.flops.unwrap_or(0),
                 bytes_accessed: event.bytes_transferred.unwrap_or(0),
-                energy_joules: 0.0, // Would be measured from power monitoring
+                energy_joules: None,
             };
             self.add_sample(sample)?;
         }
@@ -494,21 +552,22 @@ impl WorkloadCharacterizer {
     // Private analysis methods
 
     fn classify_workload_type(&self) -> TorshResult<WorkloadType> {
-        let avg_cpu =
-            self.samples.iter().map(|s| s.cpu_utilization).sum::<f64>() / self.samples.len() as f64;
+        let avg_cpu = avg_known(&self.samples, |s| s.cpu_utilization);
         let avg_memory =
             self.samples.iter().map(|s| s.memory_mb).sum::<f64>() / self.samples.len() as f64;
-        let avg_io =
-            self.samples.iter().map(|s| s.io_ops_per_sec).sum::<f64>() / self.samples.len() as f64;
+        let avg_io = avg_known(&self.samples, |s| s.io_ops_per_sec);
         let avg_flops =
             self.samples.iter().map(|s| s.flops).sum::<u64>() / self.samples.len() as u64;
 
-        // Simple classification heuristics
-        if avg_flops > 1000000 && avg_cpu > 0.8 {
+        // Simple classification heuristics. CPU/IO-based classification
+        // only fires when that metric was actually measured for at least
+        // one sample -- an unmeasured metric can never masquerade as a
+        // real signal and falsely trigger a classification.
+        if avg_flops > 1000000 && avg_cpu.is_some_and(|c| c > 0.8) {
             Ok(WorkloadType::ComputeIntensive)
         } else if avg_memory > 1000.0 {
             Ok(WorkloadType::MemoryBound)
-        } else if avg_io > 1000.0 {
+        } else if avg_io.is_some_and(|io| io > 1000.0) {
             Ok(WorkloadType::IOIntensive)
         } else {
             Ok(WorkloadType::Balanced)
@@ -516,13 +575,13 @@ impl WorkloadCharacterizer {
     }
 
     fn analyze_resource_patterns(&self) -> TorshResult<ResourcePatterns> {
-        let cpu_utilizations: Vec<f64> = self.samples.iter().map(|s| s.cpu_utilization).collect();
-        let avg_cpu = cpu_utilizations.iter().sum::<f64>() / cpu_utilizations.len() as f64;
-        let cpu_variance = cpu_utilizations
-            .iter()
-            .map(|x| (x - avg_cpu).powi(2))
-            .sum::<f64>()
-            / cpu_utilizations.len() as f64;
+        let avg_cpu = avg_known(&self.samples, |s| s.cpu_utilization);
+        let cpu_variance = avg_cpu.map(|avg_cpu| {
+            avg_known(&self.samples, |s| {
+                s.cpu_utilization.map(|c| (c - avg_cpu).powi(2))
+            })
+            .unwrap_or(0.0)
+        });
 
         let avg_memory =
             self.samples.iter().map(|s| s.memory_mb).sum::<f64>() / self.samples.len() as f64;
@@ -533,17 +592,16 @@ impl WorkloadCharacterizer {
             1.0
         };
 
+        let avg_cache_miss_rate = avg_known(&self.samples, |s| s.cache_miss_rate);
+
         Ok(ResourcePatterns {
             avg_cpu_utilization: avg_cpu,
             cpu_utilization_variance: cpu_variance,
             avg_memory_usage_mb: avg_memory,
             memory_peak_factor,
-            memory_locality_score: 0.8, // Would be calculated from access patterns
-            cache_efficiency_score: 1.0
-                - (self.samples.iter().map(|s| s.cache_miss_rate).sum::<f64>()
-                    / self.samples.len() as f64),
-            io_throughput_mbps: self.samples.iter().map(|s| s.io_ops_per_sec).sum::<f64>()
-                / self.samples.len() as f64,
+            memory_locality_score: None, // Would be calculated from access patterns
+            cache_efficiency_score: avg_cache_miss_rate.map(|miss_rate| 1.0 - miss_rate),
+            io_throughput_mbps: avg_known(&self.samples, |s| s.io_ops_per_sec),
             network_utilization: 0.0, // Would be measured from network monitoring
         })
     }
@@ -560,17 +618,17 @@ impl WorkloadCharacterizer {
 
         Ok(ComputeCharacteristics {
             arithmetic_intensity,
-            vectorization_efficiency: 0.7, // Would be measured from instruction analysis
-            ilp_score: 0.6,                // Would be calculated from instruction dependencies
-            branch_prediction_efficiency: 0.9, // Would be measured from hardware counters
+            vectorization_efficiency: None, // Would be measured from instruction analysis
+            ilp_score: None,                // Would be calculated from instruction dependencies
+            branch_prediction_efficiency: None, // Would be measured from hardware counters
             compute_to_memory_ratio: arithmetic_intensity,
-            dominant_operations: vec![OperationType::FloatingPointArithmetic], // Would be determined from instruction analysis
+            dominant_operations: None, // Would be determined from instruction analysis
         })
     }
 
     fn analyze_memory_patterns(&self) -> TorshResult<MemoryPatterns> {
         Ok(MemoryPatterns {
-            sequential_access_ratio: 0.6, // Would be calculated from access pattern analysis
+            sequential_access_ratio: None, // Would be calculated from access pattern analysis
             random_access_ratio: 0.4,
             stride_patterns: vec![
                 StridePattern {
@@ -593,7 +651,7 @@ impl WorkloadCharacterizer {
 
     fn analyze_io_patterns(&self) -> TorshResult<IOPatterns> {
         Ok(IOPatterns {
-            read_write_ratio: 2.0, // Would be calculated from I/O trace analysis
+            read_write_ratio: None, // Would be calculated from I/O trace analysis
             sequential_io_ratio: 0.7,
             avg_io_size_bytes: 4096,
             burst_patterns: vec![IOBurstPattern {
@@ -628,41 +686,43 @@ impl WorkloadCharacterizer {
     fn identify_bottlenecks(&self) -> TorshResult<Vec<PerformanceBottleneck>> {
         let mut bottlenecks = Vec::new();
 
-        // CPU bottleneck analysis
-        let avg_cpu =
-            self.samples.iter().map(|s| s.cpu_utilization).sum::<f64>() / self.samples.len() as f64;
-        if avg_cpu > 0.9 {
-            bottlenecks.push(PerformanceBottleneck {
-                bottleneck_type: BottleneckType::CPUCompute,
-                severity: avg_cpu,
-                description: "High CPU utilization indicates compute bottleneck".to_string(),
-                affected_operations: self
-                    .samples
-                    .iter()
-                    .filter(|s| s.cpu_utilization > 0.9)
-                    .map(|s| s.operation_name.clone())
-                    .collect(),
-                performance_impact_percent: 25.0,
-            });
+        // CPU bottleneck analysis -- only runs when at least one sample
+        // actually measured CPU utilization; an unmeasured metric can
+        // never masquerade as evidence of a bottleneck.
+        if let Some(avg_cpu) = avg_known(&self.samples, |s| s.cpu_utilization) {
+            if avg_cpu > 0.9 {
+                bottlenecks.push(PerformanceBottleneck {
+                    bottleneck_type: BottleneckType::CPUCompute,
+                    severity: avg_cpu,
+                    description: "High CPU utilization indicates compute bottleneck".to_string(),
+                    affected_operations: self
+                        .samples
+                        .iter()
+                        .filter(|s| s.cpu_utilization.is_some_and(|c| c > 0.9))
+                        .map(|s| s.operation_name.clone())
+                        .collect(),
+                    performance_impact_percent: 25.0,
+                });
+            }
         }
 
-        // Cache miss bottleneck analysis
-        let avg_cache_miss =
-            self.samples.iter().map(|s| s.cache_miss_rate).sum::<f64>() / self.samples.len() as f64;
-        if avg_cache_miss > 0.1 {
-            bottlenecks.push(PerformanceBottleneck {
-                bottleneck_type: BottleneckType::CacheMiss,
-                severity: avg_cache_miss,
-                description: "High cache miss rate indicates memory access inefficiency"
-                    .to_string(),
-                affected_operations: self
-                    .samples
-                    .iter()
-                    .filter(|s| s.cache_miss_rate > 0.1)
-                    .map(|s| s.operation_name.clone())
-                    .collect(),
-                performance_impact_percent: 15.0,
-            });
+        // Cache miss bottleneck analysis -- same "only if measured" rule.
+        if let Some(avg_cache_miss) = avg_known(&self.samples, |s| s.cache_miss_rate) {
+            if avg_cache_miss > 0.1 {
+                bottlenecks.push(PerformanceBottleneck {
+                    bottleneck_type: BottleneckType::CacheMiss,
+                    severity: avg_cache_miss,
+                    description: "High cache miss rate indicates memory access inefficiency"
+                        .to_string(),
+                    affected_operations: self
+                        .samples
+                        .iter()
+                        .filter(|s| s.cache_miss_rate.is_some_and(|m| m > 0.1))
+                        .map(|s| s.operation_name.clone())
+                        .collect(),
+                    performance_impact_percent: 15.0,
+                });
+            }
         }
 
         Ok(bottlenecks)
@@ -743,7 +803,7 @@ impl WorkloadCharacterizer {
 
         Ok(StabilityMetrics {
             performance_variance,
-            resource_stability: 0.8, // Would be calculated from resource usage variance
+            resource_stability: None, // Would be calculated from resource usage variance
             predictability_score: 1.0 - performance_variance.min(1.0),
             phase_changes: Vec::new(), // Would be detected from time series analysis
         })
@@ -769,14 +829,14 @@ mod tests {
             operation_name: "test_op".to_string(),
             category: "test".to_string(),
             duration_ms: 10.0,
-            cpu_utilization: 0.8,
+            cpu_utilization: Some(0.8),
             memory_mb: 100.0,
-            cache_miss_rate: 0.05,
-            io_ops_per_sec: 0.0,
-            parallel_threads: 1,
+            cache_miss_rate: Some(0.05),
+            io_ops_per_sec: Some(0.0),
+            parallel_threads: Some(1),
             flops: 1000000,
             bytes_accessed: 1024,
-            energy_joules: 0.1,
+            energy_joules: Some(0.1),
         };
 
         characterizer.add_sample(sample).unwrap();
@@ -794,14 +854,14 @@ mod tests {
                 operation_name: format!("compute_op_{i}"),
                 category: "compute".to_string(),
                 duration_ms: 10.0,
-                cpu_utilization: 0.95,
+                cpu_utilization: Some(0.95),
                 memory_mb: 50.0,
-                cache_miss_rate: 0.02,
-                io_ops_per_sec: 0.0,
-                parallel_threads: 1,
+                cache_miss_rate: Some(0.02),
+                io_ops_per_sec: Some(0.0),
+                parallel_threads: Some(1),
                 flops: 2000000,
                 bytes_accessed: 1024,
-                energy_joules: 0.2,
+                energy_joules: Some(0.2),
             };
             characterizer.add_sample(sample).unwrap();
         }

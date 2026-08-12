@@ -1,46 +1,45 @@
-//! GPU-Accelerated Gradient Computation using SciRS2-Core
+//! Activation forward/backward kernels with a GPU-offload policy layer.
 //!
-//! This module provides high-performance GPU-accelerated gradient computation
-//! leveraging SciRS2-Core's multi-backend GPU support. It achieves 10-100x speedup
-//! over CPU computation for large tensors (>50K elements).
+//! ## What this module actually does today
 //!
-//! ## Supported Backends
+//! It computes activation values and activation gradients **on the CPU**, and
+//! carries the configuration and accounting that a GPU offload path would need
+//! (backend selection, a minimum size below which offloading is not worth it,
+//! and [`GpuStats`]).
 //!
-//! - **CUDA**: NVIDIA GPU acceleration
-//! - **Metal**: Apple Silicon and Metal-capable GPUs
-//! - **WebGPU**: Cross-platform GPU compute
-//! - **ROCm**: AMD GPU acceleration
-//! - **OpenCL**: Vendor-agnostic GPU compute
+//! No GPU backend is reachable from this crate: `torsh-autograd`'s `gpu` feature
+//! enables no device dependency, so [`GpuBackend::is_available`] is `false` for
+//! every backend and [`GpuGradientComputer::should_use_gpu`] never selects the
+//! device path. The working device path in this workspace is
+//! `torsh_tensor::gpu_dispatch`, which dispatches elementwise work through
+//! oxicuda.
 //!
-//! ## Features
+//! Consequently [`GpuStats::kernel_launches`] and
+//! [`GpuStats::memory_transferred`] stay at zero here — they are only ever
+//! incremented by real kernel launches and real host/device copies, so a
+//! profile taken through this API cannot overstate GPU utilisation.
 //!
-//! - **Element-wise Operations**: GPU kernels for activation functions
-//! - **Matrix Operations**: GPU-accelerated matrix multiplications
-//! - **Reduction Operations**: Efficient parallel reductions
-//! - **Custom Kernels**: Support for user-defined GPU operations
-//! - **Automatic Fallback**: Seamless CPU fallback when GPU unavailable
+//! ## Supported activations
 //!
-//! ## Performance
-//!
-//! Target performance improvements:
-//! - 10-100x speedup for large tensors (>50K elements)
-//! - Multi-backend support for different hardware
-//! - Memory-efficient GPU memory management
+//! GELU (tanh approximation), LeakyReLU, Swish/SiLU, ReLU, Tanh and Sigmoid,
+//! forward via [`GpuGradientComputer::gpu_activation`] and backward via
+//! [`GpuGradientComputer::gpu_activation_backward`].
 //!
 //! ## Usage
 //!
-//! ```rust,no_run
-//! use torsh_autograd::gpu_gradient::{GpuGradientComputer, GpuBackend};
+//! ```rust
+//! use torsh_autograd::gpu_gradient::{ActivationType, GpuBackend, GpuGradientComputer};
 //!
-//! # fn example() -> torsh_core::error::Result<()> {
-//! // Create GPU gradient computer
-//! let mut computer = GpuGradientComputer::new(GpuBackend::CUDA)?;
+//! # fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut computer = GpuGradientComputer::new(GpuBackend::Auto)?;
 //!
-//! // Check if GPU is available
-//! if computer.is_available() {
-//!     // Compute gradients on GPU
-//!     // let result = computer.compute_backward_gpu(&tensors)?;
-//! }
+//! let input = [-1.0f32, 0.0, 2.0];
+//! let activated = computer.gpu_activation(&input, ActivationType::ReLU)?;
+//! assert_eq!(activated, vec![0.0, 0.0, 2.0]);
+//!
+//! let upstream = [1.0f32, 1.0, 1.0];
+//! let grad = computer.gpu_activation_backward(&input, &upstream, ActivationType::ReLU)?;
+//! assert_eq!(grad, vec![0.0, 0.0, 1.0]);
 //! # Ok(())
 //! # }
 //! ```
@@ -48,6 +47,12 @@
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
 use crate::error_handling::AutogradResult;
+
+/// Negative-side slope of LeakyReLU, matching the framework default.
+const LEAKY_RELU_SLOPE: f64 = 0.01;
+
+/// Cubic coefficient of the tanh GELU approximation, matching `Tensor::gelu`.
+const GELU_CUBIC_COEFFICIENT: f64 = 0.044715;
 
 /// Supported GPU backends
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,17 +85,15 @@ impl GpuBackend {
     }
 
     /// Check if this backend is available on the current system
+    ///
+    /// Always `false`: this crate has no GPU dependency in either feature
+    /// configuration (`gpu = []` enables no transport), so no backend can be
+    /// reached from here. The real device path is
+    /// `torsh_tensor::gpu_dispatch`, which dispatches through oxicuda. This
+    /// method reports the truth rather than probing for hardware that nothing
+    /// in this crate could then use.
     pub fn is_available(&self) -> bool {
-        #[cfg(feature = "gpu")]
-        {
-            // In real implementation, this would query scirs2_core::gpu
-            // For now, return false as placeholder
-            false
-        }
-        #[cfg(not(feature = "gpu"))]
-        {
-            false
-        }
+        false
     }
 
     /// Get the best available backend for this system
@@ -267,102 +270,195 @@ impl GpuGradientComputer {
         self.available && tensor_size >= self.config.min_gpu_size
     }
 
-    #[cfg(feature = "gpu")]
-    /// Compute gradients on GPU using SciRS2-Core GPU kernels
+    /// Apply an activation function elementwise.
     ///
-    /// This leverages SciRS2-Core's multi-backend GPU support for:
-    /// - Element-wise operations (activation functions)
-    /// - Matrix multiplications (GEMM/GEMV)
-    /// - Reduction operations
-    pub fn compute_gradients_gpu<T>(&mut self, data: &[T]) -> AutogradResult<Vec<T>>
-    where
-        T: Clone + Copy + Send + Sync,
-    {
-        use std::time::Instant;
-
-        if !self.should_use_gpu(data.len()) {
-            tracing::debug!(
-                "Tensor too small for GPU ({} elements), using CPU fallback",
-                data.len()
-            );
-            return Ok(data.to_vec());
-        }
-
-        let start = Instant::now();
-
-        // Placeholder for actual GPU computation using scirs2_core::gpu
-        // In full implementation, this would:
-        // 1. Transfer data to GPU memory
-        // 2. Execute GPU kernels
-        // 3. Transfer results back to CPU
-        //
-        // Example (pseudo-code):
-        // use scirs2_core::gpu::kernels::ml::{GeluKernel, LeakyReluKernel};
-        // let gpu_result = GeluKernel::execute(data)?;
-
-        let result = data.to_vec(); // Placeholder
-
-        // Update statistics
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        self.stats.total_ops += 1;
-        self.stats.total_time_ms += elapsed;
-        self.stats.kernel_launches += 1;
-        self.stats.memory_transferred += data.len() * std::mem::size_of::<T>() * 2; // To/from GPU
-
-        Ok(result)
-    }
-
-    #[cfg(not(feature = "gpu"))]
-    /// CPU fallback when GPU feature is not enabled
-    pub fn compute_gradients_gpu<T>(&mut self, data: &[T]) -> AutogradResult<Vec<T>>
-    where
-        T: Clone,
-    {
-        tracing::warn!("GPU feature not enabled, using CPU fallback");
-        Ok(data.to_vec())
-    }
-
-    #[cfg(feature = "gpu")]
-    /// Apply activation function on GPU
+    /// Supported: GELU (tanh approximation, matching `Tensor::gelu`), LeakyReLU
+    /// (slope 0.01), Swish/SiLU, ReLU, Tanh and Sigmoid.
     ///
-    /// Supported activation functions via SciRS2-Core GPU kernels:
-    /// - GELU, LeakyReLU, Swish (SiLU), ReLU, Tanh, Sigmoid
+    /// # Execution
+    ///
+    /// The work runs on the CPU. No GPU transport is wired into this crate (see
+    /// [`GpuBackend::is_available`]), so [`should_use_gpu`](Self::should_use_gpu)
+    /// is always false and no kernel-launch or host/device-transfer statistics
+    /// are recorded — the counters in [`GpuStats`] only ever move when real GPU
+    /// work happens. Elapsed time and the operation count are recorded because
+    /// they are measured, not assumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required floating-point constant cannot be
+    /// represented in `T`.
     pub fn gpu_activation<T>(
         &mut self,
         data: &[T],
         activation: ActivationType,
     ) -> AutogradResult<Vec<T>>
     where
-        T: Clone + Copy + Send + Sync,
+        T: num_traits::Float,
     {
-        if !self.should_use_gpu(data.len()) {
-            // Fall back to CPU for small tensors
-            return self.cpu_activation_fallback(data, activation);
-        }
-
-        // Placeholder for actual GPU activation using scirs2_core::gpu::kernels::ml
-        // Example:
-        // match activation {
-        //     ActivationType::GELU => GeluKernel::execute(data),
-        //     ActivationType::LeakyReLU => LeakyReluKernel::execute(data, 0.01),
-        //     ActivationType::Swish => SwishKernel::execute(data),
-        //     ...
-        // }
-
-        self.stats.kernel_launches += 1;
-        Ok(data.to_vec())
+        let start = std::time::Instant::now();
+        let result = Self::activation_forward(data, activation)?;
+        self.record_cpu_op(start);
+        Ok(result)
     }
 
-    /// CPU fallback for activation functions
-    fn cpu_activation_fallback<T>(
-        &self,
-        data: &[T],
-        _activation: ActivationType,
+    /// Backward pass of [`gpu_activation`](Self::gpu_activation).
+    ///
+    /// Returns `grad_output * f'(input)` elementwise, where `f` is `activation`
+    /// and `input` is the tensor that was fed to the forward pass. This is the
+    /// quantity a gradient computer actually needs; the forward activation alone
+    /// is not a gradient.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `input` and `grad_output` have different lengths, or
+    /// if a required floating-point constant cannot be represented in `T`.
+    pub fn gpu_activation_backward<T>(
+        &mut self,
+        input: &[T],
+        grad_output: &[T],
+        activation: ActivationType,
     ) -> AutogradResult<Vec<T>>
     where
-        T: Clone,
+        T: num_traits::Float,
     {
-        Ok(data.to_vec())
+        if input.len() != grad_output.len() {
+            return Err(crate::error_handling::AutogradError::shape_mismatch(
+                "gpu_activation_backward",
+                vec![input.len()],
+                vec![grad_output.len()],
+            ));
+        }
+
+        let start = std::time::Instant::now();
+        let derivative = Self::activation_derivative(input, activation)?;
+        let result = derivative
+            .into_iter()
+            .zip(grad_output.iter())
+            .map(|(d, &g)| d * g)
+            .collect();
+        self.record_cpu_op(start);
+        Ok(result)
+    }
+
+    /// Record one honestly-measured CPU operation.
+    ///
+    /// Deliberately leaves `kernel_launches` and `memory_transferred` alone: a
+    /// profile that reports launches and transfers that never happened is worse
+    /// than no profile at all.
+    fn record_cpu_op(&mut self, start: std::time::Instant) {
+        self.stats.total_ops += 1;
+        self.stats.total_time_ms += start.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    /// Convert an `f64` constant into `T`, or report which constant failed.
+    fn constant<T: num_traits::Float>(value: f64, what: &str) -> AutogradResult<T> {
+        T::from(value).ok_or_else(|| {
+            crate::error_handling::AutogradError::gradient_computation(
+                "activation",
+                format!("cannot represent {what} ({value}) in the element type"),
+            )
+        })
+    }
+
+    /// Elementwise activation values.
+    fn activation_forward<T: num_traits::Float>(
+        data: &[T],
+        activation: ActivationType,
+    ) -> AutogradResult<Vec<T>> {
+        let zero = T::zero();
+        let one = T::one();
+        let half: T = Self::constant(0.5, "0.5")?;
+        let leaky_slope: T = Self::constant(LEAKY_RELU_SLOPE, "the LeakyReLU slope")?;
+        let gelu_coefficient: T = Self::constant(GELU_CUBIC_COEFFICIENT, "the GELU coefficient")?;
+        let sqrt_2_over_pi: T = Self::constant((2.0 / std::f64::consts::PI).sqrt(), "sqrt(2/pi)")?;
+
+        Ok(data
+            .iter()
+            .map(|&x| match activation {
+                ActivationType::ReLU => {
+                    if x > zero {
+                        x
+                    } else {
+                        zero
+                    }
+                }
+                ActivationType::LeakyReLU => {
+                    if x > zero {
+                        x
+                    } else {
+                        leaky_slope * x
+                    }
+                }
+                ActivationType::Tanh => x.tanh(),
+                ActivationType::Sigmoid => one / (one + (-x).exp()),
+                ActivationType::Swish => x * (one / (one + (-x).exp())),
+                ActivationType::GELU => {
+                    let inner = sqrt_2_over_pi * (x + gelu_coefficient * x * x * x);
+                    half * x * (one + inner.tanh())
+                }
+            })
+            .collect())
+    }
+
+    /// Elementwise derivative of the activation with respect to its input.
+    fn activation_derivative<T: num_traits::Float>(
+        data: &[T],
+        activation: ActivationType,
+    ) -> AutogradResult<Vec<T>> {
+        let zero = T::zero();
+        let one = T::one();
+        let three: T = Self::constant(3.0, "3.0")?;
+        let half: T = Self::constant(0.5, "0.5")?;
+        let leaky_slope: T = Self::constant(LEAKY_RELU_SLOPE, "the LeakyReLU slope")?;
+        let gelu_coefficient: T = Self::constant(GELU_CUBIC_COEFFICIENT, "the GELU coefficient")?;
+        let sqrt_2_over_pi: T = Self::constant((2.0 / std::f64::consts::PI).sqrt(), "sqrt(2/pi)")?;
+
+        Ok(data
+            .iter()
+            .map(|&x| match activation {
+                // Sub-gradient 0 is the usual convention at the kink.
+                ActivationType::ReLU => {
+                    if x > zero {
+                        one
+                    } else {
+                        zero
+                    }
+                }
+                ActivationType::LeakyReLU => {
+                    if x > zero {
+                        one
+                    } else {
+                        leaky_slope
+                    }
+                }
+                // d/dx tanh(x) = 1 - tanh(x)^2
+                ActivationType::Tanh => {
+                    let t = x.tanh();
+                    one - t * t
+                }
+                // d/dx sigma(x) = sigma(x) (1 - sigma(x))
+                ActivationType::Sigmoid => {
+                    let s = one / (one + (-x).exp());
+                    s * (one - s)
+                }
+                // d/dx (x sigma(x)) = sigma(x) (1 + x (1 - sigma(x)))
+                ActivationType::Swish => {
+                    let s = one / (one + (-x).exp());
+                    s * (one + x * (one - s))
+                }
+                // With u(x) = sqrt(2/pi) (x + c x^3):
+                //   d/dx [0.5 x (1 + tanh u)] = 0.5 (1 + tanh u) + 0.5 x (1 - tanh^2 u) u'
+                ActivationType::GELU => {
+                    let inner = sqrt_2_over_pi * (x + gelu_coefficient * x * x * x);
+                    let tanh_inner = inner.tanh();
+                    let inner_derivative =
+                        sqrt_2_over_pi * (one + three * gelu_coefficient * x * x);
+                    half * (one + tanh_inner)
+                        + half * x * (one - tanh_inner * tanh_inner) * inner_derivative
+                }
+            })
+            .collect())
     }
 
     /// Report current performance statistics

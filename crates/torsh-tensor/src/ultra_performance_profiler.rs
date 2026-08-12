@@ -12,6 +12,7 @@ use scirs2_core::parallel_ops::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use torsh_core::sync::MutexExt;
 use torsh_core::TensorElement;
 
 /// Ultra-performance profiler for micro-optimization analysis
@@ -411,7 +412,7 @@ impl UltraPerformanceProfiler {
 
     /// Generate comprehensive ultra-performance report
     pub fn generate_comprehensive_report(&self) -> UltraPerformanceReport {
-        let statistics = self.statistics.lock().expect("lock should not be poisoned");
+        let statistics = self.statistics.lock_or_recover();
 
         UltraPerformanceReport {
             executive_summary: self.generate_executive_summary(&statistics),

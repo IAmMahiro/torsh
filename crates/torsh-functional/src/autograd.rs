@@ -155,7 +155,43 @@ impl Default for AutogradRegistry {
     }
 }
 
+/// Refuse an application whose backward pass could never run.
+///
+/// `torsh_tensor`'s autograd graph has no node type that dispatches back into a
+/// user-supplied `backward`, so a custom function can only be differentiated when
+/// its `forward` is built from differentiable tensor operations — the primitives
+/// then carry the gradient themselves and the custom `backward` is never needed.
+///
+/// When the inputs require gradients but the outputs came back detached, the
+/// caller is expecting a backward pass that would silently never fire. That is
+/// reported here instead of being discovered as a missing gradient during training.
+fn ensure_backward_reachable(
+    inputs: &[Tensor],
+    outputs: &[Tensor],
+    context: &str,
+) -> TorshResult<()> {
+    let inputs_need_grad = inputs.iter().any(|input| input.requires_grad());
+    let outputs_track_grad = outputs.iter().any(|output| output.requires_grad());
+    if inputs_need_grad && !outputs_track_grad {
+        return Err(TorshError::UnsupportedOperation {
+            op: format!(
+                "{context}: the custom backward cannot be connected to the autograd graph \
+                 (the forward pass returned tensors that are detached from inputs which \
+                 require gradients); build `forward` from differentiable tensor operations"
+            ),
+            dtype: "tensor".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Apply a custom autograd function
+///
+/// The gradient of the result flows through the tensor operations used inside
+/// [`CustomAutogradFunction::forward`]. If `forward` detaches its inputs (for
+/// instance by rebuilding the result from raw data) the call fails rather than
+/// returning a tensor whose backward pass would silently do nothing — see
+/// [`ensure_backward_reachable`].
 pub fn apply_custom_function<F>(function: F, inputs: &[Tensor]) -> TorshResult<Vec<Tensor>>
 where
     F: CustomAutogradFunction,
@@ -187,6 +223,8 @@ where
         ));
     }
 
+    ensure_backward_reachable(inputs, &outputs, "apply_custom_function")?;
+
     Ok(outputs)
 }
 
@@ -210,8 +248,10 @@ where
         ));
     }
 
-    // Create context
+    // Create context; the per-input flags mirror the actual tensors instead of
+    // defaulting every entry to `true`.
     let mut ctx = AutogradContext::new(inputs.len());
+    ctx.set_needs_input_grad(inputs.iter().map(|input| input.requires_grad()).collect());
 
     // Apply forward pass
     let outputs = function.forward(&mut ctx, inputs)?;
@@ -227,6 +267,8 @@ where
             "apply_custom_function_with_context",
         ));
     }
+
+    ensure_backward_reachable(inputs, &outputs, "apply_custom_function_with_context")?;
 
     Ok(outputs)
 }
@@ -459,6 +501,8 @@ pub fn apply_registered_function(name: &str, inputs: &[Tensor]) -> TorshResult<V
             "apply_registered_function",
         ));
     }
+
+    ensure_backward_reachable(inputs, &outputs, "apply_registered_function")?;
 
     Ok(outputs)
 }

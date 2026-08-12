@@ -197,7 +197,10 @@ pub fn kaiser_window(n: usize, beta: f32, periodic: bool) -> Result<Tensor> {
     Ok(window)
 }
 
-/// Gaussian window with standard deviation
+/// Gaussian window whose standard deviation `std` is given **in samples**
+///
+/// `w[i] = exp(-0.5 * ((i - (M-1)/2) / std)^2)`, matching
+/// `scipy.signal.windows.gaussian` and `torch.signal.windows.gaussian`.
 pub fn gaussian_window(n: usize, std: f32, periodic: bool) -> Result<Tensor> {
     if n == 0 {
         return Ok(zeros(&[0])?);
@@ -206,10 +209,18 @@ pub fn gaussian_window(n: usize, std: f32, periodic: bool) -> Result<Tensor> {
         return Ok(ones(&[1])?);
     }
 
+    if !(std > 0.0) || !std.is_finite() {
+        return Err(TorshError::InvalidArgument(
+            "Gaussian window standard deviation must be positive and finite".to_string(),
+        ));
+    }
+
     let n_adj = if periodic { n } else { n - 1 };
     let mut window = zeros(&[n])?;
 
-    let sigma = std as f64 * n_adj as f64 / 2.0;
+    // `std` is expressed in samples, exactly like scipy.signal.windows.gaussian
+    // and torch.signal.windows.gaussian.
+    let sigma = std as f64;
     let center = (n_adj as f64) / 2.0;
 
     for i in 0..n {
@@ -237,20 +248,28 @@ pub fn tukey_window(n: usize, alpha: f32, periodic: bool) -> Result<Tensor> {
         return hann_window(n, periodic);
     }
 
+    // scipy computes the periodic form as the symmetric window of length n+1
+    // with the last sample dropped, i.e. the taper is parameterised by n_adj.
     let n_adj = if periodic { n } else { n - 1 };
     let mut window = zeros(&[n])?;
 
-    let width = (alpha as f64 * n_adj as f64 / 2.0) as usize;
+    let alpha = alpha as f64;
+    let span = n_adj as f64;
+    // Number of samples in each taper (may be zero for very short windows).
+    let width = (alpha * span / 2.0).floor();
 
     for i in 0..n {
-        let value = if i < width {
-            0.5 * (1.0 - ((PI * i as f64) / width as f64).cos())
-        } else if i < n_adj - width {
+        let x = i as f64;
+        let value = if x <= width {
+            // Rising taper.
+            0.5 * (1.0 + (PI * (-1.0 + 2.0 * x / (alpha * span))).cos())
+        } else if x < span - width {
             1.0
         } else {
-            0.5 * (1.0 - ((PI * (n_adj - i) as f64) / width as f64).cos())
+            // Falling taper (mirror of the rising one).
+            0.5 * (1.0 + (PI * (-2.0 / alpha + 1.0 + 2.0 * x / (alpha * span))).cos())
         };
-        window.set_1d(i, value as f32)?;
+        window.set_1d(i, value.clamp(0.0, 1.0) as f32)?;
     }
 
     Ok(window)

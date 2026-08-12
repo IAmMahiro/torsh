@@ -1,8 +1,11 @@
 //! Graph Isomorphism Network (GIN) layer implementation
 //! Based on the paper "How Powerful are Graph Neural Networks?"
-
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
+
 use crate::parameter::Parameter;
 use crate::{GraphData, GraphLayer};
 use torsh_tensor::{
@@ -30,12 +33,11 @@ impl GINConv {
         eps: f64,
         train_eps: bool,
         bias: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let eps_param = if train_eps {
-            Some(Parameter::new(
-                torsh_tensor::creation::tensor_scalar(eps as f32)
-                    .expect("failed to create epsilon scalar"),
-            ))
+            Some(Parameter::new(torsh_tensor::creation::tensor_scalar(
+                eps as f32,
+            )?))
         } else {
             None
         };
@@ -43,23 +45,17 @@ impl GINConv {
         // Create a simple 2-layer MLP
         let hidden_dim = (in_features + out_features) / 2;
         let mlp = vec![
-            Parameter::new(
-                randn(&[in_features, hidden_dim]).expect("failed to create MLP layer 1 weights"),
-            ),
-            Parameter::new(
-                randn(&[hidden_dim, out_features]).expect("failed to create MLP layer 2 weights"),
-            ),
+            Parameter::new(randn(&[in_features, hidden_dim])?),
+            Parameter::new(randn(&[hidden_dim, out_features])?),
         ];
 
         let bias = if bias {
-            Some(Parameter::new(
-                zeros(&[out_features]).expect("failed to create bias tensor"),
-            ))
+            Some(Parameter::new(zeros(&[out_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             eps,
@@ -67,16 +63,13 @@ impl GINConv {
             eps_param,
             mlp,
             bias,
-        }
+        })
     }
 
     /// Apply GIN convolution
-    pub fn forward(&self, graph: &GraphData) -> GraphData {
+    pub fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         let num_nodes = graph.num_nodes;
-        let edge_flat = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_flat = graph.edge_index.to_vec()?;
         let num_edges = edge_flat.len() / 2;
         let edge_data = vec![
             edge_flat[0..num_edges].to_vec(),
@@ -94,93 +87,64 @@ impl GINConv {
         }
 
         // Aggregate neighbor features (sum aggregation for GIN)
-        let neighbor_features = zeros(&[num_nodes, self.in_features])
-            .expect("failed to create neighbor features tensor");
+        let neighbor_features = zeros(&[num_nodes, self.in_features])?;
 
         for node in 0..num_nodes {
-            let mut aggregated =
-                zeros(&[self.in_features]).expect("failed to create aggregated features tensor");
+            let mut aggregated = zeros(&[self.in_features])?;
 
             // Sum all neighbor features
             for &neighbor in &adjacency_list[node] {
                 let neighbor_feat = graph
                     .x
-                    .slice_tensor(0, neighbor, neighbor + 1)
-                    .expect("failed to slice neighbor features")
-                    .squeeze_tensor(0)
-                    .expect("failed to squeeze neighbor features");
-                aggregated = aggregated
-                    .add(&neighbor_feat)
-                    .expect("operation should succeed");
+                    .slice_tensor(0, neighbor, neighbor + 1)?
+                    .squeeze_tensor(0)?;
+                aggregated = aggregated.add(&neighbor_feat)?;
             }
 
-            let mut node_slice = neighbor_features
-                .slice_tensor(0, node, node + 1)
-                .expect("failed to slice neighbor features");
-            let _ = node_slice.copy_(
-                &aggregated
-                    .unsqueeze_tensor(0)
-                    .expect("failed to unsqueeze aggregated features"),
-            );
+            let mut node_slice = neighbor_features.slice_tensor(0, node, node + 1)?;
+            let _ = node_slice.copy_(&aggregated.unsqueeze_tensor(0)?);
         }
 
         // Get epsilon value
         let epsilon = if let Some(ref eps_param) = self.eps_param {
-            eps_param
-                .clone_data()
-                .to_vec()
-                .expect("conversion should succeed")[0] as f64
+            eps_param.clone_data().to_vec()?[0] as f64
         } else {
             self.eps
         };
 
         // Combine self and neighbor features: (1 + eps) * h_i + sum(h_j)
-        let self_weighted = graph
-            .x
-            .mul_scalar((1.0 + epsilon) as f32)
-            .expect("failed to scale self features");
-        let combined_features = self_weighted
-            .add(&neighbor_features)
-            .expect("operation should succeed");
+        let self_weighted = graph.x.mul_scalar((1.0 + epsilon) as f32)?;
+        let combined_features = self_weighted.add(&neighbor_features)?;
 
         // Apply MLP
-        let mut output = combined_features
-            .matmul(&self.mlp[0].clone_data())
-            .expect("operation should succeed");
+        let mut output = combined_features.matmul(&self.mlp[0].clone_data())?;
 
         // Apply ReLU activation (using max with zero tensor)
-        let zero_tensor =
-            zeros(output.shape().dims()).expect("failed to create zero tensor for ReLU");
-        output = output
-            .maximum(&zero_tensor)
-            .expect("failed to apply ReLU activation");
+        let zero_tensor = zeros(output.shape().dims())?;
+        output = output.maximum(&zero_tensor)?;
 
         // Second layer
-        output = output
-            .matmul(&self.mlp[1].clone_data())
-            .expect("operation should succeed");
+        output = output.matmul(&self.mlp[1].clone_data())?;
 
         // Add bias if present
         if let Some(ref bias) = self.bias {
-            output = output
-                .add(&bias.clone_data())
-                .expect("operation should succeed");
+            output = output.add(&bias.clone_data())?;
         }
 
         // Create output graph
-        GraphData {
+        Ok(GraphData {
             x: output,
             edge_index: graph.edge_index.clone(),
             edge_attr: graph.edge_attr.clone(),
             batch: graph.batch.clone(),
             num_nodes: graph.num_nodes,
             num_edges: graph.num_edges,
-        }
+        })
     }
 }
 
 impl GraphLayer for GINConv {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         self.forward(graph)
     }
 
@@ -208,7 +172,7 @@ mod tests {
     #[test]
     fn test_gin_creation() {
         let gin = GINConv::new(8, 16, 0.5, true, true);
-        let params = gin.parameters();
+        let params = gin.expect("operation should succeed").parameters();
         assert!(params.len() >= 2); // At least MLP weights
         assert!(params.len() <= 4); // At most MLP + eps + bias
     }
@@ -232,7 +196,10 @@ mod tests {
             .expect("from vec should succeed");
         let graph = GraphData::new(x, edge_index);
 
-        let output = gin.forward(&graph);
+        let output = gin
+            .expect("operation should succeed")
+            .forward(&graph)
+            .expect("operation should succeed");
         assert_eq!(output.x.shape().dims(), &[3, 6]);
         assert_eq!(output.num_nodes, 3);
     }
@@ -242,8 +209,10 @@ mod tests {
         let gin_fixed = GINConv::new(4, 8, 1.0, false, false);
         let gin_trainable = GINConv::new(4, 8, 1.0, true, false);
 
-        let fixed_params = gin_fixed.parameters();
-        let trainable_params = gin_trainable.parameters();
+        let fixed_params = gin_fixed.expect("operation should succeed").parameters();
+        let trainable_params = gin_trainable
+            .expect("operation should succeed")
+            .parameters();
 
         // Trainable eps version should have one more parameter
         assert_eq!(trainable_params.len(), fixed_params.len() + 1);

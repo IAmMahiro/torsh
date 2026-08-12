@@ -138,8 +138,8 @@ pub use simd_ops::{
     calculate_tensor_stats_simd, dequantize_per_tensor_affine_simd, find_min_max_simd,
     get_mobile_optimization_hints, get_simd_width, is_simd_available,
     quantize_batch_consistent_simd, quantize_mobile_optimized, quantize_per_channel_simd,
-    quantize_per_tensor_affine_simd, quantize_to_int8_simd, MobileOptimizationHints,
-    TensorStats as SimdTensorStats,
+    quantize_per_tensor_affine_simd, quantize_per_tensor_affine_simd_range, quantize_to_int8_simd,
+    MobileOptimizationHints, TensorStats as SimdTensorStats,
 };
 
 // ARM NEON-specific operations (only available on aarch64)

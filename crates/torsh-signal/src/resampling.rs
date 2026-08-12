@@ -101,7 +101,12 @@ impl RationalResamplerProcessor {
         }
     }
 
-    /// Resample using rational factors (simplified implementation)
+    /// Resample by the rational factor `up / down`.
+    ///
+    /// Implements the classical upsample → anti-image/anti-alias filter →
+    /// downsample chain. The interpolation filter is a linear-phase windowed
+    /// sinc whose delay is compensated internally, so output sample `m`
+    /// corresponds to input time `m * down / up`.
     pub fn resample(&self, signal: &Tensor<f32>) -> Result<Tensor<f32>> {
         let input_shape = signal.shape();
         if input_shape.ndim() != 1 {
@@ -109,11 +114,35 @@ impl RationalResamplerProcessor {
                 "Rational resampling requires 1D tensor".to_string(),
             ));
         }
+        if self.up_factor == 0 || self.down_factor == 0 {
+            return Err(TorshError::InvalidArgument(
+                "Resampling factors must be greater than zero".to_string(),
+            ));
+        }
 
         let input_length = input_shape.dims()[0];
         let output_length = (input_length * self.up_factor) / self.down_factor;
 
-        let output = zeros(&[output_length])?;
+        let upsampled = zero_stuff(signal, self.up_factor)?;
+        // Cutoff (fraction of the upsampled Nyquist) that satisfies both the
+        // anti-imaging and the anti-aliasing requirement.
+        let cutoff = 1.0 / self.up_factor.max(self.down_factor) as f32;
+        let taps = odd_taps(
+            self.filter_length
+                .max(8 * self.up_factor.max(self.down_factor)),
+        );
+        let kernel = windowed_sinc_lowpass(taps, cutoff, self.up_factor as f32);
+        let filtered = fir_filter_centered(&upsampled, &kernel)?;
+
+        let mut output = zeros(&[output_length])?;
+        let filtered_len = filtered.shape().dims()[0];
+        for m in 0..output_length {
+            let index = m * self.down_factor;
+            if index < filtered_len {
+                let value: f32 = filtered.get_1d(index)?;
+                output.set_1d(m, value)?;
+            }
+        }
         Ok(output)
     }
 }
@@ -252,7 +281,11 @@ pub fn linear_resample(
     Ok(output)
 }
 
-/// Simple decimation
+/// Decimate a signal by an integer factor.
+///
+/// Applies a linear-phase anti-aliasing lowpass with cutoff `pi / factor`
+/// before keeping every `factor`-th sample. The filter delay is compensated,
+/// so `output[m]` corresponds to `input[m * factor]`.
 pub fn decimate(signal: &Tensor<f32>, factor: usize) -> Result<Tensor<f32>> {
     let input_shape = signal.shape();
     if input_shape.ndim() != 1 {
@@ -260,15 +293,35 @@ pub fn decimate(signal: &Tensor<f32>, factor: usize) -> Result<Tensor<f32>> {
             "Decimation requires 1D tensor".to_string(),
         ));
     }
+    if factor == 0 {
+        return Err(TorshError::InvalidArgument(
+            "Decimation factor must be greater than zero".to_string(),
+        ));
+    }
 
     let input_length = input_shape.dims()[0];
     let output_length = input_length / factor;
+    if factor == 1 {
+        return Ok(signal.clone());
+    }
 
-    let output = zeros(&[output_length])?;
+    let kernel = windowed_sinc_lowpass(odd_taps(20 * factor + 1), 1.0 / factor as f32, 1.0);
+    let filtered = fir_filter_centered(signal, &kernel)?;
+
+    let mut output = zeros(&[output_length])?;
+    for m in 0..output_length {
+        let value: f32 = filtered.get_1d(m * factor)?;
+        output.set_1d(m, value)?;
+    }
     Ok(output)
 }
 
-/// Simple interpolation (zero-stuffing)
+/// Interpolate (upsample) a signal by an integer factor.
+///
+/// Zero-stuffs the signal and applies an interpolation lowpass with cutoff
+/// `pi / factor` and passband gain `factor`, so the original samples are
+/// preserved at `output[m * factor]` and the inserted samples are the
+/// band-limited interpolation of their neighbours.
 pub fn interpolate(signal: &Tensor<f32>, factor: usize) -> Result<Tensor<f32>> {
     let input_shape = signal.shape();
     if input_shape.ndim() != 1 {
@@ -276,15 +329,111 @@ pub fn interpolate(signal: &Tensor<f32>, factor: usize) -> Result<Tensor<f32>> {
             "Interpolation requires 1D tensor".to_string(),
         ));
     }
+    if factor == 0 {
+        return Err(TorshError::InvalidArgument(
+            "Interpolation factor must be greater than zero".to_string(),
+        ));
+    }
+    if factor == 1 {
+        return Ok(signal.clone());
+    }
 
-    let input_length = input_shape.dims()[0];
-    let output_length = input_length * factor;
-
-    let output = zeros(&[output_length])?;
-    Ok(output)
+    let upsampled = zero_stuff(signal, factor)?;
+    let kernel = windowed_sinc_lowpass(
+        odd_taps(20 * factor + 1),
+        1.0 / factor as f32,
+        factor as f32,
+    );
+    fir_filter_centered(&upsampled, &kernel)
 }
 
 // Helper functions for resampling
+
+/// Round a tap count up to the next odd number (linear phase, integer delay).
+fn odd_taps(taps: usize) -> usize {
+    let taps = taps.max(3);
+    if taps % 2 == 0 {
+        taps + 1
+    } else {
+        taps
+    }
+}
+
+/// Windowed-sinc lowpass kernel with unity DC gain scaled by `gain`.
+///
+/// `cutoff` is the normalised cutoff (fraction of the Nyquist frequency).
+fn windowed_sinc_lowpass(taps: usize, cutoff: f32, gain: f32) -> Vec<f32> {
+    use scirs2_core::constants::math::PI;
+    let pi_f32 = PI as f32;
+    let cutoff = cutoff.clamp(1e-6, 1.0);
+    let centre = (taps as f32 - 1.0) / 2.0;
+
+    let mut coeffs = vec![0.0f32; taps];
+    for (i, coeff) in coeffs.iter_mut().enumerate() {
+        let n = i as f32 - centre;
+        let sinc = if n.abs() < 1e-10 {
+            cutoff
+        } else {
+            (pi_f32 * cutoff * n).sin() / (pi_f32 * n)
+        };
+        // Blackman window: ~74 dB stopband attenuation.
+        let phase = 2.0 * pi_f32 * i as f32 / (taps - 1) as f32;
+        let window = 0.42 - 0.5 * phase.cos() + 0.08 * (2.0 * phase).cos();
+        *coeff = sinc * window;
+    }
+
+    let sum: f32 = coeffs.iter().sum();
+    if sum.abs() > 1e-12 {
+        for coeff in coeffs.iter_mut() {
+            *coeff *= gain / sum;
+        }
+    }
+    coeffs
+}
+
+/// Zero-stuff a signal: insert `factor - 1` zeros after every sample.
+fn zero_stuff(signal: &Tensor<f32>, factor: usize) -> Result<Tensor<f32>> {
+    let input_length = signal.shape().dims()[0];
+    let mut output = zeros(&[input_length * factor])?;
+    for i in 0..input_length {
+        let value: f32 = signal.get_1d(i)?;
+        output.set_1d(i * factor, value)?;
+    }
+    Ok(output)
+}
+
+/// Apply a symmetric (odd-length) FIR kernel with its group delay removed.
+///
+/// The signal is extended by edge replication so the response does not droop
+/// towards zero at the boundaries.
+fn fir_filter_centered(signal: &Tensor<f32>, kernel: &[f32]) -> Result<Tensor<f32>> {
+    let length = signal.shape().dims()[0];
+    if kernel.is_empty() {
+        return Err(TorshError::InvalidArgument(
+            "FIR kernel cannot be empty".to_string(),
+        ));
+    }
+    if length == 0 {
+        return Ok(signal.clone());
+    }
+
+    let half = (kernel.len() - 1) / 2;
+    let data = signal.to_vec()?;
+    let sample = |index: i64| -> f32 {
+        let clamped = index.clamp(0, length as i64 - 1) as usize;
+        data[clamped]
+    };
+
+    let mut output = zeros(&[length])?;
+    for n in 0..length {
+        let mut acc = 0.0f32;
+        for (k, &coeff) in kernel.iter().enumerate() {
+            acc += coeff * sample(n as i64 + half as i64 - k as i64);
+        }
+        output.set_1d(n, acc)?;
+    }
+    Ok(output)
+}
 
 /// Find rational approximation of a real number
 fn rational_approximation(value: f32, max_denominator: usize) -> (usize, usize) {

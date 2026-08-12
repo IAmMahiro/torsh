@@ -475,36 +475,164 @@ impl AdvancedTransforms {
         Ok(Tensor::from_vec(adjusted_data, shape.dims())?)
     }
 
-    fn adjust_hue(&self, image: &Tensor, _factor: f32) -> Result<Tensor> {
-        // Simplified hue adjustment - would convert to HSV in production
-        Ok(image.clone()) // Placeholder implementation
+    /// Rotate the hue of an interleaved `(H, W, 3)` RGB image
+    ///
+    /// `factor` is the hue shift expressed as a fraction of the full colour
+    /// circle (torchvision convention): `0.5` is a 180-degree rotation. The
+    /// conversion goes through HSV and preserves saturation and value exactly.
+    fn adjust_hue(&self, image: &Tensor, factor: f32) -> Result<Tensor> {
+        let shape = image.shape();
+        let dims = shape.dims().to_vec();
+
+        if dims.len() != 3 || dims[2] != 3 {
+            return Err(VisionError::InvalidShape(format!(
+                "adjust_hue expects an interleaved (H, W, 3) RGB image, got {:?}",
+                dims
+            )));
+        }
+
+        let shift = factor.rem_euclid(1.0) * 360.0;
+        let data = image.to_vec()?;
+        let mut adjusted = data.clone();
+
+        for pixel in adjusted.chunks_exact_mut(3) {
+            let (h, s, v) = rgb_to_hsv(pixel[0], pixel[1], pixel[2]);
+            let (r, g, b) = hsv_to_rgb((h + shift).rem_euclid(360.0), s, v);
+            pixel[0] = r;
+            pixel[1] = g;
+            pixel[2] = b;
+        }
+
+        Ok(Tensor::from_vec(adjusted, &dims)?)
     }
 
-    fn elastic_deformation(&self, image: &Tensor, alpha: f32, _sigma: f32) -> Result<Tensor> {
-        // Simplified elastic deformation
+    /// Elastic deformation of an `(H, W)` or `(H, W, C)` image
+    ///
+    /// Random displacement fields are drawn in `[-alpha, alpha]`, smoothed with a
+    /// separable Gaussian of standard deviation `sigma` (this is what makes the
+    /// deformation elastic rather than pure noise), and then applied by resampling
+    /// the source image with clamped bilinear interpolation.
+    fn elastic_deformation(&self, image: &Tensor, alpha: f32, sigma: f32) -> Result<Tensor> {
         let shape = image.shape();
-        let height = shape.dims()[0];
-        let width = shape.dims()[1];
+        let dims = shape.dims().to_vec();
+        if dims.len() != 2 && dims.len() != 3 {
+            return Err(VisionError::InvalidShape(format!(
+                "elastic_deformation expects an (H, W) or (H, W, C) image, got {:?}",
+                dims
+            )));
+        }
+
+        let height = dims[0];
+        let width = dims[1];
+        if height == 0 || width == 0 {
+            return Err(VisionError::InvalidArgument(
+                "elastic_deformation requires a non-empty image".to_string(),
+            ));
+        }
+
         let mut rng = rng();
 
         // Generate random displacement fields
         let mut dx_field = Array2::zeros((height, width));
         let mut dy_field = Array2::zeros((height, width));
 
-        for i in 0..height {
-            for j in 0..width {
-                dx_field[[i, j]] = rng.gen_range(-alpha..alpha);
-                dy_field[[i, j]] = rng.gen_range(-alpha..alpha);
+        if alpha > 0.0 {
+            for i in 0..height {
+                for j in 0..width {
+                    dx_field[[i, j]] = rng.gen_range(-alpha..alpha);
+                    dy_field[[i, j]] = rng.gen_range(-alpha..alpha);
+                }
             }
         }
 
-        // Apply simple displacement (would use proper grid sampling in production)
-        Ok(image.clone()) // Placeholder - complex implementation needed
+        // Smooth the fields so neighbouring pixels move coherently.
+        let dx_field = gaussian_smooth_field(&dx_field, sigma);
+        let dy_field = gaussian_smooth_field(&dy_field, sigma);
+
+        self.warp_hwc(image, &dims, &dx_field, &dy_field)
     }
 
-    fn apply_displacement(&self, image: &Tensor, _dx: &Tensor, _dy: &Tensor) -> Result<Tensor> {
-        // Placeholder for displacement application
-        Ok(image.clone())
+    /// Apply an explicit displacement field to an image
+    ///
+    /// `dx` and `dy` are per-pixel displacement tensors covering the image's
+    /// `(H, W)` extent. Output pixel `(x, y)` is sampled from the source at
+    /// `(x + dx, y + dy)` with clamped bilinear interpolation.
+    fn apply_displacement(&self, image: &Tensor, dx: &Tensor, dy: &Tensor) -> Result<Tensor> {
+        let shape = image.shape();
+        let dims = shape.dims().to_vec();
+        if dims.len() != 2 && dims.len() != 3 {
+            return Err(VisionError::InvalidShape(format!(
+                "apply_displacement expects an (H, W) or (H, W, C) image, got {:?}",
+                dims
+            )));
+        }
+
+        let height = dims[0];
+        let width = dims[1];
+        let expected = height * width;
+
+        let dx_data = dx.to_vec()?;
+        let dy_data = dy.to_vec()?;
+        if dx_data.len() != expected || dy_data.len() != expected {
+            return Err(VisionError::InvalidShape(format!(
+                "Displacement tensors must have {} elements each, got {} and {}",
+                expected,
+                dx_data.len(),
+                dy_data.len()
+            )));
+        }
+
+        let mut dx_field = Array2::zeros((height, width));
+        let mut dy_field = Array2::zeros((height, width));
+        for y in 0..height {
+            for x in 0..width {
+                dx_field[[y, x]] = dx_data[y * width + x];
+                dy_field[[y, x]] = dy_data[y * width + x];
+            }
+        }
+
+        self.warp_hwc(image, &dims, &dx_field, &dy_field)
+    }
+
+    /// Resample an interleaved `(H, W)` / `(H, W, C)` image through a displacement field
+    fn warp_hwc(
+        &self,
+        image: &Tensor,
+        dims: &[usize],
+        dx_field: &Array2<f32>,
+        dy_field: &Array2<f32>,
+    ) -> Result<Tensor> {
+        let height = dims[0];
+        let width = dims[1];
+        let channels = if dims.len() == 3 { dims[2] } else { 1 };
+
+        let data = image.to_vec()?;
+        let mut output = vec![0.0f32; data.len()];
+
+        for y in 0..height {
+            for x in 0..width {
+                let src_x = (x as f32 + dx_field[[y, x]]).clamp(0.0, (width - 1) as f32);
+                let src_y = (y as f32 + dy_field[[y, x]]).clamp(0.0, (height - 1) as f32);
+
+                let x1 = src_x.floor() as usize;
+                let y1 = src_y.floor() as usize;
+                let x2 = (x1 + 1).min(width - 1);
+                let y2 = (y1 + 1).min(height - 1);
+                let fx = src_x - x1 as f32;
+                let fy = src_y - y1 as f32;
+
+                for c in 0..channels {
+                    let at = |yy: usize, xx: usize| data[(yy * width + xx) * channels + c];
+                    let value = at(y1, x1) * (1.0 - fx) * (1.0 - fy)
+                        + at(y1, x2) * fx * (1.0 - fy)
+                        + at(y2, x1) * (1.0 - fx) * fy
+                        + at(y2, x2) * fx * fy;
+                    output[(y * width + x) * channels + c] = value;
+                }
+            }
+        }
+
+        Ok(Tensor::from_vec(output, dims)?)
     }
 
     /// Legacy GPU methods (maintaining compatibility)
@@ -1298,6 +1426,85 @@ mod tests {
     use torsh_tensor::creation::zeros;
 
     #[test]
+    fn test_apply_displacement_shifts_content() {
+        let transforms =
+            AdvancedTransforms::auto_detect().expect("hardware detection should succeed");
+
+        // 1x4 row: 0, 1, 2, 3
+        let data: Vec<f32> = (0..4).map(|i| i as f32).collect();
+        let image = Tensor::from_vec(data, &[1, 4]).expect("tensor creation should succeed");
+
+        // Shift the sampling one pixel to the right.
+        let dx = Tensor::from_vec(vec![1.0f32; 4], &[1, 4]).expect("dx creation should succeed");
+        let dy = Tensor::from_vec(vec![0.0f32; 4], &[1, 4]).expect("dy creation should succeed");
+
+        let out = transforms
+            .apply_displacement(&image, &dx, &dy)
+            .expect("apply_displacement should succeed");
+        let out_data = out.to_vec().expect("to_vec should succeed");
+
+        // Border clamping keeps the last sample at 3.0.
+        assert_eq!(out_data, vec![1.0, 2.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn test_apply_displacement_rejects_wrong_field_size() {
+        let transforms =
+            AdvancedTransforms::auto_detect().expect("hardware detection should succeed");
+        let image = Tensor::from_vec(vec![0.0f32; 4], &[1, 4]).expect("creation should succeed");
+        let bad = Tensor::from_vec(vec![0.0f32; 2], &[1, 2]).expect("creation should succeed");
+
+        assert!(transforms.apply_displacement(&image, &bad, &bad).is_err());
+    }
+
+    #[test]
+    fn test_elastic_deformation_preserves_shape_and_moves_pixels() {
+        let transforms =
+            AdvancedTransforms::auto_detect().expect("hardware detection should succeed");
+        let data: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let image = Tensor::from_vec(data.clone(), &[8, 8]).expect("creation should succeed");
+
+        let out = transforms
+            .elastic_deformation(&image, 2.0, 1.0)
+            .expect("elastic_deformation should succeed");
+
+        assert_eq!(out.shape().dims(), &[8, 8]);
+        let out_data = out.to_vec().expect("to_vec should succeed");
+        assert_ne!(
+            out_data, data,
+            "elastic deformation left the image untouched"
+        );
+    }
+
+    #[test]
+    fn test_adjust_hue_rejects_non_rgb() {
+        let transforms =
+            AdvancedTransforms::auto_detect().expect("hardware detection should succeed");
+        let image = Tensor::from_vec(vec![0.0f32; 8], &[2, 4]).expect("creation should succeed");
+        assert!(transforms.adjust_hue(&image, 0.25).is_err());
+    }
+
+    #[test]
+    fn test_adjust_hue_full_turn_is_identity() {
+        let transforms =
+            AdvancedTransforms::auto_detect().expect("hardware detection should succeed");
+        let data = vec![0.8f32, 0.2, 0.1, 0.1, 0.6, 0.9];
+        let image = Tensor::from_vec(data.clone(), &[1, 2, 3]).expect("creation should succeed");
+
+        let out = transforms
+            .adjust_hue(&image, 1.0)
+            .expect("adjust_hue should succeed");
+        let out_data = out.to_vec().expect("to_vec should succeed");
+
+        for (got, want) in out_data.iter().zip(data.iter()) {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "a full hue turn must be the identity, got {got} want {want}"
+            );
+        }
+    }
+
+    #[test]
     fn test_advanced_transforms() {
         let transforms = AdvancedTransforms::auto_detect().unwrap();
         let resize = transforms.create_gpu_resize((224, 224));
@@ -1403,4 +1610,99 @@ mod tests {
             result_cloned.err()
         );
     }
+}
+
+/// Convert an RGB triple to HSV (`h` in degrees, `s`/`v` in `0.0..=1.0`)
+fn rgb_to_hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+
+    let hue = if delta <= f32::EPSILON {
+        0.0
+    } else if (max - r).abs() < f32::EPSILON {
+        60.0 * (((g - b) / delta) % 6.0)
+    } else if (max - g).abs() < f32::EPSILON {
+        60.0 * (((b - r) / delta) + 2.0)
+    } else {
+        60.0 * (((r - g) / delta) + 4.0)
+    };
+
+    let saturation = if max.abs() <= f32::EPSILON {
+        0.0
+    } else {
+        delta / max
+    };
+
+    (hue.rem_euclid(360.0), saturation, max)
+}
+
+/// Convert an HSV triple (`h` in degrees) back to RGB
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    let c = v * s;
+    let hh = h.rem_euclid(360.0) / 60.0;
+    let x = c * (1.0 - ((hh % 2.0) - 1.0).abs());
+    let m = v - c;
+
+    let (r, g, b) = match hh as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+
+    (r + m, g + m, b + m)
+}
+
+/// Separable Gaussian smoothing of a 2D field with replicated borders
+fn gaussian_smooth_field(field: &Array2<f32>, sigma: f32) -> Array2<f32> {
+    let (height, width) = field.dim();
+    if sigma <= 0.0 || height == 0 || width == 0 {
+        return field.clone();
+    }
+
+    let radius = ((3.0 * sigma).ceil() as usize).max(1);
+    let mut kernel = vec![0.0f32; radius * 2 + 1];
+    let two_sigma_sq = 2.0 * sigma * sigma;
+    let mut sum = 0.0;
+    for (i, weight) in kernel.iter_mut().enumerate() {
+        let d = i as f32 - radius as f32;
+        *weight = (-d * d / two_sigma_sq).exp();
+        sum += *weight;
+    }
+    for weight in kernel.iter_mut() {
+        *weight /= sum;
+    }
+
+    // Horizontal pass
+    let mut horizontal = Array2::zeros((height, width));
+    for y in 0..height {
+        for x in 0..width {
+            let mut acc = 0.0;
+            for (k, weight) in kernel.iter().enumerate() {
+                let offset = k as isize - radius as isize;
+                let sx = (x as isize + offset).clamp(0, width as isize - 1) as usize;
+                acc += weight * field[[y, sx]];
+            }
+            horizontal[[y, x]] = acc;
+        }
+    }
+
+    // Vertical pass
+    let mut smoothed = Array2::zeros((height, width));
+    for y in 0..height {
+        for x in 0..width {
+            let mut acc = 0.0;
+            for (k, weight) in kernel.iter().enumerate() {
+                let offset = k as isize - radius as isize;
+                let sy = (y as isize + offset).clamp(0, height as isize - 1) as usize;
+                acc += weight * horizontal[[sy, x]];
+            }
+            smoothed[[y, x]] = acc;
+        }
+    }
+
+    smoothed
 }

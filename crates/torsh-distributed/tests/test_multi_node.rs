@@ -182,6 +182,7 @@ pub async fn multi_node_worker() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_two_node_communication() -> Result<()> {
     let config = MultiNodeTestConfig {
         num_nodes: 2,
@@ -207,6 +208,7 @@ async fn test_two_node_communication() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_multi_node_gradient_aggregation() -> Result<()> {
     // Simulate gradient aggregation across multiple nodes
     let world_size = 4;
@@ -250,6 +252,7 @@ async fn test_multi_node_gradient_aggregation() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_node_failure_simulation() -> Result<()> {
     // Test behavior when a node fails during communication
     let world_size = 3;
@@ -284,6 +287,7 @@ async fn test_node_failure_simulation() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_dynamic_node_joining() -> Result<()> {
     // Test adding nodes to an existing training session
     let initial_world_size = 2;
@@ -329,6 +333,7 @@ async fn test_dynamic_node_joining() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_cross_node_data_consistency() -> Result<()> {
     // Test that data remains consistent across nodes during operations
     let world_size = 4;

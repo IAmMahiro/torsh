@@ -1,7 +1,7 @@
 //! Kernel fusion optimization for JIT compilation
 
 use crate::graph::{ComputationGraph, NodeId, Operation};
-use crate::JitResult;
+use crate::{JitError, JitResult};
 use indexmap::IndexSet;
 use std::collections::HashSet;
 
@@ -117,8 +117,13 @@ impl KernelFusion {
         fusion_groups.extend(self.find_depthwise_separable_patterns(&graph)?);
         fusion_groups.extend(self.find_batchnorm_activation_patterns(&graph)?);
 
+        // The finders above run independently and routinely claim the same node
+        // (conv+relu and relu+add both contain the relu). Overlapping groups would
+        // put one operation into two fused kernels, so make them disjoint first.
+        let merged_groups = self.merge_fusion_groups(fusion_groups);
+
         // Try to grow fusion groups
-        let grown_groups = self.grow_fusion_groups(&graph, fusion_groups)?;
+        let grown_groups = self.grow_fusion_groups(&graph, merged_groups)?;
 
         self.create_fused_graph(graph, grown_groups)
     }
@@ -148,7 +153,11 @@ impl KernelFusion {
             })
             .collect();
 
-        self.create_fused_graph(graph, limited_groups)
+        // Different patterns can claim the same node; keep the groups disjoint so no
+        // operation ends up inside two fused kernels.
+        let merged_groups = self.merge_fusion_groups(limited_groups);
+
+        self.create_fused_graph(graph, merged_groups)
     }
 
     /// Find chains of element-wise operations
@@ -172,6 +181,34 @@ impl KernelFusion {
         Ok(chains)
     }
 
+    /// Check that a producer may be folded into a consumer
+    ///
+    /// Fusing folds the producer's value into the consumer, so the intermediate
+    /// value stops being observable. That is only legal when the consumer is the
+    /// producer's sole user. Without the check a graph such as
+    /// `y = conv(x); z = relu(y); w = sigmoid(y)` would silently compute
+    /// `w = sigmoid(relu(conv(x)))`.
+    ///
+    /// Extra *inputs* of the consumer (a bias for instance) are fine: they simply
+    /// become inputs of the fused kernel.
+    ///
+    /// # Arguments
+    /// * `graph` - Graph being fused
+    /// * `producer` - Node producing the intermediate value
+    /// * `consumer` - Node consuming it
+    ///
+    /// # Returns
+    /// * `bool` - True when the pair can be fused
+    fn can_fuse_producer_consumer(
+        &self,
+        graph: &ComputationGraph,
+        producer: NodeId,
+        consumer: NodeId,
+    ) -> bool {
+        let successors: Vec<_> = graph.successors(producer).collect();
+        successors.len() == 1 && successors[0] == consumer
+    }
+
     /// Find conv+activation patterns
     fn find_conv_activation_patterns(
         &self,
@@ -184,7 +221,9 @@ impl KernelFusion {
                 // Check successors for activations
                 for succ_id in graph.successors(conv_id) {
                     if let Some(succ_node) = graph.node(succ_id) {
-                        if self.is_activation(&succ_node.op) {
+                        if self.is_activation(&succ_node.op)
+                            && self.can_fuse_producer_consumer(graph, conv_id, succ_id)
+                        {
                             patterns.push(vec![conv_id, succ_id]);
                         }
                     }
@@ -207,7 +246,9 @@ impl KernelFusion {
                 // Check successors for activations
                 for succ_id in graph.successors(linear_id) {
                     if let Some(succ_node) = graph.node(succ_id) {
-                        if self.is_activation(&succ_node.op) {
+                        if self.is_activation(&succ_node.op)
+                            && self.can_fuse_producer_consumer(graph, linear_id, succ_id)
+                        {
                             patterns.push(vec![linear_id, succ_id]);
                         }
                     }
@@ -251,7 +292,9 @@ impl KernelFusion {
                 // Look for bias add
                 for succ_id in graph.successors(current) {
                     if let Some(succ_node) = graph.node(succ_id) {
-                        if matches!(&succ_node.op, Operation::Add) {
+                        if matches!(&succ_node.op, Operation::Add)
+                            && self.can_fuse_producer_consumer(graph, current, succ_id)
+                        {
                             chain.push(succ_id);
                             current = succ_id;
                             break;
@@ -262,7 +305,9 @@ impl KernelFusion {
                 // Look for activation
                 for succ_id in graph.successors(current) {
                     if let Some(succ_node) = graph.node(succ_id) {
-                        if self.is_activation(&succ_node.op) {
+                        if self.is_activation(&succ_node.op)
+                            && self.can_fuse_producer_consumer(graph, current, succ_id)
+                        {
                             chain.push(succ_id);
                             break;
                         }
@@ -291,8 +336,13 @@ impl KernelFusion {
             if pattern.ops.contains(&node.op) {
                 let mut group = vec![node_id];
 
-                // Try to extend the group with compatible operations
+                // Extend the group with the single compatible consumer, if any.
+                // Collecting every matching successor would collapse a fan-out into
+                // one value and lose the other branches.
                 for succ_id in graph.successors(node_id) {
+                    if !self.can_fuse_producer_consumer(graph, node_id, succ_id) {
+                        continue;
+                    }
                     if let Some(succ_node) = graph.node(succ_id) {
                         if pattern.ops.contains(&succ_node.op) {
                             group.push(succ_id);
@@ -409,12 +459,17 @@ impl KernelFusion {
     }
 
     /// Grow fusion groups by including compatible neighbors
+    ///
+    /// Growth is tracked globally: a node already owned by another group is never
+    /// pulled into a second one, otherwise the same operation would be emitted by
+    /// two fused kernels and the dataflow rewiring would become ambiguous.
     fn grow_fusion_groups(
         &self,
         graph: &ComputationGraph,
         groups: Vec<Vec<NodeId>>,
     ) -> JitResult<Vec<Vec<NodeId>>> {
         let mut grown = Vec::new();
+        let mut claimed: HashSet<NodeId> = groups.iter().flatten().copied().collect();
 
         for group in groups {
             let mut grown_group: IndexSet<NodeId> = group.into_iter().collect();
@@ -428,10 +483,13 @@ impl KernelFusion {
                 let current_nodes: Vec<_> = grown_group.iter().copied().collect();
                 for node in current_nodes {
                     for pred in graph.predecessors(node) {
-                        if !grown_group.contains(&pred) {
+                        if !grown_group.contains(&pred) && !claimed.contains(&pred) {
                             if let Some(pred_node) = graph.node(pred) {
-                                if self.can_add_to_group(graph, &grown_group, pred, &pred_node.op) {
+                                if self.can_add_to_group(graph, &grown_group, pred, &pred_node.op)
+                                    && self.can_fuse_producer_consumer(graph, pred, node)
+                                {
                                     grown_group.insert(pred);
+                                    claimed.insert(pred);
                                     changed = true;
                                 }
                             }
@@ -814,21 +872,36 @@ impl KernelFusion {
 
             let fused_node_id = new_graph.add_node(fused_node);
 
-            // Map all nodes in the group to the fused node
+            // Map all nodes in the group to the fused node. A node that is already
+            // mapped belongs to two overlapping groups, which would silently
+            // reroute its edges to whichever kernel happens to be processed last.
             for &node_id in group {
-                node_mapping.insert(node_id, fused_node_id);
+                if let Some(previous) = node_mapping.insert(node_id, fused_node_id) {
+                    return Err(JitError::FusionError(format!(
+                        "node {:?} appears in more than one fusion group \
+                         (already mapped to {:?}, now {:?})",
+                        node_id, previous, fused_node_id
+                    )));
+                }
             }
         }
 
         // Third pass: Add edges to the new graph
         for (src, dst, edge) in graph.edges() {
-            if let (Some(&new_src), Some(&new_dst)) =
-                (node_mapping.get(&src), node_mapping.get(&dst))
-            {
-                // Skip self-edges that might occur from fusion
-                if new_src != new_dst {
-                    new_graph.add_edge(new_src, new_dst, edge.clone());
-                }
+            let (Some(&new_src), Some(&new_dst)) = (node_mapping.get(&src), node_mapping.get(&dst))
+            else {
+                // Every node was either copied or fused, so a missing mapping means
+                // the grouping is inconsistent; dropping the edge would silently
+                // disconnect the graph.
+                return Err(JitError::FusionError(format!(
+                    "edge {:?} -> {:?} has no counterpart in the fused graph",
+                    src, dst
+                )));
+            };
+
+            // Skip self-edges that might occur from fusion
+            if new_src != new_dst {
+                new_graph.add_edge(new_src, new_dst, edge.clone());
             }
         }
 

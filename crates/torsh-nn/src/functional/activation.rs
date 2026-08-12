@@ -43,14 +43,89 @@ pub fn leaky_relu(input: &Tensor, negative_slope: f32) -> Result<Tensor> {
     positive_part.add(&scaled_negative)
 }
 
-/// GELU activation function
+/// Which GELU formulation to evaluate.
+///
+/// Mirrors the `approximate` argument of `torch.nn.functional.gelu`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GeluApproximation {
+    /// Exact definition `0.5 * x * (1 + erf(x / sqrt(2)))`.
+    ///
+    /// This is `approximate="none"` in PyTorch and the default here.
+    #[default]
+    None,
+    /// Hendrycks & Gimpel tanh formulation
+    /// `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`.
+    ///
+    /// This is `approximate="tanh"` in PyTorch.
+    Tanh,
+}
+
+impl GeluApproximation {
+    /// Parse the PyTorch spelling of the `approximate` argument.
+    ///
+    /// Accepts `"none"` and `"tanh"`; anything else is rejected.
+    pub fn from_str_arg(value: &str) -> Result<Self> {
+        match value {
+            "none" => Ok(Self::None),
+            "tanh" => Ok(Self::Tanh),
+            other => Err(TorshError::InvalidArgument(format!(
+                "gelu approximate must be \"none\" or \"tanh\", got \"{other}\""
+            ))),
+        }
+    }
+}
+
+/// GELU activation function (exact erf formulation).
+///
+/// Computes `0.5 * x * (1 + erf(x / sqrt(2)))`, matching
+/// `torch.nn.functional.gelu(x)` with the default `approximate="none"`.
+/// Use [`gelu_with_approximation`] to select the tanh formulation.
 pub fn gelu(input: &Tensor) -> Result<Tensor> {
-    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    // For now, use simplified approximation: x * sigmoid(1.702 * x)
-    let factor = torsh_tensor::creation::full_like(input, 1.702)?;
-    let scaled = input.mul_op(&factor)?;
-    let sigmoid_result = sigmoid(&scaled)?;
-    input.mul_op(&sigmoid_result)
+    gelu_with_approximation(input, GeluApproximation::None)
+}
+
+/// GELU activation function with an explicit formulation selector.
+///
+/// The exact variant evaluates the error function through
+/// `scirs2_core`'s SIMD-accelerated `erf`; the tanh variant uses the
+/// closed-form polynomial approximation.
+pub fn gelu_with_approximation(input: &Tensor, approximate: GeluApproximation) -> Result<Tensor> {
+    let data = input.to_vec()?;
+
+    let result_data: Vec<f32> = match approximate {
+        GeluApproximation::None => {
+            use scirs2_core::ndarray::Array1;
+            use scirs2_core::ndarray_ext::elementwise::erf_simd;
+
+            let scaled: Array1<f32> =
+                Array1::from_iter(data.iter().map(|&x| x * std::f32::consts::FRAC_1_SQRT_2));
+            let erf_values = erf_simd(&scaled.view());
+            data.iter()
+                .zip(erf_values.iter())
+                .map(|(&x, &e)| 0.5 * x * (1.0 + e))
+                .collect()
+        }
+        GeluApproximation::Tanh => {
+            const COEFF: f32 = 0.044_715;
+            let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
+            data.iter()
+                .map(|&x| {
+                    let inner = sqrt_2_over_pi * (x + COEFF * x * x * x);
+                    // tanh saturates well before f32 overflow; clamp defensively.
+                    let t = if inner > 20.0 {
+                        1.0
+                    } else if inner < -20.0 {
+                        -1.0
+                    } else {
+                        inner.tanh()
+                    };
+                    0.5 * x * (1.0 + t)
+                })
+                .collect()
+        }
+    };
+
+    Tensor::from_data(result_data, input.shape().dims().to_vec(), input.device())
 }
 
 /// Sigmoid activation function
@@ -78,76 +153,97 @@ pub fn sigmoid(input: &Tensor) -> Result<Tensor> {
     Tensor::from_data(result_data, input.shape().dims().to_vec(), input.device())
 }
 
-/// Numerically stable softmax implementation
-/// Enhanced with SciRS2-inspired numerical stability techniques
+/// Numerically stable softmax along `dim`.
+///
+/// `dim` defaults to `-1` (the last axis) and accepts negative indices, matching
+/// `torch.nn.functional.softmax`. Normalization happens slice-by-slice along
+/// `dim` for tensors of any rank; the maximum of each slice is subtracted before
+/// exponentiating for numerical stability.
 pub fn softmax(input: &Tensor, dim: Option<i32>) -> Result<Tensor> {
     let dim = dim.unwrap_or(-1);
-    let shape = input.shape();
-
-    // Handle simple case for now - assume 2D tensors and dim=1 (row-wise softmax)
-    if shape.dims().len() == 2 && dim == 1 {
-        let data = input.to_vec()?;
-        let rows = shape.dims()[0];
-        let cols = shape.dims()[1];
-        let mut result_data = vec![0.0; data.len()];
-
-        // Process each row separately
-        for row in 0..rows {
-            let row_start = row * cols;
-            let row_end = (row + 1) * cols;
-            let row_data = &data[row_start..row_end];
-
-            // Find max for numerical stability
-            let max_val = row_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-            // Compute exp(x - max) and sum
-            let mut exp_sum = 0.0;
-            let mut exp_vals = Vec::with_capacity(cols);
-
-            for &x in row_data {
-                let exp_val = (x - max_val).exp();
-                exp_vals.push(exp_val);
-                exp_sum += exp_val;
-            }
-
-            // Normalize by sum
-            for (i, exp_val) in exp_vals.into_iter().enumerate() {
-                result_data[row_start + i] = exp_val / exp_sum;
-            }
-        }
-
-        return Tensor::from_data(result_data, shape.dims().to_vec(), input.device());
-    }
-
-    // Fallback: Use the old approach for 1D tensors or other cases
-    // For numerical stability, subtract max
-    let data = input.to_vec()?;
-    let max_val = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-    let shifted_data: Vec<f32> = data.iter().map(|&x| x - max_val).collect();
-    let exp_data: Vec<f32> = shifted_data.iter().map(|&x| x.exp()).collect();
-    let sum_exp: f32 = exp_data.iter().sum();
-
-    let result_data: Vec<f32> = exp_data.iter().map(|&x| x / sum_exp).collect();
-
-    Tensor::from_data(result_data, shape.dims().to_vec(), input.device())
+    softmax_along(input, dim, false)
 }
 
-/// Log-softmax implementation with enhanced numerical stability
+/// Log-softmax along `dim` with enhanced numerical stability.
+///
+/// Computes `x - max(x) - log(sum(exp(x - max(x))))` slice-by-slice along `dim`,
+/// which avoids the catastrophic cancellation of `log(softmax(x))`. `dim`
+/// defaults to `-1` and accepts negative indices.
 pub fn log_softmax(input: &Tensor, dim: Option<i32>) -> Result<Tensor> {
     let dim = dim.unwrap_or(-1);
+    softmax_along(input, dim, true)
+}
 
-    // Subtract max for numerical stability
-    let max_vals = input.max_dim(dim, true)?;
-    let shifted = input.sub(&max_vals)?;
+/// Shared slice-wise (log-)softmax kernel.
+///
+/// Iterates the `outer x inner` slices orthogonal to `dim` so that every slice
+/// along `dim` is normalized independently, for arbitrary tensor rank.
+fn softmax_along(input: &Tensor, dim: i32, logarithmic: bool) -> Result<Tensor> {
+    let shape_binding = input.shape();
+    let shape = shape_binding.dims();
 
-    // Compute log(sum(exp(x - max(x))))
-    let exp_vals = shifted.exp()?;
-    let sum_exp = exp_vals.sum_dim(&[dim], true)?;
-    let log_sum_exp = sum_exp.log()?;
+    if shape.is_empty() {
+        return Err(TorshError::InvalidOperation(
+            "Cannot compute softmax on a tensor with no dimensions".to_string(),
+        ));
+    }
 
-    // Return x - max(x) - log(sum(exp(x - max(x))))
-    shifted.sub(&log_sum_exp)
+    let rank = shape.len() as i32;
+    let actual_dim = if dim < 0 { rank + dim } else { dim };
+    if actual_dim < 0 || actual_dim >= rank {
+        return Err(TorshError::InvalidArgument(format!(
+            "Dimension {} out of range for a {}-dimensional tensor",
+            dim, rank
+        )));
+    }
+    let actual_dim = actual_dim as usize;
+
+    let data = input.to_vec()?;
+    let dim_size = shape[actual_dim];
+    if dim_size == 0 {
+        return Err(TorshError::InvalidOperation(format!(
+            "Cannot compute softmax along a zero-length dimension {actual_dim}"
+        )));
+    }
+    let outer_size: usize = shape[..actual_dim].iter().product();
+    let inner_size: usize = shape[actual_dim + 1..].iter().product();
+
+    let mut result_data = vec![0.0f32; data.len()];
+
+    for outer in 0..outer_size {
+        for inner in 0..inner_size {
+            let base = outer * dim_size * inner_size + inner;
+
+            // Slice maximum for numerical stability.
+            let mut max_val = f32::NEG_INFINITY;
+            for d in 0..dim_size {
+                let value = data[base + d * inner_size];
+                if value > max_val {
+                    max_val = value;
+                }
+            }
+
+            let mut sum_exp = 0.0f32;
+            for d in 0..dim_size {
+                sum_exp += (data[base + d * inner_size] - max_val).exp();
+            }
+
+            if logarithmic {
+                let log_sum_exp = sum_exp.ln();
+                for d in 0..dim_size {
+                    let idx = base + d * inner_size;
+                    result_data[idx] = data[idx] - max_val - log_sum_exp;
+                }
+            } else {
+                for d in 0..dim_size {
+                    let idx = base + d * inner_size;
+                    result_data[idx] = (data[idx] - max_val).exp() / sum_exp;
+                }
+            }
+        }
+    }
+
+    Tensor::from_data(result_data, shape.to_vec(), input.device())
 }
 
 /// Tanh activation function

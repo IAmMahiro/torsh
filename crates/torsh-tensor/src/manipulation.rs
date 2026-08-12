@@ -8,7 +8,9 @@
 //! - Tiling: tile, repeat_interleave
 //! - Utilities: unflatten, take_along_dim
 
+use crate::core_ops::Operation;
 use crate::{Tensor, TensorElement};
+use std::sync::Arc;
 use torsh_core::error::{Result, TorshError};
 
 impl<T: TensorElement + Copy + Default> Tensor<T> {
@@ -71,18 +73,42 @@ impl<T: TensorElement + Copy + Default> Tensor<T> {
         let outer_size: usize = first_shape[..dim].iter().product();
         let inner_size: usize = first_shape[dim..].iter().product();
 
+        // Materialise every input exactly once (previously this happened once per
+        // (outer, tensor) pair, i.e. `outer_size` full copies of every input).
+        let sources: Vec<Vec<T>> = tensors
+            .iter()
+            .map(|tensor| tensor.to_vec())
+            .collect::<Result<Vec<_>>>()?;
+
         for outer in 0..outer_size {
-            for tensor in tensors {
-                let data = tensor.to_vec()?;
-                for inner in 0..inner_size {
-                    let idx = outer * inner_size + inner;
-                    result_data.push(data[idx]);
-                }
+            for source in &sources {
+                // One contiguous run per (outer, tensor) pair.
+                let start = outer * inner_size;
+                let run = source.get(start..start + inner_size).ok_or_else(|| {
+                    TorshError::IndexError {
+                        index: start + inner_size,
+                        size: source.len(),
+                    }
+                })?;
+                result_data.extend_from_slice(run);
             }
         }
 
         let device = tensors[0].device.clone();
-        Self::from_data(result_data, output_shape, device)
+        let mut result = Self::from_data(result_data, output_shape, device)?;
+
+        // Record the stack so each input's gradient is its slice of the seed
+        // along the newly-inserted axis `dim`.
+        let any_requires_grad = tensors.iter().any(|t| t.requires_grad);
+        if crate::should_record_grad(any_requires_grad) {
+            result.requires_grad = true;
+            result.operation = Operation::Stack {
+                inputs: tensors.iter().map(|t| Arc::new(t.clone())).collect(),
+                dim,
+            };
+        }
+
+        Ok(result)
     }
 
     /// Split tensor into chunks

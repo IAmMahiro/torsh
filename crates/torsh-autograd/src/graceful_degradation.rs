@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Mutex, RwLock};
+use torsh_core::sync::{MutexExt, RwLockExt};
 
 /// Supported operation categories for degradation handling
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -243,10 +244,7 @@ impl GracefulDegradationManager {
         operation_name: String,
         info: UnsupportedOperationInfo,
     ) {
-        let mut registry = self
-            .operation_registry
-            .write()
-            .expect("lock should not be poisoned");
+        let mut registry = self.operation_registry.write_or_recover();
         registry.insert(operation_name, info);
     }
 
@@ -255,10 +253,7 @@ impl GracefulDegradationManager {
         operation_name: String,
         strategy: DegradationStrategy,
     ) {
-        let mut strategies = self
-            .degradation_strategies
-            .write()
-            .expect("lock should not be poisoned");
+        let mut strategies = self.degradation_strategies.write_or_recover();
         strategies.insert(operation_name, strategy);
     }
 
@@ -267,10 +262,7 @@ impl GracefulDegradationManager {
         fallback_id: String,
         function: Box<dyn FallbackFunction>,
     ) {
-        let mut functions = self
-            .fallback_functions
-            .write()
-            .expect("lock should not be poisoned");
+        let mut functions = self.fallback_functions.write_or_recover();
         functions.insert(fallback_id, function);
     }
 
@@ -283,18 +275,12 @@ impl GracefulDegradationManager {
     }
 
     pub fn is_operation_supported(&self, operation_name: &str) -> bool {
-        let registry = self
-            .operation_registry
-            .read()
-            .expect("lock should not be poisoned");
+        let registry = self.operation_registry.read_or_recover();
         !registry.contains_key(operation_name)
     }
 
     pub fn get_operation_info(&self, operation_name: &str) -> Option<UnsupportedOperationInfo> {
-        let registry = self
-            .operation_registry
-            .read()
-            .expect("lock should not be poisoned");
+        let registry = self.operation_registry.read_or_recover();
         registry.get(operation_name).cloned()
     }
 
@@ -344,10 +330,7 @@ impl GracefulDegradationManager {
     where
         F: FnOnce() -> AutogradResult<R>,
     {
-        let strategies = self
-            .degradation_strategies
-            .read()
-            .expect("lock should not be poisoned");
+        let strategies = self.degradation_strategies.read_or_recover();
         let strategy = strategies.get(operation_name);
 
         match strategy {
@@ -438,10 +421,7 @@ impl GracefulDegradationManager {
                 fallback_id,
                 metadata: _metadata,
             }) => {
-                let functions = self
-                    .fallback_functions
-                    .read()
-                    .expect("lock should not be poisoned");
+                let functions = self.fallback_functions.read_or_recover();
                 if let Some(fallback_fn) = functions.get(fallback_id) {
                     tracing::info!(
                         "Using user-defined fallback '{}' for operation '{}'",
@@ -500,10 +480,7 @@ impl GracefulDegradationManager {
         success: bool,
         error_message: Option<String>,
     ) {
-        let registry = self
-            .operation_registry
-            .read()
-            .expect("lock should not be poisoned");
+        let registry = self.operation_registry.read_or_recover();
         let category = registry
             .get(operation_name)
             .map(|info| info.category.clone())
@@ -526,10 +503,7 @@ impl GracefulDegradationManager {
     }
 
     pub fn get_degradation_statistics(&self) -> DegradationStatistics {
-        let history = self
-            .degradation_history
-            .lock()
-            .expect("lock should not be poisoned");
+        let history = self.degradation_history.lock_or_recover();
         DegradationStatistics::from_events(&history)
     }
 

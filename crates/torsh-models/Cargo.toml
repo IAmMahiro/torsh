@@ -28,7 +28,7 @@ video = []
 generative = []
 rl = []
 domain = []
-download = ["reqwest", "tokio"]
+download = ["reqwest", "tokio", "rustls", "webpki-roots", "oxitls-rustcrypto-provider"]
 diffusion_extended = []
 
 [dependencies]
@@ -51,6 +51,10 @@ anyhow.workspace = true
 # Model downloading (optional)
 reqwest = { workspace = true, features = ["json", "stream"], optional = true }
 tokio = { workspace = true, features = ["fs", "io-util"], optional = true }
+# Pure-Rust TLS stack for the download client (no aws-lc-rs / ring / BoringSSL)
+rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+oxitls-rustcrypto-provider = { workspace = true, optional = true }
 
 # File system and utilities
 sha2 = { workspace = true }
@@ -58,7 +62,7 @@ hex = { workspace = true }
 chrono = { workspace = true }
 
 # Progress reporting
-indicatif = "0.18"
+indicatif = { workspace = true }
 
 # Async traits
 async-trait.workspace = true
@@ -67,7 +71,7 @@ async-trait.workspace = true
 tracing.workspace = true
 
 # Utilities
-dirs = "6.0"
+dirs = { workspace = true }
 lazy_static = { workspace = true }
 futures-util = { workspace = true }
 parking_lot = { workspace = true }

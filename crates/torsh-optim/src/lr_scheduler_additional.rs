@@ -42,11 +42,7 @@ impl<O: Optimizer> LRScheduler for MultiStepLR<O> {
             .map(|&base_lr| base_lr * self.gamma.powi(num_milestones_passed))
             .collect();
 
-        for (i, &lr) in new_lrs.iter().enumerate() {
-            if i == 0 {
-                self.base.optimizer.set_lr(lr);
-            }
-        }
+        self.base.optimizer.set_lrs(&new_lrs);
 
         self.base.last_lr = new_lrs;
         Ok(())
@@ -67,6 +63,10 @@ impl<O: Optimizer> LRScheduler for MultiStepLR<O> {
     fn reset(&mut self) {
         self.base.last_epoch = 0;
         self.base.last_lr = self.base.base_lrs.clone();
+        // Push the base rates back onto the optimizer so a reset actually
+        // restores them (per group, not broadcast).
+        let base_lrs = self.base.base_lrs.clone();
+        self.base.optimizer.set_lrs(&base_lrs);
     }
 
     fn state_dict(&self) -> SchedulerState {
@@ -193,11 +193,7 @@ impl<O: Optimizer> LRScheduler for CyclicLR<O> {
                 .collect()
         };
 
-        for (i, &lr) in new_lrs.iter().enumerate() {
-            if i == 0 {
-                self.base.optimizer.set_lr(lr);
-            }
-        }
+        self.base.optimizer.set_lrs(&new_lrs);
 
         self.base.last_lr = new_lrs;
         self.base.last_epoch += 1;
@@ -219,6 +215,10 @@ impl<O: Optimizer> LRScheduler for CyclicLR<O> {
     fn reset(&mut self) {
         self.base.last_epoch = 0;
         self.base.last_lr = self.base.base_lrs.clone();
+        // Push the base rates back onto the optimizer so a reset actually
+        // restores them (per group, not broadcast).
+        let base_lrs = self.base.base_lrs.clone();
+        self.base.optimizer.set_lrs(&base_lrs);
         self.cycle = 0;
         self.step_in_cycle = 0;
     }
@@ -301,11 +301,7 @@ impl<O: Optimizer> LRScheduler for PolynomialLR<O> {
             .map(|&base_lr| base_lr * factor)
             .collect();
 
-        for (i, &lr) in new_lrs.iter().enumerate() {
-            if i == 0 {
-                self.base.optimizer.set_lr(lr);
-            }
-        }
+        self.base.optimizer.set_lrs(&new_lrs);
 
         self.base.last_lr = new_lrs;
         Ok(())
@@ -326,6 +322,10 @@ impl<O: Optimizer> LRScheduler for PolynomialLR<O> {
     fn reset(&mut self) {
         self.base.last_epoch = 0;
         self.base.last_lr = self.base.base_lrs.clone();
+        // Push the base rates back onto the optimizer so a reset actually
+        // restores them (per group, not broadcast).
+        let base_lrs = self.base.base_lrs.clone();
+        self.base.optimizer.set_lrs(&base_lrs);
     }
 
     fn state_dict(&self) -> SchedulerState {
@@ -392,11 +392,7 @@ impl<O: Optimizer> LRScheduler for LinearLR<O> {
             .map(|&base_lr| base_lr * factor)
             .collect();
 
-        for (i, &lr) in new_lrs.iter().enumerate() {
-            if i == 0 {
-                self.base.optimizer.set_lr(lr);
-            }
-        }
+        self.base.optimizer.set_lrs(&new_lrs);
 
         self.base.last_lr = new_lrs;
         Ok(())
@@ -417,6 +413,10 @@ impl<O: Optimizer> LRScheduler for LinearLR<O> {
     fn reset(&mut self) {
         self.base.last_epoch = 0;
         self.base.last_lr = self.base.base_lrs.clone();
+        // Push the base rates back onto the optimizer so a reset actually
+        // restores them (per group, not broadcast).
+        let base_lrs = self.base.base_lrs.clone();
+        self.base.optimizer.set_lrs(&base_lrs);
     }
 
     fn state_dict(&self) -> SchedulerState {
@@ -487,11 +487,7 @@ impl<O: Optimizer> LRScheduler for ConstantLR<O> {
             .map(|&base_lr| base_lr * factor)
             .collect();
 
-        for (i, &lr) in new_lrs.iter().enumerate() {
-            if i == 0 {
-                self.base.optimizer.set_lr(lr);
-            }
-        }
+        self.base.optimizer.set_lrs(&new_lrs);
 
         self.base.last_lr = new_lrs;
         Ok(())
@@ -512,6 +508,10 @@ impl<O: Optimizer> LRScheduler for ConstantLR<O> {
     fn reset(&mut self) {
         self.base.last_epoch = 0;
         self.base.last_lr = self.base.base_lrs.clone();
+        // Push the base rates back onto the optimizer so a reset actually
+        // restores them (per group, not broadcast).
+        let base_lrs = self.base.base_lrs.clone();
+        self.base.optimizer.set_lrs(&base_lrs);
     }
 
     fn state_dict(&self) -> SchedulerState {
@@ -582,11 +582,7 @@ impl<O: Optimizer> LRScheduler for CosineAnnealingWarmRestarts<O> {
             })
             .collect();
 
-        for (i, &lr) in new_lrs.iter().enumerate() {
-            if i == 0 {
-                self.base.optimizer.set_lr(lr);
-            }
-        }
+        self.base.optimizer.set_lrs(&new_lrs);
 
         self.base.last_lr = new_lrs;
         self.base.last_epoch += 1;
@@ -608,6 +604,10 @@ impl<O: Optimizer> LRScheduler for CosineAnnealingWarmRestarts<O> {
     fn reset(&mut self) {
         self.base.last_epoch = 0;
         self.base.last_lr = self.base.base_lrs.clone();
+        // Push the base rates back onto the optimizer so a reset actually
+        // restores them (per group, not broadcast).
+        let base_lrs = self.base.base_lrs.clone();
+        self.base.optimizer.set_lrs(&base_lrs);
         self.t_cur = -1;
     }
 

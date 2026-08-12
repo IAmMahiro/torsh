@@ -8,6 +8,7 @@
 use crate::Tensor;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use torsh_core::sync::RwLockExt;
 use torsh_core::{device::DeviceType, dtype::TensorElement, error::Result};
 
 // GPU compute is provided by oxicuda via `crate::gpu_dispatch` (the real device
@@ -534,10 +535,7 @@ impl OperationScheduler {
         dependencies: Vec<DeviceType>,
     ) -> Result<u64> {
         // Generate unique operation ID
-        let mut counter = self
-            .operation_counter
-            .write()
-            .expect("lock should not be poisoned");
+        let mut counter = self.operation_counter.write_or_recover();
         *counter += 1;
         let op_id = *counter;
         drop(counter);

@@ -1025,9 +1025,9 @@ pub mod pretrained {
         let model = BertEncoder::bert_base(vocab_size)?;
 
         if pretrained {
-            println!(
-                "Loading BERT-Base with random weights (pretrained weights not implemented yet)"
-            );
+            return Err(torsh_core::error::TorshError::NotImplemented(
+                "BERT-Base pretrained weights are not available; call with pretrained=false for a randomly-initialized model".to_string(),
+            ));
         }
 
         Ok(Box::new(model))
@@ -1039,9 +1039,9 @@ pub mod pretrained {
         let model = BertEncoder::bert_large(vocab_size)?;
 
         if pretrained {
-            println!(
-                "Loading BERT-Large with random weights (pretrained weights not implemented yet)"
-            );
+            return Err(torsh_core::error::TorshError::NotImplemented(
+                "BERT-Large pretrained weights are not available; call with pretrained=false for a randomly-initialized model".to_string(),
+            ));
         }
 
         Ok(Box::new(model))
@@ -1053,9 +1053,9 @@ pub mod pretrained {
         let model = GPTDecoder::gpt2_small(vocab_size)?;
 
         if pretrained {
-            println!(
-                "Loading GPT-2 Small with random weights (pretrained weights not implemented yet)"
-            );
+            return Err(torsh_core::error::TorshError::NotImplemented(
+                "GPT-2 Small pretrained weights are not available; call with pretrained=false for a randomly-initialized model".to_string(),
+            ));
         }
 
         Ok(Box::new(model))
@@ -1067,9 +1067,9 @@ pub mod pretrained {
         let model = GPTDecoder::gpt2_medium(vocab_size)?;
 
         if pretrained {
-            println!(
-                "Loading GPT-2 Medium with random weights (pretrained weights not implemented yet)"
-            );
+            return Err(torsh_core::error::TorshError::NotImplemented(
+                "GPT-2 Medium pretrained weights are not available; call with pretrained=false for a randomly-initialized model".to_string(),
+            ));
         }
 
         Ok(Box::new(model))

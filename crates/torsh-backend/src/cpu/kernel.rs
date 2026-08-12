@@ -30,7 +30,7 @@ impl CpuKernel {
         let _cpu_kernel = Self::new(descriptor)?;
 
         let handle = KernelHandle::Generic {
-            handle: Box::new("CPU kernel placeholder".to_string()),
+            handle: std::sync::Arc::new("CPU kernel placeholder".to_string()),
         };
 
         let metadata = KernelMetadata {

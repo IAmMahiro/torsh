@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use torsh_core::error::TorshError;
+use torsh_core::sync::{MutexExt, RwLockExt};
 
 #[cfg(feature = "serialize")]
 use serde::{Deserialize, Serialize};
@@ -468,10 +469,7 @@ impl AdaptiveKernelSelector {
 
     /// Register a kernel implementation
     pub fn register_kernel(&self, kernel: KernelImplementation) -> Result<()> {
-        let mut registry = self
-            .kernel_registry
-            .write()
-            .expect("lock should not be poisoned");
+        let mut registry = self.kernel_registry.write_or_recover();
         registry.register_kernel(kernel)
     }
 
@@ -480,10 +478,7 @@ impl AdaptiveKernelSelector {
         &self,
         kernel: Box<dyn CustomKernel + Send + Sync>,
     ) -> Result<()> {
-        let mut registry = self
-            .kernel_registry
-            .write()
-            .expect("lock should not be poisoned");
+        let mut registry = self.kernel_registry.write_or_recover();
         registry.register_custom_kernel(kernel)
     }
 
@@ -496,10 +491,7 @@ impl AdaptiveKernelSelector {
         workload: &WorkloadCharacteristics,
         system_state: &SystemState,
     ) -> Result<KernelSelection> {
-        let registry = self
-            .kernel_registry
-            .read()
-            .expect("lock should not be poisoned");
+        let registry = self.kernel_registry.read_or_recover();
 
         // Get candidate kernels
         let candidates = registry.get_candidates(operation_type, backend_type, inputs)?;
@@ -690,10 +682,7 @@ impl AdaptiveKernelSelector {
 
     /// Get historical performance score for a kernel
     fn get_historical_performance_score(&self, kernel_id: &str) -> Result<f64> {
-        let tracker = self
-            .performance_tracker
-            .lock()
-            .expect("lock should not be poisoned");
+        let tracker = self.performance_tracker.lock_or_recover();
 
         if let Some(stats) = tracker.usage_stats.get(kernel_id) {
             let success_rate = stats.successful_executions as f64 / stats.total_executions as f64;
@@ -741,10 +730,7 @@ impl AdaptiveKernelSelector {
         workload: &WorkloadCharacteristics,
         system_state: &SystemState,
     ) -> Result<()> {
-        let mut tracker = self
-            .performance_tracker
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut tracker = self.performance_tracker.lock_or_recover();
         tracker.track_selection(selection, workload, system_state)
     }
 
@@ -755,19 +741,13 @@ impl AdaptiveKernelSelector {
         actual_performance: ActualPerformance,
         predicted_performance: Option<PerformancePrediction>,
     ) -> Result<()> {
-        let mut tracker = self
-            .performance_tracker
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut tracker = self.performance_tracker.lock_or_recover();
         tracker.update_performance_feedback(kernel_id, actual_performance, predicted_performance)
     }
 
     /// Get selection statistics
     pub fn get_selection_statistics(&self) -> Result<SelectionStatistics> {
-        let tracker = self
-            .performance_tracker
-            .lock()
-            .expect("lock should not be poisoned");
+        let tracker = self.performance_tracker.lock_or_recover();
         Ok(tracker.get_statistics())
     }
 
@@ -778,10 +758,7 @@ impl AdaptiveKernelSelector {
         backend_type: BackendType,
         test_inputs: &[KernelInputs],
     ) -> Result<BenchmarkResults> {
-        let registry = self
-            .kernel_registry
-            .read()
-            .expect("lock should not be poisoned");
+        let registry = self.kernel_registry.read_or_recover();
         let kernels = registry.get_kernels_for_operation(operation_type, backend_type);
 
         let mut results = BenchmarkResults::new();

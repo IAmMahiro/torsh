@@ -10,7 +10,7 @@ use crate::{
 };
 // ✅ SciRS2 POLICY: Use scirs2_core::parallel_ops instead of rayon::prelude
 use scirs2_core::parallel_ops::*;
-use torsh_core::error::Result;
+use torsh_core::error::{Result, TorshError};
 
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
@@ -231,13 +231,15 @@ where
 /// use torsh_data::dataset::TensorDataset;
 ///
 /// let dataset = TensorDataset::new(vec![1, 2, 3, 4, 5]);
+/// // NOTE: `build()` only produces sequential-order loaders; shuffling
+/// // requires `build_with_random_sampling()` (or `build_auto()`, which
+/// // dispatches on `.shuffle(..)` automatically).
 /// let dataloader = DataLoaderBuilder::new(dataset)
 ///     .batch_size(32)
-///     .shuffle(true)
 ///     .num_workers(4)
 ///     .pin_memory(true)
 ///     .drop_last(true)
-///     .build()?;
+///     .build_with_random_sampling()?;
 /// ```
 pub struct DataLoaderBuilder<D: Dataset> {
     dataset: D,
@@ -343,9 +345,25 @@ impl<D: Dataset> DataLoaderBuilder<D> {
     ///
     /// Creates a DataLoader that processes the dataset in sequential order.
     /// This is the default behavior when shuffle is false or not specified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `.shuffle(true)` was set on this builder: `build()`
+    /// can only construct a sequential-order `DataLoader` (its return type is
+    /// fixed to `BatchingSampler<SequentialSampler>`), so honoring a shuffle
+    /// request here is not possible without silently producing the wrong
+    /// iteration order. Use [`Self::build_with_random_sampling`] or
+    /// [`Self::build_auto`] instead when shuffling is desired.
     pub fn build(
         self,
     ) -> Result<DataLoader<D, BatchingSampler<SequentialSampler>, DefaultCollate>> {
+        if self.shuffle {
+            return Err(TorshError::InvalidArgument(
+                "DataLoaderBuilder::build() only supports sequential sampling and cannot honor \
+                 shuffle(true); call build_with_random_sampling() or build_auto() instead"
+                    .to_string(),
+            ));
+        }
         let batch_size = self.batch_size.unwrap_or(1);
         let base_sampler = SequentialSampler::new(self.dataset.len());
         let batch_sampler = BatchingSampler::new(base_sampler, batch_size, self.drop_last);
@@ -417,6 +435,22 @@ pub type SimpleDataLoader<D> = DataLoader<D, BatchingSampler<SequentialSampler>,
 ///
 /// This type alias provides a convenient shorthand for DataLoader with random sampling.
 pub type RandomDataLoader<D> = DataLoader<D, BatchingSampler<RandomSampler>, DefaultCollate>;
+
+impl<D, C> DataLoader<D, BatchingSampler<RandomSampler>, C>
+where
+    D: Dataset,
+    C: Collate<D::Item>,
+{
+    /// Advance the underlying [`RandomSampler`] to a new epoch.
+    ///
+    /// Call this once per training epoch before `iter()` so each epoch draws a
+    /// fresh, epoch-derived permutation instead of repeating the same order
+    /// (see `RandomSampler::set_epoch`). Reproducible: the same `(generator,
+    /// epoch)` pair always yields the same order.
+    pub fn set_epoch(&mut self, epoch: usize) {
+        self.sampler.set_epoch(epoch);
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -20,8 +20,8 @@ pub mod stft;
 
 // Re-export all public APIs to maintain compatibility
 pub use mel::{
-    create_fb_matrix, hz_to_mel, inverse_mel_scale, mel_filterbank, mel_scale, mel_spectrogram,
-    mel_to_hz,
+    create_fb_matrix, hz_to_mel, inverse_mel_scale, mel_filterbank, mel_filterbank_with_norm,
+    mel_scale, mel_spectrogram, mel_to_hz, MelNorm,
 };
 pub use spectrogram::spectrogram;
 pub use stft::{istft, stft, StftParams};

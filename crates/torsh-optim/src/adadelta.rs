@@ -154,7 +154,7 @@ impl Optimizer for AdaDelta {
                 acc_delta = acc_delta.add(&delta_term)?;
 
                 // Apply update to parameter
-                *param = param.add(&delta)?;
+                crate::param_update::add_assign(&mut param, &delta)?;
 
                 // Update state
                 state.insert("square_avg".to_string(), square_avg);
@@ -175,6 +175,10 @@ impl Optimizer for AdaDelta {
 
     fn set_lr(&mut self, lr: f32) {
         self.base.set_lr(lr);
+    }
+
+    fn set_lrs(&mut self, lrs: &[f32]) {
+        self.base.set_lrs(lrs);
     }
 
     fn add_param_group(&mut self, params: Vec<Arc<RwLock<Tensor>>>, options: HashMap<String, f32>) {

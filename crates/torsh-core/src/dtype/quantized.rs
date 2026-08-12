@@ -10,6 +10,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::dtype::core::DType;
 use crate::dtype::traits::TensorElement;
+use crate::error::TorshError;
 
 /// Quantized 8-bit signed integer with scale and zero-point parameters
 ///
@@ -137,9 +138,14 @@ impl QInt8 {
     ///
     /// Calculates optimal scale and zero-point to represent the given range
     /// [min_value, max_value] using the full i8 range.
-    pub fn quantize_range(value: f32, min_value: f32, max_value: f32) -> Self {
-        let (scale, zero_point) = calculate_qint8_params(min_value, max_value);
-        Self::quantize(value, scale, zero_point)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TorshError::InvalidArgument`] if `min_value`/`max_value` are
+    /// non-finite or `max_value < min_value`; see [`calculate_qint8_params`].
+    pub fn quantize_range(value: f32, min_value: f32, max_value: f32) -> Result<Self, TorshError> {
+        let (scale, zero_point) = calculate_qint8_params(min_value, max_value)?;
+        Ok(Self::quantize(value, scale, zero_point))
     }
 
     /// Check if this is a symmetric quantization (zero_point == 0)
@@ -290,9 +296,14 @@ impl QUInt8 {
     }
 
     /// Quantize with automatic scale and zero-point calculation
-    pub fn quantize_range(value: f32, min_value: f32, max_value: f32) -> Self {
-        let (scale, zero_point) = calculate_quint8_params(min_value, max_value);
-        Self::quantize(value, scale, zero_point)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TorshError::InvalidArgument`] if `min_value`/`max_value` are
+    /// non-finite or `max_value < min_value`; see [`calculate_quint8_params`].
+    pub fn quantize_range(value: f32, min_value: f32, max_value: f32) -> Result<Self, TorshError> {
+        let (scale, zero_point) = calculate_quint8_params(min_value, max_value)?;
+        Ok(Self::quantize(value, scale, zero_point))
     }
 
     /// Check if this is a symmetric quantization (zero_point == 0)
@@ -362,13 +373,30 @@ impl TensorElement for QUInt8 {
 
 /// Calculate optimal quantization parameters for QInt8
 ///
-/// Returns (scale, zero_point) that maps [min_value, max_value] to the full i8 range.
-pub fn calculate_qint8_params(min_value: f32, max_value: f32) -> (f32, i8) {
-    assert!(max_value >= min_value, "max_value must be >= min_value");
+/// Returns (scale, zero_point) that maps `[min_value, max_value]` to the full i8 range.
+///
+/// # Errors
+///
+/// Returns [`TorshError::InvalidArgument`] if `min_value` or `max_value` is
+/// non-finite (NaN or infinite calibration statistics usually indicate a bad
+/// tensor upstream), or if `max_value < min_value`.
+pub fn calculate_qint8_params(min_value: f32, max_value: f32) -> Result<(f32, i8), TorshError> {
+    if !min_value.is_finite() || !max_value.is_finite() {
+        return Err(TorshError::InvalidArgument(format!(
+            "non-finite calibration statistics (tensor contains NaN/Inf): min={}, max={}",
+            min_value, max_value
+        )));
+    }
+    if max_value < min_value {
+        return Err(TorshError::InvalidArgument(format!(
+            "max_value must be >= min_value: min={}, max={}",
+            min_value, max_value
+        )));
+    }
 
     if max_value == min_value {
         // Degenerate case - all values are the same
-        return (1.0, 0);
+        return Ok((1.0, 0));
     }
 
     let qmin = i8::MIN as f32;
@@ -384,18 +412,35 @@ pub fn calculate_qint8_params(min_value: f32, max_value: f32) -> (f32, i8) {
     let zero_point_real = qmin - min_value / scale;
     let zero_point = zero_point_real.round().clamp(qmin, qmax) as i8;
 
-    (scale, zero_point)
+    Ok((scale, zero_point))
 }
 
 /// Calculate optimal quantization parameters for QUInt8
 ///
-/// Returns (scale, zero_point) that maps [min_value, max_value] to the full u8 range.
-pub fn calculate_quint8_params(min_value: f32, max_value: f32) -> (f32, u8) {
-    assert!(max_value >= min_value, "max_value must be >= min_value");
+/// Returns (scale, zero_point) that maps `[min_value, max_value]` to the full u8 range.
+///
+/// # Errors
+///
+/// Returns [`TorshError::InvalidArgument`] if `min_value` or `max_value` is
+/// non-finite (NaN or infinite calibration statistics usually indicate a bad
+/// tensor upstream), or if `max_value < min_value`.
+pub fn calculate_quint8_params(min_value: f32, max_value: f32) -> Result<(f32, u8), TorshError> {
+    if !min_value.is_finite() || !max_value.is_finite() {
+        return Err(TorshError::InvalidArgument(format!(
+            "non-finite calibration statistics (tensor contains NaN/Inf): min={}, max={}",
+            min_value, max_value
+        )));
+    }
+    if max_value < min_value {
+        return Err(TorshError::InvalidArgument(format!(
+            "max_value must be >= min_value: min={}, max={}",
+            min_value, max_value
+        )));
+    }
 
     if max_value == min_value {
         // Degenerate case - all values are the same
-        return (1.0, 0);
+        return Ok((1.0, 0));
     }
 
     let qmin = 0.0;
@@ -408,7 +453,7 @@ pub fn calculate_quint8_params(min_value: f32, max_value: f32) -> (f32, u8) {
     let zero_point_real = qmin - min_value / scale;
     let zero_point = zero_point_real.round().clamp(qmin, qmax) as u8;
 
-    (scale, zero_point)
+    Ok((scale, zero_point))
 }
 
 /// Quantization schemes for different use cases
@@ -487,19 +532,29 @@ impl QuantizationObserver {
     }
 
     /// Calculate quantization parameters for QInt8
+    ///
+    /// Returns `None` if no samples have been observed yet. `update`/
+    /// `update_batch` only ever fold in finite values, and `min_val`/
+    /// `max_val` track the same observed set, so `min_val <= max_val` is a
+    /// standing invariant once `count > 0` -- the underlying calculation can
+    /// never actually fail here, so a `Result` error is folded into `None`
+    /// via `.ok()` rather than exposed as a second, unreachable failure mode.
     pub fn calculate_qint8_params(&self) -> Option<(f32, i8)> {
         if self.count == 0 {
             return None;
         }
-        Some(calculate_qint8_params(self.min_val, self.max_val))
+        calculate_qint8_params(self.min_val, self.max_val).ok()
     }
 
     /// Calculate quantization parameters for QUInt8
+    ///
+    /// See [`Self::calculate_qint8_params`] for why a `Result` error from the
+    /// underlying calculation can never actually occur here.
     pub fn calculate_quint8_params(&self) -> Option<(f32, u8)> {
         if self.count == 0 {
             return None;
         }
-        Some(calculate_quint8_params(self.min_val, self.max_val))
+        calculate_quint8_params(self.min_val, self.max_val).ok()
     }
 
     /// Reset the observer
@@ -519,11 +574,14 @@ impl QuantizationObserver {
     }
 
     /// Calculate quantization parameters for QInt32
+    ///
+    /// See [`Self::calculate_qint8_params`] for why a `Result` error from the
+    /// underlying calculation can never actually occur here.
     pub fn calculate_qint32_params(&self) -> Option<(f32, i32)> {
         if self.count == 0 {
             return None;
         }
-        Some(calculate_qint32_params(self.min_val, self.max_val))
+        calculate_qint32_params(self.min_val, self.max_val).ok()
     }
 }
 
@@ -611,9 +669,14 @@ impl QInt32 {
     }
 
     /// Quantize with automatic scale and zero-point calculation
-    pub fn quantize_range(value: f32, min_value: f32, max_value: f32) -> Self {
-        let (scale, zero_point) = calculate_qint32_params(min_value, max_value);
-        Self::quantize(value, scale, zero_point)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TorshError::InvalidArgument`] if `min_value`/`max_value` are
+    /// non-finite or `max_value < min_value`; see [`calculate_qint32_params`].
+    pub fn quantize_range(value: f32, min_value: f32, max_value: f32) -> Result<Self, TorshError> {
+        let (scale, zero_point) = calculate_qint32_params(min_value, max_value)?;
+        Ok(Self::quantize(value, scale, zero_point))
     }
 
     /// Check if this is a symmetric quantization (zero_point == 0)
@@ -683,13 +746,30 @@ impl TensorElement for QInt32 {
 
 /// Calculate optimal quantization parameters for QInt32
 ///
-/// Returns (scale, zero_point) that maps [min_value, max_value] to the full i32 range.
-pub fn calculate_qint32_params(min_value: f32, max_value: f32) -> (f32, i32) {
-    assert!(max_value >= min_value, "max_value must be >= min_value");
+/// Returns (scale, zero_point) that maps `[min_value, max_value]` to the full i32 range.
+///
+/// # Errors
+///
+/// Returns [`TorshError::InvalidArgument`] if `min_value` or `max_value` is
+/// non-finite (NaN or infinite calibration statistics usually indicate a bad
+/// tensor upstream), or if `max_value < min_value`.
+pub fn calculate_qint32_params(min_value: f32, max_value: f32) -> Result<(f32, i32), TorshError> {
+    if !min_value.is_finite() || !max_value.is_finite() {
+        return Err(TorshError::InvalidArgument(format!(
+            "non-finite calibration statistics (tensor contains NaN/Inf): min={}, max={}",
+            min_value, max_value
+        )));
+    }
+    if max_value < min_value {
+        return Err(TorshError::InvalidArgument(format!(
+            "max_value must be >= min_value: min={}, max={}",
+            min_value, max_value
+        )));
+    }
 
     if max_value == min_value {
         // Degenerate case - all values are the same
-        return (1.0, 0);
+        return Ok((1.0, 0));
     }
 
     let qmin = i32::MIN as f64;
@@ -702,7 +782,7 @@ pub fn calculate_qint32_params(min_value: f32, max_value: f32) -> (f32, i32) {
     let zero_point_real = qmin - (min_value as f64 / scale as f64);
     let zero_point = zero_point_real.round().clamp(qmin, qmax) as i32;
 
-    (scale, zero_point)
+    Ok((scale, zero_point))
 }
 
 #[cfg(test)]
@@ -743,7 +823,8 @@ mod tests {
         let max_val = 10.0;
         let test_value = 5.0;
 
-        let quantized = QInt8::quantize_range(test_value, min_val, max_val);
+        let quantized = QInt8::quantize_range(test_value, min_val, max_val)
+            .expect("quantize_range should succeed");
         let restored = quantized.dequantize();
 
         // Should be close to original
@@ -800,11 +881,13 @@ mod tests {
         let max_val = 10.0;
 
         // Test QInt8 parameter calculation
-        let (scale_i8, zero_point_i8) = calculate_qint8_params(min_val, max_val);
+        let (scale_i8, zero_point_i8) =
+            calculate_qint8_params(min_val, max_val).expect("calculation should succeed");
         assert!(scale_i8 > 0.0);
 
         // Test QUInt8 parameter calculation
-        let (scale_u8, _zero_point_u8) = calculate_quint8_params(min_val, max_val);
+        let (scale_u8, _zero_point_u8) =
+            calculate_quint8_params(min_val, max_val).expect("calculation should succeed");
         assert!(scale_u8 > 0.0);
 
         // Verify the parameters work
@@ -886,7 +969,8 @@ mod tests {
         assert_eq!(q_small.value, i8::MIN);
 
         // Test degenerate range
-        let (scale, zero_point) = calculate_qint8_params(5.0, 5.0);
+        let (scale, zero_point) =
+            calculate_qint8_params(5.0, 5.0).expect("degenerate range should succeed");
         assert_eq!(scale, 1.0);
         assert_eq!(zero_point, 0);
     }

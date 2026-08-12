@@ -1,81 +1,40 @@
-//! NCCL-optimized collective operations
+//! NCCL-oriented collective operation wrappers.
 //!
-//! This module provides NCCL-specific implementations of collective operations
-//! that can take advantage of GPU-optimized communication when NCCL backend is available.
+//! These wrappers expose a NCCL-style API surface but, because no real
+//! NVIDIA NCCL / GPU transport is wired in yet, they delegate to the crate's
+//! generic (and now genuinely functional) collective implementations in
+//! [`crate::collectives`], which perform real cross-rank communication over the
+//! pure-Rust TCP backend.
 //!
-//! ## Features
-//!
-//! - **High-performance GPU communication**: Uses NVIDIA NCCL for optimized GPU-to-GPU communication
-//! - **Automatic fallback**: Falls back to generic implementations when NCCL is unavailable
-//! - **Batch operations**: Supports batching multiple operations for better performance
-//! - **Async support**: All operations are async and non-blocking
-//!
-//! ## Current Implementation Status
-//!
-//! This implementation currently provides enhanced mock implementations that simulate
-//! real NCCL behavior for testing and development purposes. The mock implementations:
-//!
-//! - Simulate realistic timing delays
-//! - Provide predictable tensor transformations for testing
-//! - Include proper error handling and validation
-//! - Support all major NCCL collective operations
+//! There is deliberately **no fabricated GPU simulation** here: the previous
+//! implementation invented reduction/gather results (e.g. multiplying by
+//! `world_size`), which silently corrupted data. When a real NCCL backend
+//! (via future `cudarc`+`nccl` / `oxicuda-comm` bindings) becomes available,
+//! these wrappers should dispatch to it for `BackendType::Nccl` process groups.
 //!
 //! ## Usage Example
 //!
 //! ```rust,no_run
-//! use torsh_distributed::nccl_ops::{nccl_all_reduce, NcclBatch};
+//! use torsh_distributed::nccl_ops::nccl_all_reduce;
 //! use torsh_distributed::{ReduceOp, init_process_group, BackendType};
 //! use torsh_tensor::Tensor;
 //!
 //! async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//!     let pg = init_process_group(BackendType::Nccl, 0, 4, "127.0.0.1", 29500).await?;
-//!
-//!     // Single operation
+//!     let pg = init_process_group(BackendType::Gloo, 0, 1, "127.0.0.1", 29500).await?;
 //!     let mut tensor: Tensor<f32> = Tensor::from_vec(vec![1.0; 1000], &[1000])?;
 //!     nccl_all_reduce(&mut tensor, ReduceOp::Sum, &pg).await?;
-//!     
-//!     // Batch operations
-//!     let mut batch = NcclBatch::new();
-//!     batch.all_reduce(0, ReduceOp::Sum)
-//!          .broadcast(1, 0)
-//!          .reduce_scatter(2, 3, ReduceOp::Sum);
-//!     batch.execute(&pg).await?;
-//!     
 //!     Ok(())
 //! }
 //! ```
 
-use crate::backend::BackendType;
 use crate::{ProcessGroup, ReduceOp, TorshDistributedError, TorshResult};
-use log::info;
 use torsh_core::dtype::FloatElement;
 use torsh_tensor::Tensor;
 
-#[cfg(feature = "nccl")]
-use crate::backend::NcclBackend;
-
-/// Emit the NCCL simulation warning exactly once per process lifetime.
+/// NCCL-style all-reduce.
 ///
-/// Real NCCL requires the `cudarc` crate with the `nccl` feature and a
-/// compatible GPU driver. Until that integration is wired in, all collective
-/// ops in this module perform in-process simulation only — data is NOT
-/// exchanged across ranks.
-#[cfg(feature = "nccl")]
-fn warn_nccl_simulated_once() {
-    use std::sync::OnceLock;
-    static WARNED: OnceLock<()> = OnceLock::new();
-    WARNED.get_or_init(|| {
-        tracing::warn!(
-            "NCCL backend is simulated — collective ops are local; \
-             real NCCL requires cudarc+nccl feature"
-        );
-    });
-}
-
-/// NCCL-optimized all-reduce operation
-///
-/// This function automatically detects if NCCL backend is available and uses
-/// optimized GPU communication paths when possible.
+/// Delegates to the real [`crate::collectives::all_reduce`], performing a
+/// genuine cross-rank reduction (no fabricated results).
 pub async fn nccl_all_reduce<T>(
     tensor: &mut Tensor<T>,
     op: ReduceOp,
@@ -90,437 +49,54 @@ where
         + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>,
 {
-    match group.backend_type() {
-        #[cfg(feature = "nccl")]
-        BackendType::Nccl => nccl_all_reduce_impl(tensor, op, group).await,
-        _ => {
-            // Fall back to generic implementation
-            crate::collectives::all_reduce(tensor, op, group).await
-        }
-    }
+    crate::collectives::all_reduce(tensor, op, group).await
 }
 
-/// NCCL-optimized broadcast operation
+/// NCCL-style broadcast. Delegates to the real [`crate::collectives::broadcast`].
 pub async fn nccl_broadcast<T: FloatElement>(
     tensor: &mut Tensor<T>,
     src_rank: u32,
     group: &ProcessGroup,
 ) -> TorshResult<()> {
-    match group.backend_type() {
-        #[cfg(feature = "nccl")]
-        BackendType::Nccl => nccl_broadcast_impl(tensor, src_rank, group).await,
-        _ => {
-            // Fall back to generic implementation
-            crate::collectives::broadcast(tensor, src_rank, group).await
-        }
-    }
+    crate::collectives::broadcast(tensor, src_rank, group).await
 }
 
-/// NCCL-optimized reduce-scatter operation
+/// NCCL-style reduce-scatter.
 ///
-/// Performs element-wise reduction across all processes and scatters the result
-/// such that each process receives a portion of the output tensor.
+/// Delegates to the real [`crate::collectives::reduce_scatter`], which performs
+/// a full all-reduce followed by keeping this rank's contiguous chunk.
 pub async fn nccl_reduce_scatter<T: FloatElement + Default + Copy>(
     input: &Tensor<T>,
     output: &mut Tensor<T>,
     op: ReduceOp,
     group: &ProcessGroup,
 ) -> TorshResult<()> {
-    match group.backend_type() {
-        #[cfg(feature = "nccl")]
-        BackendType::Nccl => nccl_reduce_scatter_impl(input, output, op, group).await,
-        _ => {
-            // Fall back to generic implementation using all-reduce + scatter
-            let mut temp = input.clone();
-            crate::collectives::all_reduce(&mut temp, op, group).await?;
-
-            // Scatter the result (simplified implementation)
-            let world_size = group.world_size() as usize;
-            let chunk_size = temp.numel() / world_size;
-            let _start_idx = group.rank() as usize * chunk_size;
-            let _end_idx = _start_idx + chunk_size;
-
-            // Implement proper tensor slicing for reduce-scatter
-            // Each rank gets an equal chunk of the reduced tensor
-            let temp_data = temp.to_vec()?;
-            if chunk_size * world_size <= temp_data.len() {
-                let chunk_data = temp_data[_start_idx.._end_idx].to_vec();
-                *output = Tensor::from_vec(chunk_data, &[chunk_size])?;
-            } else {
-                // Handle edge case where tensor size is not evenly divisible
-                *output = temp.clone();
-            }
-            Ok(())
-        }
-    }
+    crate::collectives::reduce_scatter(output, input, op, group).await
 }
 
-/// NCCL-optimized all-gather operation
-///
-/// Gathers tensors from all processes and concatenates them.
+/// NCCL-style all-gather. Delegates to the real [`crate::collectives::all_gather`].
 pub async fn nccl_all_gather<T: FloatElement>(
     input: &Tensor<T>,
     output: &mut Vec<Tensor<T>>,
     group: &ProcessGroup,
 ) -> TorshResult<()> {
-    match group.backend_type() {
-        #[cfg(feature = "nccl")]
-        BackendType::Nccl => nccl_all_gather_impl(input, output, group).await,
-        _ => {
-            // Fall back to generic implementation
-            crate::collectives::all_gather(output, input, group).await
-        }
-    }
+    crate::collectives::all_gather(output, input, group).await
 }
 
-#[cfg(feature = "nccl")]
-async fn nccl_all_reduce_impl<T>(
-    tensor: &mut Tensor<T>,
-    op: ReduceOp,
-    group: &ProcessGroup,
-) -> TorshResult<()>
-where
-    T: FloatElement
-        + Default
-        + Copy
-        + std::ops::Add<Output = T>
-        + std::ops::Sub<Output = T>
-        + std::ops::Mul<Output = T>
-        + std::ops::Div<Output = T>,
-{
-    warn_nccl_simulated_once();
-    let backend = group.backend();
-
-    // Check backend readiness and get info without holding the lock across await
-    let (rank, world_size, device_id) = {
-        let backend_guard = backend.read();
-        if !backend_guard.is_ready() {
-            return Err(TorshDistributedError::BackendNotInitialized);
-        }
-        let device_id = backend_guard
-            .as_any()
-            .downcast_ref::<NcclBackend>()
-            .map(|b| b.device_id());
-        (backend_guard.rank(), backend_guard.world_size(), device_id)
-    };
-
-    // Enhanced mock implementation of NCCL all-reduce
-    // In a real implementation, this would:
-    // 1. Get tensor data pointer and size
-    // 2. Call ncclAllReduce with appropriate parameters
-    // 3. Synchronize CUDA stream
-
-    tracing::debug!(
-        "NCCL All-Reduce: {} elements, op: {:?}, rank: {}, world_size: {}",
-        tensor.numel(),
-        op,
-        rank,
-        world_size
-    );
-
-    // Enhanced mock implementation with realistic behavior
-    if let Some(dev_id) = device_id {
-        // Simulate GPU synchronization delay
-        tokio::time::sleep(tokio::time::Duration::from_micros(10)).await;
-
-        tracing::debug!(
-            "NCCL All-Reduce completed on device {} ({} elements)",
-            dev_id,
-            tensor.numel()
-        );
-    }
-
-    // Apply reduction operation with more realistic simulation
-    match op {
-        ReduceOp::Sum => {
-            // In real NCCL, this would sum across all ranks
-            // For mock: simulate the effect by scaling based on world size
-            let ws = world_size as f32;
-            let current_data = tensor.to_vec()?;
-            let simulated_sum: Vec<T> = current_data
-                .iter()
-                .map(|&x| x * T::from(ws).unwrap_or_default())
-                .collect();
-            *tensor = Tensor::from_vec(simulated_sum, tensor.shape().dims())?;
-        }
-        ReduceOp::Product => {
-            // In real NCCL, this would multiply across all ranks
-            // For mock: simulate by raising to power of world size
-            let current_data = tensor.to_vec()?;
-            let simulated_product: Vec<T> = current_data
-                .iter()
-                .map(|&x| {
-                    let mut result = x;
-                    for _ in 1..world_size {
-                        result = result * x;
-                    }
-                    result
-                })
-                .collect();
-            *tensor = Tensor::from_vec(simulated_product, tensor.shape().dims())?;
-        }
-        ReduceOp::Min | ReduceOp::Max => {
-            // For min/max operations, values would remain unchanged
-            // assuming this rank has typical values
-            tracing::debug!("Min/Max operation: tensor values unchanged in mock");
-        }
-        _ => {
-            return Err(TorshDistributedError::InvalidArgument {
-                arg: "reduce_op".to_string(),
-                reason: format!("Unsupported reduce operation: {:?}", op),
-                expected: "Sum, Product, Min, or Max".to_string(),
-            });
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(feature = "nccl")]
-async fn nccl_broadcast_impl<T: FloatElement>(
-    tensor: &mut Tensor<T>,
-    src_rank: u32,
-    group: &ProcessGroup,
-) -> TorshResult<()> {
-    let backend = group.backend();
-    let (rank, device_id) = {
-        let backend_guard = backend.read();
-
-        if !backend_guard.is_ready() {
-            return Err(TorshDistributedError::BackendNotInitialized);
-        }
-
-        if src_rank >= backend_guard.world_size() {
-            return Err(TorshDistributedError::RankOutOfBounds {
-                rank: src_rank,
-                world_size: backend_guard.world_size(),
-            });
-        }
-
-        // Enhanced mock implementation of NCCL broadcast
-        // In a real implementation, this would call ncclBcast with appropriate parameters
-
-        let rank = backend_guard.rank();
-        let device_id = backend_guard
-            .as_any()
-            .downcast_ref::<NcclBackend>()
-            .map(|b| b.device_id());
-
-        tracing::debug!(
-            "NCCL Broadcast: {} elements from rank {} to rank {}",
-            tensor.numel(),
-            src_rank,
-            rank
-        );
-
-        (rank, device_id)
-    }; // Drop backend_guard before await
-
-    // Enhanced mock implementation with realistic behavior
-    if let Some(device_id) = device_id {
-        // Simulate GPU synchronization delay
-        tokio::time::sleep(tokio::time::Duration::from_micros(5)).await;
-
-        tracing::debug!(
-            "NCCL Broadcast completed on device {} ({} elements)",
-            device_id,
-            tensor.numel()
-        );
-    }
-
-    // In a real broadcast, non-source ranks would receive the tensor data from src_rank
-    // For mock implementation, we simulate receiving "broadcast" data
-    if rank != src_rank {
-        // Simulate receiving broadcast data by applying a predictable transformation
-        // This helps verify that broadcast operations are being called correctly
-        let current_data = tensor.to_vec()?;
-        let broadcast_data: Vec<T> = current_data
-            .iter()
-            .map(|&x| {
-                // Apply transformation for non-root ranks
-                if let Some(offset) = T::from(0.1 * src_rank as f32) {
-                    x + offset
-                } else {
-                    x
-                }
-            })
-            .collect();
-        *tensor = Tensor::from_vec(broadcast_data, tensor.shape().dims())?;
-
-        tracing::debug!(
-            "Rank {} received broadcast data from rank {}",
-            rank,
-            src_rank
-        );
-    } else {
-        tracing::debug!("Source rank {} broadcasting data", src_rank);
-    }
-    Ok(())
-}
-
-#[cfg(feature = "nccl")]
-async fn nccl_reduce_scatter_impl<T: FloatElement>(
-    input: &Tensor<T>,
-    output: &mut Tensor<T>,
-    op: ReduceOp,
-    group: &ProcessGroup,
-) -> TorshResult<()> {
-    let backend = group.backend();
-    let (world_size, rank, tensor_size_bytes, device_id) = {
-        let backend_guard = backend.read();
-
-        if !backend_guard.is_ready() {
-            return Err(TorshDistributedError::BackendNotInitialized);
-        }
-
-        // Enhanced NCCL reduce-scatter algorithm simulation
-        // Simulates the actual ncclReduceScatter operation with realistic timing and algorithm steps
-
-        let world_size = backend_guard.world_size() as usize;
-        let rank = backend_guard.rank() as usize;
-        let tensor_size_bytes = input.numel() * std::mem::size_of::<T>();
-        let device_id = backend_guard
-            .as_any()
-            .downcast_ref::<NcclBackend>()
-            .map(|b| b.device_id());
-
-        info!(
-            "🔀 NCCL Reduce-Scatter: {} elements, op: {:?}, rank: {}/{}",
-            input.numel(),
-            op,
-            rank,
-            world_size
-        );
-
-        (world_size, rank, tensor_size_bytes, device_id)
-    }; // Drop backend_guard before await
-
-    // Simulate reduce-scatter algorithm phases
-    // Phase 1: Reduce-scatter ring algorithm
-    for _step in 0..world_size - 1 {
-        // Send chunk to next rank, receive from previous rank
-        let chunk_size_bytes = tensor_size_bytes / world_size;
-
-        // Network transfer simulation (send + receive)
-        let transfer_time_us = (chunk_size_bytes as f64 * 0.01).max(50.0);
-        tokio::time::sleep(tokio::time::Duration::from_micros(transfer_time_us as u64)).await;
-
-        // Local reduction computation simulation
-        let reduction_time_us = match op {
-            ReduceOp::Sum | ReduceOp::Mean => (chunk_size_bytes as f64 * 0.001).max(10.0),
-            ReduceOp::Max | ReduceOp::Min => (chunk_size_bytes as f64 * 0.002).max(15.0),
-            ReduceOp::Product => (chunk_size_bytes as f64 * 0.003).max(20.0),
-            _ => (chunk_size_bytes as f64 * 0.002).max(15.0), // Default for other ops
-        };
-        tokio::time::sleep(tokio::time::Duration::from_micros(reduction_time_us as u64)).await;
-    }
-
-    #[cfg(feature = "nccl")]
-    if let Some(device_id) = device_id {
-        info!("    NCCL Reduce-Scatter completed on device {}", device_id);
-    } else {
-        info!("    NCCL Reduce-Scatter completed (mock implementation)");
-    }
-
-    // Mock implementation: each rank gets a portion of the input
-    let chunk_size = input.numel() / world_size;
-    let _start_idx = rank * chunk_size;
-    let _end_idx = (_start_idx + chunk_size).min(input.numel());
-
-    // Implement proper tensor slicing for reduce-scatter
-    // Create output tensor with the appropriate chunk for this rank
-    let input_data = input.to_vec()?;
-    if chunk_size > 0 && _end_idx <= input_data.len() {
-        let chunk_data = input_data[_start_idx.._end_idx].to_vec();
-        *output = Tensor::from_vec(chunk_data, &[chunk_size])?;
-    } else {
-        // Handle edge case where tensor cannot be evenly divided
-        *output = input.clone();
-    }
-
-    Ok(())
-}
-
-#[cfg(feature = "nccl")]
-async fn nccl_all_gather_impl<T: FloatElement>(
-    input: &Tensor<T>,
-    output: &mut Vec<Tensor<T>>,
-    group: &ProcessGroup,
-) -> TorshResult<()> {
-    let backend = group.backend();
-    let (device_id, world_size) = {
-        let backend_guard = backend.read();
-
-        if !backend_guard.is_ready() {
-            return Err(TorshDistributedError::BackendNotInitialized);
-        }
-
-        // Enhanced mock implementation of NCCL all-gather
-        // In a real implementation, this would call ncclAllGather with appropriate parameters
-
-        let rank = backend_guard.rank();
-        let world_size = backend_guard.world_size();
-        let device_id = backend_guard
-            .as_any()
-            .downcast_ref::<NcclBackend>()
-            .map(|b| b.device_id());
-
-        tracing::debug!(
-            "NCCL All-Gather: {} elements from rank {}",
-            input.numel(),
-            rank
-        );
-
-        (device_id, world_size)
-    }; // Drop backend_guard before await
-
-    // Enhanced mock implementation with realistic behavior
-    if let Some(device_id) = device_id {
-        // Simulate GPU synchronization delay
-        tokio::time::sleep(tokio::time::Duration::from_micros(15)).await;
-
-        tracing::debug!("NCCL All-Gather completed on device {}", device_id);
-    }
-
-    // Enhanced mock implementation: simulate gathering from different ranks
-    output.clear();
-
-    for rank in 0..world_size {
-        // Simulate that each rank contributes slightly different data
-        let input_data = input.to_vec()?;
-        let rank_data: Vec<T> = input_data
-            .iter()
-            .map(|&x| {
-                // Simulate data from each rank with slight variation
-                if let Some(offset) = T::from(0.01 * rank as f32) {
-                    x + offset
-                } else {
-                    x
-                }
-            })
-            .collect();
-        let rank_tensor = Tensor::from_vec(rank_data, input.shape().dims())?;
-        output.push(rank_tensor);
-    }
-
-    tracing::debug!(
-        "All-Gather collected {} tensors from {} ranks",
-        output.len(),
-        world_size
-    );
-
-    Ok(())
-}
-
-/// Batch multiple collective operations for better performance
+/// Batch of collective operations.
 ///
-/// This function allows batching multiple collective operations to reduce
-/// the number of kernel launches and improve overall throughput.
+/// The batched fast-path (`ncclGroupStart`/`ncclGroupEnd`) requires a real NCCL
+/// backend, which is not yet available; [`NcclBatch::execute`] therefore returns
+/// an honest error rather than pretending to execute the batch.
 pub struct NcclBatch {
     operations: Vec<NcclOperation>,
 }
 
+// Fields are retained to describe queued operations for a future real batched
+// NCCL implementation; `execute` currently returns an honest error without
+// reading them, so they are intentionally unread for now.
 #[derive(Debug)]
+#[allow(dead_code)]
 enum NcclOperation {
     AllReduce {
         tensor_id: usize,
@@ -538,21 +114,21 @@ enum NcclOperation {
 }
 
 impl NcclBatch {
-    /// Create a new batch
+    /// Create a new batch.
     pub fn new() -> Self {
         Self {
             operations: Vec::new(),
         }
     }
 
-    /// Add an all-reduce operation to the batch
+    /// Add an all-reduce operation to the batch.
     pub fn all_reduce(&mut self, tensor_id: usize, op: ReduceOp) -> &mut Self {
         self.operations
             .push(NcclOperation::AllReduce { tensor_id, op });
         self
     }
 
-    /// Add a broadcast operation to the batch
+    /// Add a broadcast operation to the batch.
     pub fn broadcast(&mut self, tensor_id: usize, src_rank: u32) -> &mut Self {
         self.operations.push(NcclOperation::Broadcast {
             tensor_id,
@@ -561,7 +137,7 @@ impl NcclBatch {
         self
     }
 
-    /// Add a reduce-scatter operation to the batch
+    /// Add a reduce-scatter operation to the batch.
     pub fn reduce_scatter(&mut self, input_id: usize, output_id: usize, op: ReduceOp) -> &mut Self {
         self.operations.push(NcclOperation::ReduceScatter {
             input_id,
@@ -571,94 +147,26 @@ impl NcclBatch {
         self
     }
 
-    /// Execute all operations in the batch
-    pub async fn execute(&self, group: &ProcessGroup) -> TorshResult<()> {
-        match group.backend_type() {
-            #[cfg(feature = "nccl")]
-            BackendType::Nccl => self.execute_nccl_batch(group).await,
-            _ => {
-                // Fall back to executing operations individually
-                Err(TorshDistributedError::feature_not_available(
-                    "Batch operations",
-                    "nccl feature flag",
-                ))
-            }
-        }
+    /// Number of operations queued in the batch.
+    pub fn len(&self) -> usize {
+        self.operations.len()
     }
 
-    #[cfg(feature = "nccl")]
-    async fn execute_nccl_batch(&self, _group: &ProcessGroup) -> TorshResult<()> {
-        info!(
-            " Executing NCCL batch with {} operations",
-            self.operations.len()
-        );
+    /// Whether the batch is empty.
+    pub fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
 
-        // Enhanced mock implementation of NCCL batch execution
-        // In a real implementation, this would:
-        // 1. Start a NCCL group call (ncclGroupStart)
-        // 2. Queue all operations without executing them
-        // 3. End the group call to execute all operations together (ncclGroupEnd)
-        // This provides better performance by overlapping communication
-
-        tracing::debug!(
-            "Starting NCCL group execution with {} operations",
-            self.operations.len()
-        );
-
-        // Simulate group start
-        let start_time = std::time::Instant::now();
-
-        // In real NCCL, operations would be queued here
-        for (i, op) in self.operations.iter().enumerate() {
-            match op {
-                NcclOperation::AllReduce { tensor_id, op } => {
-                    tracing::debug!(
-                        "   Queuing {}. All-Reduce tensor {} with op {:?}",
-                        i + 1,
-                        tensor_id,
-                        op
-                    );
-                }
-                NcclOperation::Broadcast {
-                    tensor_id,
-                    src_rank,
-                } => {
-                    tracing::debug!(
-                        "   Queuing {}. Broadcast tensor {} from rank {}",
-                        i + 1,
-                        tensor_id,
-                        src_rank
-                    );
-                }
-                NcclOperation::ReduceScatter {
-                    input_id,
-                    output_id,
-                    op,
-                } => {
-                    tracing::debug!(
-                        "   Queuing {}. Reduce-Scatter tensor {} -> {} with op {:?}",
-                        i + 1,
-                        input_id,
-                        output_id,
-                        op
-                    );
-                }
-            }
-        }
-
-        // Simulate batch execution time (would be overlapped in real NCCL)
-        let base_delay = 20; // microseconds
-        let per_op_delay = 5; // microseconds per operation
-        let total_delay = base_delay + (per_op_delay * self.operations.len());
-        tokio::time::sleep(tokio::time::Duration::from_micros(total_delay as u64)).await;
-
-        let execution_time = start_time.elapsed();
-        tracing::debug!(
-            "NCCL batch execution completed in {:?} ({} operations)",
-            execution_time,
-            self.operations.len()
-        );
-        Ok(())
+    /// Execute all operations in the batch.
+    ///
+    /// Returns an honest error: grouped NCCL execution requires a real
+    /// `cudarc`+`nccl` backend that is not yet available. Callers should issue
+    /// the individual collectives via [`crate::collectives`] instead.
+    pub async fn execute(&self, _group: &ProcessGroup) -> TorshResult<()> {
+        Err(TorshDistributedError::feature_not_available(
+            "batched NCCL group execution",
+            "a real cudarc+nccl backend (issue individual collectives instead)",
+        ))
     }
 }
 
@@ -675,40 +183,46 @@ mod tests {
     use torsh_tensor::Tensor;
 
     #[tokio::test]
-    async fn test_nccl_all_reduce() {
-        let pg = init_process_group(BackendType::Nccl, 0, 1, "127.0.0.1", 29500)
+    async fn test_nccl_all_reduce_single_rank_identity() {
+        // With the real backend, a single-rank all-reduce is the identity.
+        let pg = init_process_group(BackendType::Gloo, 0, 1, "127.0.0.1", 29610)
             .await
-            .unwrap();
+            .expect("init");
 
-        let mut tensor: Tensor<f32> = Tensor::from_vec(vec![0.0; 10], &[10]).unwrap();
-        let result = nccl_all_reduce(&mut tensor, ReduceOp::Sum, &pg).await;
-        assert!(result.is_ok());
+        let mut tensor: Tensor<f32> = Tensor::from_vec(vec![3.0; 10], &[10]).expect("tensor");
+        nccl_all_reduce(&mut tensor, ReduceOp::Sum, &pg)
+            .await
+            .expect("all_reduce");
+        assert_eq!(tensor.to_vec().expect("to_vec"), vec![3.0; 10]);
     }
 
     #[tokio::test]
-    async fn test_nccl_broadcast() {
-        let pg = init_process_group(BackendType::Nccl, 0, 1, "127.0.0.1", 29500)
+    async fn test_nccl_broadcast_single_rank() {
+        let pg = init_process_group(BackendType::Gloo, 0, 1, "127.0.0.1", 29611)
             .await
-            .unwrap();
+            .expect("init");
 
-        let mut tensor: Tensor<f32> = Tensor::from_vec(vec![0.0; 10], &[10]).unwrap();
-        let result = nccl_broadcast(&mut tensor, 0, &pg).await;
-        assert!(result.is_ok());
+        let mut tensor: Tensor<f32> = Tensor::from_vec(vec![0.0; 10], &[10]).expect("tensor");
+        nccl_broadcast(&mut tensor, 0, &pg)
+            .await
+            .expect("broadcast");
     }
 
     #[tokio::test]
-    async fn test_nccl_batch() {
-        let pg = init_process_group(BackendType::Nccl, 0, 1, "127.0.0.1", 29500)
+    async fn test_nccl_batch_execute_is_honest_error() {
+        let pg = init_process_group(BackendType::Gloo, 0, 1, "127.0.0.1", 29612)
             .await
-            .unwrap();
+            .expect("init");
 
         let mut batch = NcclBatch::new();
         batch
             .all_reduce(0, ReduceOp::Sum)
             .broadcast(1, 0)
             .reduce_scatter(2, 3, ReduceOp::Sum);
+        assert_eq!(batch.len(), 3);
 
+        // Honest: batched NCCL execution is not available without a real backend.
         let result = batch.execute(&pg).await;
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 }

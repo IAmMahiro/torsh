@@ -353,8 +353,35 @@ pub fn conv_transpose1d(
     let in_channels = input_shape[1];
     let input_length = input_shape[2];
 
+    if weight_shape.len() != 3 {
+        return Err(torsh_core::TorshError::dimension_error_with_context(
+            "Weight must be 3D (C_in, C_out/groups, kernel_size)",
+            "conv_transpose1d",
+        ));
+    }
+    if groups == 0 {
+        return Err(torsh_core::TorshError::invalid_argument_with_context(
+            "groups must be greater than zero",
+            "conv_transpose1d",
+        ));
+    }
+    if weight_shape[0] != in_channels {
+        return Err(torsh_core::TorshError::dimension_error_with_context(
+            "Weight's first dimension must equal the number of input channels",
+            "conv_transpose1d",
+        ));
+    }
+    if in_channels % groups != 0 {
+        return Err(torsh_core::TorshError::invalid_argument_with_context(
+            "in_channels must be divisible by groups",
+            "conv_transpose1d",
+        ));
+    }
+
     let kernel_size = weight_shape[2];
-    let out_channels = weight_shape[1] * groups;
+    let out_channels_per_group = weight_shape[1];
+    let out_channels = out_channels_per_group * groups;
+    let in_channels_per_group = in_channels / groups;
 
     // Calculate output length
     let output_length = conv_transpose_output_size(
@@ -366,37 +393,37 @@ pub fn conv_transpose1d(
         dilation,
     );
 
-    // Fallback implementation using conv2d operations
-    // This is a simplified approach - transpose conv can be implemented as
-    // regular conv with modified stride and padding patterns
-
-    // Create output tensor with proper shape
+    // Direct scatter formulation of the transposed convolution:
+    // out[b, oc, i * stride + k * dilation - padding] += in[b, ic, i] * w[ic, oc_local, k]
     let output_shape = vec![batch_size, out_channels, output_length];
     let mut output_data = vec![0.0f32; output_shape.iter().product()];
 
-    // Apply basic transposed convolution logic
-    // This is a simplified implementation that would need optimization
-    for b in 0..batch_size {
-        for out_c in 0..out_channels {
-            for in_c in 0..(in_channels / groups) {
-                let weight_idx = in_c * out_channels / groups + out_c;
+    // Both accessors are hoisted out of the loop nest: reading them per innermost
+    // iteration costs O(N·C·L·K) tensor reads for no benefit.
+    let input_data = input.data()?;
+    let weight_data = weight.data()?;
 
-                for i in 0..input_length {
-                    for k in 0..kernel_size {
-                        let output_pos = i * stride + k * dilation;
-                        if output_pos >= padding && output_pos < output_length + padding {
+    for b in 0..batch_size {
+        for g in 0..groups {
+            for ic_local in 0..in_channels_per_group {
+                let in_c = g * in_channels_per_group + ic_local;
+                let input_base = b * in_channels * input_length + in_c * input_length;
+                for oc_local in 0..out_channels_per_group {
+                    let out_c = g * out_channels_per_group + oc_local;
+                    let weight_base = (in_c * out_channels_per_group + oc_local) * kernel_size;
+                    let output_base = b * out_channels * output_length + out_c * output_length;
+
+                    for i in 0..input_length {
+                        let input_val = input_data[input_base + i];
+                        for k in 0..kernel_size {
+                            let output_pos = i * stride + k * dilation;
+                            if output_pos < padding {
+                                continue;
+                            }
                             let final_pos = output_pos - padding;
                             if final_pos < output_length {
-                                // Simplified weight access
-                                let input_data = input.data()?;
-                                let weight_data = weight.data()?;
-                                let input_val = input_data
-                                    [b * in_channels * input_length + in_c * input_length + i];
-                                let weight_val = weight_data[weight_idx * kernel_size + k];
-                                let output_idx = b * out_channels * output_length
-                                    + out_c * output_length
-                                    + final_pos;
-                                output_data[output_idx] += input_val * weight_val;
+                                output_data[output_base + final_pos] +=
+                                    input_val * weight_data[weight_base + k];
                             }
                         }
                     }
@@ -407,9 +434,17 @@ pub fn conv_transpose1d(
 
     let mut result = Tensor::from_data(output_data, output_shape, input.device())?;
 
-    // Add bias if provided
+    // Add bias if provided: a [C_out] bias must be reshaped to [1, C_out, 1] so
+    // right-aligned broadcasting matches the channel axis and not the length axis.
     if let Some(bias_tensor) = bias {
-        result = result.add_op(bias_tensor)?;
+        if bias_tensor.numel() != out_channels {
+            return Err(torsh_core::TorshError::dimension_error_with_context(
+                "Bias must have one entry per output channel",
+                "conv_transpose1d",
+            ));
+        }
+        let bias_reshaped = bias_tensor.view(&[1, out_channels as i32, 1])?;
+        result = result.add_op(&bias_reshaped)?;
     }
 
     Ok(result)

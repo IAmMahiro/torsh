@@ -650,15 +650,30 @@ impl FewShotEvaluator {
         Ok((accuracy, avg_loss))
     }
 
-    /// Get predicted label from logits
+    /// Get predicted label from logits (argmax).
+    ///
+    /// Returns an error on empty logits or NaN values so a diverged model
+    /// surfaces as an explicit failure rather than an ordering panic.
     fn get_predicted_label(&self, logits: &Tensor) -> Result<usize> {
-        // Find the index with maximum value
         let data = logits.to_vec()?;
-        let (max_idx, _) = data
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).expect("logit values should be comparable"))
-            .expect("logits tensor should not be empty");
+        if data.is_empty() {
+            return Err(TorshError::ComputeError(
+                "cannot take argmax of empty logits tensor".to_string(),
+            ));
+        }
+        let mut max_idx = 0usize;
+        let mut max_val = f32::NEG_INFINITY;
+        for (i, &v) in data.iter().enumerate() {
+            if v.is_nan() {
+                return Err(TorshError::ComputeError(
+                    "logits contain NaN; the model may have diverged".to_string(),
+                ));
+            }
+            if v > max_val {
+                max_val = v;
+                max_idx = i;
+            }
+        }
         Ok(max_idx)
     }
 

@@ -237,6 +237,17 @@ impl Shape {
 
     /// Get the total number of elements
     ///
+    /// # Overflow
+    ///
+    /// This method **saturates to `usize::MAX`** if the product of the
+    /// dimensions overflows `usize`, rather than panicking or wrapping. It is
+    /// intended for display/debug/diagnostic use where an approximate value
+    /// is acceptable. Callers that need to detect overflow (e.g. before
+    /// sizing an allocation or validating a bounds check) must use
+    /// [`Shape::try_numel`] instead, since a saturated `usize::MAX` can
+    /// silently turn an overflow into either an instant out-of-memory abort
+    /// or a bounds check that incorrectly passes.
+    ///
     /// # Examples
     ///
     /// ```
@@ -256,6 +267,42 @@ impl Shape {
             .iter()
             .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
             .unwrap_or(usize::MAX)
+    }
+
+    /// Get the total number of elements, reporting overflow as an error
+    ///
+    /// Unlike [`Shape::numel`], which saturates to `usize::MAX` when the
+    /// product of dimensions overflows, this returns
+    /// [`TorshError::InvalidShape`] so callers that need an exact element
+    /// count -- for allocation sizing or bounds validation -- can detect and
+    /// report the overflow instead of silently operating on a saturated
+    /// value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the product of the dimensions overflows `usize`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use torsh_core::shape::Shape;
+    ///
+    /// let shape = Shape::new(vec![2, 3, 4]);
+    /// assert_eq!(shape.try_numel().unwrap(), 24);
+    ///
+    /// let overflowing = Shape::new(vec![usize::MAX, 2]);
+    /// assert!(overflowing.try_numel().is_err());
+    /// ```
+    pub fn try_numel(&self) -> Result<usize> {
+        self.dims
+            .iter()
+            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+            .ok_or_else(|| {
+                TorshError::InvalidShape(format!(
+                    "Shape element count overflows usize: dims={:?}",
+                    self.dims
+                ))
+            })
     }
 
     /// Check if the shape is empty (contains zero)

@@ -73,10 +73,12 @@ impl BenchmarkConfig {
 fn create_benchmark_graph(config: &BenchmarkConfig) -> GraphData {
     if config.num_features == 16 {
         generation::erdos_renyi(config.num_nodes, config.edge_probability)
+            .expect("operation should succeed")
     } else {
         // For larger feature sizes, create custom graph
         let x = randn(&[config.num_nodes, config.num_features]).unwrap();
-        let base_graph = generation::erdos_renyi(config.num_nodes, config.edge_probability);
+        let base_graph = generation::erdos_renyi(config.num_nodes, config.edge_probability)
+            .expect("operation should succeed");
 
         GraphData {
             x,
@@ -144,15 +146,18 @@ fn test_comprehensive_layer_performance() {
         println!("{}", "-".repeat(60));
 
         // Test GCN
-        let gcn = GCNConv::new(config.num_features, config.out_features, true);
+        let gcn = GCNConv::new(config.num_features, config.out_features, true)
+            .expect("operation should succeed");
         let (gcn_time, _gcn_throughput, num_edges) = benchmark_layer(&gcn, &config, "GCN");
 
         // Test SAGE
-        let sage = SAGEConv::new(config.num_features, config.out_features, true);
+        let sage = SAGEConv::new(config.num_features, config.out_features, true)
+            .expect("operation should succeed");
         let (sage_time, _sage_throughput, _) = benchmark_layer(&sage, &config, "SAGE");
 
         // Test GIN
-        let gin = GINConv::new(config.num_features, config.out_features, 0.0, false, true);
+        let gin = GINConv::new(config.num_features, config.out_features, 0.0, false, true)
+            .expect("operation should succeed");
         let (gin_time, _gin_throughput, _) = benchmark_layer(&gin, &config, "GIN");
 
         // Test MPNN
@@ -164,7 +169,8 @@ fn test_comprehensive_layer_performance() {
             config.out_features * 2,
             AggregationType::Mean,
             true,
-        );
+        )
+        .expect("operation should succeed");
         let (mpnn_time, _mpnn_throughput, _) = benchmark_layer(&mpnn, &config, "MPNN");
 
         // Test GraphTransformer (with smaller head count for performance)
@@ -176,7 +182,8 @@ fn test_comprehensive_layer_performance() {
             heads,
             0.0,
             true,
-        );
+        )
+        .expect("operation should succeed");
         let (transformer_time, _transformer_throughput, _) =
             benchmark_layer(&transformer, &config, "Transformer");
 
@@ -226,7 +233,7 @@ fn test_memory_scalability() {
         println!("\n📊 Testing {} nodes", num_nodes);
 
         // Test different layers for memory efficiency
-        let gcn = GCNConv::new(16, 32, true);
+        let gcn = GCNConv::new(16, 32, true).expect("operation should succeed");
         let graph = create_benchmark_graph(&config);
 
         let start = Instant::now();
@@ -266,8 +273,8 @@ fn test_edge_density_performance() {
     for density in densities {
         println!("\n📊 Edge density: {:.1}%", density * 100.0);
 
-        let graph = generation::erdos_renyi(base_nodes, density);
-        let gcn = GCNConv::new(16, 32, true);
+        let graph = generation::erdos_renyi(base_nodes, density).expect("operation should succeed");
+        let gcn = GCNConv::new(16, 32, true).expect("operation should succeed");
 
         let start = Instant::now();
         for _ in 0..20 {
@@ -307,11 +314,15 @@ fn test_deep_network_performance() {
         let mut layers: Vec<Box<dyn GraphLayer>> = Vec::new();
 
         // First layer
-        layers.push(Box::new(GCNConv::new(64, 32, true)));
+        layers.push(Box::new(
+            GCNConv::new(64, 32, true).expect("operation should succeed"),
+        ));
 
         // Hidden layers
         for _ in 1..num_layers {
-            layers.push(Box::new(GCNConv::new(32, 32, true)));
+            layers.push(Box::new(
+                GCNConv::new(32, 32, true).expect("operation should succeed"),
+            ));
         }
 
         // Benchmark deep forward pass
@@ -320,7 +331,9 @@ fn test_deep_network_performance() {
             let mut current_graph = graph.clone();
 
             for layer in &layers {
-                current_graph = layer.forward(&current_graph);
+                current_graph = layer
+                    .forward(&current_graph)
+                    .expect("operation should succeed");
             }
 
             // Validate final output
@@ -353,14 +366,14 @@ fn test_batch_processing_simulation() {
     println!("{}", "=".repeat(40));
 
     let batch_sizes = vec![1, 4, 8, 16];
-    let gcn = GCNConv::new(16, 32, true);
+    let gcn = GCNConv::new(16, 32, true).expect("operation should succeed");
 
     for batch_size in batch_sizes {
         println!("\n📊 Batch size: {}", batch_size);
 
         // Create multiple graphs
         let graphs: Vec<GraphData> = (0..batch_size)
-            .map(|_| generation::erdos_renyi(100, 0.1))
+            .map(|_| generation::erdos_renyi(100, 0.1).expect("operation should succeed"))
             .collect();
 
         // Time sequential processing (current approach)
@@ -402,7 +415,8 @@ fn test_pytorch_geometric_comparison_analysis() {
     let _graph = create_benchmark_graph(&config);
 
     // Benchmark our implementations
-    let gcn = GCNConv::new(config.num_features, config.out_features, true);
+    let gcn = GCNConv::new(config.num_features, config.out_features, true)
+        .expect("operation should succeed");
     let (torsh_time, torsh_throughput, _) = benchmark_layer(&gcn, &config, "ToRSh-GCN");
 
     println!("\n📊 Performance Analysis:");
@@ -458,9 +472,18 @@ fn test_resource_efficiency_metrics() {
 
     // Different layer configurations
     let configurations = vec![
-        ("Lightweight", GCNConv::new(128, 64, false)),
-        ("Standard", GCNConv::new(128, 128, true)),
-        ("Heavy", GCNConv::new(128, 256, true)),
+        (
+            "Lightweight",
+            GCNConv::new(128, 64, false).expect("operation should succeed"),
+        ),
+        (
+            "Standard",
+            GCNConv::new(128, 128, true).expect("operation should succeed"),
+        ),
+        (
+            "Heavy",
+            GCNConv::new(128, 256, true).expect("operation should succeed"),
+        ),
     ];
 
     for (name, layer) in configurations {
@@ -476,7 +499,7 @@ fn test_resource_efficiency_metrics() {
         // Performance benchmark
         let start = Instant::now();
         for _ in 0..10 {
-            let _output = layer.forward(&graph);
+            let _output = layer.forward(&graph).expect("operation should succeed");
         }
         let duration = start.elapsed().as_millis() as f64 / 10.0;
 

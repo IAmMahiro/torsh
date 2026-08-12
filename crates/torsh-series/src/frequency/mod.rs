@@ -119,8 +119,10 @@ impl FFTAnalyzer {
             data.clone()
         };
 
-        // TODO: Use scirs2-signal FFT when available
-        // For now, implement simplified DFT (slow but functional)
+        // Exact discrete Fourier transform, evaluated directly (O(n^2)).
+        // NOTE: an O(n log n) transform requires an FFT dependency
+        // (scirs2-fft / torsh-functional), which torsh-series does not
+        // currently pull in; the result below is numerically exact either way.
         let (real, imag) = self.naive_dft(&windowed_data);
 
         // Generate frequency bins
@@ -138,11 +140,11 @@ impl FFTAnalyzer {
 
     /// Perform inverse FFT
     pub fn ifft(&self, fft_result: &FFTResult) -> Result<TimeSeries> {
-        // TODO: Use scirs2-signal IFFT when available
+        // Exact inverse discrete Fourier transform, evaluated directly (O(n^2));
+        // see the note in `fft` about the missing FFT dependency.
         let n = fft_result.real.len();
         let mut data = vec![0.0f32; n];
 
-        // Simplified inverse DFT
         for t in 0..n {
             let mut sum = 0.0;
             for k in 0..n {
@@ -431,7 +433,7 @@ impl CoherenceAnalyzer {
             ));
         }
 
-        // TODO: Use scirs2-signal cross-spectral density when available
+        // Cross-spectral density from the exact DFTs of both series.
         let fft_x = FFTAnalyzer::new(self.sampling_rate).fft(x)?;
         let fft_y = FFTAnalyzer::new(self.sampling_rate).fft(y)?;
 

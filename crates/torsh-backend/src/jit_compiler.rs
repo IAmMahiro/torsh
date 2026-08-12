@@ -20,6 +20,7 @@ use crate::kernel_generation::{GeneratedKernel, KernelSpec, OptimizationFlags};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use torsh_core::sync::{MutexExt, RwLockExt};
 
 #[cfg(feature = "serialize")]
 use serde::{Deserialize, Serialize};
@@ -402,38 +403,24 @@ impl JitCompiler {
 
         // Check if we have a compiled version
         {
-            let kernels = self.kernels.read().expect("lock should not be poisoned");
+            let kernels = self.kernels.read_or_recover();
             if let Some(jit_kernel) = kernels.get(&spec_hash) {
-                self.stats
-                    .lock()
-                    .expect("lock should not be poisoned")
-                    .cache_hits += 1;
+                self.stats.lock_or_recover().cache_hits += 1;
                 return Ok(Arc::new(jit_kernel.clone()));
             }
         }
 
-        self.stats
-            .lock()
-            .expect("lock should not be poisoned")
-            .cache_misses += 1;
+        self.stats.lock_or_recover().cache_misses += 1;
 
         // Check code cache if enabled
         if let Some(ref cache) = self.code_cache {
-            if let Some(cached_kernel) = cache
-                .lock()
-                .expect("lock should not be poisoned")
-                .get(&spec_hash)
-            {
+            if let Some(cached_kernel) = cache.lock_or_recover().get(&spec_hash) {
                 let jit_kernel = JitKernel::new(cached_kernel, self.config.initial_tier);
                 let result = Arc::new(jit_kernel.clone());
                 self.kernels
-                    .write()
-                    .expect("lock should not be poisoned")
+                    .write_or_recover()
                     .insert(spec_hash, jit_kernel);
-                self.stats
-                    .lock()
-                    .expect("lock should not be poisoned")
-                    .cache_hits += 1;
+                self.stats.lock_or_recover().cache_hits += 1;
                 return Ok(result);
             }
         }
@@ -444,29 +431,21 @@ impl JitCompiler {
 
         let kernel = self
             .kernel_generator
-            .lock()
-            .expect("kernel_generator lock should not be poisoned")
+            .lock_or_recover()
             .generate_kernel(optimized_spec)?;
 
         let jit_kernel = JitKernel::new(kernel.clone(), tier);
 
         // Store in code cache if enabled
         if let Some(ref cache) = self.code_cache {
-            cache
-                .lock()
-                .expect("lock should not be poisoned")
-                .insert(spec_hash.clone(), kernel);
+            cache.lock_or_recover().insert(spec_hash.clone(), kernel);
         }
 
         let result = Arc::new(jit_kernel.clone());
         self.kernels
-            .write()
-            .expect("lock should not be poisoned")
+            .write_or_recover()
             .insert(spec_hash, jit_kernel);
-        self.stats
-            .lock()
-            .expect("lock should not be poisoned")
-            .compilations += 1;
+        self.stats.lock_or_recover().compilations += 1;
 
         Ok(result)
     }
@@ -478,7 +457,7 @@ impl JitCompiler {
         execution_time: Duration,
         input_sizes: &[usize],
     ) -> BackendResult<()> {
-        let mut kernels = self.kernels.write().expect("lock should not be poisoned");
+        let mut kernels = self.kernels.write_or_recover();
 
         if let Some(jit_kernel) = kernels.get_mut(spec_hash) {
             jit_kernel
@@ -491,10 +470,7 @@ impl JitCompiler {
 
                 // Only recompile if benefit is positive and significant
                 if benefit > 0.01 {
-                    self.stats
-                        .lock()
-                        .expect("lock should not be poisoned")
-                        .recompilations += 1;
+                    self.stats.lock_or_recover().recompilations += 1;
                     // Trigger async recompilation (drop lock first to avoid deadlock)
                     // In production, this would spawn a background task
                 }
@@ -566,29 +542,22 @@ impl JitCompiler {
 
     /// Get compilation statistics
     pub fn statistics(&self) -> JitStatistics {
-        self.stats
-            .lock()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.stats.lock_or_recover().clone()
     }
 
     /// Clear all compiled kernels and caches
     pub fn clear(&self) {
-        self.kernels
-            .write()
-            .expect("lock should not be poisoned")
-            .clear();
+        self.kernels.write_or_recover().clear();
         if let Some(ref cache) = self.code_cache {
-            cache.lock().expect("lock should not be poisoned").clear();
+            cache.lock_or_recover().clear();
         }
-        *self.stats.lock().expect("lock should not be poisoned") = JitStatistics::default();
+        *self.stats.lock_or_recover() = JitStatistics::default();
     }
 
     /// Get current cache size in bytes
     pub fn cache_size_bytes(&self) -> usize {
         self.kernels
-            .read()
-            .expect("kernels RwLock should not be poisoned")
+            .read_or_recover()
             .values()
             .map(|k| k.size_bytes)
             .sum()
@@ -598,7 +567,7 @@ impl JitCompiler {
     pub fn evict_if_needed(&self) {
         let cache_size = self.cache_size_bytes();
         if cache_size > self.config.max_cache_size {
-            let mut kernels = self.kernels.write().expect("lock should not be poisoned");
+            let mut kernels = self.kernels.write_or_recover();
 
             // Sort by last used time and evict oldest
             let mut kernel_ages: Vec<_> = kernels
@@ -614,10 +583,7 @@ impl JitCompiler {
                 kernels.remove(key);
             }
 
-            self.stats
-                .lock()
-                .expect("lock should not be poisoned")
-                .evictions += evict_count;
+            self.stats.lock_or_recover().evictions += evict_count;
         }
     }
 }

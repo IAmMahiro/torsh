@@ -394,7 +394,7 @@ impl MemoryEfficientAdam {
             .mul_scalar(-group_lr)?;
 
         // Update parameters
-        *param_write = param_write.add(&update)?;
+        crate::param_update::add_assign(&mut param_write, &update)?;
 
         // Update state
         param_state.insert(momentum_key, new_momentum);
@@ -630,7 +630,7 @@ impl Optimizer for MemoryEfficientLBFGS {
                 let mut param_write = param.write();
                 if let Some(grad) = param_write.grad() {
                     let update = grad.mul_scalar(-group.lr)?;
-                    *param_write = param_write.add(&update)?;
+                    crate::param_update::add_assign(&mut param_write, &update)?;
                 }
             }
         }

@@ -66,18 +66,22 @@ impl PySGD {
         dampening: f32,
         weight_decay: f32,
         nesterov: bool,
-    ) -> Self {
+    ) -> PyResult<Self> {
         if nesterov && (momentum <= 0.0 || dampening != 0.0) {
-            panic!("Nesterov momentum requires a momentum and zero dampening");
+            // Return a catchable ValueError instead of panicking across the FFI
+            // boundary (a Rust panic becomes an uncatchable PanicException).
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Nesterov momentum requires a positive momentum and zero dampening",
+            ));
         }
 
-        PySGD {
+        Ok(PySGD {
             momentum,
             dampening,
             weight_decay,
             nesterov,
             learning_rate: lr,
-        }
+        })
     }
 
     fn step(&mut self) -> PyResult<()> {
@@ -271,7 +275,7 @@ mod tests {
             let tensor = PyTensor::new(data.as_ref(), None, None, true).unwrap();
             let params = vec![tensor];
 
-            let sgd = PySGD::new(params, 0.01, 0.9, 0.0, 0.0, false);
+            let sgd = PySGD::new(params, 0.01, 0.9, 0.0, 0.0, false).unwrap();
             assert_eq!(sgd.lr(), 0.01);
             assert_eq!(sgd.momentum(), 0.9);
         });
@@ -300,7 +304,7 @@ mod tests {
             let tensor = PyTensor::new(data.as_ref(), None, None, true).unwrap();
             let params = vec![tensor];
 
-            let mut sgd = PySGD::new(params, 0.01, 0.0, 0.0, 0.0, false);
+            let mut sgd = PySGD::new(params, 0.01, 0.0, 0.0, 0.0, false).unwrap();
 
             // Should not error
             assert!(sgd.step().is_ok());

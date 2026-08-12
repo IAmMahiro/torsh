@@ -161,8 +161,7 @@ impl HyperparameterOptimizer {
         let objective_value = objective.item()? as f64;
 
         // Compute gradients with respect to hyperparameters
-        let gradients =
-            self.compute_hyperparameter_gradients(&objective, &objective_fn, &current_values)?;
+        let gradients = self.compute_hyperparameter_gradients(&objective_fn, &current_values)?;
 
         // Update hyperparameters using gradients
         self.update_hyperparameters(&gradients)?;
@@ -241,7 +240,6 @@ impl HyperparameterOptimizer {
     /// Compute gradients with respect to hyperparameters
     fn compute_hyperparameter_gradients<F>(
         &self,
-        objective: &Tensor,
         objective_fn: &F,
         current_values: &HashMap<String, f64>,
     ) -> Result<HashMap<String, Tensor>>
@@ -252,11 +250,7 @@ impl HyperparameterOptimizer {
 
         for (name, hyperparam) in &self.hyperparameters {
             let grad = if self.config.second_order {
-                // Second-order gradient computation (Hessian-vector product).
-                // Not yet implemented; tracked separately from this fix (see
-                // `compute_second_order_gradient` and `higher_order_gradients.rs`).
-                let param_with_grad = hyperparam.value.clone();
-                self.compute_second_order_gradient(objective, &param_with_grad)?
+                self.compute_second_order_gradient(objective_fn, current_values, name, hyperparam)?
             } else {
                 // First-order gradient via central finite differences.
                 self.compute_first_order_gradient(objective_fn, current_values, name, hyperparam)?
@@ -330,15 +324,89 @@ impl HyperparameterOptimizer {
         (f32::EPSILON as f64).cbrt() * x.abs().max(1.0)
     }
 
-    /// Compute second-order gradient (for more accurate optimization)
-    fn compute_second_order_gradient(
+    /// Step size for the *second* central difference.
+    ///
+    /// A second difference divides by `h^2`, so the cancellation error of the
+    /// three objective evaluations is amplified by `1/h^2` instead of `1/h`.
+    /// With values round-tripping through `f32`-backed `Tensor`s, the
+    /// first-derivative step (`eps^(1/3)`, see [`Self::finite_difference_step`])
+    /// would inflate that noise by roughly four orders of magnitude, so the
+    /// Hessian term uses the standard `eps^(1/4)` step instead.
+    fn second_difference_step(x: f64) -> f64 {
+        (f32::EPSILON as f64).powf(0.25) * x.abs().max(1.0)
+    }
+
+    /// Compute a second-order (safeguarded Newton) update direction for one
+    /// hyperparameter.
+    ///
+    /// The objective is only available as a black box over concrete
+    /// hyperparameter values (see [`Self::compute_first_order_gradient`] for why
+    /// no tape exists), so both derivatives are taken numerically about the
+    /// current raw value `x`:
+    ///
+    /// * gradient `g = (f(x+h) - f(x-h)) / 2h`
+    /// * curvature `c = (f(x+h) - 2 f(x) + f(x-h)) / h^2`
+    ///
+    /// and the returned direction is the Newton step `g / c`. Because
+    /// `update_hyperparameters` applies `x <- x - meta_learning_rate * d`, that
+    /// makes the meta learning rate a damping factor on a true Newton step,
+    /// which is what "second order" buys: the step shrinks automatically in
+    /// sharply curved directions and lengthens in flat ones, instead of using
+    /// one fixed rate everywhere.
+    ///
+    /// **Safeguard.** A Newton step is only a descent direction where the
+    /// objective is locally convex. When the measured curvature is not usefully
+    /// positive (`c <= |g| * sqrt(eps)`, which also covers the numerically
+    /// indistinguishable-from-zero case), the plain first-order gradient is
+    /// returned instead. This is the standard safeguarded-Newton fallback, not a
+    /// silent no-op: the direction is always a real derivative of the objective.
+    fn compute_second_order_gradient<F>(
         &self,
-        _objective: &Tensor,
-        parameter: &Tensor,
-    ) -> Result<Tensor> {
-        // TODO: Implement second-order gradient computation when autograd API is available
-        // For now, return zeros as placeholder
-        Ok(Tensor::zeros_like(parameter)?)
+        objective_fn: &F,
+        current_values: &HashMap<String, f64>,
+        name: &str,
+        hyperparam: &OptimizableHyperparameter,
+    ) -> Result<Tensor>
+    where
+        F: Fn(&HashMap<String, f64>) -> Result<Tensor>,
+    {
+        let raw_value = hyperparam.value.item()? as f64;
+        let step = Self::second_difference_step(raw_value);
+
+        let evaluate_at = |raw: f64| -> Result<f64> {
+            let actual_value = if hyperparam.log_scale { raw.exp() } else { raw };
+            let mut perturbed = current_values.clone();
+            perturbed.insert(name.to_string(), actual_value);
+            Ok(objective_fn(&perturbed)?.item()? as f64)
+        };
+
+        let objective_center = evaluate_at(raw_value)?;
+        let objective_plus = evaluate_at(raw_value + step)?;
+        let objective_minus = evaluate_at(raw_value - step)?;
+
+        let gradient = (objective_plus - objective_minus) / (2.0 * step);
+        let curvature = (objective_plus - 2.0 * objective_center + objective_minus) / (step * step);
+
+        let curvature_floor = gradient.abs() * (f32::EPSILON as f64).sqrt();
+        let direction = if curvature > curvature_floor && curvature.is_finite() {
+            gradient / curvature
+        } else {
+            tracing::debug!(
+                "Hyperparameter '{name}': curvature {curvature} is not usefully positive, \
+                 falling back to the first-order direction"
+            );
+            gradient
+        };
+
+        if !direction.is_finite() {
+            return Err(TorshError::AutogradError(format!(
+                "second-order hyperparameter gradient for '{name}' is not finite \
+                 (gradient {gradient}, curvature {curvature}); the objective is likely \
+                 discontinuous at this point"
+            )));
+        }
+
+        Tensor::scalar(direction as f32)
     }
 
     /// Update hyperparameters using computed gradients
@@ -579,9 +647,8 @@ mod tests {
         );
 
         let current_values = optimizer.get_current_values().unwrap();
-        let objective_tensor = objective(&current_values).unwrap();
         let gradients = optimizer
-            .compute_hyperparameter_gradients(&objective_tensor, &objective, &current_values)
+            .compute_hyperparameter_gradients(&objective, &current_values)
             .unwrap();
 
         let grad_x = gradients["x"].item().unwrap() as f64;

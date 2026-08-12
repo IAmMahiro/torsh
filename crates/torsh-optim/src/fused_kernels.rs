@@ -72,7 +72,7 @@ pub fn fused_adam_step(
     let update = exp_avg.div(&denom)?.mul_scalar(corrected_lr)?;
 
     // Apply update to parameter
-    *param = param.sub(&update)?;
+    crate::param_update::sub_assign(&mut *param, &update)?;
 
     Ok(())
 }
@@ -132,7 +132,7 @@ pub fn fused_sgd_step(
 
     // Apply update: param = param - lr * update
     let scaled_update = update.mul_scalar(lr)?;
-    *param = param.sub(&scaled_update)?;
+    crate::param_update::sub_assign(&mut *param, &scaled_update)?;
 
     Ok(())
 }
@@ -198,7 +198,7 @@ pub fn fused_rmsprop_step(
 
     // Apply update: param = param - lr * update
     let scaled_update = update.mul_scalar(lr)?;
-    *param = param.sub(&scaled_update)?;
+    crate::param_update::sub_assign(&mut *param, &scaled_update)?;
 
     Ok(())
 }
@@ -243,7 +243,7 @@ pub fn fused_adagrad_step(
 
     // Compute and apply update: param = param - lr * grad / denom
     let update = effective_grad.div(&denom)?.mul_scalar(lr)?;
-    *param = param.sub(&update)?;
+    crate::param_update::sub_assign(&mut *param, &update)?;
 
     Ok(())
 }
@@ -309,7 +309,7 @@ pub fn fused_adadelta_step(
     *acc_delta = acc_delta.add(&delta_sq_term)?;
 
     // Apply update to parameter
-    *param = param.add(&delta)?;
+    crate::param_update::add_assign(&mut *param, &delta)?;
 
     Ok(())
 }

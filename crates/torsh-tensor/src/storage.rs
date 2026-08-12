@@ -52,24 +52,44 @@ const SIMD_OPTIMIZED_THRESHOLD: usize = 10240;
 // ============================================================================
 // PHASE 5: SIMD-OPTIMIZED LOCK-FREE STORAGE
 // ============================================================================
-// Uses Copy-on-Write semantics with atomic flag instead of RwLock.
+// Reads are lock-free (a single atomic flag check) for as long as the storage
+// has never been written to; the first write copies the buffer once into a
+// guarded copy-on-write buffer.
 // Benefits:
-// - No lock acquisition overhead for reads (~20ns savings)
+// - No lock acquisition overhead for reads of read-only tensors (~20ns savings)
 // - Direct slice access for SIMD operations
-// - Thread-safe through atomic COW semantics
+// - Mutation support at every tensor size, without ever mutating memory a
+//   previously handed-out `&[T]` still points into
 // ============================================================================
 
 /// SIMD-optimized storage with Copy-on-Write semantics (Phase 5)
 ///
-/// This storage variant eliminates RwLock overhead for read operations:
-/// - Reads are lock-free (just atomic flag check)
-/// - Writes trigger copy-on-write if shared
-/// - Optimal for SIMD operations on medium-to-large tensors
+/// This storage variant eliminates lock overhead for read operations *while the
+/// tensor has never been written to*, which is the dominant case for SIMD
+/// workloads:
+///
+/// - The buffer handed to [`SimdStorage::new`] is **never mutated in place**, so
+///   [`SimdStorage::try_as_slice`] can hand out a plain `&[T]` with no guard at
+///   all (that is the "lock-free read" this variant exists for).
+/// - The first write copies that buffer once into a private copy-on-write buffer
+///   guarded by an `RwLock`; every later write mutates it in place, so a
+///   `for i in 0..n { t.set(i, v) }` loop is O(n), not O(n²).
+/// - Once the copy exists, readers go through the same `RwLock`, exactly like
+///   [`TensorStorage::Aligned`]. Slices handed out earlier stay valid because the
+///   original buffer is kept alive and untouched for the storage's lifetime.
+///
+/// This is what makes `set`/`set_slice`/`with_slice_mut` work on tensors of every
+/// size instead of failing above the 10 KB `SimdOptimized` threshold.
 #[cfg(feature = "simd")]
 pub struct SimdStorage<T> {
-    /// The actual aligned data
-    data: AlignedVec<T>,
-    /// Whether this storage is shared (needs COW on write)
+    /// The buffer published at construction. Immutable for the whole lifetime of
+    /// this storage, which is what makes lock-free slice hand-out sound.
+    original: AlignedVec<T>,
+    /// Copy-on-write buffer holding the authoritative data once a write happened.
+    cow: RwLock<Option<AlignedVec<T>>>,
+    /// Lock-free flag: `true` once `cow` holds the authoritative data.
+    mutated: AtomicBool,
+    /// Whether this storage is shared with another `TensorStorage` handle
     shared: AtomicBool,
 }
 
@@ -78,29 +98,48 @@ impl<T> SimdStorage<T> {
     /// Create new SIMD storage from data
     pub fn new(data: AlignedVec<T>) -> Self {
         Self {
-            data,
+            original: data,
+            cow: RwLock::new(None),
+            mutated: AtomicBool::new(false),
             shared: AtomicBool::new(false),
         }
     }
 
     /// Get the length of the storage
+    ///
+    /// Mutation never changes the element count, so this stays lock-free.
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.original.len()
     }
 
     /// Check if storage is empty
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    /// Get immutable slice (lock-free)
-    pub fn as_slice(&self) -> &[T] {
-        self.data.as_slice()
+        self.original.is_empty()
     }
 
     /// Get the capacity
     pub fn capacity(&self) -> usize {
-        self.data.capacity()
+        self.original.capacity()
+    }
+
+    /// Whether this storage has been written to (and therefore keeps its
+    /// authoritative data in the guarded copy-on-write buffer).
+    pub fn is_mutated(&self) -> bool {
+        self.mutated.load(Ordering::Acquire)
+    }
+
+    /// Get the immutable, lock-free slice.
+    ///
+    /// Returns `None` once the storage has been written to: after that the
+    /// authoritative data lives behind a lock and cannot be exposed as an
+    /// unguarded borrow. Callers should fall back to
+    /// [`SimdStorage::with_slice`].
+    pub fn try_as_slice(&self) -> Option<&[T]> {
+        if self.is_mutated() {
+            None
+        } else {
+            Some(self.original.as_slice())
+        }
     }
 
     /// Mark as shared (for Clone)
@@ -116,20 +155,62 @@ impl<T> SimdStorage<T> {
 
 #[cfg(feature = "simd")]
 impl<T: Copy> SimdStorage<T> {
-    /// Get mutable slice - only if not shared
-    ///
-    /// Returns None if the storage is shared (would need COW)
-    pub fn as_mut_slice_if_unique(&mut self) -> Option<&mut [T]> {
-        if self.shared.load(Ordering::SeqCst) {
-            None // Shared, cannot mutate directly
-        } else {
-            Some(self.data.as_mut_slice())
+    /// Read the storage contents, lock-free while it has never been written to.
+    pub fn with_slice<R>(&self, f: impl FnOnce(&[T]) -> R) -> R {
+        if !self.is_mutated() {
+            return f(self.original.as_slice());
+        }
+        // A poisoned lock still holds structurally valid data (the only panic
+        // path while it is held is an allocation failure before publication),
+        // so recover rather than fail every subsequent read.
+        let guard = self.cow.read().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(buffer) => f(buffer.as_slice()),
+            // `mutated` is only set after `cow` is populated, so this is
+            // unreachable; fall back to the original rather than panic.
+            None => f(self.original.as_slice()),
+        }
+    }
+
+    /// Mutate the storage contents, promoting to the copy-on-write buffer on the
+    /// first call.
+    pub fn with_slice_mut<R>(&self, f: impl FnOnce(&mut [T]) -> R) -> Result<R> {
+        let mut guard = self.cow.write().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let source = self.original.as_slice();
+            let mut buffer = AlignedVec::with_capacity(source.len()).map_err(|e| {
+                TorshError::InvalidArgument(format!("Failed to create SIMD COW buffer: {e}"))
+            })?;
+            if !source.is_empty() {
+                // SAFETY: `buffer` has capacity for `source.len()` elements of
+                // `T` and the regions do not overlap; `T: Copy` so a bitwise
+                // copy is a valid initialization.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source.as_ptr(),
+                        buffer.as_mut_ptr(),
+                        source.len(),
+                    );
+                    buffer.set_len(source.len());
+                }
+            }
+            *guard = Some(buffer);
+            // Publish only after the buffer is populated: a reader that observes
+            // `mutated == true` is guaranteed to find `cow` initialized.
+            self.mutated.store(true, Ordering::Release);
+        }
+
+        match guard.as_mut() {
+            Some(buffer) => Ok(f(buffer.as_mut_slice())),
+            None => Err(TorshError::SynchronizationError(
+                "SIMD copy-on-write buffer disappeared".to_string(),
+            )),
         }
     }
 
     /// Convert to Vec (copying data)
     pub fn to_vec(&self) -> Vec<T> {
-        self.data.as_slice().to_vec()
+        self.with_slice(|slice| slice.to_vec())
     }
 }
 
@@ -137,7 +218,8 @@ impl<T: Copy> SimdStorage<T> {
 impl<T> std::fmt::Debug for SimdStorage<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SimdStorage")
-            .field("len", &self.data.len())
+            .field("len", &self.original.len())
+            .field("mutated", &self.mutated.load(Ordering::Relaxed))
             .field("shared", &self.shared.load(Ordering::Relaxed))
             .finish()
     }
@@ -206,18 +288,64 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
         Ok(Self::MemoryMapped(Arc::new(RwLock::new(storage))))
     }
 
+    /// Create disk-backed storage of `num_elements` copies of `value` without
+    /// ever holding the whole tensor in RAM.
+    ///
+    /// This is the storage behind [`crate::Tensor::disk_backed`]: the backing
+    /// file is filled in bounded chunks, so datasets larger than available
+    /// memory can be created.
+    pub fn memory_mapped_filled(
+        num_elements: usize,
+        value: T,
+        file_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let storage = MemoryMappedStorage::new_filled(num_elements, value, file_path)?;
+        Ok(Self::MemoryMapped(Arc::new(RwLock::new(storage))))
+    }
+
     /// Create cache-line aligned storage for SIMD operations (14.17x speedup potential)
     #[cfg(feature = "simd")]
     pub fn aligned(data: Vec<T>) -> Result<Self> {
+        Ok(Self::Aligned(Arc::new(RwLock::new(Self::to_aligned_vec(
+            &data,
+        )?))))
+    }
+
+    /// Create cache-line aligned storage directly from a borrowed slice.
+    ///
+    /// Same result as [`TensorStorage::aligned`] without the intermediate `Vec`:
+    /// callers that already hold (or can borrow) the source data pay one
+    /// allocation and one bulk copy instead of two of each.
+    #[cfg(feature = "simd")]
+    pub(crate) fn aligned_from_slice(data: &[T]) -> Result<Self> {
+        Ok(Self::Aligned(Arc::new(RwLock::new(Self::to_aligned_vec(
+            data,
+        )?))))
+    }
+
+    /// Bulk-copy `data` into a freshly allocated [`AlignedVec`].
+    ///
+    /// This is one `copy_nonoverlapping` rather than a per-element `push` with a
+    /// capacity check per iteration, which is what every tensor ≥ 1 KB pays on
+    /// construction.
+    #[cfg(feature = "simd")]
+    fn to_aligned_vec(data: &[T]) -> Result<AlignedVec<T>> {
         let mut aligned_vec = AlignedVec::with_capacity(data.len()).map_err(|e| {
             TorshError::InvalidArgument(format!("Failed to create aligned storage: {e}"))
         })?;
 
-        for item in data {
-            aligned_vec.push(item);
+        if !data.is_empty() {
+            // SAFETY: `aligned_vec` was allocated with capacity for `data.len()`
+            // elements of `T`, the two regions cannot overlap (the destination
+            // was just allocated), and `T: Copy` so a bitwise copy is a valid
+            // initialization of the destination elements.
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), aligned_vec.as_mut_ptr(), data.len());
+                aligned_vec.set_len(data.len());
+            }
         }
 
-        Ok(Self::Aligned(Arc::new(RwLock::new(aligned_vec))))
+        Ok(aligned_vec)
     }
 
     /// 🚀 **Phase 7**: Create fast result storage (skips alignment copy)
@@ -246,14 +374,7 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
     /// - **Note**: Has ~10µs alignment copy overhead for 50K elements
     #[cfg(feature = "simd")]
     pub fn simd_optimized(data: Vec<T>) -> Result<Self> {
-        let mut aligned_vec = AlignedVec::with_capacity(data.len()).map_err(|e| {
-            TorshError::InvalidArgument(format!("Failed to create SIMD storage: {e}"))
-        })?;
-
-        for item in data {
-            aligned_vec.push(item);
-        }
-
+        let aligned_vec = Self::to_aligned_vec(&data)?;
         let simd_storage = SimdStorage::new(aligned_vec);
         Ok(Self::SimdOptimized(Arc::new(simd_storage)))
     }
@@ -351,16 +472,16 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
             }
             #[cfg(feature = "simd")]
             Self::SimdOptimized(storage) => {
-                // Lock-free access!
-                let slice = storage.as_slice();
-                if index >= slice.len() {
-                    Err(TorshError::IndexOutOfBounds {
-                        index,
-                        size: slice.len(),
-                    })
-                } else {
-                    Ok(slice[index])
-                }
+                // Lock-free while the storage has never been written to.
+                storage.with_slice(|slice| {
+                    slice
+                        .get(index)
+                        .copied()
+                        .ok_or_else(|| TorshError::IndexOutOfBounds {
+                            index,
+                            size: slice.len(),
+                        })
+                })
             }
         }
     }
@@ -406,13 +527,19 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
                 Ok(())
             }
             #[cfg(feature = "simd")]
-            Self::SimdOptimized(_storage) => {
-                // SimdOptimized uses COW - cannot mutate through shared reference
-                // Caller should use make_unique() first if mutation is needed
-                Err(TorshError::InvalidArgument(
-                    "SimdOptimized storage is immutable. Use make_unique() for mutable access."
-                        .to_string(),
-                ))
+            Self::SimdOptimized(storage) => {
+                // Copy-on-write: the first write promotes the immutable buffer
+                // into a guarded mutable copy, later writes go straight in.
+                storage.with_slice_mut(|slice| {
+                    let size = slice.len();
+                    match slice.get_mut(index) {
+                        Some(slot) => {
+                            *slot = value;
+                            Ok(())
+                        }
+                        None => Err(TorshError::IndexOutOfBounds { index, size }),
+                    }
+                })?
             }
         }
     }
@@ -456,9 +583,7 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
                 Ok(slice[start..start + len].to_vec())
             }
             #[cfg(feature = "simd")]
-            Self::SimdOptimized(storage) => {
-                // Lock-free access!
-                let slice = storage.as_slice();
+            Self::SimdOptimized(storage) => storage.with_slice(|slice| {
                 if start + len > slice.len() {
                     return Err(TorshError::IndexOutOfBounds {
                         index: start + len - 1,
@@ -466,7 +591,7 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
                     });
                 }
                 Ok(slice[start..start + len].to_vec())
-            }
+            }),
         }
     }
 
@@ -512,13 +637,17 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
                 Ok(())
             }
             #[cfg(feature = "simd")]
-            Self::SimdOptimized(_storage) => {
-                // SimdOptimized uses COW - cannot mutate through shared reference
-                Err(TorshError::InvalidArgument(
-                    "SimdOptimized storage is immutable. Use make_unique() for mutable access."
-                        .to_string(),
-                ))
-            }
+            Self::SimdOptimized(storage) => storage.with_slice_mut(|slice| {
+                let size = slice.len();
+                if start + values.len() > size {
+                    return Err(TorshError::IndexOutOfBounds {
+                        index: start + values.len() - 1,
+                        size,
+                    });
+                }
+                slice[start..start + values.len()].copy_from_slice(values);
+                Ok(())
+            })?,
         }
     }
 
@@ -548,10 +677,7 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
                 Ok(data_guard.as_slice().to_vec())
             }
             #[cfg(feature = "simd")]
-            Self::SimdOptimized(storage) => {
-                // Lock-free access!
-                Ok(storage.to_vec())
-            }
+            Self::SimdOptimized(storage) => Ok(storage.to_vec()),
         }
     }
 
@@ -596,8 +722,10 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
             }
             #[cfg(feature = "simd")]
             Self::SimdOptimized(storage) => {
-                // Lock-free access!
-                storage.capacity() * std::mem::size_of::<T>()
+                // After the first write the copy-on-write buffer is held
+                // alongside the (retained) original one.
+                let buffers = if storage.is_mutated() { 2 } else { 1 };
+                storage.capacity() * std::mem::size_of::<T>() * buffers
             }
         }
     }
@@ -655,24 +783,27 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
             }
             #[cfg(feature = "simd")]
             Self::SimdOptimized(storage) => {
-                // 🚀 Lock-free access - no lock acquisition!
-                f(storage.as_slice())
+                // 🚀 Lock-free access while the storage has never been written to.
+                storage.with_slice(f)
             }
         }
     }
 
     /// Try to get direct slice access without closures (only works for SimdOptimized)
     ///
-    /// Returns `Some(&[T])` if storage is SimdOptimized (lock-free),
-    /// returns `None` for other storage types (which require lock acquisition).
+    /// Returns `Some(&[T])` if storage is SimdOptimized **and** has never been
+    /// written to (in which case its buffer is immutable and an unguarded borrow
+    /// is sound). Returns `None` for every other storage type, and for a
+    /// SimdOptimized storage that has been mutated — callers must fall back to
+    /// [`TensorStorage::with_slice`].
     ///
     /// # Performance
-    /// - SimdOptimized: Direct slice access, zero overhead
+    /// - SimdOptimized (unmutated): Direct slice access, zero overhead
     /// - Others: Returns None (use with_slice instead)
     #[cfg(feature = "simd")]
     pub fn try_as_slice_direct(&self) -> Option<&[T]> {
         match self {
-            Self::SimdOptimized(storage) => Some(storage.as_slice()),
+            Self::SimdOptimized(storage) => storage.try_as_slice(),
             _ => None,
         }
     }
@@ -726,32 +857,43 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
                 f(data_guard.as_mut_slice())
             }
             #[cfg(feature = "simd")]
-            Self::SimdOptimized(_) => {
-                // SimdOptimized uses COW - cannot mutate through shared reference
-                Err(TorshError::InvalidArgument(
-                    "SimdOptimized storage is immutable. Use make_unique() for mutable access."
-                        .to_string(),
-                ))
+            Self::SimdOptimized(storage) => {
+                // Copy-on-write promotion, then a direct mutable slice.
+                storage.with_slice_mut(f)?
             }
         }
     }
 }
 
+/// Build a backing-file path that is unique per storage instance.
+///
+/// A single per-process name would make two temporary memory-mapped tensors
+/// share (and truncate) one file, so the name carries the pid, a monotonic
+/// counter and a nanosecond timestamp.
+fn unique_backing_path() -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "torsh_tensor_{pid}_{nanos}_{seq}.mmap",
+        pid = std::process::id()
+    ))
+}
+
 impl<T: TensorElement> MemoryMappedStorage<T> {
-    /// Create new memory-mapped storage
-    pub fn new(data: Vec<T>, file_path: Option<PathBuf>) -> Result<Self> {
+    /// Open (or create) the backing file for a storage instance.
+    fn open_backing_file(file_path: Option<PathBuf>) -> Result<(File, PathBuf, bool)> {
         let (file_path, is_temporary) = match file_path {
             Some(path) => (path, false),
-            None => {
-                // Create temporary file
-                let temp_dir = std::env::temp_dir();
-                let temp_file = temp_dir.join(format!("torsh_tensor_{}.mmap", std::process::id()));
-                (temp_file, true)
-            }
+            // Unique per storage instance: sharing one name per process made
+            // every new temporary tensor truncate the previous one's data.
+            None => (unique_backing_path(), true),
         };
 
-        // Create and write data to file
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -761,11 +903,18 @@ impl<T: TensorElement> MemoryMappedStorage<T> {
                 TorshError::IoError(format!("Failed to create memory-mapped file: {e}"))
             })?;
 
+        Ok((file, file_path, is_temporary))
+    }
+
+    /// Create new memory-mapped storage
+    pub fn new(data: Vec<T>, file_path: Option<PathBuf>) -> Result<Self> {
+        let (mut file, file_path, is_temporary) = Self::open_backing_file(file_path)?;
+
         // Write data to file
         let data_bytes = unsafe {
             std::slice::from_raw_parts(
                 data.as_ptr() as *const u8,
-                data.len() * std::mem::size_of::<T>(),
+                std::mem::size_of_val(data.as_slice()),
             )
         };
         file.write_all(data_bytes).map_err(|e| {
@@ -783,6 +932,62 @@ impl<T: TensorElement> MemoryMappedStorage<T> {
             access_pattern: VecDeque::new(),
             is_temporary,
         })
+    }
+
+    /// Create memory-mapped storage of `num_elements` copies of `value` **without
+    /// materialising the tensor in RAM**.
+    ///
+    /// The backing file is written in bounded chunks, so a tensor larger than
+    /// available memory can be created: peak resident memory is the chunk size,
+    /// not the tensor size.
+    pub fn new_filled(num_elements: usize, value: T, file_path: Option<PathBuf>) -> Result<Self>
+    where
+        T: Copy,
+    {
+        let (mut file, file_path, is_temporary) = Self::open_backing_file(file_path)?;
+
+        let element_size = std::mem::size_of::<T>();
+        if element_size > 0 && num_elements > 0 {
+            // Write in ~1 MiB chunks so peak RAM stays bounded.
+            const TARGET_CHUNK_BYTES: usize = 1024 * 1024;
+            let chunk_elements = (TARGET_CHUNK_BYTES / element_size).clamp(1, num_elements);
+            let chunk = vec![value; chunk_elements];
+            let chunk_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    chunk.as_ptr() as *const u8,
+                    std::mem::size_of_val(chunk.as_slice()),
+                )
+            };
+
+            let mut written = 0usize;
+            while written < num_elements {
+                let remaining = num_elements - written;
+                let this_chunk = remaining.min(chunk_elements);
+                file.write_all(&chunk_bytes[..this_chunk * element_size])
+                    .map_err(|e| {
+                        TorshError::IoError(format!("Failed to write to memory-mapped file: {e}"))
+                    })?;
+                written += this_chunk;
+            }
+        }
+
+        file.flush()
+            .map_err(|e| TorshError::IoError(format!("Failed to flush memory-mapped file: {e}")))?;
+
+        Ok(Self {
+            file,
+            file_path,
+            num_elements,
+            cache: HashMap::new(),
+            max_cache_size: 10000,
+            access_pattern: VecDeque::new(),
+            is_temporary,
+        })
+    }
+
+    /// Path of the file backing this storage.
+    pub fn file_path(&self) -> &std::path::Path {
+        &self.file_path
     }
 
     /// Get element at index with caching
@@ -841,6 +1046,11 @@ impl<T: TensorElement> MemoryMappedStorage<T> {
     }
 
     /// Get slice of elements
+    ///
+    /// The whole range is fetched with a **single** positional read into the
+    /// destination buffer, instead of one syscall (and one heap allocation) per
+    /// element via the LRU cache. The cache is bypassed on purpose: every write
+    /// goes through to the file, so the file is authoritative.
     pub fn get_slice(&mut self, start: usize, len: usize) -> Result<Vec<T>>
     where
         T: Copy,
@@ -852,14 +1062,83 @@ impl<T: TensorElement> MemoryMappedStorage<T> {
             });
         }
 
-        let mut buf = global_acquire_uninit::<T>(len);
-        let uninit = buf.as_uninit_slice_mut();
-        let mut count = 0;
-        for i in 0..len {
-            uninit[count].write(self.get(start + i)?);
-            count += 1;
+        if len == 0 {
+            return Ok(Vec::new());
         }
-        Ok(buf.into_vec(count))
+
+        let element_size = std::mem::size_of::<T>();
+        let mut buf = global_acquire_uninit::<T>(len);
+
+        if element_size == 0 {
+            // Zero-sized elements carry no bytes: nothing to read.
+            let uninit = buf.as_uninit_slice_mut();
+            for slot in uninit.iter_mut().take(len) {
+                // SAFETY: a zero-sized type has exactly one value; reading the
+                // (empty) representation back is a no-op.
+                slot.write(unsafe { std::mem::zeroed() });
+            }
+            return Ok(buf.into_vec(len));
+        }
+
+        {
+            let byte_len = len * element_size;
+            let ptr = buf.as_uninit_slice_mut().as_mut_ptr() as *mut u8;
+            // SAFETY: the buffer is allocated for `len` elements of `T`, so it
+            // spans `byte_len` bytes and is correctly aligned for `T`. The bytes
+            // are zeroed before a `&mut [u8]` is formed so no uninitialized
+            // memory is ever exposed as an initialized reference; the read then
+            // overwrites exactly that range, which is what `into_vec(len)`
+            // claims as initialized.
+            let byte_buf = unsafe {
+                std::ptr::write_bytes(ptr, 0, byte_len);
+                std::slice::from_raw_parts_mut(ptr, byte_len)
+            };
+            self.read_bytes_at(byte_buf, (start * element_size) as u64)?;
+        }
+
+        Ok(buf.into_vec(len))
+    }
+
+    /// Read exactly `buffer.len()` bytes at `offset` from the backing file.
+    fn read_bytes_at(&mut self, buffer: &mut [u8], offset: u64) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.file.read_exact_at(buffer, offset).map_err(|e| {
+                TorshError::IoError(format!("Failed to read from memory-mapped file: {e}"))
+            })?;
+        }
+
+        #[cfg(windows)]
+        {
+            let mut read_total = 0usize;
+            while read_total < buffer.len() {
+                let n = self
+                    .file
+                    .seek_read(&mut buffer[read_total..], offset + read_total as u64)
+                    .map_err(|e| {
+                        TorshError::IoError(format!("Failed to read from memory-mapped file: {e}"))
+                    })?;
+                if n == 0 {
+                    return Err(TorshError::IoError(
+                        "Unexpected end of memory-mapped file".to_string(),
+                    ));
+                }
+                read_total += n;
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            self.file.seek(SeekFrom::Start(offset)).map_err(|e| {
+                TorshError::IoError(format!("Failed to seek in memory-mapped file: {e}"))
+            })?;
+            self.file.read_exact(buffer).map_err(|e| {
+                TorshError::IoError(format!("Failed to read from memory-mapped file: {e}"))
+            })?;
+        }
+
+        Ok(())
     }
 
     /// Set slice of elements
@@ -926,8 +1205,9 @@ impl<T: TensorElement> MemoryMappedStorage<T> {
             })?;
         }
 
-        // Convert bytes to T
-        let value = unsafe { std::ptr::read(buffer.as_ptr() as *const T) };
+        // Convert bytes to T. The byte buffer is a `Vec<u8>` (alignment 1), so
+        // the read must be an unaligned one.
+        let value = unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const T) };
         Ok(value)
     }
 

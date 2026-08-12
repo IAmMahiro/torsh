@@ -70,7 +70,12 @@
 //! While this crate produces a Python extension module (cdylib), the core ToRSh
 //! framework remains 100% Pure Rust. This crate is the Python bridge only.
 
-#![allow(dead_code)] // Framework infrastructure for future use
+// The 27 never-compiled orphan modules that this attribute used to hide
+// (android/ios/swift/java/lua/matlab/... ~20k lines) have been deleted. It is
+// retained only for the genuinely-compiled interop modules
+// (numpy_compatibility / pandas_support / scipy_integration), whose public
+// struct fields are part of a forward-looking API surface not yet all consumed.
+#![allow(dead_code)]
 
 // C API and Node.js N-API bindings (enabled by "nodejs" feature)
 #[cfg(feature = "nodejs")]

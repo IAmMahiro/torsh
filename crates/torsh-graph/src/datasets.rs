@@ -466,12 +466,12 @@ impl GraphDatasetCollection {
         nodes_per_graph: usize,
         edge_probability: f64,
         num_features: usize,
-    ) -> Vec<GraphData> {
+    ) -> Result<Vec<GraphData>, torsh_core::error::TorshError> {
         use crate::scirs2_integration::generation;
 
         (0..num_graphs)
             .map(|_| {
-                let mut graph = generation::erdos_renyi(nodes_per_graph, edge_probability);
+                let mut graph = generation::erdos_renyi(nodes_per_graph, edge_probability)?;
 
                 // Ensure correct feature dimension
                 if graph.x.shape().dims()[1] != num_features {
@@ -482,12 +482,11 @@ impl GraphDatasetCollection {
                         new_features,
                         &[nodes_per_graph, num_features],
                         DeviceType::Cpu,
-                    )
-                    .expect("feature tensor creation with valid dimensions should succeed");
+                    )?;
                     graph.x = x;
                 }
 
-                graph
+                Ok(graph)
             })
             .collect()
     }
@@ -504,7 +503,7 @@ impl GraphDatasetCollection {
         for _ in 1..augmentation_factor {
             for graph in &base_graphs {
                 // Simple augmentation: add noise to features
-                let augmented = Self::add_feature_noise(graph, 0.1);
+                let augmented = Self::add_feature_noise(graph, 0.1)?;
                 augmented_graphs.push(augmented);
             }
         }
@@ -513,25 +512,39 @@ impl GraphDatasetCollection {
     }
 
     /// Add noise to node features for data augmentation
-    pub fn add_feature_noise(graph: &GraphData, noise_level: f32) -> GraphData {
+    ///
+    /// # Errors
+    /// Returns an error when the node-feature tensor cannot be read back or the
+    /// noisy tensor cannot be allocated.
+    pub fn add_feature_noise(graph: &GraphData, noise_level: f32) -> IoResult<GraphData> {
         let mut rng = scirs2_core::random::thread_rng();
-        let features = graph.x.to_vec().expect("conversion should succeed");
+        let features = graph.x.to_vec().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("node feature conversion failed: {e:?}"),
+            )
+        })?;
         let noisy_features: Vec<f32> = features
             .iter()
             .map(|&x| x + (rng.random::<f32>() - 0.5) * 2.0 * noise_level)
             .collect();
 
-        let noisy_x = from_vec(noisy_features, graph.x.shape().dims(), DeviceType::Cpu)
-            .expect("noisy feature tensor creation with same dimensions should succeed");
+        let noisy_x =
+            from_vec(noisy_features, graph.x.shape().dims(), DeviceType::Cpu).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("noisy feature tensor creation failed: {e:?}"),
+                )
+            })?;
 
-        GraphData {
+        Ok(GraphData {
             x: noisy_x,
             edge_index: graph.edge_index.clone(),
             edge_attr: graph.edge_attr.clone(),
             batch: graph.batch.clone(),
             num_nodes: graph.num_nodes,
             num_edges: graph.num_edges,
-        }
+        })
     }
 
     /// Split dataset into train/validation/test
@@ -622,17 +635,10 @@ impl TemporalGraphLoader {
                 match loader.load_from_file(&file_path) {
                     Ok(graph) => graphs.push(graph),
                     Err(e) => {
-                        eprintln!("Warning: Failed to load timestep {}: {}", t, e);
-                        // Create empty graph as placeholder
-                        let x = from_vec(
-                            vec![0.0; self.node_features],
-                            &[1, self.node_features],
-                            DeviceType::Cpu,
-                        )
-                        .expect("placeholder tensor creation should succeed");
-                        let edge_index = from_vec(vec![], &[2, 0], DeviceType::Cpu)
-                            .expect("empty edge tensor creation should succeed");
-                        graphs.push(GraphData::new(x, edge_index));
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("failed to load timestep {t}: {e}"),
+                        ));
                     }
                 }
             }
@@ -689,7 +695,8 @@ mod tests {
 
     #[test]
     fn test_graph_dataset_collection() {
-        let graphs = GraphDatasetCollection::create_synthetic_dataset(5, 10, 0.2, 4);
+        let graphs = GraphDatasetCollection::create_synthetic_dataset(5, 10, 0.2, 4)
+            .expect("operation should succeed");
 
         assert_eq!(graphs.len(), 5);
         for graph in graphs {
@@ -700,7 +707,8 @@ mod tests {
 
     #[test]
     fn test_train_val_test_split() {
-        let graphs = GraphDatasetCollection::create_synthetic_dataset(100, 10, 0.1, 3);
+        let graphs = GraphDatasetCollection::create_synthetic_dataset(100, 10, 0.1, 3)
+            .expect("operation should succeed");
         let (train, val, test) = GraphDatasetCollection::train_val_test_split(graphs, 0.7, 0.2);
 
         assert_eq!(train.len(), 70);
@@ -710,7 +718,8 @@ mod tests {
 
     #[test]
     fn test_graph_sampler() {
-        let graphs = GraphDatasetCollection::create_synthetic_dataset(10, 5, 0.3, 2);
+        let graphs = GraphDatasetCollection::create_synthetic_dataset(10, 5, 0.3, 2)
+            .expect("operation should succeed");
         let sampler = GraphSampler::new(3, false);
         let batches = sampler.sample_batches(&graphs);
 
@@ -721,8 +730,11 @@ mod tests {
 
     #[test]
     fn test_feature_noise_augmentation() {
-        let base_graph = GraphDatasetCollection::create_synthetic_dataset(1, 5, 0.4, 3)[0].clone();
-        let noisy_graph = GraphDatasetCollection::add_feature_noise(&base_graph, 0.1);
+        let base_graph = GraphDatasetCollection::create_synthetic_dataset(1, 5, 0.4, 3)
+            .expect("operation should succeed")[0]
+            .clone();
+        let noisy_graph = GraphDatasetCollection::add_feature_noise(&base_graph, 0.1)
+            .expect("operation should succeed");
 
         assert_eq!(noisy_graph.num_nodes, base_graph.num_nodes);
         assert_eq!(noisy_graph.num_edges, base_graph.num_edges);

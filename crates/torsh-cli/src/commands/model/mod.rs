@@ -31,6 +31,7 @@ pub mod enhanced_serialization;
 pub mod optimization;
 pub mod profiling;
 pub mod pytorch_parser;
+pub mod pytorch_reader;
 pub mod real_benchmarking;
 pub mod serialization;
 pub mod tensor_integration;

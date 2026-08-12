@@ -17,6 +17,9 @@
 //! - Peyré et al. "Computational Optimal Transport" (2019)
 //! - Vayer et al. "Optimal Transport for structured data with application on graphs" (ICML 2019)
 //! - Titouan et al. "Optimal Transport Graph Neural Networks" (2022)
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
 
 use crate::GraphData;
 use scirs2_core::ndarray::{Array1, Array2};

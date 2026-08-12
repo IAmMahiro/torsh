@@ -180,12 +180,10 @@ impl Optimizer for AdaMax {
                             .map_err(OptimizerError::TensorError)?,
                     )
                     .map_err(OptimizerError::TensorError)?;
-                *param = param
-                    .sub(
-                        &update
-                            .mul_scalar(step_size)
-                            .map_err(OptimizerError::TensorError)?,
-                    )
+                let scaled_update = update
+                    .mul_scalar(step_size)
+                    .map_err(OptimizerError::TensorError)?;
+                crate::param_update::sub_assign(&mut param, &scaled_update)
                     .map_err(OptimizerError::TensorError)?;
             }
         }

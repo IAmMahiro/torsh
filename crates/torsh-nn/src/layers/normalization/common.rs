@@ -3,6 +3,8 @@
 //! This module provides shared functionality used across different normalization
 //! implementations including configuration types, utility functions, and common patterns.
 
+use parking_lot::RwLock;
+use std::sync::Arc;
 use torsh_core::error::Result;
 use torsh_tensor::{creation::*, Tensor};
 
@@ -136,6 +138,101 @@ impl NormalizationStats {
             }
         }
         Ok(())
+    }
+}
+
+/// Running statistics buffers for batch-normalization layers.
+///
+/// The buffers live behind `Arc<RwLock<Tensor>>` so a `forward(&self, ...)` can
+/// update them, and so the very same handles can be published through
+/// [`crate::Module::named_buffers`] — there is exactly one copy of the state,
+/// not a registered buffer plus a disconnected shadow.
+#[derive(Debug, Clone)]
+pub struct RunningStats {
+    running_mean: Arc<RwLock<Tensor>>,
+    running_var: Arc<RwLock<Tensor>>,
+    num_batches_tracked: Arc<RwLock<Tensor>>,
+}
+
+impl RunningStats {
+    /// Create zero-mean / unit-variance running statistics for `num_features`.
+    pub fn new(num_features: usize) -> Result<Self> {
+        Ok(Self {
+            running_mean: Arc::new(RwLock::new(zeros(&[num_features])?)),
+            running_var: Arc::new(RwLock::new(ones(&[num_features])?)),
+            num_batches_tracked: Arc::new(RwLock::new(zeros(&[1])?)),
+        })
+    }
+
+    /// Shared handle to the running mean buffer.
+    pub fn running_mean_handle(&self) -> Arc<RwLock<Tensor>> {
+        Arc::clone(&self.running_mean)
+    }
+
+    /// Shared handle to the running variance buffer.
+    pub fn running_var_handle(&self) -> Arc<RwLock<Tensor>> {
+        Arc::clone(&self.running_var)
+    }
+
+    /// Shared handle to the batch counter buffer.
+    pub fn num_batches_tracked_handle(&self) -> Arc<RwLock<Tensor>> {
+        Arc::clone(&self.num_batches_tracked)
+    }
+
+    /// Snapshot of the current running mean.
+    pub fn running_mean(&self) -> Tensor {
+        self.running_mean.read().clone()
+    }
+
+    /// Snapshot of the current running variance.
+    pub fn running_var(&self) -> Tensor {
+        self.running_var.read().clone()
+    }
+
+    /// Number of batches folded into the running statistics so far.
+    pub fn num_batches_tracked(&self) -> Result<f32> {
+        let counter = self.num_batches_tracked.read();
+        Ok(counter.to_vec()?.first().copied().unwrap_or(0.0))
+    }
+
+    /// Fold a batch into the running statistics.
+    ///
+    /// `batch_var` must be the **unbiased** batch variance, matching PyTorch,
+    /// which normalizes with the biased variance but tracks the unbiased one.
+    pub fn update(&self, batch_mean: &Tensor, batch_var: &Tensor, momentum: f32) -> Result<()> {
+        let one_minus_momentum = 1.0 - momentum;
+
+        {
+            let mut running_mean = self.running_mean.write();
+            *running_mean = running_mean
+                .mul_scalar(one_minus_momentum)?
+                .add(&batch_mean.mul_scalar(momentum)?)?;
+        }
+        {
+            let mut running_var = self.running_var.write();
+            *running_var = running_var
+                .mul_scalar(one_minus_momentum)?
+                .add(&batch_var.mul_scalar(momentum)?)?;
+        }
+        {
+            let mut counter = self.num_batches_tracked.write();
+            *counter = counter.add_scalar(1.0)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Convert a biased (population) variance into the unbiased (sample) variance.
+///
+/// `count` is the number of elements that contributed to each channel
+/// statistic. With a single sample the correction is undefined, so the biased
+/// value is returned unchanged.
+pub fn unbiased_variance(biased: &Tensor, count: usize) -> Result<Tensor> {
+    if count > 1 {
+        biased.mul_scalar(count as f32 / (count - 1) as f32)
+    } else {
+        Ok(biased.clone())
     }
 }
 
@@ -354,6 +451,89 @@ pub mod utils {
         }
 
         Tensor::from_data(channel_vars, vec![channels], input.device())
+    }
+
+    /// Broadcast shape that lines a per-channel vector up with an `NC...` tensor.
+    fn channel_broadcast_shape(rank: usize, channels: usize) -> Vec<i32> {
+        let mut shape = vec![1i32; rank];
+        if rank >= 2 {
+            shape[1] = channels as i32;
+        }
+        shape
+    }
+
+    /// Apply a *per-channel* normalization: `(x - mean) / sqrt(var + eps) * weight + bias`.
+    ///
+    /// `mean`, `var`, `weight` and `bias` are 1-D tensors of length `C` and are
+    /// explicitly reshaped to `[1, C, 1, ...]` before broadcasting. This is what
+    /// distinguishes it from [`apply_normalization`], whose generic trailing-axis
+    /// broadcast silently aligns `C` with the *last* axis whenever the two happen
+    /// to have the same length (e.g. an `[N, 2, 2, 2]` input).
+    pub fn apply_channel_normalization(
+        input: &Tensor,
+        mean: &Tensor,
+        var: &Tensor,
+        weight: Option<&Tensor>,
+        bias: Option<&Tensor>,
+        eps: f32,
+    ) -> Result<Tensor> {
+        let input_shape = input.shape();
+        let dims = input_shape.dims();
+
+        if dims.len() < 2 {
+            return Err(torsh_core::error::TorshError::InvalidShape(format!(
+                "channel normalization expects an (N, C, ...) tensor, got {dims:?}"
+            )));
+        }
+
+        let channels = dims[1];
+        let broadcast = channel_broadcast_shape(dims.len(), channels);
+
+        let inv_std = var.add_scalar(eps)?.sqrt()?;
+        let centered = input.sub(&mean.reshape(&broadcast)?)?;
+        let mut normalized = centered.div(&inv_std.reshape(&broadcast)?)?;
+
+        if let Some(w) = weight {
+            normalized = normalized.mul(&w.reshape(&broadcast)?)?;
+        }
+        if let Some(b) = bias {
+            normalized = normalized.add(&b.reshape(&broadcast)?)?;
+        }
+
+        Ok(normalized)
+    }
+
+    /// Apply a per-channel affine map `x * scale + shift`.
+    ///
+    /// Used by batch renormalization, where the correction terms `r`/`d` fold
+    /// into a single scale/shift pair per channel.
+    pub fn apply_channel_affine(input: &Tensor, scale: &[f32], shift: &[f32]) -> Result<Tensor> {
+        let input_shape = input.shape();
+        let dims = input_shape.dims();
+
+        if dims.len() < 2 {
+            return Err(torsh_core::error::TorshError::InvalidShape(format!(
+                "channel affine expects an (N, C, ...) tensor, got {dims:?}"
+            )));
+        }
+
+        let channels = dims[1];
+        if scale.len() != channels || shift.len() != channels {
+            return Err(torsh_core::error::TorshError::InvalidShape(format!(
+                "expected {channels} scale/shift values, got {} and {}",
+                scale.len(),
+                shift.len()
+            )));
+        }
+
+        let broadcast: Vec<usize> = channel_broadcast_shape(dims.len(), channels)
+            .into_iter()
+            .map(|d| d as usize)
+            .collect();
+        let scale_tensor = Tensor::from_data(scale.to_vec(), broadcast.clone(), input.device())?;
+        let shift_tensor = Tensor::from_data(shift.to_vec(), broadcast, input.device())?;
+
+        input.mul(&scale_tensor)?.add(&shift_tensor)
     }
 
     /// Apply normalization transformation: (x - mean) / sqrt(var + eps) * weight + bias

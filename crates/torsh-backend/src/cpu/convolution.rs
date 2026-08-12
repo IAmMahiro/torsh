@@ -112,7 +112,14 @@ impl CpuConvolutionOps {
                 std::slice::from_raw_parts_mut(output_ptr as *mut f32, output.size / 4);
 
             match config.conv_type {
-                ConvolutionType::Conv2D => {
+                // Plain, dilated, grouped and depthwise 2D convolution are all
+                // handled by the one generalized direct kernel: depthwise is
+                // simply `groups == in_channels`, dilation and groups are read
+                // straight from the config so nothing is silently ignored.
+                ConvolutionType::Conv2D
+                | ConvolutionType::DilatedConv2D
+                | ConvolutionType::GroupedConv2D
+                | ConvolutionType::DepthwiseConv2D => {
                     algorithms::DirectConvolution::conv2d_direct(
                         input_data,
                         kernel_data,
@@ -122,15 +129,8 @@ impl CpuConvolutionOps {
                         &config.output_dims,
                         (config.strides[0], config.strides[1]),
                         (config.padding[0], config.padding[1]),
-                    )?;
-                }
-                ConvolutionType::DepthwiseConv2D => {
-                    // Simplified depthwise convolution - would need specialized implementation
-                    self.depthwise_direct_implementation(
-                        input_data,
-                        kernel_data,
-                        output_data,
-                        config,
+                        (config.dilation[0], config.dilation[1]),
+                        config.groups,
                     )?;
                 }
                 _ => {
@@ -193,79 +193,67 @@ impl CpuConvolutionOps {
 
         Ok(())
     }
+}
 
-    /// Simplified depthwise convolution implementation
-    fn depthwise_direct_implementation(
-        &self,
-        input: &[f32],
-        kernel: &[f32],
-        output: &mut [f32],
-        config: &ConvolutionConfig,
-    ) -> BackendResult<()> {
-        let (batch, channels, in_h, in_w) = (
-            config.input_dims[0],
-            config.input_dims[1],
-            config.input_dims[2],
-            config.input_dims[3],
-        );
-        let (_, _, k_h, k_w) = (
-            config.kernel_dims[0],
-            config.kernel_dims[1],
-            config.kernel_dims[2],
-            config.kernel_dims[3],
-        );
-        let (_, _, out_h, out_w) = (
-            config.output_dims[0],
-            config.output_dims[1],
-            config.output_dims[2],
-            config.output_dims[3],
-        );
-        let (s_h, s_w) = (config.strides[0], config.strides[1]);
-        let (p_h, p_w) = (config.padding[0], config.padding[1]);
+/// Compute the NCHW output spatial size for a dilated convolution and assemble
+/// a [`ConvolutionConfig`] from caller-supplied shapes.
+///
+/// This replaces the previous placeholder-dimension approach: buffer byte
+/// lengths cannot recover a tensor shape, so the shapes are passed explicitly
+/// and the output size is derived from them together with the stride, padding
+/// and dilation actually requested.
+fn build_conv_config(
+    conv_type: ConvolutionType,
+    input_shape: [usize; 4],
+    kernel_shape: [usize; 4],
+    stride: (usize, usize),
+    padding: (usize, usize),
+    dilation: (usize, usize),
+    groups: usize,
+) -> BackendResult<ConvolutionConfig> {
+    let [n, c_in, in_h, in_w] = input_shape;
+    let [c_out, _k_in_per_group, k_h, k_w] = kernel_shape;
+    let (s_h, s_w) = stride;
+    let (p_h, p_w) = padding;
+    let (d_h, d_w) = dilation;
 
-        for b in 0..batch {
-            for c in 0..channels {
-                for oh in 0..out_h {
-                    for ow in 0..out_w {
-                        let mut sum = 0.0;
-
-                        for kh in 0..k_h {
-                            for kw in 0..k_w {
-                                let ih = oh * s_h + kh;
-                                let iw = ow * s_w + kw;
-
-                                if ih >= p_h && iw >= p_w && ih < in_h + p_h && iw < in_w + p_w {
-                                    let input_h = ih - p_h;
-                                    let input_w = iw - p_w;
-
-                                    if input_h < in_h && input_w < in_w {
-                                        let input_idx = b * channels * in_h * in_w
-                                            + c * in_h * in_w
-                                            + input_h * in_w
-                                            + input_w;
-                                        let kernel_idx = c * k_h * k_w + kh * k_w + kw;
-
-                                        if input_idx < input.len() && kernel_idx < kernel.len() {
-                                            sum += input[input_idx] * kernel[kernel_idx];
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        let output_idx =
-                            b * channels * out_h * out_w + c * out_h * out_w + oh * out_w + ow;
-
-                        if output_idx < output.len() {
-                            output[output_idx] = sum;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
+    if s_h == 0 || s_w == 0 || d_h == 0 || d_w == 0 {
+        return Err(torsh_core::error::TorshError::BackendError(
+            "convolution stride and dilation must be non-zero".to_string(),
+        ));
     }
+
+    // Effective (dilated) kernel extent.
+    let eff_h = d_h * (k_h - 1) + 1;
+    let eff_w = d_w * (k_w - 1) + 1;
+    if in_h + 2 * p_h < eff_h || in_w + 2 * p_w < eff_w {
+        return Err(torsh_core::error::TorshError::BackendError(format!(
+            "convolution kernel ({}x{} dilated to {}x{}) does not fit padded input ({}x{})",
+            k_h,
+            k_w,
+            eff_h,
+            eff_w,
+            in_h + 2 * p_h,
+            in_w + 2 * p_w
+        )));
+    }
+
+    let out_h = (in_h + 2 * p_h - eff_h) / s_h + 1;
+    let out_w = (in_w + 2 * p_w - eff_w) / s_w + 1;
+
+    Ok(ConvolutionConfig {
+        conv_type,
+        input_dims: vec![n, c_in, in_h, in_w],
+        output_dims: vec![n, c_out, out_h, out_w],
+        kernel_dims: vec![kernel_shape[0], kernel_shape[1], k_h, k_w],
+        strides: vec![s_h, s_w],
+        padding: vec![p_h, p_w],
+        dilation: vec![d_h, d_w],
+        groups,
+        padding_mode: PaddingMode::Custom,
+        dtype: torsh_core::dtype::DType::F32,
+        algorithm: ConvolutionAlgorithm::Direct,
+    })
 }
 
 #[async_trait::async_trait]
@@ -317,25 +305,21 @@ impl ConvolutionOps for CpuConvolutionOps {
         kernel: &Buffer,
         bias: Option<&Buffer>,
         output: &Buffer,
+        input_shape: [usize; 4],
+        kernel_shape: [usize; 4],
         stride: (usize, usize),
         padding: (usize, usize),
         dilation: (usize, usize),
     ) -> BackendResult<()> {
-        // Create a basic configuration from parameters
-        // For a full implementation, we'd need to infer dimensions from buffer sizes
-        let config = ConvolutionConfig {
-            conv_type: ConvolutionType::Conv2D,
-            input_dims: vec![1, 1, 32, 32],  // Placeholder dimensions
-            output_dims: vec![1, 1, 32, 32], // Placeholder dimensions
-            kernel_dims: vec![1, 1, 3, 3],   // Placeholder dimensions
-            strides: vec![stride.0, stride.1],
-            padding: vec![padding.0, padding.1],
-            dilation: vec![dilation.0, dilation.1],
-            groups: 1,
-            padding_mode: PaddingMode::Custom,
-            dtype: torsh_core::dtype::DType::F32,
-            algorithm: ConvolutionAlgorithm::Auto,
-        };
+        let config = build_conv_config(
+            ConvolutionType::Conv2D,
+            input_shape,
+            kernel_shape,
+            stride,
+            padding,
+            dilation,
+            1,
+        )?;
 
         self.convolution(device, input, kernel, bias, output, &config)
             .await
@@ -348,23 +332,24 @@ impl ConvolutionOps for CpuConvolutionOps {
         kernel: &Buffer,
         bias: Option<&Buffer>,
         output: &Buffer,
+        input_shape: [usize; 4],
+        kernel_shape: [usize; 4],
         stride: (usize, usize),
         padding: (usize, usize),
+        dilation: (usize, usize),
     ) -> BackendResult<()> {
-        // Create depthwise configuration
-        let config = ConvolutionConfig {
-            conv_type: ConvolutionType::DepthwiseConv2D,
-            input_dims: vec![1, 16, 32, 32], // Placeholder dimensions
-            output_dims: vec![1, 16, 32, 32], // Placeholder dimensions
-            kernel_dims: vec![16, 1, 3, 3],  // Placeholder dimensions
-            strides: vec![stride.0, stride.1],
-            padding: vec![padding.0, padding.1],
-            dilation: vec![1, 1],
-            groups: 16, // Depthwise means groups = input channels
-            padding_mode: PaddingMode::Custom,
-            dtype: torsh_core::dtype::DType::F32,
-            algorithm: ConvolutionAlgorithm::Direct,
-        };
+        // Depthwise convolution is grouped convolution with one group per input
+        // channel; the kernel is laid out as [C_out, 1, kH, kW].
+        let groups = input_shape[1];
+        let config = build_conv_config(
+            ConvolutionType::DepthwiseConv2D,
+            input_shape,
+            kernel_shape,
+            stride,
+            padding,
+            dilation,
+            groups,
+        )?;
 
         self.convolution(device, input, kernel, bias, output, &config)
             .await
@@ -393,24 +378,22 @@ impl ConvolutionOps for CpuConvolutionOps {
         kernel: &Buffer,
         bias: Option<&Buffer>,
         output: &Buffer,
+        input_shape: [usize; 4],
+        kernel_shape: [usize; 4],
         groups: usize,
         stride: (usize, usize),
         padding: (usize, usize),
+        dilation: (usize, usize),
     ) -> BackendResult<()> {
-        // Create grouped configuration
-        let config = ConvolutionConfig {
-            conv_type: ConvolutionType::GroupedConv2D,
-            input_dims: vec![1, 16, 32, 32], // Placeholder dimensions
-            output_dims: vec![1, 16, 32, 32], // Placeholder dimensions
-            kernel_dims: vec![16, 16 / groups, 3, 3], // Placeholder dimensions
-            strides: vec![stride.0, stride.1],
-            padding: vec![padding.0, padding.1],
-            dilation: vec![1, 1],
+        let config = build_conv_config(
+            ConvolutionType::GroupedConv2D,
+            input_shape,
+            kernel_shape,
+            stride,
+            padding,
+            dilation,
             groups,
-            padding_mode: PaddingMode::Custom,
-            dtype: torsh_core::dtype::DType::F32,
-            algorithm: ConvolutionAlgorithm::Direct,
-        };
+        )?;
 
         self.convolution(device, input, kernel, bias, output, &config)
             .await

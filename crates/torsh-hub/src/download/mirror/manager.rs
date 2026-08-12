@@ -79,7 +79,7 @@ impl MirrorManager {
         }
         validate_selection_strategy(&config.selection_strategy)?;
 
-        let client = Client::builder()
+        let client = crate::tls::client_builder()?
             .user_agent("torsh-hub/0.1.0-alpha.2")
             .timeout(config.connection_timeout)
             .build()

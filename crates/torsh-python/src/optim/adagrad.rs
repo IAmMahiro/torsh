@@ -26,6 +26,7 @@ pub struct PyAdaGrad {
 #[pymethods]
 impl PyAdaGrad {
     #[new]
+    #[pyo3(signature = (params, lr=None, lr_decay=None, weight_decay=None, eps=None))]
     fn new(
         params: Vec<PyTensor>,
         lr: Option<f32>,

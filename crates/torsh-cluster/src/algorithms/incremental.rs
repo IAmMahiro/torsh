@@ -98,10 +98,11 @@ pub struct OnlineKMeansResult {
 }
 
 impl ClusteringResult for OnlineKMeansResult {
-    fn labels(&self) -> &Tensor {
-        self.labels
-            .as_ref()
-            .unwrap_or_else(|| panic!("Labels not available for online clustering result"))
+    fn labels(&self) -> Option<&Tensor> {
+        // Unlike batch algorithms, online clustering may not have processed
+        // any labeled batch yet, so labels are genuinely optional here --
+        // honestly reflected in the return type rather than panicking.
+        self.labels.as_ref()
     }
 
     fn n_clusters(&self) -> usize {
@@ -608,9 +609,21 @@ pub struct SlidingWindowResult {
     pub n_recomputations: usize,
 }
 
-impl ClusteringResult for SlidingWindowResult {
-    fn labels(&self) -> &Tensor {
+impl SlidingWindowResult {
+    /// Get cluster labels for points in the current window.
+    ///
+    /// Sliding-window clustering always has a (possibly partially filled)
+    /// window of labels, so this concrete accessor is infallible; see
+    /// [`ClusteringResult::labels`] for the fallible, trait-object-safe
+    /// equivalent.
+    pub fn labels(&self) -> &Tensor {
         &self.labels
+    }
+}
+
+impl ClusteringResult for SlidingWindowResult {
+    fn labels(&self) -> Option<&Tensor> {
+        Some(&self.labels)
     }
 
     fn n_clusters(&self) -> usize {

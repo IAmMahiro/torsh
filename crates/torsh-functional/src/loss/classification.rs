@@ -8,6 +8,88 @@ use crate::utils::{function_context, safe_log_prob, validate_elementwise_shapes,
 use torsh_core::{Result as TorshResult, TorshError};
 use torsh_tensor::Tensor;
 
+/// Sum a `[N, C]` tensor along its class axis while keeping the autograd graph.
+///
+/// The reduction is expressed as a matrix product with a constant column of ones
+/// because `Tensor::sum_dim` rebuilds its result from raw data and therefore
+/// detaches the graph, which would make every loss built on it non-differentiable.
+fn row_sum(input: &Tensor) -> TorshResult<Tensor> {
+    let dims_binding = input.shape();
+    let dims = dims_binding.dims();
+    if dims.len() != 2 {
+        return Err(TorshError::InvalidArgument(format!(
+            "row_sum expects a 2-D tensor, got {}-D",
+            dims.len()
+        )));
+    }
+    let (rows, cols) = (dims[0], dims[1]);
+    let ones = Tensor::from_data(vec![1.0f32; cols], vec![cols, 1], input.device())?;
+    input.matmul(&ones)?.view(&[rows as i32])
+}
+
+/// Read the target class index of sample `index`, validating it against `num_classes`.
+fn target_class(
+    target: &Tensor,
+    index: usize,
+    num_classes: usize,
+    context: &str,
+) -> TorshResult<i64> {
+    let raw = target.get(&[index])?;
+    if !raw.is_finite() || raw.fract() != 0.0 {
+        return Err(TorshError::InvalidArgument(format!(
+            "{context}: target[{index}] = {raw} is not an integral class index"
+        )));
+    }
+    let class = raw as i64;
+    if class < 0 || class as usize >= num_classes {
+        return Err(TorshError::InvalidArgument(format!(
+            "{context}: target[{index}] = {class} is out of range for {num_classes} classes"
+        )));
+    }
+    Ok(class)
+}
+
+/// Look up the loss weight of a class, defaulting to 1.0 when no weights are given.
+fn class_weight(weight: Option<&Tensor>, class: usize, context: &str) -> TorshResult<f32> {
+    match weight {
+        Some(w) => {
+            if w.numel() <= class {
+                return Err(TorshError::InvalidArgument(format!(
+                    "{context}: weight tensor has {} entries, class {class} is out of range",
+                    w.numel()
+                )));
+            }
+            w.get(&[class])
+        }
+        None => Ok(1.0),
+    }
+}
+
+/// Validate that `input` is `[N, C]`, `target` is `[N]`, and return `(N, C)`.
+fn validate_classification_shapes(
+    input: &Tensor,
+    target: &Tensor,
+    context: &str,
+) -> TorshResult<(usize, usize)> {
+    if input.ndim() != 2 || target.ndim() != 1 {
+        return Err(TorshError::InvalidArgument(format!(
+            "{context} expects a 2-D input [N, C] and a 1-D target [N], got {}-D and {}-D",
+            input.ndim(),
+            target.ndim()
+        )));
+    }
+    let input_dims_binding = input.shape();
+    let input_dims = input_dims_binding.dims();
+    let batch_size = input_dims[0];
+    if target.shape().dims()[0] != batch_size {
+        return Err(TorshError::ShapeMismatch {
+            expected: vec![batch_size],
+            got: target.shape().dims().to_vec(),
+        });
+    }
+    Ok((batch_size, input_dims[1]))
+}
+
 /// Cross Entropy Loss
 ///
 /// This criterion computes the cross entropy loss between input logits and target.
@@ -42,7 +124,20 @@ pub fn cross_entropy(
 
 /// Negative Log Likelihood Loss
 ///
-/// The negative log likelihood loss for classification.
+/// The negative log likelihood loss for classification. `input` holds
+/// log-probabilities of shape `[N, C]` (typically the output of
+/// [`Tensor::log_softmax`]) and `target` holds the class index of every sample.
+///
+/// The target log-probability is gathered with a constant one-hot selector and a
+/// matrix product, so the returned loss stays attached to `input` in the autograd
+/// graph and `backward()` reaches it.
+///
+/// # Arguments
+/// * `input` - Log-probabilities, shape `[N, C]`
+/// * `target` - Class indices, shape `[N]`
+/// * `weight` - Optional per-class rescaling weight, shape `[C]`
+/// * `reduction` - `"none"`, `"mean"` (weighted average) or `"sum"`
+/// * `ignore_index` - Optional class index that contributes no loss and no weight
 pub fn nll_loss(
     input: &Tensor,
     target: &Tensor,
@@ -50,41 +145,51 @@ pub fn nll_loss(
     reduction: &str,
     ignore_index: Option<i64>,
 ) -> TorshResult<Tensor> {
-    // input shape: (N, C) or (N, C, d1, d2, ...)
-    // target shape: (N) or (N, d1, d2, ...)
-
-    // For now, only handle the simple 2D case without weight or ignore_index
-    if input.ndim() != 2 || target.ndim() != 1 {
-        return Err(TorshError::UnsupportedOperation {
-            op: "nll_loss with >2D input".to_string(),
-            dtype: "tensor".to_string(),
-        });
+    let context = "nll_loss";
+    if !matches!(reduction, "none" | "mean" | "sum") {
+        return Err(TorshError::InvalidArgument(format!(
+            "Unknown reduction: {}",
+            reduction
+        )));
     }
+    let (batch_size, num_classes) = validate_classification_shapes(input, target, context)?;
 
-    if weight.is_some() || ignore_index.is_some() {
-        return Err(TorshError::UnsupportedOperation {
-            op: "nll_loss with weight or ignore_index".to_string(),
-            dtype: "tensor".to_string(),
-        });
-    }
-
-    // Gather operation: for each sample, select the log probability for the target class
-    let batch_size = input.shape().dims()[0];
-    let mut losses = Vec::with_capacity(batch_size);
-
+    // Build the negated (and weighted) one-hot selector as a constant tensor:
+    // loss_i = sum_c selector[i, c] * input[i, c] = -w_{t_i} * input[i, t_i].
+    let mut selector = vec![0.0f32; batch_size * num_classes];
+    let mut total_weight = 0.0f32;
     for i in 0..batch_size {
-        let target_class = target.get(&[i])? as usize;
-        let loss_val = -input.get(&[i, target_class])?;
-        losses.push(loss_val);
+        let class = target_class(target, i, num_classes, context)?;
+        if Some(class) == ignore_index {
+            continue;
+        }
+        let w = class_weight(weight, class as usize, context)?;
+        selector[i * num_classes + class as usize] = -w;
+        total_weight += w;
     }
 
-    let loss_tensor = Tensor::from_vec(losses, &[batch_size])?;
+    // "mean" is the weight-normalised average, matching PyTorch. Folding the
+    // normalisation into the constant selector keeps the graph intact, because
+    // scalar division is not a differentiable tensor operation here.
+    if reduction == "mean" {
+        let scale = if total_weight == 0.0 {
+            0.0
+        } else {
+            1.0 / total_weight
+        };
+        for value in selector.iter_mut() {
+            *value *= scale;
+        }
+    }
 
-    // Apply reduction
+    let selector_tensor =
+        Tensor::from_data(selector, vec![batch_size, num_classes], input.device())?;
+    let per_sample = row_sum(&input.mul(&selector_tensor)?)?;
+
     match reduction {
-        "none" => Ok(loss_tensor),
-        "mean" => loss_tensor.mean(None, false),
-        "sum" => loss_tensor.sum(),
+        "none" => Ok(per_sample),
+        // The per-sample terms already carry the 1/sum(w) factor for "mean".
+        "mean" | "sum" => per_sample.sum(),
         _ => Err(TorshError::InvalidArgument(format!(
             "Unknown reduction: {}",
             reduction
@@ -137,21 +242,31 @@ pub fn binary_cross_entropy_with_logits(
 ) -> TorshResult<Tensor> {
     validate_elementwise_shapes(input, target)?;
 
-    // Use the numerically stable formula:
-    // loss = max(input, 0) - input * target + log(1 + exp(-abs(input)))
+    // Numerically stable decomposition, matching
+    // `torch.nn.functional.binary_cross_entropy_with_logits`:
+    //
+    //   loss = (1 - t) * x + log_weight * (log(1 + exp(-|x|)) + max(-x, 0))
+    //
+    // With `log_weight = 1 + (pos_weight - 1) * t` only the log-sigmoid part is
+    // rescaled. Scaling the whole expression (which is what multiplying
+    // `max(x,0) - x*t + log(1+exp(-|x|))` by `log_weight` does) also rescales the
+    // `(1 - t) * x` term, which diverges from PyTorch for fractional targets.
     let zero = Tensor::zeros_like(input)?;
-    let max_input = input.maximum(&zero)?;
-    let input_target = input.mul(target)?;
+    let one_minus_target = target.neg()?.add_scalar(1.0)?;
+    let linear_term = one_minus_target.mul(input)?; // (1 - t) * x
     let abs_input = input.abs()?;
-    let log_term = abs_input.neg()?.exp()?.add_scalar(1.0)?.log()?;
+    let softplus_term = abs_input.neg()?.exp()?.add_scalar(1.0)?.log()?; // log(1 + exp(-|x|))
+    let max_neg_input = input.neg()?.maximum(&zero)?; // max(-x, 0)
+    let log_sigmoid_term = softplus_term.add(&max_neg_input)?;
 
-    let mut loss = max_input.sub(&input_target)?.add(&log_term)?;
-
-    // Apply positive weight if provided
-    if let Some(pos_w) = pos_weight {
-        let pos_weight_term = target.mul(pos_w)?.add_scalar(1.0)?.sub(target)?;
-        loss = loss.mul(&pos_weight_term)?;
-    }
+    let mut loss = match pos_weight {
+        Some(pos_w) => {
+            // log_weight = t * pos_weight + 1 - t
+            let log_weight = target.mul(pos_w)?.add_scalar(1.0)?.sub(target)?;
+            linear_term.add(&log_weight.mul(&log_sigmoid_term)?)?
+        }
+        None => linear_term.add(&log_sigmoid_term)?,
+    };
 
     // Apply weight if provided
     if let Some(w) = weight {
@@ -189,40 +304,60 @@ pub fn multi_margin_loss(
         ));
     }
 
-    let batch_size = input.shape().dims()[0];
-    let num_classes = input.shape().dims()[1];
-    let mut losses = Vec::with_capacity(batch_size);
-
-    for i in 0..batch_size {
-        let target_class = target.get(&[i])? as usize;
-        let target_score = input.get(&[i, target_class])?;
-
-        let mut sample_loss = 0.0;
-        for j in 0..num_classes {
-            if j != target_class {
-                let score_j = input.get(&[i, j])?;
-                let margin_violation = margin - target_score + score_j;
-                if margin_violation > 0.0 {
-                    sample_loss += if p == 1 {
-                        margin_violation
-                    } else {
-                        margin_violation.powi(2)
-                    };
-                }
-            }
-        }
-
-        // Apply class weight if provided
-        if let Some(w) = weight {
-            let class_weight = w.get(&[target_class])?;
-            sample_loss *= class_weight;
-        }
-
-        losses.push(sample_loss / (num_classes - 1) as f32);
+    let (batch_size, num_classes) = validate_classification_shapes(input, target, &context)?;
+    if num_classes < 2 {
+        return Err(TorshError::config_error_with_context(
+            "multi_margin_loss requires at least two classes",
+            &context,
+        ));
     }
 
-    let loss_tensor = Tensor::from_vec(losses, &[batch_size])?;
-    reduction.apply(loss_tensor)
+    // margins[i, j] = margin - x[i, t_i] + x[i, j] is built from tensor operations
+    // so the loss stays differentiable: the target score is gathered with a
+    // constant one-hot selector and broadcast back over the class axis.
+    let mut one_hot = vec![0.0f32; batch_size * num_classes];
+    let mut sample_scale = Vec::with_capacity(batch_size);
+    let mut target_classes = Vec::with_capacity(batch_size);
+    for i in 0..batch_size {
+        let class = target_class(target, i, num_classes, &context)? as usize;
+        one_hot[i * num_classes + class] = 1.0;
+        target_classes.push(class);
+        let w = class_weight(weight, class, &context)?;
+        sample_scale.push(w / (num_classes - 1) as f32);
+    }
+    let one_hot_tensor = Tensor::from_data(one_hot, vec![batch_size, num_classes], input.device())?;
+
+    let target_scores = row_sum(&input.mul(&one_hot_tensor)?)?.view(&[batch_size as i32, 1])?;
+    let margin_tensor = Tensor::from_data(
+        vec![margin; batch_size * num_classes],
+        vec![batch_size, num_classes],
+        input.device(),
+    )?;
+    let violations = input.sub(&target_scores)?.add(&margin_tensor)?;
+
+    // Zero out the target column and every non-violating entry. The mask is a
+    // constant, which is exactly the (sub)gradient support of `max(0, .)`.
+    let violation_data = violations.data()?;
+    let mut mask = vec![0.0f32; batch_size * num_classes];
+    for i in 0..batch_size {
+        for j in 0..num_classes {
+            let index = i * num_classes + j;
+            if j != target_classes[i] && violation_data[index] > 0.0 {
+                mask[index] = 1.0;
+            }
+        }
+    }
+    let mask_tensor = Tensor::from_data(mask, vec![batch_size, num_classes], input.device())?;
+    let hinged = violations.mul(&mask_tensor)?;
+    let hinged = if p == 1 {
+        hinged
+    } else {
+        hinged.pow_scalar(2.0)?
+    };
+
+    let scale_tensor = Tensor::from_data(sample_scale, vec![batch_size], input.device())?;
+    let per_sample = row_sum(&hinged)?.mul(&scale_tensor)?;
+    reduction.apply(per_sample)
 }
 
 /// Focal Loss
@@ -239,32 +374,32 @@ pub fn focal_loss(
 ) -> TorshResult<Tensor> {
     validate_range(alpha, 0.0, 1.0, "alpha", "focal_loss")?;
     validate_range(gamma, 0.0, 5.0, "gamma", "focal_loss")?;
+    let context = "focal_loss";
+    let (batch_size, num_classes) = validate_classification_shapes(input, target, context)?;
 
-    // Apply softmax to get probabilities
+    // log-probabilities first (numerically stable), probabilities derived from them
     let dim = (input.shape().ndim() - 1) as i32;
-    let probs = input.softmax(dim)?;
+    let log_probs = input.log_softmax(dim)?;
+    let probs = log_probs.exp()?;
 
-    // Get log probabilities for numerical stability
-    let log_probs = probs.log()?;
-
-    // For each sample, get the probability of the target class
-    let batch_size = target.shape().dims()[0];
-    let mut focal_losses = Vec::with_capacity(batch_size);
-
+    // Gather the target entries with a constant one-hot selector so that the
+    // modulating factor and the log term both remain tensor expressions.
+    let mut one_hot = vec![0.0f32; batch_size * num_classes];
     for i in 0..batch_size {
-        let target_class = target.get(&[i])? as usize;
-
-        let p_t = probs.get(&[i, target_class])?;
-        let log_p_t = log_probs.get(&[i, target_class])?;
-
-        // Focal loss: -alpha * (1-p_t)^gamma * log(p_t)
-        let focal_weight = alpha * (1.0 - p_t).powf(gamma);
-        let focal_loss = -focal_weight * log_p_t;
-
-        focal_losses.push(focal_loss);
+        let class = target_class(target, i, num_classes, context)? as usize;
+        one_hot[i * num_classes + class] = 1.0;
     }
+    let one_hot_tensor = Tensor::from_data(one_hot, vec![batch_size, num_classes], input.device())?;
 
-    let loss_tensor = Tensor::from_vec(focal_losses, &[batch_size])?;
+    let p_t = row_sum(&probs.mul(&one_hot_tensor)?)?;
+    let log_p_t = row_sum(&log_probs.mul(&one_hot_tensor)?)?;
+
+    // Focal loss: -alpha * (1 - p_t)^gamma * log(p_t)
+    let ones = Tensor::from_data(vec![1.0f32; batch_size], vec![batch_size], input.device())?;
+    let modulating = ones.sub(&p_t)?.pow_scalar(gamma)?;
+    let neg_alpha = Tensor::from_data(vec![-alpha; batch_size], vec![batch_size], input.device())?;
+    let loss_tensor = modulating.mul(&log_p_t)?.mul(&neg_alpha)?;
+
     reduction.apply(loss_tensor)
 }
 
@@ -273,21 +408,33 @@ pub fn focal_loss(
 /// Applies label smoothing to the target before computing cross entropy loss.
 ///
 /// Smoothed labels: y_smooth = (1 - smoothing) * y_true + smoothing / num_classes
+///
+/// `weight` rescales each sample by the weight of its target class and `mean`
+/// divides by the sum of those weights, matching PyTorch. `ignore_index` drops the
+/// matching samples from both the loss and the normalisation. The result is a
+/// single differentiable expression in `input`.
 pub fn cross_entropy_with_label_smoothing(
     input: &Tensor,
     target: &Tensor,
     label_smoothing: f64,
     weight: Option<&Tensor>,
     reduction: &str,
-    _ignore_index: Option<i64>,
+    ignore_index: Option<i64>,
 ) -> TorshResult<Tensor> {
+    let context = "cross_entropy_with_label_smoothing";
     if label_smoothing < 0.0 || label_smoothing >= 1.0 {
         return Err(TorshError::InvalidArgument(
             "label_smoothing must be in [0.0, 1.0)".to_string(),
         ));
     }
+    if !matches!(reduction, "none" | "mean" | "sum") {
+        return Err(TorshError::InvalidArgument(format!(
+            "Unknown reduction: {}",
+            reduction
+        )));
+    }
+    let (batch_size, num_classes) = validate_classification_shapes(input, target, context)?;
 
-    let num_classes = input.shape().dims()[input.shape().ndim() - 1];
     let smoothing_value = label_smoothing as f32 / num_classes as f32;
     let confidence = 1.0 - label_smoothing as f32;
 
@@ -295,44 +442,44 @@ pub fn cross_entropy_with_label_smoothing(
     let dim = (input.shape().ndim() - 1) as i32;
     let log_probs = input.log_softmax(dim)?;
 
-    // Create smoothed target distribution
-    let batch_size = target.shape().dims()[0];
-    let mut smooth_targets = vec![smoothing_value; batch_size * num_classes];
-
-    // Set confidence for true classes
+    // Negated smoothed target distribution, scaled by the class weight of the
+    // sample. Keeping every per-sample factor inside this constant tensor means
+    // the loss is a single differentiable expression in `log_probs`.
+    let mut selector = vec![0.0f32; batch_size * num_classes];
+    let mut total_weight = 0.0f32;
     for i in 0..batch_size {
-        let target_class = target.get(&[i])? as usize;
-        smooth_targets[i * num_classes + target_class] = confidence + smoothing_value;
+        let class = target_class(target, i, num_classes, context)?;
+        if Some(class) == ignore_index {
+            continue;
+        }
+        let w = class_weight(weight, class as usize, context)?;
+        for c in 0..num_classes {
+            selector[i * num_classes + c] = -w * smoothing_value;
+        }
+        selector[i * num_classes + class as usize] = -w * (confidence + smoothing_value);
+        total_weight += w;
     }
 
-    let smooth_target_tensor = Tensor::from_vec(smooth_targets, &[batch_size, num_classes])?;
-
-    // Compute negative log likelihood with smooth targets
-    let loss = log_probs
-        .mul(&smooth_target_tensor)?
-        .neg()?
-        .sum_dim(&[1], false)?;
-
-    // Apply weight if provided
-    let loss = if let Some(w) = weight {
-        // Apply class weights based on original target
-        let mut weighted_losses = Vec::with_capacity(batch_size);
-        for i in 0..batch_size {
-            let target_class = target.get(&[i])? as usize;
-            let class_weight = w.get(&[target_class])?;
-            let sample_loss = loss.get(&[i])?;
-            weighted_losses.push(sample_loss * class_weight);
+    if reduction == "mean" {
+        let scale = if total_weight == 0.0 {
+            0.0
+        } else {
+            1.0 / total_weight
+        };
+        for value in selector.iter_mut() {
+            *value *= scale;
         }
-        Tensor::from_vec(weighted_losses, &[batch_size])?
-    } else {
-        loss.squeeze(1)?
-    };
+    }
 
-    // Apply reduction
+    let selector_tensor =
+        Tensor::from_data(selector, vec![batch_size, num_classes], input.device())?;
+    // `loss` already has shape [batch_size]; there is no class axis left to squeeze.
+    let loss = row_sum(&log_probs.mul(&selector_tensor)?)?;
+
     match reduction {
         "none" => Ok(loss),
-        "mean" => loss.mean(None, false),
-        "sum" => loss.sum(),
+        // The per-sample terms already carry the 1/sum(w) factor for "mean".
+        "mean" | "sum" => loss.sum(),
         _ => Err(TorshError::InvalidArgument(format!(
             "Unknown reduction: {}",
             reduction

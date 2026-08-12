@@ -23,7 +23,11 @@ torsh-autograd = { workspace = true }
 torsh-nn = { workspace = true }
 
 # Distributed communication
-mpi = { version = "0.8", optional = true }
+# FFI ESCAPE HATCH (F210): the `mpi` feature links the system MPI C library via
+# `mpi-sys` + bindgen (OpenMPI/MPICH). It is OFF BY DEFAULT and is the single
+# sanctioned exception to the pure-Rust policy. Enabling `--features mpi`
+# requires a working system MPI installation and leaves the pure-Rust guarantee.
+mpi = { workspace = true, optional = true }
 # Note: Real NCCL integration requires proper Rust bindings for NVIDIA NCCL
 # The "nccl" crate on crates.io is a configuration library, not NVIDIA NCCL
 # TODO: Add actual NCCL bindings when available (possibly via cudarc or custom bindings)
@@ -32,8 +36,6 @@ mpi = { version = "0.8", optional = true }
 
 # Networking
 tokio = { workspace = true, features = ["net", "sync", "rt-multi-thread"] }
-tonic = { workspace = true }
-prost = { workspace = true }
 redis = { workspace = true, optional = true, features = ["tokio-comp"] }
 
 # Serialization
@@ -65,7 +67,11 @@ scirs2-autograd = { workspace = true }
 [features]
 default = []
 mpi = ["dep:mpi"]
-nccl = []  # Mock NCCL backend (no external dependencies for now)
+# `nccl` compiles a HONEST simulated NCCL backend (no external deps, no GPU).
+# It performs NO fabricated cross-rank communication: single-rank collectives
+# are identity no-ops and multi-rank collectives return an honest error.
+# Real NCCL requires future cudarc+nccl / oxicuda-comm bindings.
+nccl = []
 redis = ["dep:redis"]
 # gloo = ["dep:gloo-sys"]
 
@@ -81,9 +87,6 @@ tokio-test = { workspace = true }
 tempfile = { workspace = true }
 futures-util = { workspace = true }
 approx = { workspace = true }
-
-[build-dependencies]
-tonic-build = { workspace = true }
 
 # Examples are located in the workspace root examples/ directory
 # and are not included when publishing to crates.io.

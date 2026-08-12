@@ -82,6 +82,7 @@ pub struct PyStepLR {
 #[pymethods]
 impl PyStepLR {
     #[new]
+    #[pyo3(signature = (optimizer, step_size, gamma))]
     fn new(optimizer: Py<PyAny>, step_size: i32, gamma: f32) -> PyResult<Self> {
         let base_lr = Python::attach(|py| get_optimizer_lr(py, &optimizer))?;
         Ok(Self {
@@ -166,6 +167,7 @@ pub struct PyMultiStepLR {
 #[pymethods]
 impl PyMultiStepLR {
     #[new]
+    #[pyo3(signature = (optimizer, milestones, gamma))]
     fn new(optimizer: Py<PyAny>, milestones: Vec<i32>, gamma: f32) -> PyResult<Self> {
         let base_lr = Python::attach(|py| get_optimizer_lr(py, &optimizer))?;
         let mut milestones = milestones;
@@ -251,6 +253,7 @@ pub struct PyExponentialLR {
 #[pymethods]
 impl PyExponentialLR {
     #[new]
+    #[pyo3(signature = (optimizer, gamma))]
     fn new(optimizer: Py<PyAny>, gamma: f32) -> PyResult<Self> {
         let base_lr = Python::attach(|py| get_optimizer_lr(py, &optimizer))?;
         Ok(Self {
@@ -328,6 +331,7 @@ pub struct PyCosineAnnealingLR {
 #[pymethods]
 impl PyCosineAnnealingLR {
     #[new]
+    #[pyo3(signature = (optimizer, t_max, eta_min))]
     fn new(optimizer: Py<PyAny>, t_max: i32, eta_min: f32) -> PyResult<Self> {
         let base_lr = Python::attach(|py| get_optimizer_lr(py, &optimizer))?;
         Ok(Self {
@@ -412,6 +416,7 @@ pub struct PyLinearLR {
 #[pymethods]
 impl PyLinearLR {
     #[new]
+    #[pyo3(signature = (optimizer, start_factor, end_factor, total_iters))]
     fn new(
         optimizer: Py<PyAny>,
         start_factor: f32,
@@ -522,6 +527,7 @@ pub struct PyReduceLROnPlateau {
 #[pymethods]
 impl PyReduceLROnPlateau {
     #[new]
+    #[pyo3(signature = (optimizer, mode, factor, patience, threshold))]
     fn new(
         optimizer: Py<PyAny>,
         mode: &str,

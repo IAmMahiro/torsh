@@ -12,6 +12,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use torsh_core::sync::RwLockExt;
 
 /// Priority levels for gradient computation tasks
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -594,58 +595,39 @@ impl ThreadSafeGradientScheduler {
 
     /// Schedule a task
     pub fn schedule_task(&self, task: GradientTask) -> AutogradResult<usize> {
-        self.scheduler
-            .write()
-            .expect("lock should not be poisoned")
-            .schedule_task(task)
+        self.scheduler.write_or_recover().schedule_task(task)
     }
 
     /// Get next task
     pub fn get_next_task(&self) -> Option<GradientTask> {
-        self.scheduler
-            .write()
-            .expect("lock should not be poisoned")
-            .get_next_task()
+        self.scheduler.write_or_recover().get_next_task()
     }
 
     /// Complete a task
     pub fn complete_task(&self, task_id: usize) -> AutogradResult<()> {
-        self.scheduler
-            .write()
-            .expect("lock should not be poisoned")
-            .complete_task(task_id)
+        self.scheduler.write_or_recover().complete_task(task_id)
     }
 
     /// Fail a task
     pub fn fail_task(&self, task_id: usize, error_message: String) -> AutogradResult<()> {
         self.scheduler
-            .write()
-            .expect("lock should not be poisoned")
+            .write_or_recover()
             .fail_task(task_id, error_message)
     }
 
     /// Get statistics
     pub fn get_stats(&self) -> SchedulingStats {
-        self.scheduler
-            .read()
-            .expect("lock should not be poisoned")
-            .get_stats()
+        self.scheduler.read_or_recover().get_stats()
     }
 
     /// Get resource utilization
     pub fn get_resource_utilization(&self) -> (f64, f64) {
-        self.scheduler
-            .read()
-            .expect("lock should not be poisoned")
-            .get_resource_utilization()
+        self.scheduler.read_or_recover().get_resource_utilization()
     }
 
     /// Check if idle
     pub fn is_idle(&self) -> bool {
-        self.scheduler
-            .read()
-            .expect("lock should not be poisoned")
-            .is_idle()
+        self.scheduler.read_or_recover().is_idle()
     }
 }
 
@@ -670,10 +652,7 @@ pub fn schedule_gradient_task(
     estimated_duration: Duration,
     estimated_memory: usize,
 ) -> AutogradResult<usize> {
-    let mut scheduler = GLOBAL_SCHEDULER
-        .scheduler
-        .write()
-        .expect("lock should not be poisoned");
+    let mut scheduler = GLOBAL_SCHEDULER.scheduler.write_or_recover();
     scheduler.create_and_schedule_task(task_type, priority, estimated_duration, estimated_memory)
 }
 

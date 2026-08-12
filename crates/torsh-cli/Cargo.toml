@@ -33,7 +33,7 @@ scirs2-metrics = { workspace = true, optional = true }
 
 # CLI framework
 clap = { workspace = true, features = ["derive", "env", "color"] }
-clap_complete = "4.6"
+clap_complete = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
@@ -41,18 +41,20 @@ tokio = { workspace = true }
 # Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-serde_yaml = "0.9"
-toml = "1.1"
+# Maintained pure-Rust YAML (serde_yaml fork); replaces the unmaintained
+# serde_yaml 0.9.34+deprecated (RUSTSEC-2024-0370).
+serde_norway = { workspace = true }
+toml = { workspace = true }
 
 # File handling
-walkdir = "2.5"
-glob = "0.3"
+walkdir = { workspace = true }
+glob = { workspace = true }
 
 # Progress and UI
-indicatif = "0.18"
-console = "0.16"
-dialoguer = "0.12"
-colored = "3.1"
+indicatif = { workspace = true }
+console = { workspace = true }
+dialoguer = { workspace = true }
+colored = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
@@ -64,20 +66,24 @@ thiserror = { workspace = true }
 
 # Utilities
 chrono = { workspace = true }
-humantime = "2.4"
-byte-unit = "5.2"
+humantime = { workspace = true }
+byte-unit = { workspace = true }
 uuid = { workspace = true }
-fastrand = "2.4"
+fastrand = { workspace = true }
 
 # Networking for model downloads
 reqwest = { workspace = true, features = ["json", "stream"] }
+# Pure-Rust TLS provider (replaces reqwest's aws-lc-rs/BoringSSL default backend)
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+oxitls-rustcrypto-provider = { workspace = true }
 futures-util = { workspace = true }
 
 # System info - Pure Rust (libc removed for SciRS2 Pure Rust ecosystem)
 sysinfo = { workspace = true }
 
 # Directory utilities
-dirs = "6.0"
+dirs = { workspace = true }
 
 [features]
 default = ["nn", "optim", "data", "vision", "text", "quantization", "jit", "hub", "profiler", "linalg", "metrics"]

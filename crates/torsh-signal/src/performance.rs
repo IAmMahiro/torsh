@@ -162,7 +162,12 @@ impl SIMDSignalProcessor {
         Ok(output)
     }
 
-    /// Optimized FFT operation
+    /// Magnitude spectrum of a real signal.
+    ///
+    /// Every optimisation level routes through the real, OxiFFT-backed FFT
+    /// exposed by `torsh-functional`; the returned tensor holds `|X[k]|` for
+    /// all `n` bins (the upper half mirrors the lower one, as expected for a
+    /// real input).
     pub fn simd_fft(&mut self, signal: &Tensor<f32>) -> Result<Tensor<f32>> {
         let start_time = Instant::now();
 
@@ -174,19 +179,26 @@ impl SIMDSignalProcessor {
         }
 
         let n = shape.dims()[0];
-
-        // For now, return zeros as placeholder - in production would use actual FFT
-        // Would integrate with scirs2-fft when available
-        let mut output = zeros(&[n])?;
-
-        // Simple DFT implementation for demonstration
-        if self.optimization_level == OptimizationLevel::Maximum {
-            self.compute_simple_dft(signal, &mut output)?;
-            self.stats.simd_accelerated += 1;
-        } else {
-            // Just return zeros for now
+        if n == 0 {
+            return Err(TorshError::InvalidArgument(
+                "SIMD FFT requires a non-empty signal".to_string(),
+            ));
         }
 
+        // Real FFT: n/2 + 1 unique bins, mirrored below.
+        let spectrum = torsh_functional::spectral::rfft(signal, Some(n), Some(-1), None)
+            .map_err(|e| TorshError::ComputeError(format!("FFT computation failed: {e}")))?;
+
+        let mut output = zeros(&[n])?;
+        for k in 0..n {
+            let index = if k <= n / 2 { k } else { n - k };
+            let value = spectrum.get_1d(index)?;
+            output.set_1d(k, value.norm())?;
+        }
+
+        if self.optimization_level != OptimizationLevel::None {
+            self.stats.simd_accelerated += 1;
+        }
         self.stats.operations_performed += 1;
         self.stats.total_processing_time += start_time.elapsed().as_secs_f64();
 
@@ -395,31 +407,6 @@ impl SIMDSignalProcessor {
                 }
             }
             output.set_1d(i, sum)?;
-        }
-
-        Ok(())
-    }
-
-    fn compute_simple_dft(&self, signal: &Tensor<f32>, output: &mut Tensor<f32>) -> Result<()> {
-        let n = signal.shape().dims()[0];
-        let pi = scirs2_core::constants::math::PI as f32;
-
-        // Simple DFT implementation (magnitude only for simplicity)
-        for k in 0..n {
-            let mut real_sum = 0.0f32;
-            let mut imag_sum = 0.0f32;
-
-            for n_idx in 0..n {
-                let signal_val: f32 = signal.get_1d(n_idx)?;
-                let angle = -2.0 * pi * (k * n_idx) as f32 / n as f32;
-
-                real_sum += signal_val * angle.cos();
-                imag_sum += signal_val * angle.sin();
-            }
-
-            // Store magnitude
-            let magnitude = (real_sum * real_sum + imag_sum * imag_sum).sqrt();
-            output.set_1d(k, magnitude)?;
         }
 
         Ok(())

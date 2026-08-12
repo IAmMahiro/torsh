@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use torsh_core::sync::MutexExt;
 
 use torsh_core::{
     device::DeviceType,
@@ -438,7 +439,7 @@ impl<T: TensorElement + Copy> ComputationGraph<T> {
             + torsh_core::FloatElement,
     {
         let sorted = self.topological_sort()?;
-        let mut cache = self.cache.lock().expect("lock should not be poisoned");
+        let mut cache = self.cache.lock_or_recover();
         cache.clear();
 
         // Evaluate nodes in topological order

@@ -224,9 +224,24 @@ pub mod transforms {
     }
 
     impl AddNoise {
+        /// # Panics
+        ///
+        /// Panics if `noise_level` is negative. See [`Self::try_new`] for a
+        /// non-panicking variant.
         pub fn new(noise_level: f32) -> Self {
             assert!(noise_level >= 0.0, "Noise level must be non-negative");
             Self { noise_level }
+        }
+
+        /// Fallible variant of [`Self::new`] that returns an error instead of
+        /// panicking when `noise_level` is negative.
+        pub fn try_new(noise_level: f32) -> Result<Self> {
+            if noise_level < 0.0 {
+                return Err(TorshError::InvalidArgument(format!(
+                    "Noise level must be non-negative, got {noise_level}"
+                )));
+            }
+            Ok(Self { noise_level })
         }
     }
 
@@ -235,10 +250,12 @@ pub mod transforms {
 
         fn transform(&self, input: AudioData) -> Result<Self::Output> {
             // ✅ SciRS2 Policy Compliant - Using scirs2_core::random instead of direct rand
-            // Rng trait is needed for gen_range() method
+            // Rng trait is needed for gen_range() method. Uses the thread-local
+            // entropy-seeded RNG rather than a fixed-literal seed, which would
+            // otherwise draw the identical "random" noise on every call (F007).
             #[allow(unused_imports)]
-            use scirs2_core::random::{Random, Rng};
-            let mut rng = Random::seed(42);
+            use scirs2_core::random::{thread_rng, Rng};
+            let mut rng = thread_rng();
 
             let noisy_samples: Vec<f32> = input
                 .samples

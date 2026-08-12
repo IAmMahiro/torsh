@@ -89,6 +89,7 @@ use torsh_core::dtype::FloatElement;
 use torsh_core::error::Result;
 #[cfg(target_os = "linux")]
 use torsh_core::error::TorshError;
+use torsh_core::sync::RwLockExt;
 
 /// Enhanced gradient computation memory analysis result
 ///
@@ -465,10 +466,7 @@ impl<T: FloatElement + Send + Sync + 'static> AdaptiveMemoryManager<T> {
         size: usize,
         operation_name: &str,
     ) -> Result<Vec<T>> {
-        let current_pressure = *self
-            .current_pressure
-            .read()
-            .expect("lock should not be poisoned");
+        let current_pressure = *self.current_pressure.read_or_recover();
         let strategy = self.determine_allocation_strategy(current_pressure);
 
         // Update gradient history
@@ -817,20 +815,14 @@ impl<T: FloatElement + Send + Sync + 'static> AdaptiveMemoryManager<T> {
     /// }
     /// ```
     pub fn get_memory_pressure(&self) -> MemoryPressure {
-        *self
-            .current_pressure
-            .read()
-            .expect("lock should not be poisoned")
+        *self.current_pressure.read_or_recover()
     }
 
     /// Get system memory information
     ///
     /// Returns current system memory statistics.
     pub fn get_memory_info(&self) -> SystemMemoryInfo {
-        self.memory_info
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.memory_info.read_or_recover().clone()
     }
 
     /// Get memory usage statistics

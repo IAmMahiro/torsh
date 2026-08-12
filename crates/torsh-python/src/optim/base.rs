@@ -18,6 +18,7 @@ pub struct PyOptimizer {
 #[pymethods]
 impl PyOptimizer {
     #[new]
+    #[pyo3(signature = ())]
     fn new() -> Self {
         Self {}
     }

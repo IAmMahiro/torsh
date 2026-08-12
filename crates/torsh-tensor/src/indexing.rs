@@ -1,6 +1,8 @@
 //! Tensor indexing and slicing operations
 
+use crate::core_ops::Operation;
 use crate::{Tensor, TensorElement};
+use std::sync::Arc;
 use torsh_core::error::{Result, TorshError};
 
 /// Index type for tensor indexing
@@ -210,27 +212,53 @@ impl<T: TensorElement> Tensor<T> {
         }
 
         // Use specialized extraction logic for advanced indexing
-        if expanded_indices
+        let (mut result, index_map) = if expanded_indices
             .iter()
             .any(|idx| matches!(idx, TensorIndex::List(_) | TensorIndex::Mask(_)))
         {
-            self.extract_advanced_indexing(&expanded_indices, &output_shape)
+            self.extract_advanced_indexing(&expanded_indices, &output_shape)?
         } else {
-            self.extract_basic_indexing(&expanded_indices, &output_shape, &slices)
+            self.extract_basic_indexing(&expanded_indices, &output_shape, &slices)?
+        };
+        // Record the gather so gradients scatter back into the indexed tensor
+        // (this is what makes narrow/select/slice differentiable and unblocks
+        // RNN-style graphs). `index_map[o]` is the input logical index that fed
+        // output position `o`.
+        self.record_gather(&mut result, index_map);
+        Ok(result)
+    }
+
+    /// Record `result` as a gather of `self` for autograd. No-op when gradients
+    /// are not being tracked, so inference keeps building plain leaves.
+    pub(crate) fn record_gather(&self, result: &mut Self, index_map: Vec<usize>) {
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = Operation::Gather {
+                input: Arc::new(self.clone()),
+                index_map: Arc::new(index_map),
+            };
         }
     }
 
-    /// Extract data using basic indexing (ranges, single indices, all)
+    /// Extract data using basic indexing (ranges, single indices, all).
+    ///
+    /// Returns the gathered tensor and, alongside it, the map from each output
+    /// logical position to the input logical index it was copied from — the
+    /// exact information the backward pass scatters through.
     fn extract_basic_indexing(
         &self,
         indices: &[TensorIndex],
         output_shape: &[usize],
         slices: &[(usize, usize, usize)],
-    ) -> Result<Self> {
+    ) -> Result<(Self, Vec<usize>)> {
         let input_data = self.to_vec()?;
 
         let output_size = output_shape.iter().product();
         let mut output_data = Vec::with_capacity(output_size);
+        // Only the autograd path needs the output→input map; inference skips the
+        // allocation entirely.
+        let record = crate::should_record_grad(self.requires_grad);
+        let mut index_map = Vec::with_capacity(if record { output_size } else { 0 });
 
         let input_strides = self.compute_strides();
         let output_strides = compute_strides_from_shape(output_shape);
@@ -279,21 +307,31 @@ impl<T: TensorElement> Tensor<T> {
             }
 
             output_data.push(input_data[input_flat_idx]);
+            if record {
+                index_map.push(input_flat_idx);
+            }
         }
 
-        Self::from_data(output_data, output_shape.to_vec(), self.device)
+        let result = Self::from_data(output_data, output_shape.to_vec(), self.device)?;
+        Ok((result, index_map))
     }
 
-    /// Extract data using advanced indexing (lists, masks)
+    /// Extract data using advanced indexing (lists, masks).
+    ///
+    /// Also returns the output→input logical index map for the backward scatter;
+    /// fancy indexing that reads one input element several times produces
+    /// duplicate entries, and the scatter accumulates them (PyTorch semantics).
     fn extract_advanced_indexing(
         &self,
         indices: &[TensorIndex],
         output_shape: &[usize],
-    ) -> Result<Self> {
+    ) -> Result<(Self, Vec<usize>)> {
         let input_data = self.to_vec()?;
 
         let output_size = output_shape.iter().product();
         let mut output_data = Vec::with_capacity(output_size);
+        let record = crate::should_record_grad(self.requires_grad);
+        let mut index_map = Vec::with_capacity(if record { output_size } else { 0 });
 
         let input_strides = self.compute_strides();
         let output_strides = compute_strides_from_shape(output_shape);
@@ -427,9 +465,13 @@ impl<T: TensorElement> Tensor<T> {
             }
 
             output_data.push(input_data[input_flat_idx]);
+            if record {
+                index_map.push(input_flat_idx);
+            }
         }
 
-        Self::from_data(output_data, output_shape.to_vec(), self.device)
+        let result = Self::from_data(output_data, output_shape.to_vec(), self.device)?;
+        Ok((result, index_map))
     }
 
     /// Expand ellipsis into explicit All indices

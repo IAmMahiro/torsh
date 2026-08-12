@@ -555,15 +555,25 @@ impl QuantumCircuit {
     }
 
     /// Add a gate to the circuit
-    pub fn add_gate(&mut self, gate: Box<dyn QuantumGate>) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gate acts on a qubit outside the circuit. Gate
+    /// definitions routinely come from user input or from generated ansätze, so
+    /// an out-of-range index is ordinary invalid input to reject, not a reason
+    /// to abort the process.
+    pub fn add_gate(&mut self, gate: Box<dyn QuantumGate>) -> AutogradResult<()> {
         // Validate that all qubits are within range
         for qubit in gate.qubits() {
             if qubit.index() >= self.num_qubits {
-                panic!(
-                    "Gate qubit index {} exceeds circuit size {}",
-                    qubit.index(),
-                    self.num_qubits
-                );
+                return Err(AutogradError::gradient_computation(
+                    "quantum_circuit_add_gate",
+                    format!(
+                        "gate qubit index {} exceeds circuit size {}",
+                        qubit.index(),
+                        self.num_qubits
+                    ),
+                ));
             }
         }
 
@@ -576,6 +586,7 @@ impl QuantumCircuit {
         }
 
         self.gates.push(gate);
+        Ok(())
     }
 
     /// Execute the quantum circuit on a given initial state
@@ -671,11 +682,11 @@ impl QuantumCircuit {
             if i == gate_idx {
                 // Clone gate with shifted parameter
                 let cloned_gate = self.clone_gate_with_shift(gate, local_param_idx, shift)?;
-                new_circuit.add_gate(cloned_gate);
+                new_circuit.add_gate(cloned_gate)?;
             } else {
                 // Clone gate as-is
                 let cloned_gate = self.clone_gate(gate)?;
-                new_circuit.add_gate(cloned_gate);
+                new_circuit.add_gate(cloned_gate)?;
             }
         }
 
@@ -1141,10 +1152,14 @@ mod tests {
         let mut circuit = QuantumCircuit::new(2);
 
         // Add X gate to first qubit
-        circuit.add_gate(Box::new(PauliX::new(Qubit::new(0))));
+        circuit
+            .add_gate(Box::new(PauliX::new(Qubit::new(0))))
+            .expect("qubit 0 is inside a 2-qubit circuit");
 
         // Add CNOT gate
-        circuit.add_gate(Box::new(CNOT::new(Qubit::new(0), Qubit::new(1))));
+        circuit
+            .add_gate(Box::new(CNOT::new(Qubit::new(0), Qubit::new(1))))
+            .expect("qubits 0 and 1 are inside a 2-qubit circuit");
 
         let initial_state = QuantumState::zeros(2);
         let final_state = circuit.execute(&initial_state).unwrap();
@@ -1168,7 +1183,9 @@ mod tests {
     #[test]
     fn test_parameter_gradient_computation() {
         let mut circuit = QuantumCircuit::new(1);
-        circuit.add_gate(Box::new(RotationY::new(Qubit::new(0), PI / 4.0)));
+        circuit
+            .add_gate(Box::new(RotationY::new(Qubit::new(0), PI / 4.0)))
+            .expect("qubit 0 is inside a 1-qubit circuit");
 
         let initial_state = QuantumState::zeros(1);
         let gradients = circuit.compute_gradients(&initial_state).unwrap();

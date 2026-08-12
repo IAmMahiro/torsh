@@ -674,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "KNOWN ISSUE: TransformerBlock tensor slicing - FlashMultiHeadAttention uses complex 5D tensor reshaping with narrow/squeeze operations that fail in batch scenarios. Deferred to v0.2.0 for attention mechanism refactor. See: TODO.md"]
+    #[ignore = "SLOW TEST: benchmarks ViT-Tiny/Small/Base at batch 1 and 4 in a debug build (>15 minutes). Run explicitly with `cargo test -- --ignored`."]
     fn test_quick_benchmark() {
         let result = run_quick_benchmark();
         assert!(result.is_ok());

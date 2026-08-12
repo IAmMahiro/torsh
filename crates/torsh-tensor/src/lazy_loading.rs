@@ -18,6 +18,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use torsh_core::sync::{MutexExt, RwLockExt};
 
 use torsh_core::{
     dtype::TensorElement,
@@ -219,10 +220,7 @@ impl<T: TensorElement + bytemuck::Pod> LazyTensor<T> {
     fn load_chunk(&self, chunk_index: usize) -> Result<Arc<CachedChunk<T>>> {
         // Check if chunk is already cached
         {
-            let cache = self
-                .chunk_cache
-                .read()
-                .expect("lock should not be poisoned");
+            let cache = self.chunk_cache.read_or_recover();
             if let Some(cached) = cache.get(&chunk_index) {
                 // Update access time and return cached chunk
                 return Ok(Arc::new(CachedChunk {
@@ -252,10 +250,7 @@ impl<T: TensorElement + bytemuck::Pod> LazyTensor<T> {
 
         // Add to cache
         {
-            let mut cache = self
-                .chunk_cache
-                .write()
-                .expect("lock should not be poisoned");
+            let mut cache = self.chunk_cache.write_or_recover();
 
             // Clean up cache if needed
             self.cleanup_cache(&mut cache);
@@ -290,7 +285,7 @@ impl<T: TensorElement + bytemuck::Pod> LazyTensor<T> {
     /// This requires `T: bytemuck::Pod` (see the impl block), which additionally
     /// guarantees that any bit pattern read from the file is a valid `T`.
     fn load_chunk_from_file(&self, start_element: usize, chunk_size: usize) -> Result<Vec<T>> {
-        let mut file = self.file.lock().expect("lock should not be poisoned");
+        let mut file = self.file.lock_or_recover();
 
         let file_offset =
             self.metadata.data_offset + (start_element as u64 * self.metadata.element_size as u64);
@@ -352,10 +347,7 @@ impl<T: TensorElement> LazyTensor<T> {
 
     /// Get cache statistics
     pub fn cache_stats(&self) -> CacheStats {
-        let cache = self
-            .chunk_cache
-            .read()
-            .expect("lock should not be poisoned");
+        let cache = self.chunk_cache.read_or_recover();
 
         let total_cached_elements: usize = cache.values().map(|chunk| chunk.data.len()).sum();
 
@@ -368,10 +360,7 @@ impl<T: TensorElement> LazyTensor<T> {
 
     /// Force cleanup of all cached chunks
     pub fn clear_cache(&self) {
-        let mut cache = self
-            .chunk_cache
-            .write()
-            .expect("lock should not be poisoned");
+        let mut cache = self.chunk_cache.write_or_recover();
         cache.clear();
     }
 
@@ -380,10 +369,7 @@ impl<T: TensorElement> LazyTensor<T> {
         let stats = self.cache_stats();
 
         if stats.estimated_memory_usage > self.config.memory_pressure_threshold {
-            let mut cache = self
-                .chunk_cache
-                .write()
-                .expect("lock should not be poisoned");
+            let mut cache = self.chunk_cache.write_or_recover();
 
             // Aggressive cleanup - keep only recently accessed chunks
             let recent_threshold = Duration::from_secs(60);

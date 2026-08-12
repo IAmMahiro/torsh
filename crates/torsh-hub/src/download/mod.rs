@@ -32,7 +32,7 @@
 //! # fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Simple download with validation
 //! validate_url("https://example.com/file.zip")?;
-//! download_file("https://example.com/file.zip", Path::new("file.zip"), true)?;
+//! download_file("https://example.com/file.zip", Path::new("file.zip"), true, None)?;
 //! # Ok(())
 //! # }
 //! ```

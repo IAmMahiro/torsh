@@ -40,24 +40,82 @@ update of oxiarc-{lzhuf,brotli,bzip2,lzma,snappy}); torsh-jit E0275 inference ov
 
 ### Wave plan
 - [x] **Wave 0**: build blockers (oxiarc lock mix, torsh-jit E0275) — done inline.
-- [ ] **Wave 1 (running)**: torsh-tensor foundation (dim ops + BLAS matmul / autograd graph
-  completeness / storage+creation+RNG / views+strides / math_ops copies+in-place) ×5 Opus,
-  torsh-core honesty (Sonnet), torsh-data samplers+loaders (Sonnet), metrics/cluster/series
-  formulas (Sonnet), hub+package security (Sonnet), profiler/utils fabrication removal (Sonnet).
-- [ ] **Wave 2**: torsh-nn (parameter/dropout/norm/attention/RNN), torsh-optim (amsgrad, F040
+- [x] **Wave 1 (done 2026-08-12)**: 10/10 agents green. torsh-core honesty (fabricated GPU specs
+  → real sysctl/honest Err, 21 phantom cfgs removed), torsh-tensor foundation (dim-aware
+  cumsum/sort/argmin/argmax/sum_dim/var/std; BLAS matmul via oxiblas; mul/div + broadcast
+  Add/Sub + ND-matmul backward implemented with finite-difference proofs; conv backward now
+  honest error; visited-set toposort backward; entropy-seeded RNG + manual_seed; f16/bf16
+  randn fixed; mmap per-tensor temp files; SimdOptimized CoW mutation; strong-Arc view design;
+  stride-aware element access), torsh-data (samplers/shuffle/set_epoch/worker ordering; real
+  VideoFolder/IMDB loaders), metrics/cluster formulas, hub/package tar-zip-slip + integrity
+  wiring, profiler/utils fabrication removal (real measurements). Workspace: check+clippy
+  green; 10,242 tests with 5 expected reds folded into Wave 2 (no_grad wiring, 2 test
+  tolerances, 2 latent log-instability bugs exposed by real RNG).
+- [ ] **Wave 2 (running)**: fixup(tensor crosscut)→autograd(no_grad via torsh-core grad-mode)
+  chain, torsh-nn (parameter/dropout/norm/attention/RNN), torsh-optim (amsgrad, F040
   param-replacement design), torsh-autograd (clip_grad_norm, no_grad wiring, checkpointing),
   torsh-functional (losses/attention), torsh-linalg (real eig/svd via scirs2/oxiblas),
   torsh-signal (real filter design), torsh-text (BPE loop, tokenizers purity), torsh-vision,
   torsh-quantization (scale math), torsh-fx/jit (graph rewrites), torsh-graph (Result forwards).
-- [ ] **Wave 3**: torsh-distributed (honest errors + real local backend), torsh-backend Phase 4
-  CUDA deletion (~50k lines; NB memory/manager.rs live consumer), torsh-python/ffi import fixes
-  + torsh-ffi split (torsh-capi/torsh-node/torsh-wasm), torsh-cli real train/quantize,
-  torsh-models (checksums, orphans), hub real signing (RustCrypto), dead-code deletion
-  (torsh-tensor src/ops, orphan files, .bak files).
-- [ ] **Wave 4**: workspace deps minimization + deny.toml + purity (reqwest/tokenizers/hdf5/
-  parquet feature surgery), lock-poison expect() remediation via torsh-core sync helpers,
-  README/docs truth pass, examples relocation, CHANGELOG.
-- [ ] **Final**: workspace check/clippy/nextest green + cargo deny check bans + gatekeeper review.
+- [x] **Wave 3 (done 2026-08-12)**: 7/7 agents green. torsh-tensor dead-code deletion (**36,476
+  lines**: src/ops/**, .bak/.bak2-6, lib_new/ops_legacy/lazy_ops; normal_/multinomial ported
+  live) + autograd completion (cat/stack/narrow/select/slice/log_softmax/unary exp·ln·tanh·
+  sigmoid·relu now record backward; from_vec length validation; CoW-safe copy_from/set_data).
+  torsh-distributed (real TCP process-group backend; every fake-success collective → honest
+  Err; MockBackend confined to cfg(test)). torsh-backend Phase 4 (**73,329 lines** of legacy
+  CUDA FFI deleted, build.rs cuda_available removed → host-independent API, real GPU path is
+  torsh-tensor oxicuda; ConvolutionOps trait signature changed — BREAKING). torsh-python
+  import fixes (uint16/functional/sys.modules/submodules; maturin+pytest green; 27 orphan
+  files deleted; torsh-ffi split DEFERRED — needs root [workspace] surgery). torsh-cli real
+  training loop + real .pt reader (replaced RNG-fabricated losses/quantize accuracy).
+  torsh-models/hub (Ed25519 signing, real checksums, model-zoo orphan wiring, NaN-safe sorts).
+  Post-wave: 10 cross-crate regressions fixed inline — copy_from view write-through restored
+  (PyTorch in-place-on-view semantics; MPNN scatter) + 2 latent test-data bugs exposed by the
+  new from_vec validation. Workspace check+clippy+nextest green.
+- [x] **Wave 4 (done 2026-08-12)**: 3/3 agents green. **deny.toml created** → `cargo deny check
+  bans` OK; dead deps removed (cust/cuda-sys/cudnn-sys workspace decls, optirs/optirs-core,
+  protobuf, sprs, fs2, dead rand); lzma-rs → oxiarc-lzma (roundtrip test); **rustfft/ring/
+  onig-sys/openblas all removed from the default graph** (imageproc default-features=false,
+  tokenizers already pure, text/vision pretrained opt-in); MSRV 1.77 → 1.87; ~35 crate-local
+  version pins hoisted to [workspace.dependencies] (zero tree drift). Lock-poison: new
+  `torsh_core::sync` recovery helpers + **843 poison-expect sites** converted across
+  core/tensor/autograd/backend. Docs: README purity/crate-list/test-count/roadmap truth pass,
+  CHANGELOG 0.2.0 section, docs/ version bump, npm-publish.yml added, per-crate README fixes.
+- [x] **Wave 5 (done 2026-08-12)**: **aws-lc-sys / aws-lc-rs / ring removed from the default
+  build** — reqwest switched to `rustls-no-provider` + pure-Rust `oxitls-rustcrypto-provider`
+  + `webpki-roots` (real cert verification, no weakening); 15 client-build sites rewired in
+  cli/hub/utils via new `tls.rs` helpers; verified by a genuine HTTPS handshake to
+  huggingface.co. 3 more fabrication sites (mock_hf_model / fake mirror health / dummy model
+  bytes) → honest Err. torsh-models `download` feature given the same pure-Rust TLS wiring so
+  its opt-in client cannot panic on the absent default provider.
+- [x] **Gatekeeper review (done)**: independent Opus verification of the critical-fix set —
+  RNG entropy, matmul (ndarray/matrixmultiply SIMD GEMM), autograd backward (finite-diff),
+  archive-slip sanitizer *proven called* + real Ed25519, distributed honest-Err + real TCP —
+  all VERIFIED. One miss caught & fixed post-review: torsh-profiler `ml_analysis.rs`
+  parallel-analysis returned fabricated efficiency constants + seed(42) → now computed from the
+  real event timeline (interval-union CPU util, per-thread load balance, `Option` memory-eff
+  when no bytes data) with deterministic stratified sampling. Also deleted 7 dead
+  `*_original_*lines.rs`/`.bak`/`.backup` files and de-mock'd isend/irecv comments.
+- [x] **Final verification**: workspace check --all-targets/--all-features + clippy -D warnings
+  + nextest + `cargo deny check bans` green; default-graph free of rustfft/ring/onig/openblas/
+  aws-lc-sys.
+
+### Final verification snapshot (campaign complete, 2026-08-12)
+`cargo check --workspace --all-targets` ✓ · `cargo check --workspace --all-features --all-targets` ✓ ·
+`cargo clippy --workspace --all-targets -- -D warnings` ✓ · `cargo nextest run --workspace`
+**10,638 passed / 98 skipped / 0 failed** ✓ · `cargo test --workspace --doc` **all pass** ✓ ·
+feature-gated suites (quant-experimental 299 / sparse-matlab 277 / data-privacy+audio 452 /
+distributed-nccl 377 / tensor-hdf5 748 / models-download 268) all ✓ ·
+`cargo deny check bans` **ok** ✓ · default-graph `cargo tree -i {aws-lc-sys, aws-lc-rs, ring,
+rustfft, onig-sys, openblas, cust}` all **absent** ✓ · 0 files ≥ 2000 lines ✓ · 0 production
+`todo!()`/`unimplemented!()` ✓. Not committed/pushed (awaiting explicit user request).
+
+### Documented follow-ups (post-campaign, not release blockers)
+- torsh-ffi split into torsh-capi/torsh-node/torsh-wasm (needs root [workspace] surgery; imports fixed, split deferred).
+- Lock-poison remaining crates (~700 sites: distributed 317, fx 62, jit 59, vision 46, …) — helper exists, mechanical.
+- Example relocation blocked on an example-rewrite pass (root examples/ have 0.1.x-era API drift); webgpu feature-name fixed, honest status banner added.
+- torsh-core cudnn-sys optional C-FFI leak (F203); blake3 asm transitive via scirs2-datasets; hdf5 → oxih5 when ready.
+- Deeper perf: Storage::Device residency (kills per-op H2D/D2H), sum_dim non-keepdim autograd, gelu/leaky_relu backward records, RNN cell narrow-gradient (needs Slice/Cat records — partially landed).
 
 Full finding digest: session scratchpad `discovery.json` / `digest.md` (318 items, F000–F317).
 

@@ -104,6 +104,7 @@ pub mod guards;
 pub mod variable_env;
 
 // Existing specialized modules
+pub mod checkpoint;
 pub mod checkpoint_scheduler;
 pub mod common_utils;
 pub mod communication_efficient;
@@ -635,12 +636,54 @@ pub mod clip {
     use crate::autograd_traits::AutogradTensor;
     use num_traits::Float;
 
-    /// Clip gradients by global norm
+    /// Numerical guard added to the measured norm before dividing, mirroring
+    /// PyTorch's `clip_grad_norm_`, so an all-zero gradient set cannot divide by
+    /// zero.
+    const NORM_EPSILON: f64 = 1e-6;
+
+    /// Convert an `f64` constant into the element type, or fail loudly.
+    ///
+    /// Silently substituting `1.0` for a failed conversion (the previous
+    /// behaviour) turns the epsilon guard into a term that dominates small
+    /// norms and quietly changes the clip factor, so the conversion is checked.
+    fn cast<T: torsh_core::dtype::TensorElement>(value: f64, what: &str) -> Result<T> {
+        T::from_f64(value).ok_or_else(|| {
+            TorshError::AutogradError(format!(
+                "gradient clipping: cannot represent {what} ({value}) in the tensor element type"
+            ))
+        })
+    }
+
+    /// Compute the global `p`-norm of a gradient set and clip it to `max_norm`.
+    ///
+    /// Returns the **pre-clip** total norm (the quantity
+    /// `torch.nn.utils.clip_grad_norm_` reports) together with the clipped
+    /// gradients, one per input, in the same order.
+    ///
+    /// Every gradient is scaled by the same coefficient
+    /// `min(max_norm / (total_norm + 1e-6), 1)`, so the direction of the joint
+    /// gradient is preserved and a set already within `max_norm` is returned
+    /// unchanged.
+    ///
+    /// # Why gradients are returned instead of mutated
+    ///
+    /// [`AutogradTensor`] exposes no in-place mutation — its only writer is
+    /// [`AutogradTensor::with_data`], which produces a new tensor sharing the
+    /// original's shape, device and `requires_grad`. Taking `&mut` here would
+    /// therefore compile while still having nothing to call, which is exactly
+    /// how the earlier version of this function came to compute a clip
+    /// coefficient and drop it on the floor. Callers assign the returned
+    /// gradients back onto their parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `norm_type` or the epsilon guard cannot be
+    /// represented in `T`, or if a clipped gradient cannot be rebuilt.
     pub fn clip_grad_norm<T>(
         gradients: &[&dyn AutogradTensor<T>],
         max_norm: T,
         norm_type: f32,
-    ) -> Result<T>
+    ) -> Result<(T, Vec<Box<dyn AutogradTensor<T>>>)>
     where
         T: torsh_core::dtype::TensorElement
             + Float
@@ -649,50 +692,88 @@ pub mod clip {
             + Send
             + Sync
             + std::fmt::Display,
-        f32: From<T>,
     {
         if gradients.is_empty() {
-            return Ok(<T as num_traits::Zero>::zero());
+            return Ok((<T as num_traits::Zero>::zero(), Vec::new()));
         }
 
-        // Calculate total norm
-        let mut total_norm = <T as num_traits::Zero>::zero();
+        let total_norm = grad_norm(gradients, norm_type)?;
+
+        let epsilon = cast::<T>(NORM_EPSILON, "the norm epsilon")?;
+        let clip_coef = (max_norm / (total_norm + epsilon)).min(<T as num_traits::One>::one());
+
+        tracing::debug!("Gradient norm {total_norm}, max {max_norm}, clip coefficient {clip_coef}");
+
+        // A coefficient of exactly 1 means the set is already within budget;
+        // rebuilding the tensors anyway would only add rounding noise.
+        if clip_coef >= <T as num_traits::One>::one() {
+            let unchanged = gradients.iter().map(|g| g.clone_tensor()).collect();
+            return Ok((total_norm, unchanged));
+        }
+
+        let scale =
+            <T as torsh_core::dtype::TensorElement>::to_f64(&clip_coef).ok_or_else(|| {
+                TorshError::AutogradError(
+                    "gradient clipping: clip coefficient is not representable as f64".to_string(),
+                )
+            })?;
+
+        let clipped = gradients
+            .iter()
+            .map(|grad| grad.mul_scalar(scale))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok((total_norm, clipped))
+    }
+
+    /// Global `p`-norm of a gradient set, without clipping.
+    ///
+    /// `norm_type` 1 and 2 use direct accumulation; any other finite `p` uses
+    /// `sum(|g|^p)^(1/p)`.
+    pub fn grad_norm<T>(gradients: &[&dyn AutogradTensor<T>], norm_type: f32) -> Result<T>
+    where
+        T: torsh_core::dtype::TensorElement + Float + Clone + Send + Sync,
+    {
+        if norm_type <= 0.0 || !norm_type.is_finite() {
+            return Err(TorshError::AutogradError(format!(
+                "gradient clipping: norm type must be a positive finite number, got {norm_type}"
+            )));
+        }
+
+        let mut accumulator = <T as num_traits::Zero>::zero();
+        let exponent = cast::<T>(norm_type as f64, "the norm exponent")?;
 
         for grad in gradients {
             let data = grad.data();
-            for &val in data.iter() {
-                if norm_type == 2.0 {
-                    total_norm = total_norm + val * val;
-                } else if norm_type == 1.0 {
-                    total_norm = total_norm + val.abs();
-                } else {
-                    let abs_val = val.abs();
-                    total_norm = total_norm
-                        + abs_val.powf(T::from(norm_type).unwrap_or(<T as num_traits::One>::one()));
-                }
+            for &value in data.iter() {
+                accumulator = accumulator
+                    + if norm_type == 2.0 {
+                        value * value
+                    } else if norm_type == 1.0 {
+                        value.abs()
+                    } else {
+                        value.abs().powf(exponent)
+                    };
             }
         }
 
-        if norm_type == 2.0 {
-            total_norm = total_norm.sqrt();
-        } else if norm_type != 1.0 {
-            total_norm =
-                total_norm.powf(T::from(1.0 / norm_type).unwrap_or(<T as num_traits::One>::one()));
-        }
-
-        tracing::debug!("Calculated gradient norm: {:?}", total_norm);
-
-        // Calculate clipping ratio
-        let clip_coef =
-            max_norm / (total_norm + T::from(1e-6).unwrap_or(<T as num_traits::One>::one()));
-        let clip_coef = clip_coef.min(<T as num_traits::One>::one());
-
-        tracing::debug!("Gradient clipping coefficient: {:?}", clip_coef);
-
-        Ok(total_norm)
+        Ok(if norm_type == 2.0 {
+            accumulator.sqrt()
+        } else if norm_type == 1.0 {
+            accumulator
+        } else {
+            accumulator.powf(cast::<T>(
+                1.0 / norm_type as f64,
+                "the inverse norm exponent",
+            )?)
+        })
     }
 
-    /// Clip gradients by value
+    /// Clamp every element of a gradient into `[min_value, max_value]`.
+    ///
+    /// Returns the clipped values; the input tensor is left untouched because
+    /// [`AutogradTensor`] has no in-place writer (see [`clip_grad_norm`]). Use
+    /// [`clip_grad_value_tensors`] to get tensors back instead of raw data.
     pub fn clip_grad_value<T>(
         gradient: &dyn AutogradTensor<T>,
         min_value: T,
@@ -701,6 +782,12 @@ pub mod clip {
     where
         T: torsh_core::dtype::TensorElement + Float + Clone + std::fmt::Debug + Send + Sync,
     {
+        if min_value > max_value {
+            return Err(TorshError::AutogradError(
+                "gradient clipping: min_value must not exceed max_value".to_string(),
+            ));
+        }
+
         let data = gradient.data();
         let clipped: Vec<T> = data
             .iter()
@@ -708,6 +795,28 @@ pub mod clip {
             .collect();
 
         Ok(clipped)
+    }
+
+    /// Element-wise clamp over a whole gradient set, returning rebuilt tensors.
+    ///
+    /// This is the counterpart of [`clip_grad_norm`] for value clipping: the
+    /// results are ready to be assigned back onto the parameters they came
+    /// from.
+    pub fn clip_grad_value_tensors<T>(
+        gradients: &[&dyn AutogradTensor<T>],
+        min_value: T,
+        max_value: T,
+    ) -> Result<Vec<Box<dyn AutogradTensor<T>>>>
+    where
+        T: torsh_core::dtype::TensorElement + Float + Clone + std::fmt::Debug + Send + Sync,
+    {
+        gradients
+            .iter()
+            .map(|gradient| {
+                let clipped = clip_grad_value(*gradient, min_value, max_value)?;
+                gradient.with_data(clipped)
+            })
+            .collect()
     }
 }
 

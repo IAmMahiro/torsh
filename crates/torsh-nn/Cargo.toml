@@ -33,7 +33,7 @@ num-traits = { workspace = true }
 parking_lot = { workspace = true }
 indexmap = { workspace = true }
 bytemuck = { workspace = true }
-num_cpus = "1.17"
+num_cpus = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

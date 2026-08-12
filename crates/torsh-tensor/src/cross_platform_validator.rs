@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use torsh_core::sync::MutexExt;
 // use serde::{Serialize, Deserialize}; // Temporarily removed to avoid dependency issues
 
 /// Cross-platform performance validator and hardware optimizer
@@ -954,10 +955,7 @@ impl CrossPlatformValidator {
 
     /// Detect and analyze current hardware configuration
     pub fn detect_hardware(&self) -> Result<HardwareDetectionReport, Box<dyn std::error::Error>> {
-        let detector = self
-            .hardware_detector
-            .lock()
-            .expect("lock should not be poisoned");
+        let detector = self.hardware_detector.lock_or_recover();
         detector.detect_full_hardware_configuration()
     }
 
@@ -966,10 +964,7 @@ impl CrossPlatformValidator {
         &self,
         config: &OptimizationConfig,
     ) -> Result<OptimizationReport, Box<dyn std::error::Error>> {
-        let mut optimizer = self
-            .platform_optimizer
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut optimizer = self.platform_optimizer.lock_or_recover();
         optimizer.apply_hardware_optimizations(config)
     }
 
@@ -978,10 +973,7 @@ impl CrossPlatformValidator {
         &self,
         test_config: &ValidationConfig,
     ) -> Result<ValidationReport, Box<dyn std::error::Error>> {
-        let validator = self
-            .validation_framework
-            .lock()
-            .expect("lock should not be poisoned");
+        let validator = self.validation_framework.lock_or_recover();
         validator.run_comprehensive_validation(test_config)
     }
 
@@ -989,10 +981,7 @@ impl CrossPlatformValidator {
     pub fn get_optimization_recommendations(
         &self,
     ) -> Result<OptimizationRecommendations, Box<dyn std::error::Error>> {
-        let registry = self
-            .optimization_registry
-            .lock()
-            .expect("lock should not be poisoned");
+        let registry = self.optimization_registry.lock_or_recover();
         registry.generate_recommendations()
     }
 
@@ -1001,10 +990,7 @@ impl CrossPlatformValidator {
         &self,
         baseline: &PerformanceBaseline,
     ) -> Result<RegressionReport, Box<dyn std::error::Error>> {
-        let database = self
-            .validation_database
-            .lock()
-            .expect("lock should not be poisoned");
+        let database = self.validation_database.lock_or_recover();
         database.analyze_performance_regression(baseline)
     }
 

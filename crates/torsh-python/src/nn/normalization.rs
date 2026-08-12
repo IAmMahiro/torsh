@@ -25,6 +25,7 @@ pub struct PyBatchNorm2d {
 #[pymethods]
 impl PyBatchNorm2d {
     #[new]
+    #[pyo3(signature = (num_features, eps=None, momentum=None, affine=None, track_running_stats=None))]
     fn new(
         num_features: usize,
         eps: Option<f32>,
@@ -313,6 +314,7 @@ pub struct PyBatchNorm1d {
 #[pymethods]
 impl PyBatchNorm1d {
     #[new]
+    #[pyo3(signature = (num_features, eps=None, momentum=None, affine=None, track_running_stats=None))]
     fn new(
         num_features: usize,
         eps: Option<f32>,
@@ -561,6 +563,7 @@ pub struct PyLayerNorm {
 #[pymethods]
 impl PyLayerNorm {
     #[new]
+    #[pyo3(signature = (normalized_shape, eps=None, elementwise_affine=None))]
     fn new(
         normalized_shape: Vec<usize>,
         eps: Option<f32>,

@@ -11,9 +11,12 @@
 //! - Graph signal processing
 //! - Chebyshev polynomial filters
 //! - Spectral clustering
-
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
+
 use crate::parameter::Parameter;
 use crate::{GraphData, GraphLayer};
 use scirs2_core::ndarray::Array2;
@@ -38,12 +41,12 @@ pub struct SpectralGraphAnalysis;
 
 impl SpectralGraphAnalysis {
     /// Compute graph Laplacian matrix
-    pub fn compute_laplacian(graph: &GraphData, laplacian_type: LaplacianType) -> Array2<f32> {
+    pub fn compute_laplacian(
+        graph: &GraphData,
+        laplacian_type: LaplacianType,
+    ) -> Result<Array2<f32>> {
         let num_nodes = graph.num_nodes;
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
 
         // Build adjacency matrix
         let mut adj = Array2::zeros((num_nodes, num_nodes));
@@ -78,7 +81,7 @@ impl SpectralGraphAnalysis {
                         laplacian[[i, j]] -= adj[[i, j]];
                     }
                 }
-                laplacian
+                Ok(laplacian)
             }
             LaplacianType::Symmetric => {
                 let mut laplacian = Array2::zeros((num_nodes, num_nodes));
@@ -100,7 +103,7 @@ impl SpectralGraphAnalysis {
                         laplacian[[i, j]] -= d_inv_sqrt[i] * adj[[i, j]] * d_inv_sqrt[j];
                     }
                 }
-                laplacian
+                Ok(laplacian)
             }
             LaplacianType::RandomWalk => {
                 let mut laplacian = Array2::zeros((num_nodes, num_nodes));
@@ -122,14 +125,14 @@ impl SpectralGraphAnalysis {
                         laplacian[[i, j]] -= d_inv[i] * adj[[i, j]];
                     }
                 }
-                laplacian
+                Ok(laplacian)
             }
         }
     }
 
     /// Compute spectral embedding using eigendecomposition (simplified power iteration)
-    pub fn spectral_embedding(graph: &GraphData, num_components: usize) -> Tensor {
-        let laplacian = Self::compute_laplacian(graph, LaplacianType::Symmetric);
+    pub fn spectral_embedding(graph: &GraphData, num_components: usize) -> Result<Tensor> {
+        let laplacian = Self::compute_laplacian(graph, LaplacianType::Symmetric)?;
         let num_nodes = graph.num_nodes;
 
         // Simplified spectral embedding using power iteration
@@ -168,12 +171,11 @@ impl SpectralGraphAnalysis {
             embeddings.extend(v);
         }
 
-        from_vec(
+        Ok(from_vec(
             embeddings,
             &[num_nodes, num_components],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec embeddings should succeed")
+        )?)
     }
 
     /// Compute graph spectrum (eigenvalues) - simplified version
@@ -195,12 +197,12 @@ impl SpectralGraphAnalysis {
     }
 
     /// Spectral clustering
-    pub fn spectral_clustering(graph: &GraphData, num_clusters: usize) -> Vec<usize> {
+    pub fn spectral_clustering(graph: &GraphData, num_clusters: usize) -> Result<Vec<usize>> {
         let num_nodes = graph.num_nodes;
 
         // Get spectral embedding
         let embedding = Self::spectral_embedding(graph, num_clusters);
-        let embedding_data = embedding.to_vec().expect("conversion should succeed");
+        let embedding_data = embedding?.to_vec()?;
 
         // K-means clustering on embedding (simplified)
         let mut labels = vec![0; num_nodes];
@@ -262,7 +264,7 @@ impl SpectralGraphAnalysis {
             centroids = new_centroids;
         }
 
-        labels
+        Ok(labels)
     }
 }
 
@@ -281,38 +283,34 @@ pub struct ChebConv {
 
 impl ChebConv {
     /// Create a new Chebyshev convolution layer
-    pub fn new(in_features: usize, out_features: usize, k: usize, use_bias: bool) -> Self {
+    pub fn new(in_features: usize, out_features: usize, k: usize, use_bias: bool) -> Result<Self> {
         let mut weights = Vec::new();
 
         for _ in 0..k {
-            weights.push(Parameter::new(
-                randn(&[in_features, out_features]).expect("randn weights should succeed"),
-            ));
+            weights.push(Parameter::new(randn(&[in_features, out_features])?));
         }
 
         let bias = if use_bias {
-            Some(Parameter::new(
-                zeros(&[out_features]).expect("zeros bias should succeed"),
-            ))
+            Some(Parameter::new(zeros(&[out_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             k,
             weights,
             bias,
-        }
+        })
     }
 
     /// Forward pass through Chebyshev convolution
-    pub fn forward(&self, graph: &GraphData) -> GraphData {
+    pub fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         let num_nodes = graph.num_nodes;
 
         // Compute normalized Laplacian
-        let laplacian = SpectralGraphAnalysis::compute_laplacian(graph, LaplacianType::Symmetric);
+        let laplacian = SpectralGraphAnalysis::compute_laplacian(graph, LaplacianType::Symmetric)?;
 
         // Convert to tensor format
         let lap_data: Vec<f32> = laplacian.iter().copied().collect();
@@ -320,8 +318,7 @@ impl ChebConv {
             lap_data,
             &[num_nodes, num_nodes],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec laplacian should succeed");
+        )?;
 
         // Compute Chebyshev polynomials
         let mut chebyshev_polynomials = Vec::new();
@@ -331,50 +328,39 @@ impl ChebConv {
 
         // T_1 = L @ X
         if self.k > 1 {
-            let t1 = lap_tensor
-                .matmul(&graph.x)
-                .expect("operation should succeed");
+            let t1 = lap_tensor.matmul(&graph.x)?;
             chebyshev_polynomials.push(t1);
         }
 
         // T_k = 2 * L @ T_{k-1} - T_{k-2}
         for i in 2..self.k {
-            let term1 = lap_tensor
-                .matmul(&chebyshev_polynomials[i - 1])
-                .expect("operation should succeed");
-            let term1_scaled = term1.mul_scalar(2.0).expect("operation should succeed");
-            let t_k = term1_scaled
-                .sub(&chebyshev_polynomials[i - 2])
-                .expect("operation should succeed");
+            let term1 = lap_tensor.matmul(&chebyshev_polynomials[i - 1])?;
+            let term1_scaled = term1.mul_scalar(2.0)?;
+            let t_k = term1_scaled.sub(&chebyshev_polynomials[i - 2])?;
             chebyshev_polynomials.push(t_k);
         }
 
         // Compute output: sum of weighted Chebyshev polynomials
-        let mut output =
-            zeros::<f32>(&[num_nodes, self.out_features]).expect("zeros output should succeed");
+        let mut output = zeros::<f32>(&[num_nodes, self.out_features])?;
 
         for (i, t_k) in chebyshev_polynomials.iter().enumerate().take(self.k) {
-            let weighted = t_k
-                .matmul(&self.weights[i].clone_data())
-                .expect("operation should succeed");
-            output = output.add(&weighted).expect("operation should succeed");
+            let weighted = t_k.matmul(&self.weights[i].clone_data())?;
+            output = output.add(&weighted)?;
         }
 
         // Add bias
         if let Some(ref bias) = self.bias {
-            output = output
-                .add(&bias.clone_data())
-                .expect("operation should succeed");
+            output = output.add(&bias.clone_data())?;
         }
 
         let mut output_graph = graph.clone();
         output_graph.x = output;
-        output_graph
+        Ok(output_graph)
     }
 }
 
 impl GraphLayer for ChebConv {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         self.forward(graph)
     }
 
@@ -412,34 +398,28 @@ impl SpectralConv {
         out_features: usize,
         num_filters: usize,
         use_bias: bool,
-    ) -> Self {
-        let spectral_weights = Parameter::new(
-            randn(&[num_filters, in_features]).expect("randn spectral_weights should succeed"),
-        );
-        let spatial_weight = Parameter::new(
-            randn(&[in_features, out_features]).expect("randn spatial_weight should succeed"),
-        );
+    ) -> Result<Self> {
+        let spectral_weights = Parameter::new(randn(&[num_filters, in_features])?);
+        let spatial_weight = Parameter::new(randn(&[in_features, out_features])?);
 
         let bias = if use_bias {
-            Some(Parameter::new(
-                zeros(&[out_features]).expect("zeros bias should succeed"),
-            ))
+            Some(Parameter::new(zeros(&[out_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             num_filters,
             spectral_weights,
             spatial_weight,
             bias,
-        }
+        })
     }
 
     /// Forward pass through spectral convolution
-    pub fn forward(&self, graph: &GraphData) -> GraphData {
+    pub fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         let _num_nodes = graph.num_nodes;
 
         // Get spectral embedding (simplified)
@@ -448,33 +428,27 @@ impl SpectralConv {
         // Apply spectral filtering
         // spectral_features: [num_nodes, num_filters], spectral_weights: [num_filters, in_features]
         // Result: [num_nodes, in_features]
-        let filtered = spectral_features
-            .matmul(&self.spectral_weights.clone_data())
-            .expect("operation should succeed");
+        let filtered = spectral_features?.matmul(&self.spectral_weights.clone_data())?;
 
         // Combine with spatial features
-        let combined = filtered.add(&graph.x).expect("operation should succeed");
+        let combined = filtered.add(&graph.x)?;
 
         // Apply spatial transform
-        let mut output = combined
-            .matmul(&self.spatial_weight.clone_data())
-            .expect("operation should succeed");
+        let mut output = combined.matmul(&self.spatial_weight.clone_data())?;
 
         // Add bias
         if let Some(ref bias) = self.bias {
-            output = output
-                .add(&bias.clone_data())
-                .expect("operation should succeed");
+            output = output.add(&bias.clone_data())?;
         }
 
         let mut output_graph = graph.clone();
         output_graph.x = output;
-        output_graph
+        Ok(output_graph)
     }
 }
 
 impl GraphLayer for SpectralConv {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         self.forward(graph)
     }
 
@@ -497,37 +471,34 @@ pub struct GraphSignalProcessing;
 
 impl GraphSignalProcessing {
     /// Graph Fourier transform
-    pub fn graph_fourier_transform(graph: &GraphData, signal: &Tensor) -> Tensor {
+    pub fn graph_fourier_transform(graph: &GraphData, signal: &Tensor) -> Result<Tensor> {
         // Simplified GFT using spectral embedding as basis
         let num_nodes = graph.num_nodes;
         let embedding = SpectralGraphAnalysis::spectral_embedding(graph, num_nodes);
 
         // Project signal onto spectral basis
-        embedding
-            .t()
-            .expect("operation should succeed")
-            .matmul(signal)
-            .expect("operation should succeed")
+        Ok(embedding?.t()?.matmul(signal)?)
     }
 
     /// Inverse graph Fourier transform
-    pub fn inverse_graph_fourier_transform(graph: &GraphData, spectral_signal: &Tensor) -> Tensor {
+    pub fn inverse_graph_fourier_transform(
+        graph: &GraphData,
+        spectral_signal: &Tensor,
+    ) -> Result<Tensor> {
         let num_nodes = graph.num_nodes;
-        let embedding = SpectralGraphAnalysis::spectral_embedding(graph, num_nodes);
+        let embedding = SpectralGraphAnalysis::spectral_embedding(graph, num_nodes)?;
 
         // Project back to spatial domain
-        embedding
-            .matmul(spectral_signal)
-            .expect("operation should succeed")
+        Ok(embedding.matmul(spectral_signal)?)
     }
 
     /// Low-pass filter on graph signal
-    pub fn low_pass_filter(graph: &GraphData, signal: &Tensor, cutoff: usize) -> Tensor {
+    pub fn low_pass_filter(graph: &GraphData, signal: &Tensor, cutoff: usize) -> Result<Tensor> {
         // Transform to spectral domain
-        let spectral = Self::graph_fourier_transform(graph, signal);
+        let spectral = Self::graph_fourier_transform(graph, signal)?;
 
         // Apply low-pass filter (zero out high frequencies)
-        let mut filtered_data = spectral.to_vec().expect("conversion should succeed");
+        let mut filtered_data = spectral.to_vec()?;
         let _signal_dim = signal.shape().dims()[1];
 
         for i in cutoff..filtered_data.len() {
@@ -538,20 +509,19 @@ impl GraphSignalProcessing {
             filtered_data,
             spectral.shape().dims(),
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec filtered_spectral should succeed");
+        )?;
 
         // Transform back to spatial domain
         Self::inverse_graph_fourier_transform(graph, &filtered_spectral)
     }
 
     /// High-pass filter on graph signal
-    pub fn high_pass_filter(graph: &GraphData, signal: &Tensor, cutoff: usize) -> Tensor {
+    pub fn high_pass_filter(graph: &GraphData, signal: &Tensor, cutoff: usize) -> Result<Tensor> {
         // Transform to spectral domain
-        let spectral = Self::graph_fourier_transform(graph, signal);
+        let spectral = Self::graph_fourier_transform(graph, signal)?;
 
         // Apply high-pass filter (zero out low frequencies)
-        let mut filtered_data = spectral.to_vec().expect("conversion should succeed");
+        let mut filtered_data = spectral.to_vec()?;
 
         for i in 0..cutoff.min(filtered_data.len()) {
             filtered_data[i] = 0.0;
@@ -561,8 +531,7 @@ impl GraphSignalProcessing {
             filtered_data,
             spectral.shape().dims(),
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec filtered_spectral should succeed");
+        )?;
 
         // Transform back to spatial domain
         Self::inverse_graph_fourier_transform(graph, &filtered_spectral)
@@ -583,7 +552,7 @@ mod tests {
 
         let laplacian = SpectralGraphAnalysis::compute_laplacian(&graph, LaplacianType::Symmetric);
 
-        assert_eq!(laplacian.shape(), [4, 4]);
+        assert_eq!(laplacian.expect("operation should succeed").shape(), [4, 4]);
     }
 
     #[test]
@@ -595,7 +564,10 @@ mod tests {
 
         let embedding = SpectralGraphAnalysis::spectral_embedding(&graph, 3);
 
-        assert_eq!(embedding.shape().dims(), &[5, 3]);
+        assert_eq!(
+            embedding.expect("operation should succeed").shape().dims(),
+            &[5, 3]
+        );
     }
 
     #[test]
@@ -610,7 +582,7 @@ mod tests {
 
         let labels = SpectralGraphAnalysis::spectral_clustering(&graph, 2);
 
-        assert_eq!(labels.len(), 6);
+        assert_eq!(labels.expect("operation should succeed").len(), 6);
     }
 
     #[test]
@@ -621,7 +593,10 @@ mod tests {
         let graph = GraphData::new(features, edge_index);
 
         let cheb = ChebConv::new(6, 8, 3, true);
-        let output = cheb.forward(&graph);
+        let output = cheb
+            .expect("operation should succeed")
+            .forward(&graph)
+            .expect("operation should succeed");
 
         assert_eq!(output.x.shape().dims(), &[4, 8]);
     }
@@ -634,7 +609,10 @@ mod tests {
         let graph = GraphData::new(features, edge_index);
 
         let spec_conv = SpectralConv::new(4, 6, 3, true);
-        let output = spec_conv.forward(&graph);
+        let output = spec_conv
+            .expect("operation should succeed")
+            .forward(&graph)
+            .expect("operation should succeed");
 
         assert_eq!(output.x.shape().dims(), &[5, 6]);
     }
@@ -646,11 +624,18 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 3], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features.clone(), edge_index);
 
-        let spectral = GraphSignalProcessing::graph_fourier_transform(&graph, &features);
+        let spectral = GraphSignalProcessing::graph_fourier_transform(&graph, &features)
+            .expect("operation should succeed");
         let reconstructed =
             GraphSignalProcessing::inverse_graph_fourier_transform(&graph, &spectral);
 
-        assert_eq!(reconstructed.shape().dims(), features.shape().dims());
+        assert_eq!(
+            reconstructed
+                .expect("operation should succeed")
+                .shape()
+                .dims(),
+            features.shape().dims()
+        );
     }
 
     #[test]
@@ -662,6 +647,9 @@ mod tests {
 
         let filtered = GraphSignalProcessing::low_pass_filter(&graph, &features, 2);
 
-        assert_eq!(filtered.shape().dims(), features.shape().dims());
+        assert_eq!(
+            filtered.expect("operation should succeed").shape().dims(),
+            features.shape().dims()
+        );
     }
 }

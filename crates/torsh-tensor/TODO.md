@@ -1014,17 +1014,11 @@ For production use, rely on the standard feature set which has been thoroughly t
   - **Prerequisites:** none
   - **Risk:** Essentially unbounded scope tied to proprietary vendor SDKs outside Pure-Rust policy; recommend keeping as explicit no-op indefinitely.
 
-- [ ] torsh-tensor: tests/tensor_tests.rs:202 — "TODO: Implement normal_ in-place function"
-  - **Approach:** fn normal_ doesn't exist in the active src tree (only in uncompiled ops.rs.backup). Needs a new in-place .normal_(mean,std) method on Tensor using scirs2-core::random (already a hard dep). Test body is block-commented, ready to uncomment once implemented.
-  - **Scope:** small
-  - **Prerequisites:** none
-  - **Risk:** Low — self-contained; watch RNG-source consistency with rest of crate.
+- [x] **COMPLETED** (wave3_deadcode_tensor): torsh-tensor: tests/tensor_tests.rs:202 — "TODO: Implement normal_ in-place function"
+  - Ported a real `Tensor::normal_(mean, std)` (in-place, PyTorch-compatible) into `src/creation.rs` on top of the wave-1 process-global RNG (`with_rng`/`box_muller`/`sample_to_element`), replacing the only prior implementation which lived in uncompiled `src/ops.rs.backup` (now deleted) and used the banned direct `rand`/`rand_distr` crates. Rejects `requires_grad` tensors and non-finite/negative `std`, matching the other in-place ops. Test uncommented in tests/tensor_tests.rs; further coverage in tests/hardening_deadcode.rs.
 
-- [ ] torsh-tensor: tests/tensor_tests.rs:232 — "TODO: Implement multinomial sampling function"
-  - **Approach:** fn multinomial doesn't exist in active src (only ops.rs.backup). Needs Tensor::multinomial(&weights,num_samples,replacement) via cumulative-distribution sampling on scirs2-core::random, with explicit error cases (over-sampling without replacement, all-zero weights) per the commented test.
-  - **Scope:** small
-  - **Prerequisites:** none
-  - **Risk:** Low-medium — correctness-sensitive edge cases are explicitly tested but self-contained.
+- [x] **COMPLETED** (wave3_deadcode_tensor): torsh-tensor: tests/tensor_tests.rs:232 — "TODO: Implement multinomial sampling function"
+  - Ported a real `Tensor::multinomial(&weights, num_samples, replacement)` into `src/creation.rs` via cumulative-distribution sampling on the wave-1 process-global RNG, replacing the only prior implementation which lived in uncompiled `src/ops.rs.backup` (now deleted). Validates 1-D shape, finite/non-negative weights, all-zero weights, and over-sampling without replacement; a last-positive-weight fallback guards the floating-point boundary case so a zero-weight category can never be selected. Test uncommented in tests/tensor_tests.rs; further coverage (including the boundary-fallback regression) in tests/hardening_deadcode.rs.
 
 - [ ] torsh-tensor: math_ops.rs:55 — "TODO: scirs2_core::profiling module not available yet"
   - **Approach:** same finding as memory_pool.rs:72 — module now exists upstream but isn't reachable until the profiling feature is forwarded in Cargo.toml.

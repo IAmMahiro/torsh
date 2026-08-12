@@ -23,9 +23,16 @@ torsh-data = { workspace = true }
 torsh-linalg = { workspace = true }
 
 # Text processing
-tokenizers = { version = "0.23", features = ["unstable_wasm"] }
-unicode-segmentation = "1.13"
-regex = "1.12"
+# Pure Rust profile: default features would pull `onig` (Oniguruma, C) and
+# `esaxx_fast` (esaxx-rs/cpp, C++). `unstable_wasm` selects the pure-Rust
+# `fancy-regex` backend instead, and dropping `esaxx_fast` keeps esaxx-rs on its
+# pure-Rust `suffix_rs` path (Unigram training only).
+tokenizers = { version = "0.23", default-features = false, features = [
+    "unstable_wasm",
+    "progressbar",
+] }
+unicode-segmentation = { workspace = true }
+regex = { workspace = true }
 
 # Scientific computing - comprehensive NLP integration
 scirs2-core = { workspace = true }
@@ -44,7 +51,7 @@ anyhow = { workspace = true }
 # Utilities
 reqwest = { workspace = true, features = ["blocking"], optional = true }
 oxiarc-archive = { workspace = true, optional = true }
-dirs = "6.0"
+dirs = { workspace = true }
 lazy_static = { workspace = true }
 # rand = { workspace = true }  # REMOVED: Use scirs2_core::random instead (SciRS2 POLICY)
 # rayon = "1.11"  # REMOVED: Use scirs2_core::parallel_ops instead (SciRS2 POLICY) - Migration completed!
@@ -56,5 +63,7 @@ approx = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-default = ["pretrained"]
+# Pure-Rust by default: `pretrained` (network downloads via reqwest, which pulls
+# a rustls TLS provider) is opt-in so a default build stays C/asm-free.
+default = []
 pretrained = ["reqwest", "oxiarc-archive"]

@@ -7,6 +7,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
+use torsh_core::sync::MutexExt;
 
 use crate::cpu::error::CpuResult;
 
@@ -50,10 +51,7 @@ impl KernelFusionOptimizer {
 
     /// Register a fused kernel
     pub fn register_fused_kernel(&self, name: String, kernel: Box<dyn FusedKernel + Send + Sync>) {
-        let mut kernels = self
-            .fused_kernels
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut kernels = self.fused_kernels.lock_or_recover();
         kernels.insert(name, kernel);
     }
 
@@ -69,10 +67,7 @@ impl KernelFusionOptimizer {
         }
 
         let fusion_key = operation_sequence.join("->");
-        let kernels = self
-            .fused_kernels
-            .lock()
-            .expect("lock should not be poisoned");
+        let kernels = self.fused_kernels.lock_or_recover();
 
         if let Some(kernel) = kernels.get(&fusion_key) {
             kernel.execute(inputs, outputs)?;
@@ -283,11 +278,8 @@ impl MemoryOptimizer {
             return vec![0.0; size];
         }
 
-        let mut pool = self
-            .memory_pool
-            .lock()
-            .expect("lock should not be poisoned");
-        let mut stats = self.stats.lock().expect("lock should not be poisoned");
+        let mut pool = self.memory_pool.lock_or_recover();
+        let mut stats = self.stats.lock_or_recover();
 
         if let Some(buffers) = pool.get_mut(&size) {
             if let Some(buffer) = buffers.pop() {
@@ -312,16 +304,13 @@ impl MemoryOptimizer {
         let size = buffer.len();
         buffer.fill(0.0); // Clear for reuse
 
-        let mut pool = self
-            .memory_pool
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut pool = self.memory_pool.lock_or_recover();
         pool.entry(size).or_default().push(buffer);
     }
 
     /// Get memory statistics
     pub fn get_stats(&self) -> MemoryStats {
-        let stats = self.stats.lock().expect("lock should not be poisoned");
+        let stats = self.stats.lock_or_recover();
         MemoryStats {
             total_allocated: stats.total_allocated,
             pool_hits: stats.pool_hits,
@@ -332,13 +321,10 @@ impl MemoryOptimizer {
 
     /// Clear memory pool
     pub fn clear_pool(&self) {
-        let mut pool = self
-            .memory_pool
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut pool = self.memory_pool.lock_or_recover();
         pool.clear();
 
-        let mut stats = self.stats.lock().expect("lock should not be poisoned");
+        let mut stats = self.stats.lock_or_recover();
         stats.total_allocated = 0;
     }
 }

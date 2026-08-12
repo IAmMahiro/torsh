@@ -10,9 +10,12 @@
 //! - Neural graph matching networks
 //! - Graph alignment and correspondence learning
 //! - Siamese and triplet networks for graph similarity
-
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
+
 use crate::parameter::Parameter;
 use crate::GraphData;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -45,7 +48,10 @@ impl GraphEditDistance {
     }
 
     /// Compute approximate graph edit distance between two graphs
-    pub fn compute(&self, graph1: &GraphData, graph2: &GraphData) -> f32 {
+    ///
+    /// # Errors
+    /// Propagates tensor-operation failures from the feature distance.
+    pub fn compute(&self, graph1: &GraphData, graph2: &GraphData) -> Result<f32> {
         let n1 = graph1.num_nodes;
         let n2 = graph2.num_nodes;
 
@@ -58,15 +64,15 @@ impl GraphEditDistance {
         let edge_ops = ((e1 as i32 - e2 as i32).abs() as f32) * self.edge_cost;
 
         // Feature dissimilarity (using L2 distance)
-        let feature_cost = self.compute_feature_distance(graph1, graph2);
+        let feature_cost = self.compute_feature_distance(graph1, graph2)?;
 
-        node_ops + edge_ops + feature_cost
+        Ok(node_ops + edge_ops + feature_cost)
     }
 
     /// Compute feature distance between graphs
-    fn compute_feature_distance(&self, graph1: &GraphData, graph2: &GraphData) -> f32 {
-        let f1_data = graph1.x.to_vec().expect("conversion should succeed");
-        let f2_data = graph2.x.to_vec().expect("conversion should succeed");
+    fn compute_feature_distance(&self, graph1: &GraphData, graph2: &GraphData) -> Result<f32> {
+        let f1_data = graph1.x.to_vec()?;
+        let f2_data = graph2.x.to_vec()?;
 
         let min_len = f1_data.len().min(f2_data.len());
         let mut dist = 0.0;
@@ -78,7 +84,7 @@ impl GraphEditDistance {
         // Add penalty for size mismatch
         dist += ((f1_data.len() as i32 - f2_data.len() as i32).abs() as f32) * self.node_subst_cost;
 
-        dist.sqrt()
+        Ok(dist.sqrt())
     }
 
     /// Find approximate node correspondence between two graphs
@@ -86,7 +92,7 @@ impl GraphEditDistance {
         &self,
         graph1: &GraphData,
         graph2: &GraphData,
-    ) -> Vec<(usize, usize)> {
+    ) -> Result<Vec<(usize, usize)>> {
         let mut correspondences = Vec::new();
         let n1 = graph1.num_nodes;
         let n2 = graph2.num_nodes;
@@ -103,7 +109,7 @@ impl GraphEditDistance {
                     continue;
                 }
 
-                let similarity = self.node_similarity(graph1, i, graph2, j);
+                let similarity = self.node_similarity(graph1, i, graph2, j)?;
                 if similarity > best_similarity {
                     best_similarity = similarity;
                     best_match = Some(j);
@@ -116,7 +122,7 @@ impl GraphEditDistance {
             }
         }
 
-        correspondences
+        Ok(correspondences)
     }
 
     /// Compute similarity between two nodes
@@ -126,37 +132,19 @@ impl GraphEditDistance {
         node1: usize,
         graph2: &GraphData,
         node2: usize,
-    ) -> f32 {
-        let f1 = graph1
-            .x
-            .slice_tensor(0, node1, node1 + 1)
-            .expect("node1 slice should succeed");
-        let f2 = graph2
-            .x
-            .slice_tensor(0, node2, node2 + 1)
-            .expect("node2 slice should succeed");
+    ) -> Result<f32> {
+        let f1 = graph1.x.slice_tensor(0, node1, node1 + 1)?;
+        let f2 = graph2.x.slice_tensor(0, node2, node2 + 1)?;
 
         // Cosine similarity
-        let dot = f1
-            .dot(&f2.t().expect("transpose should succeed"))
-            .expect("dot product should succeed")
-            .item()
-            .expect("tensor should have single item");
-        let norm1 = f1
-            .norm()
-            .expect("norm1 computation should succeed")
-            .item()
-            .expect("tensor should have single item");
-        let norm2 = f2
-            .norm()
-            .expect("norm2 computation should succeed")
-            .item()
-            .expect("tensor should have single item");
+        let dot = f1.dot(&f2.t()?)?.item()?;
+        let norm1 = f1.norm()?.item()?;
+        let norm2 = f2.norm()?.item()?;
 
         if norm1 > 0.0 && norm2 > 0.0 {
-            dot / (norm1 * norm2)
+            Ok(dot / (norm1 * norm2))
         } else {
-            0.0
+            Ok(0.0)
         }
     }
 }
@@ -191,7 +179,10 @@ impl GraphKernel {
     }
 
     /// Compute kernel similarity between two graphs
-    pub fn compute(&self, graph1: &GraphData, graph2: &GraphData) -> f32 {
+    ///
+    /// # Errors
+    /// Propagates tensor-operation failures from the underlying kernel.
+    pub fn compute(&self, graph1: &GraphData, graph2: &GraphData) -> Result<f32> {
         match self.kernel_type {
             GraphKernelType::RandomWalk => self.random_walk_kernel(graph1, graph2),
             GraphKernelType::ShortestPath => self.shortest_path_kernel(graph1, graph2),
@@ -201,10 +192,10 @@ impl GraphKernel {
     }
 
     /// Random walk kernel
-    fn random_walk_kernel(&self, graph1: &GraphData, graph2: &GraphData) -> f32 {
+    fn random_walk_kernel(&self, graph1: &GraphData, graph2: &GraphData) -> Result<f32> {
         // Simplified: count common random walk patterns
-        let walks1 = self.sample_random_walks(graph1, 10, 5);
-        let walks2 = self.sample_random_walks(graph2, 10, 5);
+        let walks1 = self.sample_random_walks(graph1, 10, 5)?;
+        let walks2 = self.sample_random_walks(graph2, 10, 5)?;
 
         let mut common_count = 0;
         for w1 in &walks1 {
@@ -213,7 +204,7 @@ impl GraphKernel {
             }
         }
 
-        common_count as f32 / (walks1.len() + walks2.len()) as f32
+        Ok(common_count as f32 / (walks1.len() + walks2.len()) as f32)
     }
 
     /// Sample random walks from a graph
@@ -222,13 +213,10 @@ impl GraphKernel {
         graph: &GraphData,
         num_walks: usize,
         walk_length: usize,
-    ) -> Vec<Vec<usize>> {
+    ) -> Result<Vec<Vec<usize>>> {
         let mut rng = scirs2_core::random::thread_rng();
         let mut walks = Vec::new();
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
 
         // Build adjacency list
         let mut adj_list: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -266,14 +254,14 @@ impl GraphKernel {
             walks.push(walk);
         }
 
-        walks
+        Ok(walks)
     }
 
     /// Shortest path kernel
-    fn shortest_path_kernel(&self, graph1: &GraphData, graph2: &GraphData) -> f32 {
+    fn shortest_path_kernel(&self, graph1: &GraphData, graph2: &GraphData) -> Result<f32> {
         // Compare shortest path distributions
-        let sp1 = self.compute_shortest_paths_distribution(graph1);
-        let sp2 = self.compute_shortest_paths_distribution(graph2);
+        let sp1 = self.compute_shortest_paths_distribution(graph1)?;
+        let sp2 = self.compute_shortest_paths_distribution(graph2)?;
 
         // Compute histogram intersection
         let mut intersection = 0.0;
@@ -281,19 +269,16 @@ impl GraphKernel {
             intersection += sp1[i].min(sp2[i]);
         }
 
-        intersection
+        Ok(intersection)
     }
 
     /// Compute distribution of shortest path lengths
-    fn compute_shortest_paths_distribution(&self, graph: &GraphData) -> Vec<f32> {
+    fn compute_shortest_paths_distribution(&self, graph: &GraphData) -> Result<Vec<f32>> {
         let max_path_len = 10;
         let mut distribution = vec![0.0; max_path_len];
 
         // Simplified: use BFS to compute some shortest paths
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
         let mut adj_list: HashMap<usize, Vec<usize>> = HashMap::new();
 
         for i in (0..edge_data.len()).step_by(2) {
@@ -323,7 +308,7 @@ impl GraphKernel {
             }
         }
 
-        distribution
+        Ok(distribution)
     }
 
     /// BFS to compute shortest path lengths
@@ -354,10 +339,10 @@ impl GraphKernel {
     }
 
     /// Weisfeiler-Lehman kernel
-    fn wl_kernel(&self, graph1: &GraphData, graph2: &GraphData) -> f32 {
+    fn wl_kernel(&self, graph1: &GraphData, graph2: &GraphData) -> Result<f32> {
         // Simplified WL: compare node label histograms after one iteration
-        let labels1 = self.wl_iteration(graph1);
-        let labels2 = self.wl_iteration(graph2);
+        let labels1 = self.wl_iteration(graph1)?;
+        let labels2 = self.wl_iteration(graph2)?;
 
         // Compute label histogram similarity
         let mut hist1: HashMap<usize, f32> = HashMap::new();
@@ -380,19 +365,16 @@ impl GraphKernel {
             intersection += count1.min(count2);
         }
 
-        intersection / (labels1.len() + labels2.len()) as f32
+        Ok(intersection / (labels1.len() + labels2.len()) as f32)
     }
 
     /// One iteration of Weisfeiler-Lehman relabeling
-    fn wl_iteration(&self, graph: &GraphData) -> Vec<usize> {
+    fn wl_iteration(&self, graph: &GraphData) -> Result<Vec<usize>> {
         let num_nodes = graph.num_nodes;
         let labels = vec![0; num_nodes]; // Initial labels
 
         // Build adjacency list
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
         let mut adj_list: HashMap<usize, Vec<usize>> = HashMap::new();
 
         for i in (0..edge_data.len()).step_by(2) {
@@ -422,14 +404,14 @@ impl GraphKernel {
                 .fold(0usize, |acc, &l| acc.wrapping_mul(31).wrapping_add(l));
         }
 
-        new_labels
+        Ok(new_labels)
     }
 
     /// Graphlet kernel
-    fn graphlet_kernel(&self, graph1: &GraphData, graph2: &GraphData) -> f32 {
+    fn graphlet_kernel(&self, graph1: &GraphData, graph2: &GraphData) -> Result<f32> {
         // Simplified: count small subgraph patterns (triangles, stars, etc.)
-        let graphlets1 = self.count_graphlets(graph1);
-        let graphlets2 = self.count_graphlets(graph2);
+        let graphlets1 = self.count_graphlets(graph1)?;
+        let graphlets2 = self.count_graphlets(graph2)?;
 
         // Compare graphlet counts
         let mut similarity = 0.0;
@@ -439,18 +421,15 @@ impl GraphKernel {
             }
         }
 
-        similarity / (graph1.num_nodes + graph2.num_nodes) as f32
+        Ok(similarity / (graph1.num_nodes + graph2.num_nodes) as f32)
     }
 
     /// Count small graphlet patterns
-    fn count_graphlets(&self, graph: &GraphData) -> HashMap<String, f32> {
+    fn count_graphlets(&self, graph: &GraphData) -> Result<HashMap<String, f32>> {
         let mut counts = HashMap::new();
 
         // Build adjacency list
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
         let mut adj_list: HashMap<usize, Vec<usize>> = HashMap::new();
 
         for i in (0..edge_data.len()).step_by(2) {
@@ -488,7 +467,7 @@ impl GraphKernel {
         }
         counts.insert("star".to_string(), stars);
 
-        counts
+        Ok(counts)
     }
 }
 
@@ -517,45 +496,25 @@ pub struct GraphMatchingNetwork {
 
 impl GraphMatchingNetwork {
     /// Create a new graph matching network
-    pub fn new(node_embedding_dim: usize, hidden_dim: usize, use_bias: bool) -> Self {
-        let node_encoder1 = Parameter::new(
-            randn(&[node_embedding_dim, hidden_dim])
-                .expect("failed to create node_encoder1 tensor"),
-        );
-        let node_encoder2 = Parameter::new(
-            randn(&[hidden_dim, hidden_dim]).expect("failed to create node_encoder2 tensor"),
-        );
+    pub fn new(node_embedding_dim: usize, hidden_dim: usize, use_bias: bool) -> Result<Self> {
+        let node_encoder1 = Parameter::new(randn(&[node_embedding_dim, hidden_dim])?);
+        let node_encoder2 = Parameter::new(randn(&[hidden_dim, hidden_dim])?);
 
-        let attention_query = Parameter::new(
-            randn(&[hidden_dim, hidden_dim]).expect("failed to create attention_query tensor"),
-        );
-        let attention_key = Parameter::new(
-            randn(&[hidden_dim, hidden_dim]).expect("failed to create attention_key tensor"),
-        );
-        let attention_value = Parameter::new(
-            randn(&[hidden_dim, hidden_dim]).expect("failed to create attention_value tensor"),
-        );
+        let attention_query = Parameter::new(randn(&[hidden_dim, hidden_dim])?);
+        let attention_key = Parameter::new(randn(&[hidden_dim, hidden_dim])?);
+        let attention_value = Parameter::new(randn(&[hidden_dim, hidden_dim])?);
 
-        let matching_layer1 = Parameter::new(
-            randn(&[hidden_dim * 2, hidden_dim]).expect("failed to create matching_layer1 tensor"),
-        );
-        let matching_layer2 = Parameter::new(
-            randn(&[hidden_dim, (hidden_dim / 2)])
-                .expect("failed to create matching_layer2 tensor"),
-        );
-        let output_layer = Parameter::new(
-            randn(&[(hidden_dim / 2), 1]).expect("failed to create output_layer tensor"),
-        );
+        let matching_layer1 = Parameter::new(randn(&[hidden_dim * 2, hidden_dim])?);
+        let matching_layer2 = Parameter::new(randn(&[hidden_dim, (hidden_dim / 2)])?);
+        let output_layer = Parameter::new(randn(&[(hidden_dim / 2), 1])?);
 
         let bias = if use_bias {
-            Some(Parameter::new(
-                zeros(&[1]).expect("failed to create bias tensor"),
-            ))
+            Some(Parameter::new(zeros(&[1])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             node_embedding_dim,
             hidden_dim,
             node_encoder1,
@@ -567,30 +526,26 @@ impl GraphMatchingNetwork {
             matching_layer2,
             output_layer,
             bias,
-        }
+        })
     }
 
     /// Compute similarity score between two graphs
-    pub fn compute_similarity(&self, graph1: &GraphData, graph2: &GraphData) -> f32 {
+    pub fn compute_similarity(&self, graph1: &GraphData, graph2: &GraphData) -> Result<f32> {
         // Encode both graphs
-        let h1 = self.encode_graph(&graph1.x);
-        let h2 = self.encode_graph(&graph2.x);
+        let h1 = self.encode_graph(&graph1.x)?;
+        let h2 = self.encode_graph(&graph2.x)?;
 
         // Cross-graph attention
-        let attended1 = self.cross_attention(&h1, &h2);
-        let attended2 = self.cross_attention(&h2, &h1);
+        let attended1 = self.cross_attention(&h1, &h2)?;
+        let attended2 = self.cross_attention(&h2, &h1)?;
 
         // Pool to graph-level representations
-        let g1 = attended1
-            .mean(Some(&[0]), false)
-            .expect("mean pooling g1 should succeed");
-        let g2 = attended2
-            .mean(Some(&[0]), false)
-            .expect("mean pooling g2 should succeed");
+        let g1 = attended1.mean(Some(&[0]), false)?;
+        let g2 = attended2.mean(Some(&[0]), false)?;
 
         // Concatenate
-        let g1_data = g1.to_vec().expect("conversion should succeed");
-        let g2_data = g2.to_vec().expect("conversion should succeed");
+        let g1_data = g1.to_vec()?;
+        let g2_data = g2.to_vec()?;
         let mut concat_data = g1_data;
         concat_data.extend(g2_data);
 
@@ -598,75 +553,52 @@ impl GraphMatchingNetwork {
             concat_data,
             &[1, self.hidden_dim * 2],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("concat tensor creation should succeed");
+        )?;
 
         // Matching layers
-        let mut h = concat
-            .matmul(&self.matching_layer1.clone_data())
-            .expect("operation should succeed");
-        h = self.relu(&h);
+        let mut h = concat.matmul(&self.matching_layer1.clone_data())?;
+        h = self.relu(&h)?;
 
-        h = h
-            .matmul(&self.matching_layer2.clone_data())
-            .expect("operation should succeed");
-        h = self.relu(&h);
+        h = h.matmul(&self.matching_layer2.clone_data())?;
+        h = self.relu(&h)?;
 
-        let mut score = h
-            .matmul(&self.output_layer.clone_data())
-            .expect("operation should succeed");
+        let mut score = h.matmul(&self.output_layer.clone_data())?;
         if let Some(ref bias) = self.bias {
-            score = score
-                .add(&bias.clone_data())
-                .expect("operation should succeed");
+            score = score.add(&bias.clone_data())?;
         }
 
         // Sigmoid activation
-        let score_val = score.item().expect("tensor should have single item");
-        1.0 / (1.0 + (-score_val).exp())
+        let score_val = score.item()?;
+        Ok(1.0 / (1.0 + (-score_val).exp()))
     }
 
     /// Encode graph features
-    fn encode_graph(&self, x: &Tensor) -> Tensor {
-        let mut h = x
-            .matmul(&self.node_encoder1.clone_data())
-            .expect("operation should succeed");
-        h = self.relu(&h);
-        h = h
-            .matmul(&self.node_encoder2.clone_data())
-            .expect("operation should succeed");
+    fn encode_graph(&self, x: &Tensor) -> Result<Tensor> {
+        let mut h = x.matmul(&self.node_encoder1.clone_data())?;
+        h = self.relu(&h)?;
+        h = h.matmul(&self.node_encoder2.clone_data())?;
         self.relu(&h)
     }
 
     /// Cross-graph attention mechanism
-    fn cross_attention(&self, query_graph: &Tensor, key_value_graph: &Tensor) -> Tensor {
-        let _q = query_graph
-            .matmul(&self.attention_query.clone_data())
-            .expect("attention query matmul should succeed");
-        let _k = key_value_graph
-            .matmul(&self.attention_key.clone_data())
-            .expect("attention key matmul should succeed");
-        let v = key_value_graph
-            .matmul(&self.attention_value.clone_data())
-            .expect("attention value matmul should succeed");
+    fn cross_attention(&self, query_graph: &Tensor, key_value_graph: &Tensor) -> Result<Tensor> {
+        let _q = query_graph.matmul(&self.attention_query.clone_data())?;
+        let _k = key_value_graph.matmul(&self.attention_key.clone_data())?;
+        let v = key_value_graph.matmul(&self.attention_value.clone_data())?;
 
         // Simplified attention: mean pooling
         // In practice, would compute q @ k^T / sqrt(d), then softmax, then @ v
-        v.mean(Some(&[0]), false)
-            .expect("mean should succeed")
-            .unsqueeze(0)
-            .expect("unsqueeze should succeed")
+        Ok(v.mean(Some(&[0]), false)?.unsqueeze(0)?)
     }
 
-    fn relu(&self, x: &Tensor) -> Tensor {
-        let data = x.to_vec().expect("conversion should succeed");
+    fn relu(&self, x: &Tensor) -> Result<Tensor> {
+        let data = x.to_vec()?;
         let activated: Vec<f32> = data.iter().map(|&v| v.max(0.0)).collect();
-        from_vec(
+        Ok(from_vec(
             activated,
             x.shape().dims(),
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("relu tensor creation should succeed")
+        )?)
     }
 
     fn parameters(&self) -> Vec<Tensor> {
@@ -699,29 +631,23 @@ pub struct SiameseGraphNetwork {
 
 impl SiameseGraphNetwork {
     /// Create a new Siamese graph network
-    pub fn new(input_dim: usize, hidden_dim: usize, output_dim: usize) -> Self {
-        let embedding_network = Parameter::new(
-            randn(&[input_dim, hidden_dim]).expect("failed to create embedding_network tensor"),
-        );
+    pub fn new(input_dim: usize, hidden_dim: usize, output_dim: usize) -> Result<Self> {
+        let embedding_network = Parameter::new(randn(&[input_dim, hidden_dim])?);
 
-        Self {
+        Ok(Self {
             embedding_network,
             hidden_dim,
             output_dim,
-        }
+        })
     }
 
     /// Compute embeddings for a graph
-    pub fn embed(&self, graph: &GraphData) -> Tensor {
-        let mut h = graph
-            .x
-            .matmul(&self.embedding_network.clone_data())
-            .expect("embedding matmul should succeed");
-        h = self.relu(&h);
+    pub fn embed(&self, graph: &GraphData) -> Result<Tensor> {
+        let mut h = graph.x.matmul(&self.embedding_network.clone_data())?;
+        h = self.relu(&h)?;
 
         // Global pooling
-        h.mean(Some(&[0]), false)
-            .expect("mean pooling should succeed")
+        Ok(h.mean(Some(&[0]), false)?)
     }
 
     /// Compute contrastive loss between similar and dissimilar pairs
@@ -731,37 +657,32 @@ impl SiameseGraphNetwork {
         graph2: &GraphData,
         is_similar: bool,
         margin: f32,
-    ) -> f32 {
-        let emb1 = self.embed(graph1);
-        let emb2 = self.embed(graph2);
+    ) -> Result<f32> {
+        let emb1 = self.embed(graph1)?;
+        let emb2 = self.embed(graph2)?;
 
         // Euclidean distance
-        let diff = emb1.sub(&emb2).expect("operation should succeed");
-        let dist_sq = diff
-            .dot(&diff)
-            .expect("dot product should succeed")
-            .item()
-            .expect("tensor should have single item");
+        let diff = emb1.sub(&emb2)?;
+        let dist_sq = diff.dot(&diff)?.item()?;
         let dist = dist_sq.sqrt();
 
         if is_similar {
             // Pull similar graphs closer
-            dist_sq
+            Ok(dist_sq)
         } else {
             // Push dissimilar graphs apart
-            (margin - dist).max(0.0).powi(2)
+            Ok((margin - dist).max(0.0).powi(2))
         }
     }
 
-    fn relu(&self, x: &Tensor) -> Tensor {
-        let data = x.to_vec().expect("conversion should succeed");
+    fn relu(&self, x: &Tensor) -> Result<Tensor> {
+        let data = x.to_vec()?;
         let activated: Vec<f32> = data.iter().map(|&v| v.max(0.0)).collect();
-        from_vec(
+        Ok(from_vec(
             activated,
             x.shape().dims(),
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("siamese relu tensor creation should succeed")
+        )?)
     }
 
     fn parameters(&self) -> Vec<Tensor> {
@@ -788,7 +709,9 @@ mod tests {
         let graph2 = GraphData::new(features2, edge_index2);
 
         let ged = GraphEditDistance::new();
-        let distance = ged.compute(&graph1, &graph2);
+        let distance = ged
+            .compute(&graph1, &graph2)
+            .expect("operation should succeed");
 
         assert!(distance > 0.0);
     }
@@ -804,7 +727,9 @@ mod tests {
         let graph2 = GraphData::new(features2, edge_index);
 
         let ged = GraphEditDistance::new();
-        let correspondences = ged.node_correspondence(&graph1, &graph2);
+        let correspondences = ged
+            .node_correspondence(&graph1, &graph2)
+            .expect("operation should succeed");
 
         assert_eq!(correspondences.len(), 3);
     }
@@ -820,7 +745,9 @@ mod tests {
         let graph2 = GraphData::new(features2, edge_index);
 
         let kernel = GraphKernel::new(GraphKernelType::RandomWalk);
-        let similarity = kernel.compute(&graph1, &graph2);
+        let similarity = kernel
+            .compute(&graph1, &graph2)
+            .expect("operation should succeed");
 
         assert!(similarity >= 0.0 && similarity <= 1.0);
     }
@@ -836,7 +763,9 @@ mod tests {
         let graph2 = GraphData::new(features2, edge_index);
 
         let kernel = GraphKernel::new(GraphKernelType::ShortestPath);
-        let similarity = kernel.compute(&graph1, &graph2);
+        let similarity = kernel
+            .compute(&graph1, &graph2)
+            .expect("operation should succeed");
 
         assert!(similarity >= 0.0 && similarity <= 1.0);
     }
@@ -852,7 +781,9 @@ mod tests {
         let graph2 = GraphData::new(features2, edge_index);
 
         let kernel = GraphKernel::new(GraphKernelType::WeisfeilerLehman);
-        let similarity = kernel.compute(&graph1, &graph2);
+        let similarity = kernel
+            .compute(&graph1, &graph2)
+            .expect("operation should succeed");
 
         assert!(similarity >= 0.0);
     }
@@ -870,8 +801,10 @@ mod tests {
         let graph1 = GraphData::new(features1, edge_index1);
         let graph2 = GraphData::new(features2, edge_index2);
 
-        let gmn = GraphMatchingNetwork::new(8, 16, true);
-        let similarity = gmn.compute_similarity(&graph1, &graph2);
+        let gmn = GraphMatchingNetwork::new(8, 16, true).expect("operation should succeed");
+        let similarity = gmn
+            .compute_similarity(&graph1, &graph2)
+            .expect("operation should succeed");
 
         assert!(similarity >= 0.0 && similarity <= 1.0);
     }
@@ -886,20 +819,27 @@ mod tests {
         let graph1 = GraphData::new(features1, edge_index.clone());
         let graph2 = GraphData::new(features2, edge_index);
 
-        let siamese = SiameseGraphNetwork::new(6, 12, 8);
+        let siamese = SiameseGraphNetwork::new(6, 12, 8).expect("operation should succeed");
 
         let emb1 = siamese.embed(&graph1);
-        let emb2 = siamese.embed(&graph2);
+        let emb2 = siamese.embed(&graph2).expect("operation should succeed");
 
-        assert_eq!(emb1.shape().dims(), &[12]);
+        assert_eq!(
+            emb1.expect("operation should succeed").shape().dims(),
+            &[12]
+        );
         assert_eq!(emb2.shape().dims(), &[12]);
 
         // Test contrastive loss for similar graphs
-        let loss_similar = siamese.contrastive_loss(&graph1, &graph2, true, 1.0);
+        let loss_similar = siamese
+            .contrastive_loss(&graph1, &graph2, true, 1.0)
+            .expect("operation should succeed");
         assert!(loss_similar >= 0.0);
 
         // Test contrastive loss for dissimilar graphs
-        let loss_dissimilar = siamese.contrastive_loss(&graph1, &graph2, false, 1.0);
+        let loss_dissimilar = siamese
+            .contrastive_loss(&graph1, &graph2, false, 1.0)
+            .expect("operation should succeed");
         assert!(loss_dissimilar >= 0.0);
     }
 
@@ -914,7 +854,9 @@ mod tests {
         let graph2 = GraphData::new(features2, edge_index);
 
         let kernel = GraphKernel::new(GraphKernelType::Graphlet);
-        let similarity = kernel.compute(&graph1, &graph2);
+        let similarity = kernel
+            .compute(&graph1, &graph2)
+            .expect("operation should succeed");
 
         assert!(similarity >= 0.0);
     }

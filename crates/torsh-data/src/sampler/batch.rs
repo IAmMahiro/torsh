@@ -53,6 +53,21 @@ impl<S: Sampler> BatchingSampler<S> {
         }
     }
 
+    /// Fallible variant of [`new`](Self::new) that returns an error instead of
+    /// panicking when `batch_size` is 0.
+    pub fn try_new(
+        sampler: S,
+        batch_size: usize,
+        drop_last: bool,
+    ) -> torsh_core::error::Result<Self> {
+        crate::utils::validate_positive(batch_size, "batch_size")?;
+        Ok(Self {
+            sampler,
+            batch_size,
+            drop_last,
+        })
+    }
+
     /// Get the batch size
     pub fn batch_size(&self) -> usize {
         self.batch_size
@@ -89,6 +104,36 @@ impl<S: Sampler> BatchingSampler<S> {
     ) -> BatchingSampler<super::distributed::DistributedWrapper<S>> {
         let distributed_sampler = self.sampler.into_distributed(num_replicas, rank);
         BatchingSampler::new(distributed_sampler, self.batch_size, self.drop_last)
+    }
+}
+
+// F008: forward `set_epoch` through `BatchingSampler` for the epoch-aware
+// sampler types, so a `DataLoader` built with e.g. `RandomSampler` doesn't
+// need to unwrap its batch sampler just to advance the epoch each training
+// loop iteration.
+impl BatchingSampler<super::basic::RandomSampler> {
+    /// Advance the underlying [`RandomSampler`](super::basic::RandomSampler) to
+    /// a new epoch. See `RandomSampler::set_epoch`.
+    pub fn set_epoch(&mut self, epoch: usize) {
+        self.sampler.set_epoch(epoch);
+    }
+}
+
+impl BatchingSampler<super::distributed::DistributedSampler> {
+    /// Advance the underlying
+    /// [`DistributedSampler`](super::distributed::DistributedSampler) to a new
+    /// epoch. See `DistributedSampler::set_epoch`.
+    pub fn set_epoch(&mut self, epoch: usize) {
+        self.sampler.set_epoch(epoch);
+    }
+}
+
+impl<S: Sampler> BatchingSampler<super::distributed::DistributedWrapper<S>> {
+    /// Advance the underlying
+    /// [`DistributedWrapper`](super::distributed::DistributedWrapper) to a new
+    /// epoch. See `DistributedWrapper::set_epoch`.
+    pub fn set_epoch(&mut self, epoch: usize) {
+        self.sampler.set_epoch(epoch);
     }
 }
 

@@ -180,7 +180,7 @@ impl Optimizer for NAdam {
                 let denom = exp_avg_sq_corrected.sqrt()?.add_scalar(eps)?;
                 let update = m_hat.div(&denom)?.mul_scalar(group.lr)?;
 
-                *param = param.sub(&update)?;
+                crate::param_update::sub_assign(&mut param, &update)?;
             }
         }
 

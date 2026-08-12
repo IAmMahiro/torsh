@@ -313,18 +313,21 @@ pub fn bernoulli(input: &Tensor, generator: Option<u64>) -> TorshResult<Tensor> 
     };
 
     let data = input.data()?;
+
+    // Validate before sampling: an out-of-range (or NaN) probability is user data,
+    // not a programming error, so it is reported through the Result channel.
+    for (index, &p) in data.iter().enumerate() {
+        if !(0.0..=1.0).contains(&p) {
+            return Err(TorshError::InvalidArgument(format!(
+                "bernoulli: all values in input must be between 0 and 1, \
+                 but element {index} is {p}"
+            )));
+        }
+    }
+
     let values: Vec<f32> = data
         .iter()
-        .map(|&p| {
-            if !(0.0..=1.0).contains(&p) {
-                panic!("bernoulli: all values in input must be between 0 and 1");
-            }
-            if rng.random::<f32>() < p {
-                1.0
-            } else {
-                0.0
-            }
-        })
+        .map(|&p| if rng.random::<f32>() < p { 1.0 } else { 0.0 })
         .collect();
 
     Tensor::from_vec(values, &input.shape().dims().to_vec())

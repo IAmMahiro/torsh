@@ -7,26 +7,31 @@ use pyo3::wrap_pyfunction;
 use pyo3::PyRefMut;
 use std::cell::RefCell;
 
-/// Global autograd state manager
+/// Global autograd state manager.
+///
+/// The gradient-enabled flag is NOT stored here: it delegates to
+/// `torsh_autograd`'s process-wide grad mode (backed by
+/// `torsh_core::grad_mode`), which is the flag the tensor engine actually
+/// consults. Previously this held its own `enabled` bool that nothing outside
+/// this file read, so `no_grad()` / `set_grad_enabled(False)` silently failed
+/// to disable gradient tracking.
 pub struct AutogradState {
-    enabled: bool,
     anomaly_detection: bool,
 }
 
 impl AutogradState {
     fn new() -> Self {
         Self {
-            enabled: true,
             anomaly_detection: false,
         }
     }
 
     fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
+        torsh_autograd::set_grad_enabled(enabled);
     }
 
     fn is_enabled(&self) -> bool {
-        self.enabled
+        torsh_autograd::is_grad_enabled()
     }
 
     fn set_anomaly_detection(&mut self, enabled: bool) {

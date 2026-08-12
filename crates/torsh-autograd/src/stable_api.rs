@@ -148,7 +148,8 @@ pub fn get_api_features() -> Vec<ApiFeature> {
         beta_api!(
             "checkpoint",
             "0.1.0",
-            "Gradient checkpointing for memory efficiency"
+            "Gradient checkpointing: recompute-in-backward segments (checkpoint, \
+             checkpoint_sequential)"
         ),
         beta_api!(
             "anomaly_detection",

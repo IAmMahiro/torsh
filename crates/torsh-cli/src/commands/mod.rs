@@ -15,7 +15,7 @@ pub mod update;
 // ✅ Beta.1 Enhanced Real Implementations
 pub mod benchmark_real;
 pub mod dataset_real;
-pub mod quantize_real;
+pub mod real_training;
 pub mod train_real;
 
 // Re-export command structures

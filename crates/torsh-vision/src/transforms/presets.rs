@@ -122,7 +122,39 @@ pub mod presets {
 
     /// Custom training preset with configurable parameters
     ///
+    /// Fallible variant of [`custom_train`]
+    ///
+    /// Validates the caller-supplied strengths (which typically come from a
+    /// YAML/JSON experiment config) and returns an error instead of aborting the
+    /// job while the pipeline is being built.
+    pub fn try_custom_train(
+        size: usize,
+        flip_prob: f32,
+        color_jitter_strength: f32,
+        erase_prob: f32,
+    ) -> crate::Result<Compose> {
+        use crate::transforms::augmentation::{validate_in_range, validate_probability};
+
+        validate_probability(flip_prob, "flip_prob")?;
+        validate_probability(erase_prob, "erase_prob")?;
+        // `hue` is `strength * 0.1` and must stay within [0.0, 0.5].
+        validate_in_range(color_jitter_strength, 0.0, 5.0, "color_jitter_strength")?;
+
+        Ok(custom_train(
+            size,
+            flip_prob,
+            color_jitter_strength,
+            erase_prob,
+        ))
+    }
+
     /// Flexible training pipeline with customizable augmentation strength
+    ///
+    /// # Panics
+    ///
+    /// Panics if `flip_prob` or `erase_prob` is outside `[0.0, 1.0]`, or if
+    /// `color_jitter_strength` exceeds 5.0 (which would push the hue jitter past
+    /// its 0.5 limit). Use [`try_custom_train`] to get an error instead.
     pub fn custom_train(
         size: usize,
         flip_prob: f32,

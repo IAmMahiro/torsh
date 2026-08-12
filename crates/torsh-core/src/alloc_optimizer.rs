@@ -18,6 +18,7 @@
 //! - Better cache locality and CPU pipeline utilization
 
 use crate::shape::Shape;
+use crate::sync::MutexExt;
 
 #[cfg(feature = "std")]
 use std::cell::RefCell;
@@ -281,7 +282,7 @@ impl<T: Clone + Default> BufferPool<T> {
 
     /// Acquire a buffer from the pool
     pub fn acquire(&self) -> Vec<T> {
-        let mut buffers = self.buffers.lock().expect("lock should not be poisoned");
+        let mut buffers = self.buffers.lock_or_recover();
         buffers
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(self.buffer_capacity))
@@ -291,7 +292,7 @@ impl<T: Clone + Default> BufferPool<T> {
     pub fn release(&self, mut buffer: Vec<T>) {
         buffer.clear();
 
-        let mut buffers = self.buffers.lock().expect("lock should not be poisoned");
+        let mut buffers = self.buffers.lock_or_recover();
         if buffers.len() < self.max_pool_size {
             buffers.push(buffer);
         }
@@ -300,7 +301,7 @@ impl<T: Clone + Default> BufferPool<T> {
 
     /// Get pool statistics
     pub fn stats(&self) -> (usize, usize) {
-        let buffers = self.buffers.lock().expect("lock should not be poisoned");
+        let buffers = self.buffers.lock_or_recover();
         (buffers.len(), self.max_pool_size)
     }
 }

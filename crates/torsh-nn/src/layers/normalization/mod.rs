@@ -61,10 +61,13 @@ pub mod layer_group;
 pub mod weight_based;
 
 // Re-export common utilities and configurations for convenience
-pub use common::{utils, NormalizationConfig, NormalizationStats};
+pub use common::{unbiased_variance, utils, NormalizationConfig, NormalizationStats, RunningStats};
 
 // Re-export all batch normalization variants
-pub use batch::{BatchNorm1d, BatchNorm2d, BatchNorm3d};
+pub use batch::{
+    BatchNorm1d, BatchNorm2d, BatchNorm3d, BatchRenorm2d, BatchRenormSchedule, SyncBatchNorm2d,
+    VirtualBatchNorm2d,
+};
 
 // Re-export instance normalization variants
 pub use instance::{InstanceNorm1d, InstanceNorm2d, InstanceNorm3d};

@@ -3,6 +3,7 @@
 use crate::{Tensor, TensorStorage};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, Weak};
+use torsh_core::sync::RwLockExt;
 use torsh_core::{
     device::DeviceType,
     dtype::TensorElement,
@@ -142,14 +143,15 @@ impl<T: TensorElement + Copy> Tensor<T> {
             #[cfg(feature = "simd")]
             TensorStorage::Aligned(data) => {
                 // Convert AlignedVec to Vec for standard view handling
-                let aligned_data = data.read().expect("lock should not be poisoned");
+                let aligned_data = data.read_or_recover();
                 let vec_data = aligned_data.as_slice().to_vec();
                 Arc::new(RwLock::new(vec_data))
             }
             #[cfg(feature = "simd")]
             TensorStorage::SimdOptimized(storage) => {
-                // Lock-free access - convert to Vec for view handling
-                let vec_data = storage.as_slice().to_vec();
+                // Lock-free while unmutated; reads through the copy-on-write
+                // buffer once the storage has been written to.
+                let vec_data = storage.to_vec();
                 Arc::new(RwLock::new(vec_data))
             }
         };
@@ -212,9 +214,9 @@ impl<T: TensorElement + Copy> TensorView<T> {
 
     /// Get data as vector (materializes the view)
     pub fn to_vec(&self) -> Result<Vec<T>> {
-        let storage = self.storage.read().expect("lock should not be poisoned");
+        let storage = self.storage.read_or_recover();
         if let Some(data_ref) = &storage.data_ref {
-            let data = data_ref.read().expect("lock should not be poisoned");
+            let data = data_ref.read_or_recover();
             let mut result = Vec::with_capacity(self.shape.numel());
 
             // Extract data according to view's shape, strides, and offset
@@ -298,9 +300,9 @@ impl<T: TensorElement + Copy> TensorView<T> {
             }
         }
 
-        let storage = self.storage.read().expect("lock should not be poisoned");
+        let storage = self.storage.read_or_recover();
         if let Some(data_ref) = &storage.data_ref {
-            let data = data_ref.read().expect("lock should not be poisoned");
+            let data = data_ref.read_or_recover();
 
             // Calculate flat index from view indices
             let flat_index = self.offset
@@ -326,13 +328,13 @@ impl<T: TensorElement + Copy> TensorView<T> {
 
     /// Get memory usage of this view
     pub fn view_memory_usage(&self) -> ViewMemoryUsage {
-        let storage = self.storage.read().expect("lock should not be poisoned");
+        let storage = self.storage.read_or_recover();
         ViewMemoryUsage {
             view_elements: self.shape.numel(),
             total_elements: storage
                 .data_ref
                 .as_ref()
-                .map(|data| data.read().expect("lock should not be poisoned").len())
+                .map(|data| data.read_or_recover().len())
                 .unwrap_or(0),
             active_views: storage.view_count,
             is_contiguous: self.is_contiguous(),
@@ -343,11 +345,11 @@ impl<T: TensorElement + Copy> TensorView<T> {
     /// Calculate memory efficiency of this view
     fn calculate_memory_efficiency(&self) -> f64 {
         let view_size = self.shape.numel();
-        let storage = self.storage.read().expect("lock should not be poisoned");
+        let storage = self.storage.read_or_recover();
         let total_size = storage
             .data_ref
             .as_ref()
-            .map(|data| data.read().expect("lock should not be poisoned").len())
+            .map(|data| data.read_or_recover().len())
             .unwrap_or(1);
 
         view_size as f64 / total_size as f64

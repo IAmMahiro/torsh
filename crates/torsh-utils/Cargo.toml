@@ -23,23 +23,38 @@ torsh-nn = { workspace = true }
 torsh-profiler = { workspace = true }
 scirs2-core = { workspace = true }
 reqwest = { workspace = true, features = ["json", "blocking"], optional = true }
+# Pure-Rust TLS provider (replaces reqwest's aws-lc-rs/BoringSSL default backend).
+# Enabled together with reqwest via the explicit `reqwest` feature below.
+rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+oxitls-rustcrypto-provider = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-protobuf = { workspace = true, optional = true }
+# protobuf REMOVED: never used (the TensorBoard writer is protobuf-free by design).
 sha2 = { workspace = true }
-base64 = "0.22"
-fs2 = "0.4"
-num_cpus = "1.17"
+base64 = { workspace = true }
+# fs2 REMOVED: zero use sites in src (verified).
+num_cpus = { workspace = true }
 once_cell = { workspace = true }
 sysinfo = { workspace = true, optional = true }
 which = { workspace = true }
 
 [features]
 default = ["tensorboard", "collect_env"]
-tensorboard = ["protobuf", "reqwest"]
+tensorboard = ["reqwest"]
+# `reqwest` is an explicit feature (not the bare optional-dep feature) so that
+# enabling it also pulls the pure-Rust TLS stack (rustls + webpki-roots +
+# RustCrypto provider) used by the model_zoo download client. The no-reqwest
+# path returns honest errors instead of fabricated model data.
+reqwest = [
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "dep:oxitls-rustcrypto-provider",
+]
 collect_env = ["sysinfo"]
 
 [dev-dependencies]

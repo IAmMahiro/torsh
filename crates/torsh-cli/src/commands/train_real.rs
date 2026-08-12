@@ -738,7 +738,7 @@ pub async fn load_training_config(path: &Path) -> Result<TrainingConfig> {
     if path.extension().and_then(|s| s.to_str()) == Some("yaml")
         || path.extension().and_then(|s| s.to_str()) == Some("yml")
     {
-        serde_yaml::from_str(&content).with_context(|| "Failed to parse YAML config")
+        serde_norway::from_str(&content).with_context(|| "Failed to parse YAML config")
     } else {
         serde_json::from_str(&content).with_context(|| "Failed to parse JSON config")
     }

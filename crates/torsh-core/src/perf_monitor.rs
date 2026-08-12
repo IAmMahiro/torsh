@@ -17,6 +17,7 @@
 //! - GPU performance counters (SM utilization, memory bandwidth)
 //! - System-wide resource tracking
 
+use crate::sync::MutexExt;
 // Note: Result and TorshError kept for future error handling enhancements
 #[allow(unused_imports)]
 use crate::error::{Result, TorshError};
@@ -297,22 +298,15 @@ impl RealTimeMonitor {
 
     /// Get current CPU utilization
     ///
-    /// # SciRS2 Integration
-    /// When available, uses scirs2-core system monitoring for accurate CPU tracking
+    /// # Current Status
+    /// torsh-core does not currently wire up a real system CPU-utilization
+    /// probe, so this returns a fixed placeholder value rather than a
+    /// fabricated "detected" reading. (Not addressed by this pass; only the
+    /// dead, permanently-unset `scirs2_system_monitoring_available` cfg that
+    /// used to wrap this has been removed -- see FOLLOW-UP notes.)
     fn get_cpu_utilization() -> f64 {
         #[cfg(feature = "std")]
         {
-            // Try to use scirs2-core system monitoring if available
-            #[cfg(scirs2_system_monitoring_available)]
-            {
-                use scirs2_core::system::cpu_utilization;
-                if let Ok(util) = cpu_utilization() {
-                    return util;
-                }
-            }
-
-            // Fallback: Use sysinfo crate or estimate
-            // This is a simplified implementation
             0.5 // Placeholder
         }
         #[cfg(not(feature = "std"))]
@@ -322,19 +316,16 @@ impl RealTimeMonitor {
     }
 
     /// Get current memory usage
+    ///
+    /// # Current Status
+    /// torsh-core does not currently wire up a real system memory-usage
+    /// probe, so this returns a fixed placeholder value rather than a
+    /// fabricated "detected" reading. (Not addressed by this pass; only the
+    /// dead, permanently-unset `scirs2_memory_monitoring_available` cfg that
+    /// used to wrap this has been removed -- see FOLLOW-UP notes.)
     fn get_memory_usage() -> usize {
         #[cfg(feature = "std")]
         {
-            // Try to use scirs2-core memory monitoring if available
-            #[cfg(scirs2_memory_monitoring_available)]
-            {
-                use scirs2_core::system::memory_usage;
-                if let Ok(usage) = memory_usage() {
-                    return usage;
-                }
-            }
-
-            // Fallback estimation
             0 // Placeholder
         }
         #[cfg(not(feature = "std"))]
@@ -344,26 +335,19 @@ impl RealTimeMonitor {
     }
 
     /// Get GPU utilization
+    ///
+    /// torsh-core has no real GPU dispatch to query utilization from (GPU
+    /// compute for ToRSh is provided by oxicuda via `torsh-tensor`'s
+    /// `gpu_dispatch`), so this always returns `None`.
     fn get_gpu_utilization() -> Option<f64> {
-        #[cfg(all(feature = "gpu", scirs2_gpu_available))]
-        {
-            use crate::gpu;
-            if let Ok(device) = gpu::GpuDevice::new(0) {
-                return Some(device.utilization());
-            }
-        }
         None
     }
 
     /// Get memory bandwidth
+    ///
+    /// torsh-core does not currently wire up a real memory-bandwidth probe,
+    /// so this always returns `None` rather than a fabricated reading.
     fn get_memory_bandwidth() -> Option<f64> {
-        #[cfg(scirs2_bandwidth_monitoring_available)]
-        {
-            use scirs2_core::system::memory_bandwidth;
-            if let Ok(bw) = memory_bandwidth() {
-                return Some(bw);
-            }
-        }
         None
     }
 }
@@ -378,22 +362,21 @@ pub fn get_monitor() -> Arc<Mutex<RealTimeMonitor>> {
 /// Configure the global monitor
 pub fn configure_monitor(config: MonitorConfig) {
     let monitor = get_monitor();
-    *monitor.lock().expect("lock should not be poisoned") = RealTimeMonitor::new(config);
+    *monitor.lock_or_recover() = RealTimeMonitor::new(config);
 }
 
 /// Record an operation for monitoring
 pub fn record_operation(operation: &str, duration: Duration) {
     let monitor = get_monitor();
     monitor
-        .lock()
-        .expect("monitor lock should not be poisoned")
+        .lock_or_recover()
         .record_operation(operation, duration);
 }
 
 /// Get current performance metrics
 pub fn get_current_metrics() -> RealtimeMetrics {
     let monitor = get_monitor();
-    let guard = monitor.lock().expect("lock should not be poisoned");
+    let guard = monitor.lock_or_recover();
     guard.get_metrics()
 }
 
@@ -401,15 +384,14 @@ pub fn get_current_metrics() -> RealtimeMetrics {
 pub fn set_baseline(operation: &str, baseline_time_us: f64) {
     let monitor = get_monitor();
     monitor
-        .lock()
-        .expect("monitor lock should not be poisoned")
+        .lock_or_recover()
         .set_baseline(operation, baseline_time_us);
 }
 
 /// Get recent performance alerts
 pub fn get_recent_alerts(max_count: usize) -> Vec<PerformanceAlert> {
     let monitor = get_monitor();
-    let guard = monitor.lock().expect("lock should not be poisoned");
+    let guard = monitor.lock_or_recover();
     guard.get_alerts(max_count)
 }
 
@@ -512,10 +494,7 @@ mod tests {
         }
         // Check that operation was recorded
         let monitor = get_monitor();
-        let counts = &monitor
-            .lock()
-            .expect("lock should not be poisoned")
-            .operation_counts;
+        let counts = &monitor.lock_or_recover().operation_counts;
         assert!(counts.contains_key("test_scope"));
     }
 

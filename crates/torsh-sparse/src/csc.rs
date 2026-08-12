@@ -60,6 +60,41 @@ impl CscTensor {
             }
         }
 
+        // Validate the CSC invariants: `col_ptr` non-decreasing, starting at 0
+        // and ending at nnz, with strictly increasing row indices per column.
+        // The two-pointer sparse matmul silently drops products otherwise.
+        if col_ptr[0] != 0 {
+            return Err(TorshError::InvalidArgument(format!(
+                "Column pointer must start at 0, got {}",
+                col_ptr[0]
+            )));
+        }
+        if col_ptr[cols] != values.len() {
+            return Err(TorshError::InvalidArgument(format!(
+                "Column pointer must end at nnz ({}), got {}",
+                values.len(),
+                col_ptr[cols]
+            )));
+        }
+        for col in 0..cols {
+            let (start, end) = (col_ptr[col], col_ptr[col + 1]);
+            if start > end {
+                return Err(TorshError::InvalidArgument(format!(
+                    "Column pointer must be non-decreasing, got {start} > {end} at column {col}"
+                )));
+            }
+            for i in (start + 1)..end {
+                if row_indices[i - 1] >= row_indices[i] {
+                    return Err(TorshError::InvalidArgument(format!(
+                        "Row indices of column {col} must be strictly increasing, \
+                         got {} then {} (coalesce the COO tensor first)",
+                        row_indices[i - 1],
+                        row_indices[i]
+                    )));
+                }
+            }
+        }
+
         Ok(Self {
             col_ptr,
             row_indices,
@@ -78,6 +113,63 @@ impl CscTensor {
         shape: Shape,
     ) -> TorshResult<Self> {
         Self::new(col_ptr, row_indices, values, shape)
+    }
+
+    /// Create a CSC tensor from arrays that may be unsorted or hold duplicate
+    /// coordinates
+    ///
+    /// [`CscTensor::new`] asserts the CSC invariants (sorted, duplicate-free row
+    /// indices per column); this constructor *establishes* them by expanding the
+    /// arrays to coordinates, sorting them and summing duplicates. Use it for
+    /// data coming from outside the crate — SciPy, HDF5, MATLAB — where the
+    /// ordering is not guaranteed.
+    pub fn from_unsorted_parts(
+        col_ptr: Vec<usize>,
+        row_indices: Vec<usize>,
+        values: Vec<f32>,
+        shape: Shape,
+    ) -> TorshResult<Self> {
+        if shape.ndim() != 2 {
+            return Err(TorshError::InvalidArgument(
+                "CSC format currently only supports 2D tensors".to_string(),
+            ));
+        }
+        let cols = shape.dims()[1];
+        if col_ptr.len() != cols + 1 {
+            return Err(TorshError::InvalidArgument(format!(
+                "Column pointer length must be cols + 1, got {} for {} columns",
+                col_ptr.len(),
+                cols
+            )));
+        }
+        if row_indices.len() != values.len() {
+            return Err(TorshError::InvalidArgument(
+                "Row indices and values must have the same length".to_string(),
+            ));
+        }
+
+        let mut col_expanded = Vec::with_capacity(row_indices.len());
+        for col in 0..cols {
+            let (start, end) = (col_ptr[col], col_ptr[col + 1]);
+            if start > end || end > row_indices.len() {
+                return Err(TorshError::InvalidArgument(format!(
+                    "Column pointer range [{start}, {end}) at column {col} is invalid for {} entries",
+                    row_indices.len()
+                )));
+            }
+            for _ in start..end {
+                col_expanded.push(col);
+            }
+        }
+
+        let used = col_ptr[cols];
+        let coo = CooTensor::new(
+            row_indices[..used].to_vec(),
+            col_expanded,
+            values[..used].to_vec(),
+            shape,
+        )?;
+        Self::from_coo(&coo)
     }
 
     /// Create an empty CSC tensor with given shape
@@ -110,12 +202,16 @@ impl CscTensor {
     }
 
     /// Create from COO tensor
+    ///
+    /// The COO input is coalesced first, so duplicate coordinates are summed
+    /// (PyTorch semantics) instead of producing repeated row indices inside a
+    /// column.
     pub fn from_coo(coo: &CooTensor) -> TorshResult<Self> {
         let shape = coo.shape().clone();
         let cols = shape.dims()[1];
 
-        // Sort triplets by column then row
-        let mut triplets = coo.triplets();
+        // Sort coalesced triplets by column then row
+        let mut triplets = coo.coalesced().triplets();
         triplets.sort_by_key(|&(row, col, _)| (col, row));
 
         // Build CSC format

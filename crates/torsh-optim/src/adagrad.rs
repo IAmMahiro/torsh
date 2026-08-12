@@ -159,7 +159,8 @@ impl Optimizer for AdaGrad {
                     .map_err(OptimizerError::TensorError)?
                     .mul_scalar(clr)
                     .map_err(OptimizerError::TensorError)?;
-                *param = param.sub(&update).map_err(OptimizerError::TensorError)?;
+                crate::param_update::sub_assign(&mut param, &update)
+                    .map_err(OptimizerError::TensorError)?;
 
                 // Update state
                 state.insert("sum_of_squares".to_string(), sum_of_squares);
@@ -180,6 +181,10 @@ impl Optimizer for AdaGrad {
 
     fn set_lr(&mut self, lr: f32) {
         self.base.set_lr(lr);
+    }
+
+    fn set_lrs(&mut self, lrs: &[f32]) {
+        self.base.set_lrs(lrs);
     }
 
     fn add_param_group(&mut self, params: Vec<Arc<RwLock<Tensor>>>, options: HashMap<String, f32>) {

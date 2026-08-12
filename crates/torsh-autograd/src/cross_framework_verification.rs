@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use torsh_core::sync::MutexExt;
 
 /// Supported frameworks for gradient verification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -912,7 +913,7 @@ pub fn get_global_verifier() -> &'static std::sync::Mutex<CrossFrameworkVerifier
 
 pub fn initialize_verification_frameworks() {
     let verifier = get_global_verifier();
-    let mut verifier_lock = verifier.lock().expect("lock should not be poisoned");
+    let mut verifier_lock = verifier.lock_or_recover();
     verifier_lock.register_framework_adapter(
         SupportedFramework::Torch,
         Box::new(TorshFrameworkAdapter::new()),
@@ -1081,7 +1082,7 @@ mod tests {
     fn test_global_verifier() {
         initialize_verification_frameworks();
         let verifier = get_global_verifier();
-        let verifier_lock = verifier.lock().expect("lock should not be poisoned");
+        let verifier_lock = verifier.lock_or_recover();
 
         assert!(verifier_lock
             .framework_adapters

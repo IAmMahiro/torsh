@@ -557,6 +557,7 @@ impl ErrorDiagnosticsManager {
             JitError::BackendError(_) => ErrorCategory::External,
             JitError::FusionError(_) => ErrorCategory::Optimization,
             JitError::AbstractInterpretationError(_) => ErrorCategory::TypeInference,
+            JitError::NotImplemented(_) => ErrorCategory::UserInput,
         }
     }
 
@@ -573,6 +574,7 @@ impl ErrorDiagnosticsManager {
             JitError::BackendError(_) => ErrorSeverity::Fatal,
             JitError::FusionError(_) => ErrorSeverity::Warning,
             JitError::AbstractInterpretationError(_) => ErrorSeverity::Warning,
+            JitError::NotImplemented(_) => ErrorSeverity::Error,
         }
     }
 

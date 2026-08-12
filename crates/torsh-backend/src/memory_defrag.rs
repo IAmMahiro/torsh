@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 #[cfg(feature = "async")]
 use tokio::sync::mpsc;
+use torsh_core::sync::{MutexExt, RwLockExt};
 
 #[cfg(not(feature = "async"))]
 use std::sync::mpsc;
@@ -24,8 +25,9 @@ use torsh_core::device::DeviceType;
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaDevice as SciRs2CudaDevice;
 
-// Temporary mock for scirs2_cuda when CUDA is not available
-#[cfg(all(feature = "cuda", not(cuda_available)))]
+// CUDA device-to-device copy is not provided by torsh-backend; the real GPU
+// path lives in torsh-tensor's oxicuda backend.
+#[cfg(feature = "cuda")]
 mod scirs2_cuda {
     pub mod memory {
         pub fn copy_device_to_device(
@@ -733,10 +735,7 @@ impl DefragmentationManager {
 
     /// Get current defragmentation status for all devices
     pub fn get_status(&self) -> HashMap<String, Option<DefragmentationTask>> {
-        let tasks = self
-            .active_tasks
-            .read()
-            .expect("lock should not be poisoned");
+        let tasks = self.active_tasks.read_or_recover();
         let mut status = HashMap::new();
 
         for device_id in self.memory_managers.keys() {
@@ -748,18 +747,12 @@ impl DefragmentationManager {
 
     /// Get defragmentation statistics
     pub fn get_stats(&self) -> DefragmentationStats {
-        self.stats
-            .lock()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.stats.lock_or_recover().clone()
     }
 
     /// Cancel defragmentation for a device
     pub fn cancel_defragmentation(&self, device_id: &str) -> BackendResult<()> {
-        let mut tasks = self
-            .active_tasks
-            .write()
-            .expect("lock should not be poisoned");
+        let mut tasks = self.active_tasks.write_or_recover();
         if let Some(task) = tasks.get_mut(device_id) {
             task.status = TaskStatus::Cancelled;
             Ok(())
@@ -815,7 +808,7 @@ impl DefragmentationManager {
 
             // Add task to active tasks
             {
-                let mut tasks = active_tasks.write().expect("lock should not be poisoned");
+                let mut tasks = active_tasks.write_or_recover();
                 tasks.insert(request.device_id.clone(), task);
             }
 
@@ -844,7 +837,7 @@ impl DefragmentationManager {
 
             // Update task status
             {
-                let mut tasks = active_tasks.write().expect("lock should not be poisoned");
+                let mut tasks = active_tasks.write_or_recover();
                 if let Some(task) = tasks.get_mut(&request.device_id) {
                     task.progress = 1.0;
                     task.status = if success {
@@ -857,7 +850,7 @@ impl DefragmentationManager {
 
             // Update statistics
             {
-                let mut stats = stats.lock().expect("lock should not be poisoned");
+                let mut stats = stats.lock_or_recover();
                 stats.total_operations += 1;
                 stats.total_time += elapsed;
                 stats.total_bytes_moved += bytes_moved;
@@ -880,7 +873,7 @@ impl DefragmentationManager {
             // Remove completed task after a short delay for status visibility
             tokio::time::sleep(Duration::from_millis(1000)).await;
             {
-                let mut tasks = active_tasks.write().expect("lock should not be poisoned");
+                let mut tasks = active_tasks.write_or_recover();
                 tasks.remove(&request.device_id);
             }
         }
@@ -960,7 +953,7 @@ impl DefragmentationManager {
 
             // Update progress
             {
-                let mut tasks = active_tasks.write().expect("lock should not be poisoned");
+                let mut tasks = active_tasks.write_or_recover();
                 if let Some(task) = tasks.get_mut(device_id) {
                     task.progress = progress;
                 }
@@ -986,7 +979,7 @@ impl DefragmentationManager {
 
             // Update progress
             {
-                let mut tasks = active_tasks.write().expect("lock should not be poisoned");
+                let mut tasks = active_tasks.write_or_recover();
                 if let Some(task) = tasks.get_mut(device_id) {
                     task.progress = progress;
                 }

@@ -5,13 +5,59 @@
 
 use crate::{core::profiler::global_profiler, ProfileEvent};
 use backtrace::Backtrace;
+use std::cell::RefCell;
 use std::time::Instant;
+
+thread_local! {
+    /// Stack of "time already attributed to children" accumulators, one
+    /// entry per currently-open `ScopeGuard`/`MetricsScope` on this
+    /// thread (mirrors the real RAII call stack exactly, so cross-thread
+    /// concurrency never confuses one thread's nesting with another's).
+    ///
+    /// Used to compute each scope's *exclusive* (self) time: its own
+    /// inclusive duration minus whatever its direct children already
+    /// contributed. See [`push_scope_frame`] / [`pop_scope_frame`].
+    static SCOPE_CHILDREN_US: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Push a new "children time" accumulator frame when a scope starts.
+fn push_scope_frame() {
+    SCOPE_CHILDREN_US.with(|stack| stack.borrow_mut().push(0));
+}
+
+/// Pop this scope's accumulator frame, returning how much of its own
+/// inclusive duration was already attributed to directly-nested children.
+///
+/// If a parent frame remains on the stack, it is credited with this
+/// scope's full `inclusive_duration_us` so that the parent can, in turn,
+/// subtract that back out of its own exclusive time once it is dropped.
+fn pop_scope_frame(inclusive_duration_us: u64) -> u64 {
+    SCOPE_CHILDREN_US.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let children_us = stack.pop().unwrap_or(0);
+        if let Some(parent) = stack.last_mut() {
+            *parent += inclusive_duration_us;
+        }
+        children_us
+    })
+}
 
 /// RAII scope guard for automatic profiling
 pub struct ScopeGuard {
     name: String,
     category: String,
     start: Instant,
+    /// Set by an owning [`MetricsScope`] to indicate this guard's `Drop`
+    /// has already been fully handled (scope-stack pop *and* profiler
+    /// event) by the `MetricsScope` that wraps it. `MetricsScope` embeds a
+    /// plain `ScopeGuard` purely for its name/category/timing bookkeeping
+    /// but must emit exactly one combined event carrying its
+    /// operation_count/flops/bytes_transferred -- without this flag, the
+    /// inner guard's own automatic `Drop` (which Rust always runs, right
+    /// after `MetricsScope::drop`'s body, once a struct has a manual
+    /// `Drop` impl) would record a second, metric-less duplicate event for
+    /// the same logical scope and pop the nesting stack a second time.
+    suppressed: bool,
 }
 
 impl ScopeGuard {
@@ -22,10 +68,12 @@ impl ScopeGuard {
 
     /// Create a new scope guard with specified category
     pub fn with_category(name: &str, category: &str) -> Self {
+        push_scope_frame();
         Self {
             name: name.to_string(),
             category: category.to_string(),
             start: Instant::now(),
+            suppressed: false,
         }
     }
 
@@ -47,14 +95,31 @@ impl ScopeGuard {
 
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
+        // An enclosing `MetricsScope` already popped this scope's nesting
+        // frame and recorded a combined profiler event; nothing left to do.
+        if self.suppressed {
+            return;
+        }
+
         let duration = self.start.elapsed();
+        let duration_us = duration.as_micros() as u64;
+        let children_us = pop_scope_frame(duration_us);
         let thread_id = get_thread_id();
 
-        // Capture stack trace if enabled with overhead tracking
+        // Capture stack trace (and this scope's real start time, relative
+        // to the profiler's epoch) under one lock acquisition.
         let profiler_arc = global_profiler();
-        let (stack_trace, stack_trace_overhead_ns) = {
+        let (stack_trace, stack_trace_overhead_ns, start_us) = {
             let profiler = profiler_arc.lock();
-            if profiler.are_stack_traces_enabled() {
+            let start_us = profiler
+                .start_time
+                .map(|profiler_start| {
+                    self.start
+                        .saturating_duration_since(profiler_start)
+                        .as_micros() as u64
+                })
+                .unwrap_or(0);
+            let (trace, overhead_ns) = if profiler.are_stack_traces_enabled() {
                 if profiler.is_overhead_tracking_enabled() {
                     capture_stack_trace_with_overhead()
                 } else {
@@ -62,14 +127,15 @@ impl Drop for ScopeGuard {
                 }
             } else {
                 (None, 0)
-            }
+            };
+            (trace, overhead_ns, start_us)
         };
 
         let event = ProfileEvent {
             name: self.name.clone(),
             category: self.category.clone(),
-            start_us: 0, // This will be adjusted by the profiler
-            duration_us: duration.as_micros() as u64,
+            start_us,
+            duration_us,
             thread_id,
             operation_count: None,
             flops: None,
@@ -85,7 +151,11 @@ impl Drop for ScopeGuard {
                 profiler.overhead_stats.stack_trace_count += 1;
                 profiler.overhead_stats.total_overhead_ns += stack_trace_overhead_ns;
             }
+            // add_event() credits this event with its full duration as
+            // exclusive time by default; correct that for whatever was
+            // already attributed to this scope's own direct children.
             profiler.add_event(event);
+            profiler.exclusive_total_us = profiler.exclusive_total_us.saturating_sub(children_us);
         }
     }
 }
@@ -207,13 +277,25 @@ impl MetricsScope {
 impl Drop for MetricsScope {
     fn drop(&mut self) {
         let duration = self.guard.start.elapsed();
+        let duration_us = duration.as_micros() as u64;
+        let children_us = pop_scope_frame(duration_us);
         let thread_id = get_thread_id();
 
-        // Capture stack trace if enabled
+        // Capture stack trace (and this scope's real start time) under one
+        // lock acquisition, mirroring `ScopeGuard::drop`.
         let profiler_arc = global_profiler();
-        let (stack_trace, stack_trace_overhead_ns) = {
+        let (stack_trace, stack_trace_overhead_ns, start_us) = {
             let profiler = profiler_arc.lock();
-            if profiler.are_stack_traces_enabled() {
+            let start_us = profiler
+                .start_time
+                .map(|profiler_start| {
+                    self.guard
+                        .start
+                        .saturating_duration_since(profiler_start)
+                        .as_micros() as u64
+                })
+                .unwrap_or(0);
+            let (trace, overhead_ns) = if profiler.are_stack_traces_enabled() {
                 if profiler.is_overhead_tracking_enabled() {
                     capture_stack_trace_with_overhead()
                 } else {
@@ -221,14 +303,15 @@ impl Drop for MetricsScope {
                 }
             } else {
                 (None, 0)
-            }
+            };
+            (trace, overhead_ns, start_us)
         };
 
         let event = ProfileEvent {
             name: self.guard.name.clone(),
             category: self.guard.category.clone(),
-            start_us: 0, // Will be adjusted by profiler
-            duration_us: duration.as_micros() as u64,
+            start_us,
+            duration_us,
             thread_id,
             operation_count: self.operation_count,
             flops: self.flops,
@@ -245,7 +328,15 @@ impl Drop for MetricsScope {
                 profiler.overhead_stats.total_overhead_ns += stack_trace_overhead_ns;
             }
             profiler.add_event(event);
+            profiler.exclusive_total_us = profiler.exclusive_total_us.saturating_sub(children_us);
         }
+
+        // This scope's nesting frame is already popped and its (combined,
+        // metrics-carrying) event already recorded above; prevent the
+        // inner `ScopeGuard`'s own `Drop` -- which Rust will run
+        // automatically right after this function returns -- from doing
+        // either a second time. See the `suppressed` field's doc comment.
+        self.guard.suppressed = true;
     }
 }
 
@@ -300,7 +391,7 @@ mod tests {
         }
 
         let stats = get_global_stats().expect("get global stats should succeed");
-        assert!(stats.0 > 0); // Should have at least one event
+        assert!(stats.event_count > 0); // Should have at least one event
 
         stop_profiling();
     }
@@ -316,7 +407,7 @@ mod tests {
         }
 
         let stats = get_global_stats().expect("get global stats should succeed");
-        assert!(stats.0 > 0);
+        assert!(stats.event_count > 0);
 
         stop_profiling();
     }
@@ -333,7 +424,7 @@ mod tests {
 
         assert_eq!(result, 42);
         let stats = get_global_stats().expect("get global stats should succeed");
-        assert!(stats.0 > 0);
+        assert!(stats.event_count > 0);
 
         stop_profiling();
     }
@@ -358,7 +449,10 @@ mod tests {
         }
 
         let stats = get_global_stats().expect("get global stats should succeed");
-        assert!(stats.0 > 0);
+        // Exactly one event: MetricsScope must not also let its embedded
+        // ScopeGuard record a second, metric-less duplicate when it is
+        // auto-dropped right after MetricsScope::drop's body finishes.
+        assert_eq!(stats.event_count, 1);
 
         stop_profiling();
     }
@@ -396,7 +490,7 @@ mod tests {
         }
 
         let stats = get_global_stats().expect("get global stats should succeed");
-        assert!(stats.0 >= 2); // Should have at least 2 events
+        assert!(stats.event_count >= 2); // Should have at least 2 events
 
         stop_profiling();
     }

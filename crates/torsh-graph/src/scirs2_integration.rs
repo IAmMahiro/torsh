@@ -3,6 +3,9 @@
 //! This module provides integration points with the SciRS2 graph library,
 //! leveraging advanced graph algorithms and spectral methods for enhanced
 //! graph neural network operations.
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
 
 use crate::GraphData;
 use torsh_core::device::DeviceType;
@@ -13,25 +16,19 @@ pub mod algorithms {
     use super::*;
 
     /// PageRank algorithm using simplified implementation
-    pub fn pagerank(graph: &GraphData, damping: f64, max_iter: usize) -> Tensor {
+    pub fn pagerank(graph: &GraphData, damping: f64, max_iter: usize) -> Result<Tensor> {
         // Simplified PageRank implementation for compilation compatibility
         let num_nodes = graph.num_nodes;
-        let mut ranks = torsh_tensor::creation::full(&[num_nodes], 1.0 / num_nodes as f32)
-            .expect("initial ranks tensor creation should succeed");
+        let mut ranks = torsh_tensor::creation::full(&[num_nodes], 1.0 / num_nodes as f32)?;
 
         for _ in 0..max_iter {
-            let damped_ranks = ranks
-                .mul_scalar(damping as f32)
-                .expect("damping multiplication should succeed");
+            let damped_ranks = ranks.mul_scalar(damping as f32)?;
             let teleport_prob = (1.0 - damping) / num_nodes as f64;
-            let teleport_tensor = torsh_tensor::creation::full(&[num_nodes], teleport_prob as f32)
-                .expect("teleport tensor creation should succeed");
-            ranks = damped_ranks
-                .add(&teleport_tensor)
-                .expect("operation should succeed");
+            let teleport_tensor = torsh_tensor::creation::full(&[num_nodes], teleport_prob as f32)?;
+            ranks = damped_ranks.add(&teleport_tensor)?;
         }
 
-        ranks
+        Ok(ranks)
     }
 
     /// Community detection using basic implementation
@@ -47,35 +44,47 @@ pub mod algorithms {
     }
 
     /// Betweenness centrality using simplified implementation
-    pub fn betweenness_centrality(graph: &GraphData) -> Tensor {
+    pub fn betweenness_centrality(graph: &GraphData) -> Result<Tensor> {
         // Simplified betweenness centrality for compilation compatibility
         let uniform_centrality = vec![1.0 / graph.num_nodes as f32; graph.num_nodes];
-        torsh_tensor::creation::from_vec(uniform_centrality, &[graph.num_nodes], DeviceType::Cpu)
-            .expect("betweenness centrality tensor creation should succeed")
+        Ok(torsh_tensor::creation::from_vec(
+            uniform_centrality,
+            &[graph.num_nodes],
+            DeviceType::Cpu,
+        )?)
     }
 
     /// Eigenvector centrality using simplified implementation
-    pub fn eigenvector_centrality(graph: &GraphData, _max_iter: usize) -> Tensor {
+    pub fn eigenvector_centrality(graph: &GraphData, _max_iter: usize) -> Result<Tensor> {
         // Simplified eigenvector centrality for compilation compatibility
         let uniform_centrality = vec![1.0 / graph.num_nodes as f32; graph.num_nodes];
-        torsh_tensor::creation::from_vec(uniform_centrality, &[graph.num_nodes], DeviceType::Cpu)
-            .expect("eigenvector centrality tensor creation should succeed")
+        Ok(torsh_tensor::creation::from_vec(
+            uniform_centrality,
+            &[graph.num_nodes],
+            DeviceType::Cpu,
+        )?)
     }
 
     /// Closeness centrality using simplified implementation
-    pub fn closeness_centrality(graph: &GraphData) -> Tensor {
+    pub fn closeness_centrality(graph: &GraphData) -> Result<Tensor> {
         // Simplified closeness centrality for compilation compatibility
         let uniform_centrality = vec![1.0 / graph.num_nodes as f32; graph.num_nodes];
-        torsh_tensor::creation::from_vec(uniform_centrality, &[graph.num_nodes], DeviceType::Cpu)
-            .expect("closeness centrality tensor creation should succeed")
+        Ok(torsh_tensor::creation::from_vec(
+            uniform_centrality,
+            &[graph.num_nodes],
+            DeviceType::Cpu,
+        )?)
     }
 
     /// Katz centrality using simplified implementation
-    pub fn katz_centrality(graph: &GraphData, _alpha: f64) -> Tensor {
+    pub fn katz_centrality(graph: &GraphData, _alpha: f64) -> Result<Tensor> {
         // Simplified Katz centrality for compilation compatibility
         let uniform_centrality = vec![1.0 / graph.num_nodes as f32; graph.num_nodes];
-        torsh_tensor::creation::from_vec(uniform_centrality, &[graph.num_nodes], DeviceType::Cpu)
-            .expect("katz centrality tensor creation should succeed")
+        Ok(torsh_tensor::creation::from_vec(
+            uniform_centrality,
+            &[graph.num_nodes],
+            DeviceType::Cpu,
+        )?)
     }
 
     /// Graph connectivity analysis
@@ -124,33 +133,28 @@ pub mod spectral {
     use super::*;
 
     /// Compute graph Laplacian eigenvalues and eigenvectors
-    pub fn laplacian_eigendecomposition(graph: &GraphData) -> (Tensor, Tensor) {
+    pub fn laplacian_eigendecomposition(graph: &GraphData) -> Result<(Tensor, Tensor)> {
         // Simplified eigendecomposition for compilation compatibility
-        let eigenvalues = torsh_tensor::creation::ones(&[graph.num_nodes])
-            .expect("eigenvalues tensor creation should succeed");
-        let eigenvectors = torsh_tensor::creation::eye(graph.num_nodes)
-            .expect("eigenvectors tensor creation should succeed");
-        (eigenvalues, eigenvectors)
+        let eigenvalues = torsh_tensor::creation::ones(&[graph.num_nodes])?;
+        let eigenvectors = torsh_tensor::creation::eye(graph.num_nodes)?;
+        Ok((eigenvalues, eigenvectors))
     }
 
     /// Graph signal processing using spectral domain
-    pub fn graph_fourier_transform(graph: &GraphData, signal: &Tensor) -> Tensor {
+    pub fn graph_fourier_transform(graph: &GraphData, signal: &Tensor) -> Result<Tensor> {
         // Simplified GFT for compilation compatibility
-        let (_eigenvals, eigenvecs) = laplacian_eigendecomposition(graph);
-        eigenvecs
-            .t()
-            .expect("operation should succeed")
-            .matmul(signal)
-            .expect("operation should succeed")
+        let (_eigenvals, eigenvecs) = laplacian_eigendecomposition(graph)?;
+        Ok(eigenvecs.t()?.matmul(signal)?)
     }
 
     /// Inverse graph Fourier transform
-    pub fn inverse_graph_fourier_transform(graph: &GraphData, spectral_signal: &Tensor) -> Tensor {
+    pub fn inverse_graph_fourier_transform(
+        graph: &GraphData,
+        spectral_signal: &Tensor,
+    ) -> Result<Tensor> {
         // Simplified inverse GFT for compilation compatibility
-        let (_eigenvals, eigenvecs) = laplacian_eigendecomposition(graph);
-        eigenvecs
-            .matmul(spectral_signal)
-            .expect("operation should succeed")
+        let (_eigenvals, eigenvecs) = laplacian_eigendecomposition(graph)?;
+        Ok(eigenvecs.matmul(spectral_signal)?)
     }
 
     /// Spectral graph convolution
@@ -158,13 +162,11 @@ pub mod spectral {
         graph: &GraphData,
         signal: &Tensor,
         _filter_coeffs: &[f64],
-    ) -> Tensor {
+    ) -> Result<Tensor> {
         // Simplified spectral convolution for compilation compatibility
-        let (eigenvals, _eigenvecs) = laplacian_eigendecomposition(graph);
-        let transformed = graph_fourier_transform(graph, signal);
-        let filtered = transformed
-            .mul(&eigenvals.unsqueeze(-1).expect("operation should succeed"))
-            .expect("operation should succeed");
+        let (eigenvals, _eigenvecs) = laplacian_eigendecomposition(graph)?;
+        let transformed = graph_fourier_transform(graph, signal)?;
+        let filtered = transformed.mul(&eigenvals.unsqueeze(-1)?)?;
         inverse_graph_fourier_transform(graph, &filtered)
     }
 }
@@ -176,7 +178,7 @@ pub mod generation {
     use scirs2_core::RngExt;
 
     /// Generate Erdős-Rényi random graph
-    pub fn erdos_renyi(num_nodes: usize, edge_prob: f64) -> GraphData {
+    pub fn erdos_renyi(num_nodes: usize, edge_prob: f64) -> Result<GraphData> {
         let mut rng = Random::seed(42);
         let mut edges = Vec::new();
 
@@ -195,20 +197,17 @@ pub mod generation {
                 edges.iter().map(|&x| x as f32).collect(),
                 &[2, num_edges],
                 DeviceType::Cpu,
-            )
-            .expect("erdos_renyi edge index tensor creation should succeed")
+            )?
         } else {
-            torsh_tensor::creation::zeros(&[2, 0])
-                .expect("empty edge index tensor creation should succeed")
+            torsh_tensor::creation::zeros(&[2, 0])?
         };
 
-        let x = torsh_tensor::creation::randn(&[num_nodes, 16])
-            .expect("erdos_renyi features tensor creation should succeed");
-        GraphData::new(x, edge_index)
+        let x = torsh_tensor::creation::randn(&[num_nodes, 16])?;
+        Ok(GraphData::new(x, edge_index))
     }
 
     /// Generate Barabási-Albert preferential attachment graph
-    pub fn barabasi_albert(num_nodes: usize, edges_per_node: usize) -> GraphData {
+    pub fn barabasi_albert(num_nodes: usize, edges_per_node: usize) -> Result<GraphData> {
         let mut rng = Random::seed(42);
         let mut edges = Vec::new();
         let mut degrees = vec![0; num_nodes];
@@ -256,20 +255,17 @@ pub mod generation {
                 edges.iter().map(|&x| x as f32).collect(),
                 &[2, num_edges],
                 DeviceType::Cpu,
-            )
-            .expect("barabasi_albert edge index tensor creation should succeed")
+            )?
         } else {
-            torsh_tensor::creation::zeros(&[2, 0])
-                .expect("empty edge index tensor creation should succeed")
+            torsh_tensor::creation::zeros(&[2, 0])?
         };
 
-        let x = torsh_tensor::creation::randn(&[num_nodes, 16])
-            .expect("barabasi_albert features tensor creation should succeed");
-        GraphData::new(x, edge_index)
+        let x = torsh_tensor::creation::randn(&[num_nodes, 16])?;
+        Ok(GraphData::new(x, edge_index))
     }
 
     /// Generate small-world graph using Watts-Strogatz model
-    pub fn watts_strogatz(num_nodes: usize, k: usize, rewire_prob: f64) -> GraphData {
+    pub fn watts_strogatz(num_nodes: usize, k: usize, rewire_prob: f64) -> Result<GraphData> {
         let mut rng = Random::seed(42);
         let mut edges = Vec::new();
 
@@ -304,20 +300,17 @@ pub mod generation {
                 rewired_edges.iter().map(|&x| x as f32).collect(),
                 &[2, num_edges],
                 DeviceType::Cpu,
-            )
-            .expect("watts_strogatz edge index tensor creation should succeed")
+            )?
         } else {
-            torsh_tensor::creation::zeros(&[2, 0])
-                .expect("empty edge index tensor creation should succeed")
+            torsh_tensor::creation::zeros(&[2, 0])?
         };
 
-        let x = torsh_tensor::creation::randn(&[num_nodes, 16])
-            .expect("watts_strogatz features tensor creation should succeed");
-        GraphData::new(x, edge_index)
+        let x = torsh_tensor::creation::randn(&[num_nodes, 16])?;
+        Ok(GraphData::new(x, edge_index))
     }
 
     /// Generate complete graph
-    pub fn complete(num_nodes: usize) -> GraphData {
+    pub fn complete(num_nodes: usize) -> Result<GraphData> {
         let mut edges = Vec::new();
 
         // Connect every pair of nodes
@@ -334,16 +327,13 @@ pub mod generation {
                 edges.iter().map(|&x| x as f32).collect(),
                 &[2, num_directed_edges],
                 DeviceType::Cpu,
-            )
-            .expect("complete graph edge index tensor creation should succeed")
+            )?
         } else {
-            torsh_tensor::creation::zeros(&[2, 0])
-                .expect("empty edge index tensor creation should succeed")
+            torsh_tensor::creation::zeros(&[2, 0])?
         };
 
-        let x = torsh_tensor::creation::randn(&[num_nodes, 16])
-            .expect("complete graph features tensor creation should succeed");
-        GraphData::new(x, edge_index)
+        let x = torsh_tensor::creation::randn(&[num_nodes, 16])?;
+        Ok(GraphData::new(x, edge_index))
     }
 }
 
@@ -352,12 +342,12 @@ pub mod spatial {
     use super::*;
 
     /// K-nearest neighbors graph construction
-    pub fn knn_graph(points: &Tensor, k: usize) -> GraphData {
+    pub fn knn_graph(points: &Tensor, k: usize) -> Result<GraphData> {
         // Simplified KNN implementation for compilation compatibility
         let num_points = points.shape().dims()[0];
         let point_dim = points.shape().dims()[1];
 
-        let points_flat = points.to_vec().expect("conversion should succeed");
+        let points_flat = points.to_vec()?;
         let points_data: Vec<Vec<f64>> = points_flat
             .chunks(point_dim)
             .map(|chunk| chunk.iter().map(|&x| x as f64).collect())
@@ -386,23 +376,21 @@ pub mod spatial {
 
         let num_edges = edges.len() / 2;
         let edge_index = if num_edges > 0 {
-            torsh_tensor::creation::from_vec(edges, &[2, num_edges], DeviceType::Cpu)
-                .expect("knn edge index tensor creation should succeed")
+            torsh_tensor::creation::from_vec(edges, &[2, num_edges], DeviceType::Cpu)?
         } else {
-            torsh_tensor::creation::zeros(&[2, 0])
-                .expect("empty edge index tensor creation should succeed")
+            torsh_tensor::creation::zeros(&[2, 0])?
         };
 
-        GraphData::new(points.clone(), edge_index)
+        Ok(GraphData::new(points.clone(), edge_index))
     }
 
     /// Radius graph construction
-    pub fn radius_graph(points: &Tensor, radius: f64) -> GraphData {
+    pub fn radius_graph(points: &Tensor, radius: f64) -> Result<GraphData> {
         // Simplified radius graph implementation for compilation compatibility
         let num_points = points.shape().dims()[0];
         let point_dim = points.shape().dims()[1];
 
-        let points_flat = points.to_vec().expect("conversion should succeed");
+        let points_flat = points.to_vec()?;
         let points_data: Vec<Vec<f64>> = points_flat
             .chunks(point_dim)
             .map(|chunk| chunk.iter().map(|&x| x as f64).collect())
@@ -425,26 +413,23 @@ pub mod spatial {
 
         let num_edges = edges.len() / 2;
         let edge_index = if num_edges > 0 {
-            torsh_tensor::creation::from_vec(edges, &[2, num_edges], DeviceType::Cpu)
-                .expect("radius graph edge index tensor creation should succeed")
+            torsh_tensor::creation::from_vec(edges, &[2, num_edges], DeviceType::Cpu)?
         } else {
-            torsh_tensor::creation::zeros(&[2, 0])
-                .expect("empty edge index tensor creation should succeed")
+            torsh_tensor::creation::zeros(&[2, 0])?
         };
 
-        GraphData::new(points.clone(), edge_index)
+        Ok(GraphData::new(points.clone(), edge_index))
     }
 
     /// Delaunay triangulation graph (simplified approximation)
-    pub fn delaunay_graph(points: &Tensor) -> GraphData {
+    pub fn delaunay_graph(points: &Tensor) -> Result<GraphData> {
         // Simplified triangulation approximation for compilation compatibility
         let num_points = points.shape().dims()[0];
 
         if num_points < 3 {
             let x = points.clone();
-            let edge_index = torsh_tensor::creation::zeros(&[2, 0])
-                .expect("delaunay empty edge index tensor creation should succeed");
-            return GraphData::new(x, edge_index);
+            let edge_index = torsh_tensor::creation::zeros(&[2, 0])?;
+            return Ok(GraphData::new(x, edge_index));
         }
 
         // Connect each point to its nearest neighbors (simplified)
@@ -457,51 +442,40 @@ pub mod quantum {
     use super::*;
 
     /// Quantum walk on graph
-    pub fn quantum_walk(graph: &GraphData, steps: usize) -> Tensor {
+    pub fn quantum_walk(graph: &GraphData, steps: usize) -> Result<Tensor> {
         // Simplified quantum walk for compilation compatibility
         let adjacency = crate::utils::degree_matrix(&graph.edge_index, graph.num_nodes);
 
         // Simple random walk simulation
-        let mut state = torsh_tensor::creation::zeros(&[graph.num_nodes])
-            .expect("initial quantum walk state tensor creation should succeed");
+        let mut state = torsh_tensor::creation::zeros(&[graph.num_nodes])?;
         // Start at node 0 - simplified initialization
-        let mut state_data = state.to_vec().expect("conversion should succeed");
+        let mut state_data = state.to_vec()?;
         if !state_data.is_empty() {
             state_data[0] = 1.0;
-            state =
-                torsh_tensor::creation::from_vec(state_data, state.shape().dims(), DeviceType::Cpu)
-                    .expect("quantum walk state initialization should succeed");
+            state = torsh_tensor::creation::from_vec(
+                state_data,
+                state.shape().dims(),
+                DeviceType::Cpu,
+            )?;
         }
 
+        let adjacency = adjacency?;
         for _ in 0..steps {
-            state = adjacency
-                .matmul(&state.unsqueeze(-1).expect("operation should succeed"))
-                .expect("operation should succeed")
-                .squeeze(-1)
-                .expect("quantum walk squeeze should succeed");
-            let norm_val = state
-                .norm()
-                .expect("quantum walk norm should succeed")
-                .to_vec()
-                .expect("conversion should succeed")[0];
+            state = adjacency.matmul(&state.unsqueeze(-1)?)?.squeeze(-1)?;
+            let norm_val = state.norm()?.to_vec()?[0];
             if norm_val > 0.0 {
-                state = state
-                    .div_scalar(norm_val)
-                    .expect("quantum walk normalization should succeed");
+                state = state.div_scalar(norm_val)?;
             }
         }
 
-        state
+        Ok(state)
     }
 
     /// Quantum graph coloring
-    pub fn quantum_graph_coloring(graph: &GraphData, num_colors: usize) -> Vec<usize> {
+    pub fn quantum_graph_coloring(graph: &GraphData, num_colors: usize) -> Result<Vec<usize>> {
         // Simplified quantum graph coloring for compilation compatibility
         let num_nodes = graph.num_nodes;
-        let edge_tensor_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_tensor_data = graph.edge_index.to_vec()?;
         let edge_data = vec![
             edge_tensor_data[0..edge_tensor_data.len() / 2]
                 .iter()
@@ -541,7 +515,7 @@ pub mod quantum {
                 .unwrap_or(num_colors.saturating_sub(1));
         }
 
-        colors
+        Ok(colors)
     }
 }
 
@@ -561,7 +535,7 @@ mod tests {
     #[test]
     fn test_pagerank() {
         let graph = create_test_graph();
-        let ranks = algorithms::pagerank(&graph, 0.85, 10);
+        let ranks = algorithms::pagerank(&graph, 0.85, 10).expect("operation should succeed");
         assert_eq!(ranks.shape().dims(), &[3]);
 
         let rank_values = ranks.to_vec().expect("conversion should succeed");
@@ -579,14 +553,14 @@ mod tests {
 
     #[test]
     fn test_graph_generation() {
-        let er_graph = generation::erdos_renyi(5, 0.3);
+        let er_graph = generation::erdos_renyi(5, 0.3).expect("operation should succeed");
         assert_eq!(er_graph.num_nodes, 5);
         assert_eq!(er_graph.x.shape().dims(), &[5, 16]);
 
-        let ba_graph = generation::barabasi_albert(6, 2);
+        let ba_graph = generation::barabasi_albert(6, 2).expect("operation should succeed");
         assert_eq!(ba_graph.num_nodes, 6);
 
-        let ws_graph = generation::watts_strogatz(8, 4, 0.2);
+        let ws_graph = generation::watts_strogatz(8, 4, 0.2).expect("operation should succeed");
         assert_eq!(ws_graph.num_nodes, 8);
     }
 
@@ -599,11 +573,11 @@ mod tests {
         )
         .unwrap();
 
-        let knn = spatial::knn_graph(&points, 2);
+        let knn = spatial::knn_graph(&points, 2).expect("operation should succeed");
         assert_eq!(knn.num_nodes, 4);
         assert!(knn.num_edges > 0);
 
-        let radius = spatial::radius_graph(&points, 1.5);
+        let radius = spatial::radius_graph(&points, 1.5).expect("operation should succeed");
         assert_eq!(radius.num_nodes, 4);
     }
 
@@ -611,10 +585,11 @@ mod tests {
     fn test_quantum_algorithms() {
         let graph = create_test_graph();
 
-        let walk_state = quantum::quantum_walk(&graph, 5);
+        let walk_state = quantum::quantum_walk(&graph, 5).expect("operation should succeed");
         assert_eq!(walk_state.shape().dims(), &[3]);
 
-        let coloring = quantum::quantum_graph_coloring(&graph, 3);
+        let coloring =
+            quantum::quantum_graph_coloring(&graph, 3).expect("operation should succeed");
         assert_eq!(coloring.len(), 3);
         assert!(coloring.iter().all(|&c| c < 3));
     }

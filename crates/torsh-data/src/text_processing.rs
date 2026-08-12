@@ -351,9 +351,20 @@ pub struct NGramGenerator {
 
 impl NGramGenerator {
     /// Create n-gram generator for specified n
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` is 0. See [`Self::try_new`] for a non-panicking variant.
     pub fn new(n: usize) -> Self {
         assert!(n > 0, "N must be greater than 0");
         Self { n }
+    }
+
+    /// Fallible variant of [`Self::new`] that returns an error instead of
+    /// panicking when `n` is 0.
+    pub fn try_new(n: usize) -> Result<Self> {
+        crate::utils::validate_positive(n, "n")?;
+        Ok(Self { n })
     }
 
     /// Create bigram generator (n=2)

@@ -6,6 +6,19 @@
 
 use std::fmt;
 
+// NOTE: deliberately NOT `use crate::error::Result` at module scope -- the
+// crate's `Result<T>` alias takes one generic parameter and would shadow the
+// two-parameter `std::result::Result` used by the `FromStr` impl below.
+#[cfg(any(
+    all(
+        feature = "cudnn",
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ),
+    feature = "cuda"
+))]
+use crate::error::TorshError;
+
 /// Supported data types for tensors
 ///
 /// This enum represents all the fundamental data types that can be stored in ToRSh tensors.
@@ -365,10 +378,16 @@ impl DType {
     /// Maps ToRSh data types to cuDNN's internal data type representations
     /// for GPU acceleration. Only supports types that have cuDNN equivalents.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the data type is not supported by cuDNN (e.g., complex types,
-    /// quantized types, or boolean).
+    /// Returns [`crate::error::TorshError::UnsupportedOperation`] if the data
+    /// type has no cuDNN equivalent (e.g. complex types, quantized types, or
+    /// boolean), or no *verified* one: earlier versions of this method mapped
+    /// `I8`/`I32`/`U8` to `CUDNN_DATA_FLOAT` as a silent, incorrect fallback
+    /// (cuDNN has distinct `CUDNN_DATA_INT8`/`CUDNN_DATA_INT32` codes). Since
+    /// this crate has no verified integer mapping and cuDNN types are only
+    /// ever compiled on x86_64 Linux/Windows, those three types now return an
+    /// honest error instead of a wrong float reinterpretation.
     ///
     /// # Examples
     ///
@@ -376,9 +395,9 @@ impl DType {
     /// use torsh_core::dtype::DType;
     ///
     /// // These work with cuDNN (requires cudnn feature and library)
-    /// let _ = DType::F32.to_cudnn_data_type();
-    /// let _ = DType::F64.to_cudnn_data_type();
-    /// let _ = DType::F16.to_cudnn_data_type();
+    /// let _ = DType::F32.to_cudnn_data_type()?;
+    /// let _ = DType::F64.to_cudnn_data_type()?;
+    /// let _ = DType::F16.to_cudnn_data_type()?;
     /// ```
     /// Only available on x86_64 Linux/Windows where cuDNN SDK is supported
     #[cfg(all(
@@ -386,15 +405,15 @@ impl DType {
         target_arch = "x86_64",
         any(target_os = "linux", target_os = "windows")
     ))]
-    pub fn to_cudnn_data_type(self) -> cudnn_sys::cudnnDataType_t {
+    pub fn to_cudnn_data_type(self) -> crate::error::Result<cudnn_sys::cudnnDataType_t> {
         match self {
-            DType::F32 => cudnn_sys::cudnnDataType_t::CUDNN_DATA_FLOAT,
-            DType::F64 => cudnn_sys::cudnnDataType_t::CUDNN_DATA_DOUBLE,
-            DType::F16 => cudnn_sys::cudnnDataType_t::CUDNN_DATA_HALF,
-            // Integer and unsigned types not supported in this cuDNN version
-            // Use float as fallback for unsupported types
-            DType::I8 | DType::I32 | DType::U8 => cudnn_sys::cudnnDataType_t::CUDNN_DATA_FLOAT,
-            _ => panic!("Unsupported data type for cuDNN: {:?}", self),
+            DType::F32 => Ok(cudnn_sys::cudnnDataType_t::CUDNN_DATA_FLOAT),
+            DType::F64 => Ok(cudnn_sys::cudnnDataType_t::CUDNN_DATA_DOUBLE),
+            DType::F16 => Ok(cudnn_sys::cudnnDataType_t::CUDNN_DATA_HALF),
+            _ => Err(TorshError::UnsupportedOperation {
+                op: "to_cudnn_data_type".to_string(),
+                dtype: format!("{:?}", self),
+            }),
         }
     }
 
@@ -402,18 +421,26 @@ impl DType {
     ///
     /// Maps ToRSh data types to CUDA runtime data type representations.
     /// This is a placeholder implementation that would map to actual CUDA types.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::TorshError::UnsupportedOperation`] if the data
+    /// type has no CUDA runtime equivalent mapped here.
     #[cfg(feature = "cuda")]
-    pub fn to_cuda_data_type(self) -> u32 {
+    pub fn to_cuda_data_type(self) -> crate::error::Result<u32> {
         match self {
-            DType::F32 => 0,  // CUDA_R_32F
-            DType::F64 => 1,  // CUDA_R_64F
-            DType::F16 => 2,  // CUDA_R_16F
-            DType::I8 => 3,   // CUDA_R_8I
-            DType::I32 => 4,  // CUDA_R_32I
-            DType::U8 => 5,   // CUDA_R_8U
-            DType::C64 => 6,  // CUDA_C_32F
-            DType::C128 => 7, // CUDA_C_64F
-            _ => panic!("Unsupported data type for CUDA: {:?}", self),
+            DType::F32 => Ok(0),  // CUDA_R_32F
+            DType::F64 => Ok(1),  // CUDA_R_64F
+            DType::F16 => Ok(2),  // CUDA_R_16F
+            DType::I8 => Ok(3),   // CUDA_R_8I
+            DType::I32 => Ok(4),  // CUDA_R_32I
+            DType::U8 => Ok(5),   // CUDA_R_8U
+            DType::C64 => Ok(6),  // CUDA_C_32F
+            DType::C128 => Ok(7), // CUDA_C_64F
+            _ => Err(TorshError::UnsupportedOperation {
+                op: "to_cuda_data_type".to_string(),
+                dtype: format!("{:?}", self),
+            }),
         }
     }
 

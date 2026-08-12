@@ -9,6 +9,7 @@
 use crate::error_handling::{AutogradError, AutogradResult};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use torsh_core::sync::{MutexExt, RwLockExt};
 
 /// Types of edge cases that can occur in autograd operations
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -736,10 +737,7 @@ impl EdgeCaseHandler {
 
     /// Get current statistics
     pub fn get_statistics(&self) -> EdgeCaseStatistics {
-        self.statistics
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.statistics.read_or_recover().clone()
     }
 
     /// Reset statistics
@@ -804,17 +802,13 @@ pub fn get_global_edge_case_handler() -> &'static std::sync::Mutex<EdgeCaseHandl
 pub fn handle_tensor_edge_cases(
     tensor: &TensorInfo,
 ) -> AutogradResult<Vec<EdgeCaseHandlingResult>> {
-    let handler = get_global_edge_case_handler()
-        .lock()
-        .expect("lock should not be poisoned");
+    let handler = get_global_edge_case_handler().lock_or_recover();
     handler.handle_tensor(tensor)
 }
 
 /// Convenience function to validate shapes using the global handler
 pub fn validate_tensor_shapes(shapes: &[Vec<usize>], operation: &str) -> AutogradResult<()> {
-    let handler = get_global_edge_case_handler()
-        .lock()
-        .expect("lock should not be poisoned");
+    let handler = get_global_edge_case_handler().lock_or_recover();
     handler.validate_shapes(shapes, operation)
 }
 
@@ -961,13 +955,7 @@ mod tests {
     #[test]
     fn test_global_handler_access() {
         let handler = get_global_edge_case_handler();
-        assert!(
-            handler
-                .lock()
-                .expect("lock should not be poisoned")
-                .config
-                .enabled
-        );
+        assert!(handler.lock_or_recover().config.enabled);
     }
 
     #[test]

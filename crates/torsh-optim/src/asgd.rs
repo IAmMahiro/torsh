@@ -138,7 +138,7 @@ impl Optimizer for ASGD {
                 // Update parameter
                 drop(param_read);
                 let mut param_write = param.write();
-                *param_write = param_write.sub(&grad_to_use.mul_scalar(eta)?)?;
+                crate::param_update::sub_assign(&mut param_write, &grad_to_use.mul_scalar(eta)?)?;
 
                 // Update averaged parameter
                 if self.step_count as f32 >= self.t0 {

@@ -14,6 +14,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use torsh_core::sync::MutexExt;
 
 use scirs2_core::parallel_ops::*; // SciRS2 parallel operations
 use torsh_core::{device::DeviceType, dtype::TensorElement, error::Result};
@@ -244,10 +245,7 @@ impl<
             return Ok(BatchHandle::Immediate(self.execute_single(op)?));
         }
 
-        let mut batch_lock = self
-            .current_batch
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut batch_lock = self.current_batch.lock_or_recover();
 
         // Get or create current batch
         let batch = batch_lock.get_or_insert_with(|| OperationBatch::new(op.device()));
@@ -262,10 +260,7 @@ impl<
 
             self.execute_batch(ready_batch)?;
 
-            let mut new_batch_lock = self
-                .current_batch
-                .lock()
-                .expect("lock should not be poisoned");
+            let mut new_batch_lock = self.current_batch.lock_or_recover();
             let new_batch = new_batch_lock.get_or_insert_with(|| OperationBatch::new(op.device()));
             new_batch.add(op);
         } else {
@@ -286,11 +281,7 @@ impl<
 
     /// Force execution of any pending batch
     pub fn flush(&self) -> Result<()> {
-        let batch = self
-            .current_batch
-            .lock()
-            .expect("lock should not be poisoned")
-            .take();
+        let batch = self.current_batch.lock_or_recover().take();
 
         if let Some(batch) = batch {
             if !batch.is_empty() {
@@ -310,7 +301,7 @@ impl<
             + std::ops::Div<Output = T>
             + torsh_core::FloatElement,
     {
-        let mut stats = self.stats.lock().expect("lock should not be poisoned");
+        let mut stats = self.stats.lock_or_recover();
         stats.single_ops_executed += 1;
         drop(stats);
 
@@ -340,7 +331,7 @@ impl<
     {
         let batch_size = batch.len();
 
-        let mut stats = self.stats.lock().expect("lock should not be poisoned");
+        let mut stats = self.stats.lock_or_recover();
         stats.batches_executed += 1;
         stats.total_ops_batched += batch_size;
         stats.avg_batch_size = (stats.avg_batch_size * (stats.batches_executed - 1) as f64
@@ -375,15 +366,12 @@ impl<
 
     /// Get batching statistics
     pub fn stats(&self) -> BatchingStats {
-        self.stats
-            .lock()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.stats.lock_or_recover().clone()
     }
 
     /// Reset statistics
     pub fn reset_stats(&self) {
-        *self.stats.lock().expect("lock should not be poisoned") = BatchingStats::default();
+        *self.stats.lock_or_recover() = BatchingStats::default();
     }
 }
 

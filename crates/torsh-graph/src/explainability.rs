@@ -2,9 +2,12 @@
 //!
 //! This module provides advanced explainability methods for graph neural networks,
 //! including Layer-wise Relevance Propagation (LRP) adapted for graph structures.
-
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
+
 use crate::{GraphData, GraphLayer};
 use std::collections::HashMap;
 use torsh_tensor::{
@@ -387,7 +390,7 @@ impl GraphExplainer {
         // Store activations during forward pass
         let mut current_graph = graph.clone();
         for (i, layer) in model_layers.iter().enumerate() {
-            current_graph = layer.forward(&current_graph);
+            current_graph = layer.forward(&current_graph)?;
             self.lrp
                 .store_activation(format!("layer_{}", i), current_graph.x.clone());
         }

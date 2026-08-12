@@ -7,6 +7,7 @@ use crate::backend_integration::GpuBackendType;
 use crate::storage::TensorStorage;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock, Weak};
+use torsh_core::sync::RwLockExt;
 use torsh_core::{
     device::DeviceType,
     dtype::{DType, FloatElement, TensorElement},
@@ -39,8 +40,13 @@ where
     pub(crate) strides: Option<Vec<usize>>,
     /// Offset into the storage for views (0 for base tensors)
     pub(crate) storage_offset: usize,
-    /// Reference to base tensor for views (None for base tensors)
-    pub(crate) base_tensor: Option<Weak<Tensor<T>>>,
+    /// The tensor this one is a view of (`None` for base tensors).
+    ///
+    /// This is a *strong* handle on purpose: it keeps the source tensor's
+    /// metadata reachable for as long as any view of it exists, so aliasing can
+    /// actually be reasoned about. It costs only the metadata struct — the data
+    /// buffer inside [`TensorStorage`] is `Arc`-shared with the view anyway.
+    pub(crate) base_tensor: Option<Arc<Tensor<T>>>,
 }
 impl<T: TensorElement + Copy> Tensor<T> {
     /// Clean up dead weak references in custom operations to improve memory efficiency
@@ -182,12 +188,16 @@ impl<T: TensorElement + Copy> Tensor<T> {
         let flat_index = self.compute_flat_index(indices)?;
         self.storage.get(flat_index)
     }
-    /// Get element at single flat index
+    /// Get element at single flat index.
+    ///
+    /// `index` is a *logical* index in this tensor's own row-major order, so a
+    /// view resolves it through its strides and storage offset rather than
+    /// reading the base tensor's buffer directly.
     pub fn get_flat(&self, index: usize) -> Result<T>
     where
         T: Copy,
     {
-        self.storage.get(index)
+        self.storage.get(self.logical_to_physical(index)?)
     }
     /// Set element at index (requires multi-dimensional indices for views)
     pub fn set(&self, indices: &[usize], value: T) -> Result<()>
@@ -197,19 +207,94 @@ impl<T: TensorElement + Copy> Tensor<T> {
         let flat_index = self.compute_flat_index(indices)?;
         self.storage.set(flat_index, value)
     }
-    /// Get slice of elements
+    /// Get `len` elements starting at the logical flat index `start`.
+    ///
+    /// The range is expressed in this tensor's own row-major order; views gather
+    /// the elements through their strides instead of slicing the base buffer.
     pub fn get_slice(&self, start: usize, len: usize) -> Result<Vec<T>>
     where
         T: Copy,
     {
-        self.storage.get_slice(start, len)
+        self.check_logical_range(start, len)?;
+        if self.has_default_layout() {
+            return self.storage.get_slice(start + self.storage_offset, len);
+        }
+        let mut values = Vec::with_capacity(len);
+        for offset in 0..len {
+            values.push(
+                self.storage
+                    .get(self.logical_to_physical(start + offset)?)?,
+            );
+        }
+        Ok(values)
     }
-    /// Set slice of elements
+    /// Write `values` starting at the logical flat index `start`.
+    ///
+    /// The range is expressed in this tensor's own row-major order, so writing
+    /// through a view updates the elements the view actually addresses.
     pub fn set_slice(&self, start: usize, values: &[T]) -> Result<()>
     where
         T: Copy,
     {
-        self.storage.set_slice(start, values)
+        self.check_logical_range(start, values.len())?;
+        if self.has_default_layout() {
+            return self.storage.set_slice(start + self.storage_offset, values);
+        }
+        for (offset, &value) in values.iter().enumerate() {
+            self.storage
+                .set(self.logical_to_physical(start + offset)?, value)?;
+        }
+        Ok(())
+    }
+    /// Whether this tensor addresses its storage as a plain row-major block
+    /// (contiguous strides), so logical indices differ from physical ones only by
+    /// the storage offset.
+    pub(crate) fn has_default_layout(&self) -> bool {
+        match self.strides {
+            Some(ref strides) => *strides == self.compute_default_strides(),
+            None => true,
+        }
+    }
+    /// Validate that `[start, start + len)` lies inside this tensor.
+    fn check_logical_range(&self, start: usize, len: usize) -> Result<()> {
+        let numel = self.numel();
+        let end = start.checked_add(len).ok_or(TorshError::IndexOutOfBounds {
+            index: start,
+            size: numel,
+        })?;
+        if end > numel {
+            return Err(TorshError::IndexOutOfBounds {
+                index: end,
+                size: numel,
+            });
+        }
+        Ok(())
+    }
+    /// Translate a logical (view-order) flat index into a storage index.
+    fn logical_to_physical(&self, index: usize) -> Result<usize> {
+        let numel = self.numel();
+        if index >= numel {
+            return Err(TorshError::IndexOutOfBounds { index, size: numel });
+        }
+        if self.has_default_layout() {
+            return Ok(index + self.storage_offset);
+        }
+        // Decode the logical index into per-axis coordinates, then re-encode it
+        // with this tensor's strides.
+        let shape_binding = self.shape();
+        let dims = shape_binding.dims();
+        let strides = self.strides();
+        let mut remaining = index;
+        let mut physical = self.storage_offset;
+        for axis in (0..dims.len()).rev() {
+            let extent = dims[axis];
+            if extent == 0 {
+                return Err(TorshError::IndexOutOfBounds { index, size: numel });
+            }
+            physical += (remaining % extent) * strides[axis];
+            remaining /= extent;
+        }
+        Ok(physical)
     }
     /// Get all data as a vector (may be expensive for large memory-mapped tensors)
     /// For views, extracts only the data visible by this view
@@ -258,9 +343,24 @@ impl<T: TensorElement + Copy> Tensor<T> {
     pub fn is_memory_mapped(&self) -> bool {
         matches!(self.storage, TensorStorage::MemoryMapped(_))
     }
-    /// Check if this tensor is a view of another tensor
+    /// Check if this tensor addresses its storage through view metadata.
+    ///
+    /// The test is the *layout*, not the presence of a base handle: a tensor
+    /// with custom strides or a non-zero storage offset must be read through
+    /// [`Tensor::to_vec`]'s stride-aware path, while a tensor that owns a plain
+    /// row-major block can be read straight out of the buffer. A reshape of a
+    /// whole base tensor shares storage but keeps the default layout, so it is
+    /// deliberately *not* reported as a view.
     pub fn is_view(&self) -> bool {
-        self.base_tensor.is_some()
+        self.strides.is_some() || self.storage_offset != 0
+    }
+
+    /// The tensor this one is a view of, if any.
+    ///
+    /// Views of a view report the original base tensor, and the handle is alive
+    /// for as long as the view is.
+    pub fn base_tensor(&self) -> Option<Arc<Tensor<T>>> {
+        self.base_tensor.as_ref().map(Arc::clone)
     }
     /// Get the strides for this tensor (either custom strides for views or default contiguous strides)
     pub fn strides(&self) -> Vec<usize> {
@@ -339,7 +439,39 @@ impl<T: TensorElement + Copy> Tensor<T> {
         F: FnOnce(&[T]) -> Result<R>,
         T: Copy,
     {
-        self.storage.with_slice(f)
+        let (offset, len) = self.contiguous_window("with_data_slice")?;
+        self.storage.with_slice(|slice| {
+            let window = slice
+                .get(offset..offset + len)
+                .ok_or_else(|| Self::window_error(slice.len(), offset, len))?;
+            f(window)
+        })
+    }
+    /// Storage window this tensor occupies, or an error when its layout is not a
+    /// plain row-major block.
+    ///
+    /// Handing a strided or offset view's *base* buffer to a closure that indexes
+    /// it row-major silently reads the wrong elements, so those layouts are
+    /// rejected and the caller is told to materialise a contiguous copy first.
+    fn contiguous_window(&self, method: &str) -> Result<(usize, usize)> {
+        if !self.has_default_layout() {
+            return Err(TorshError::InvalidOperation(format!(
+                "{method} requires a contiguous tensor (strides {:?} for shape {:?}); \
+                 call .contiguous() first",
+                self.strides(),
+                self.shape().dims()
+            )));
+        }
+        Ok((self.storage_offset, self.numel()))
+    }
+    /// Error raised when the backing storage is smaller than this tensor claims.
+    fn window_error(available: usize, offset: usize, len: usize) -> TorshError {
+        TorshError::InvalidOperation(format!(
+            "tensor needs storage elements {}..{} but only {} are available",
+            offset,
+            offset + len,
+            available
+        ))
     }
     /// Execute a function with zero-copy access to tensor data (mutable)
     ///
@@ -373,7 +505,14 @@ impl<T: TensorElement + Copy> Tensor<T> {
         F: FnOnce(&mut [T]) -> Result<R>,
         T: Copy,
     {
-        self.storage.with_slice_mut(f)
+        let (offset, len) = self.contiguous_window("with_data_slice_mut")?;
+        self.storage.with_slice_mut(|slice| {
+            let available = slice.len();
+            let window = slice
+                .get_mut(offset..offset + len)
+                .ok_or_else(|| Self::window_error(available, offset, len))?;
+            f(window)
+        })
     }
     /// Create a tensor of ones with the same shape as this tensor
     pub fn ones_like(&self) -> Result<Self> {
@@ -529,7 +668,7 @@ impl<T: TensorElement + Copy> Tensor<T> {
     /// Set gradient tensor
     #[allow(dead_code)]
     pub fn set_grad(&self, grad: Option<Tensor<T>>) {
-        let mut grad_lock = self.grad.write().expect("lock should not be poisoned");
+        let mut grad_lock = self.grad.write_or_recover();
         *grad_lock = grad;
     }
     /// Get mutable access to gradient
@@ -1019,7 +1158,7 @@ impl<T: TensorElement + Copy> Tensor<T> {
     /// - [`has_grad()`](#method.has_grad) - Check if gradients exist
     /// - [`requires_grad_()`](#method.requires_grad_) - Enable gradient tracking
     pub fn grad(&self) -> Option<Self> {
-        let grad_lock = self.grad.read().expect("lock should not be poisoned");
+        let grad_lock = self.grad.read_or_recover();
         grad_lock.as_ref().cloned()
     }
     /// Check if this tensor has a computed gradient.
@@ -1049,7 +1188,7 @@ impl<T: TensorElement + Copy> Tensor<T> {
     ///
     /// - [`grad()`](#method.grad) - Access the gradient tensor
     pub fn has_grad(&self) -> bool {
-        let grad_lock = self.grad.read().expect("lock should not be poisoned");
+        let grad_lock = self.grad.read_or_recover();
         grad_lock.is_some()
     }
     /// Clear the gradient for this tensor.
@@ -1224,7 +1363,7 @@ impl<T: TensorElement + Copy> Tensor<T> {
     /// - [`backward()`](#method.backward) - Compute gradients
     /// - [`has_grad()`](#method.has_grad) - Check if gradients exist
     pub fn zero_grad(&mut self) {
-        let mut grad_lock = self.grad.write().expect("lock should not be poisoned");
+        let mut grad_lock = self.grad.write_or_recover();
         *grad_lock = None;
     }
     /// Computes gradients for all tensors in the computation graph.
@@ -1458,22 +1597,40 @@ impl<T: TensorElement + Copy> Tensor<T> {
             + std::fmt::Debug,
         f32: From<T>,
     {
-        if !self.requires_grad {
-            return Err(TorshError::AutogradError(
-                "Called backward on tensor that doesn't require grad".to_string(),
-            ));
-        }
-        if self.shape().numel() != 1 {
-            return Err(TorshError::AutogradError(
-                "Gradient can only be computed for scalar outputs".to_string(),
-            ));
-        }
-        let grad_output = self.ones_like()?;
-        self.backward_impl(&grad_output)?;
-        Ok(())
+        self.backward_with_grad(None)
     }
-    /// Backward pass with gradient - integrated with autograd system
-    pub fn backward_with_grad(&self, _gradient: Option<&Self>) -> Result<()>
+    /// Backward pass seeded with an explicit gradient.
+    ///
+    /// This is the vector-Jacobian entry point: pass the gradient of the loss
+    /// with respect to *this* tensor and it is propagated through the recorded
+    /// graph, accumulating into every reachable leaf's `grad` slot.
+    ///
+    /// # Parameters
+    ///
+    /// - `gradient`: seed gradient, which must have exactly this tensor's shape.
+    ///   `None` is only valid for scalar tensors, where a gradient of `1` is used
+    ///   (this is what [`backward()`](#method.backward) does).
+    ///
+    /// # Errors
+    ///
+    /// - the tensor does not require gradients
+    /// - `gradient` is `None` and the tensor is not a scalar
+    /// - `gradient` has a different shape than this tensor
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use torsh_tensor::Tensor;
+    /// use torsh_core::device::DeviceType;
+    ///
+    /// let x = Tensor::from_data(vec![1.0, 2.0], vec![2], DeviceType::Cpu)?
+    ///     .requires_grad_(true);
+    /// let y = x.mul(&x)?;                       // non-scalar output
+    /// let seed = Tensor::ones(&[2], DeviceType::Cpu)?;
+    /// y.backward_with_grad(Some(&seed))?;       // dy/dx = 2x
+    /// # Ok::<(), torsh_core::error::TorshError>(())
+    /// ```
+    pub fn backward_with_grad(&self, gradient: Option<&Self>) -> Result<()>
     where
         T: FloatElement
             + Copy
@@ -1491,172 +1648,30 @@ impl<T: TensorElement + Copy> Tensor<T> {
                 "Called backward on tensor that doesn't require grad".to_string(),
             ));
         }
-        Ok(())
-    }
-    /// Internal backward implementation
-    fn backward_impl(&self, grad_output: &Self) -> Result<()>
-    where
-        T: FloatElement
-            + Copy
-            + Default
-            + std::ops::Add<Output = T>
-            + std::ops::Sub<Output = T>
-            + std::ops::Mul<Output = T>
-            + std::ops::Div<Output = T>,
-    {
-        match &self.operation {
-            Operation::Leaf => {
-                let mut grad_lock = self.grad.write().expect("lock should not be poisoned");
-                if let Some(existing_grad) = grad_lock.as_ref() {
-                    let new_grad = existing_grad.add_op(grad_output)?;
-                    *grad_lock = Some(new_grad);
-                } else {
-                    *grad_lock = Some(grad_output.clone());
+        let seed = match gradient {
+            Some(provided) => {
+                let provided_shape = provided.shape();
+                let own_shape = self.shape();
+                if provided_shape.dims() != own_shape.dims() {
+                    return Err(TorshError::ShapeMismatch {
+                        expected: own_shape.dims().to_vec(),
+                        got: provided_shape.dims().to_vec(),
+                    });
                 }
+                provided.detach()
             }
-            Operation::Power { input, exponent } => {
-                if input.requires_grad {
-                    let input_data = input.to_vec()?;
-                    let grad_data: Vec<T> = input_data
-                        .iter()
-                        .map(|&x| {
-                            let exp_minus_one = *exponent - 1.0;
-                            let exp_t = T::from_f64(*exponent as f64)
-                                .expect("f64 conversion should succeed");
-                            let exp_minus_one_t = T::from_f64(exp_minus_one as f64)
-                                .expect("f64 conversion should succeed");
-                            exp_t * x.powf(exp_minus_one_t)
-                        })
-                        .collect();
-                    let input_grad =
-                        Self::from_data(grad_data, input.shape().dims().to_vec(), input.device)?;
-                    let final_grad = input_grad.mul_op(grad_output)?;
-                    input.backward_impl(&final_grad)?;
+            None => {
+                if self.shape().numel() != 1 {
+                    return Err(TorshError::AutogradError(
+                        "Gradient can only be computed for scalar outputs".to_string(),
+                    ));
                 }
+                self.ones_like()?
             }
-            Operation::Add { lhs, rhs } => {
-                if lhs.requires_grad {
-                    lhs.backward_impl(grad_output)?;
-                }
-                if rhs.requires_grad {
-                    rhs.backward_impl(grad_output)?;
-                }
-            }
-            Operation::Sub { lhs, rhs } => {
-                // d/dlhs (lhs - rhs) = +grad
-                if lhs.requires_grad {
-                    lhs.backward_impl(grad_output)?;
-                }
-                // d/drhs (lhs - rhs) = -grad
-                if rhs.requires_grad {
-                    let neg_one = T::from_f64(-1.0).expect("T must support -1.0");
-                    let neg_grad = grad_output.mul_scalar(neg_one)?;
-                    rhs.backward_impl(&neg_grad)?;
-                }
-            }
-            Operation::Mean { input, count } => {
-                // d/dinput mean(input) = grad / count  (broadcast to input shape)
-                if input.requires_grad {
-                    let scale = T::from_f64(1.0 / count).expect("T must support scalar division");
-                    let scaled_grad = grad_output.mul_scalar(scale)?;
-                    // Broadcast scalar-shaped grad to input shape
-                    let input_numel = input.numel();
-                    let grad_data = vec![
-                        scaled_grad.to_vec()?.into_iter().next().unwrap_or_else(
-                            || T::from_f64(0.0).expect("T must support 0.0")
-                        );
-                        input_numel
-                    ];
-                    let input_grad =
-                        Self::from_data(grad_data, input.shape().dims().to_vec(), input.device)?;
-                    input.backward_impl(&input_grad)?;
-                }
-            }
-            Operation::Sum { input } => {
-                // d/dinput sum(input) = grad broadcast to input shape (coefficient 1 each).
-                // sum() always reduces to a scalar, so grad_output has numel == 1.
-                if input.requires_grad {
-                    let grad_scalar = grad_output
-                        .to_vec()?
-                        .into_iter()
-                        .next()
-                        .unwrap_or_else(|| T::from_f64(0.0).expect("T must support 0.0"));
-                    let grad_data = vec![grad_scalar; input.numel()];
-                    let input_grad =
-                        Self::from_data(grad_data, input.shape().dims().to_vec(), input.device)?;
-                    input.backward_impl(&input_grad)?;
-                }
-            }
-            Operation::MatMul { lhs, rhs } => {
-                // C = lhs @ rhs (2-D, row-major).
-                //   dL/dlhs = grad @ rhsᵀ   (shape [m,k])
-                //   dL/drhs = lhsᵀ @ grad   (shape [k,n])
-                // Computed with explicit loops so no extra autograd graph is built
-                // during the backward pass and no `Sum` trait bound is required.
-                let lhs_dims = lhs.shape().dims().to_vec();
-                let rhs_dims = rhs.shape().dims().to_vec();
-                if lhs_dims.len() == 2 && rhs_dims.len() == 2 {
-                    let (m, k, n) = (lhs_dims[0], lhs_dims[1], rhs_dims[1]);
-                    let zero = T::from_f64(0.0).expect("T must support 0.0");
-                    let grad_c = grad_output.to_vec()?; // [m, n]
-                    if lhs.requires_grad {
-                        let rhs_data = rhs.to_vec()?; // [k, n]
-                        let mut grad_lhs = vec![zero; m * k];
-                        for i in 0..m {
-                            for p in 0..k {
-                                let mut acc = zero;
-                                for j in 0..n {
-                                    acc = acc + grad_c[i * n + j] * rhs_data[p * n + j];
-                                }
-                                grad_lhs[i * k + p] = acc;
-                            }
-                        }
-                        let lhs_grad = Self::from_data(grad_lhs, lhs_dims.clone(), lhs.device)?;
-                        lhs.backward_impl(&lhs_grad)?;
-                    }
-                    if rhs.requires_grad {
-                        let lhs_data = lhs.to_vec()?; // [m, k]
-                        let mut grad_rhs = vec![zero; k * n];
-                        for p in 0..k {
-                            for j in 0..n {
-                                let mut acc = zero;
-                                for i in 0..m {
-                                    acc = acc + lhs_data[i * k + p] * grad_c[i * n + j];
-                                }
-                                grad_rhs[p * n + j] = acc;
-                            }
-                        }
-                        let rhs_grad = Self::from_data(grad_rhs, rhs_dims.clone(), rhs.device)?;
-                        rhs.backward_impl(&rhs_grad)?;
-                    }
-                }
-            }
-            Operation::Mul { lhs, rhs } => {
-                if lhs.requires_grad {
-                    let lhs_grad = (**rhs).mul_op(grad_output)?;
-                    lhs.backward_impl(&lhs_grad)?;
-                }
-                if rhs.requires_grad {
-                    let rhs_grad = (**lhs).mul_op(grad_output)?;
-                    rhs.backward_impl(&rhs_grad)?;
-                }
-            }
-            Operation::Custom(op_name, inputs) => match op_name.as_str() {
-                "conv1d" | "conv2d" | "conv3d" => {}
-                _ => {
-                    for weak_input in inputs {
-                        if let Some(input) = weak_input.upgrade() {
-                            if input.requires_grad {
-                                input.backward_impl(grad_output)?;
-                            }
-                        }
-                    }
-                }
-            },
-        }
-        Ok(())
+        };
+        self.backward_impl(&seed)
     }
 }
 #[path = "types_advanced.rs"]
 mod types_advanced;
-pub use types_advanced::Operation;
+pub use types_advanced::{Im2ColConfig, Operation, UnaryKind, ViewKind};

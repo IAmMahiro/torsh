@@ -11,6 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use torsh_core::sync::MutexExt;
 
 #[cfg(feature = "serialize")]
 use serde::{Deserialize, Serialize};
@@ -322,7 +323,7 @@ impl TuningCache {
                 }
 
                 // Load compatible entries
-                let mut cache = self.cache.lock().expect("lock should not be poisoned");
+                let mut cache = self.cache.lock_or_recover();
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -354,7 +355,7 @@ impl TuningCache {
                 })?;
             }
 
-            let cache = self.cache.lock().expect("lock should not be poisoned");
+            let cache = self.cache.lock_or_recover();
             let cache_file = CacheFile {
                 metadata: self.current_metadata.clone(),
                 entries: cache.clone(),
@@ -393,13 +394,10 @@ impl TuningCache {
 
     /// Invalidate entire cache and delete file
     pub fn invalidate_cache(&self) -> CpuResult<()> {
-        let mut cache = self.cache.lock().expect("lock should not be poisoned");
+        let mut cache = self.cache.lock_or_recover();
         cache.clear();
-        *self.cache_hits.lock().expect("lock should not be poisoned") = 0;
-        *self
-            .cache_misses
-            .lock()
-            .expect("lock should not be poisoned") = 0;
+        *self.cache_hits.lock_or_recover() = 0;
+        *self.cache_misses.lock_or_recover() = 0;
 
         if let Some(ref path) = self.cache_file_path {
             if path.exists() {
@@ -415,33 +413,27 @@ impl TuningCache {
     }
 
     pub fn get(&self, key: &str) -> Option<TuningResult> {
-        let mut cache = self.cache.lock().expect("lock should not be poisoned");
+        let mut cache = self.cache.lock_or_recover();
         if let Some(entry) = cache.get_mut(key) {
             // Check if entry metadata is still compatible
             if self.current_metadata.is_compatible(&entry.metadata) {
                 entry.metadata.update_access();
-                *self.cache_hits.lock().expect("lock should not be poisoned") += 1;
+                *self.cache_hits.lock_or_recover() += 1;
                 Some(entry.result.clone())
             } else {
                 // Remove incompatible entry
                 cache.remove(key);
-                *self
-                    .cache_misses
-                    .lock()
-                    .expect("lock should not be poisoned") += 1;
+                *self.cache_misses.lock_or_recover() += 1;
                 None
             }
         } else {
-            *self
-                .cache_misses
-                .lock()
-                .expect("lock should not be poisoned") += 1;
+            *self.cache_misses.lock_or_recover() += 1;
             None
         }
     }
 
     pub fn insert(&self, key: String, result: TuningResult) {
-        let mut cache = self.cache.lock().expect("lock should not be poisoned");
+        let mut cache = self.cache.lock_or_recover();
         let entry = CacheEntry {
             result,
             metadata: self.current_metadata.clone(),
@@ -463,28 +455,19 @@ impl TuningCache {
     }
 
     pub fn get_cache_stats(&self) -> (usize, usize) {
-        let hits = *self.cache_hits.lock().expect("lock should not be poisoned");
-        let misses = *self
-            .cache_misses
-            .lock()
-            .expect("lock should not be poisoned");
+        let hits = *self.cache_hits.lock_or_recover();
+        let misses = *self.cache_misses.lock_or_recover();
         (hits, misses)
     }
 
     pub fn get_detailed_stats(&self) -> HashMap<String, usize> {
-        let cache = self.cache.lock().expect("lock should not be poisoned");
+        let cache = self.cache.lock_or_recover();
         let mut stats = HashMap::new();
         stats.insert("total_entries".to_string(), cache.len());
-        stats.insert(
-            "cache_hits".to_string(),
-            *self.cache_hits.lock().expect("lock should not be poisoned"),
-        );
+        stats.insert("cache_hits".to_string(), *self.cache_hits.lock_or_recover());
         stats.insert(
             "cache_misses".to_string(),
-            *self
-                .cache_misses
-                .lock()
-                .expect("lock should not be poisoned"),
+            *self.cache_misses.lock_or_recover(),
         );
 
         // Group by operation type
@@ -502,18 +485,15 @@ impl TuningCache {
     }
 
     pub fn clear(&self) {
-        let mut cache = self.cache.lock().expect("lock should not be poisoned");
+        let mut cache = self.cache.lock_or_recover();
         cache.clear();
-        *self.cache_hits.lock().expect("lock should not be poisoned") = 0;
-        *self
-            .cache_misses
-            .lock()
-            .expect("lock should not be poisoned") = 0;
+        *self.cache_hits.lock_or_recover() = 0;
+        *self.cache_misses.lock_or_recover() = 0;
     }
 
     /// Clean old entries from cache
     pub fn cleanup_old_entries(&self, max_age_seconds: u64) {
-        let mut cache = self.cache.lock().expect("lock should not be poisoned");
+        let mut cache = self.cache.lock_or_recover();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

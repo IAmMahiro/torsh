@@ -177,7 +177,7 @@ impl Optimizer for FTRL {
 
                 // Update parameter: w_{t+1} = -z_reg / σ
                 let new_param = z_reg.neg()?.div(&sigma)?;
-                *param = new_param;
+                crate::param_update::assign(&mut param, &new_param)?;
 
                 // Update state
                 state.insert("z".to_string(), z);

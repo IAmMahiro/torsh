@@ -332,27 +332,31 @@ pub fn safe_for_log(input: &Tensor, eps: Option<f32>, max_val: Option<f32>) -> T
     input.clamp(epsilon, maximum)
 }
 
-/// Standardized inplace operation handling
+/// Standardized inplace operation handling.
+///
+/// # In-place semantics
+/// `inplace` is accepted for PyTorch API compatibility and **has no effect**: the
+/// functional surface of this crate borrows its input immutably (`&Tensor`), and
+/// tensor buffers are shared between clones, so writing through this borrow would
+/// mutate tensors the caller still owns. The operation always allocates its
+/// result. Use the `&mut Tensor` methods on [`Tensor`] itself (`add_`, `mul_`, …)
+/// when you need true in-place mutation.
 pub fn handle_inplace_operation<F>(
     input: &Tensor,
-    inplace: bool,
+    _inplace: bool,
     operation: F,
     _context: &str,
 ) -> TorshResult<Tensor>
 where
     F: Fn(&Tensor) -> TorshResult<Tensor>,
 {
-    if inplace {
-        // For true in-place operations, we would modify the tensor in place
-        // For now, we perform the operation and return a new tensor
-        // TODO: Implement proper in-place operations when tensor mutation is available
-        operation(input)
-    } else {
-        operation(input)
-    }
+    operation(input)
 }
 
-/// Utility for element-wise operations with inplace support
+/// Utility for element-wise operations with inplace support.
+///
+/// `inplace` is accepted for PyTorch API compatibility and has no effect; see
+/// [`handle_inplace_operation`] for why.
 pub fn apply_elementwise_operation<F>(
     input: &Tensor,
     _inplace: bool,
@@ -362,7 +366,6 @@ pub fn apply_elementwise_operation<F>(
 where
     F: Fn(f32) -> f32,
 {
-    // For now, treat all operations as out-of-place since inplace is not fully implemented
     let data = input.data()?;
     let result_data: Vec<f32> = data.iter().map(|&x| operation(x)).collect();
 

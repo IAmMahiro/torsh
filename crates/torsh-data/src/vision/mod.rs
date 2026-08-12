@@ -165,6 +165,16 @@ impl VideoFolder {
         self.samples.len()
     }
 
+    /// Get the configured maximum number of frames to extract per sample
+    pub fn max_frames(&self) -> usize {
+        self.max_frames
+    }
+
+    /// Get the configured target frame rate, if set
+    pub fn frame_rate(&self) -> Option<f32> {
+        self.frame_rate
+    }
+
     /// Check if file is a supported video format
     fn is_video_file(path: &Path) -> bool {
         if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
@@ -177,19 +187,25 @@ impl VideoFolder {
         }
     }
 
-    /// Load video frames (simplified implementation)
-    fn load_video(&self, _path: &Path) -> Result<VideoFrames> {
-        // In a real implementation, this would use ffmpeg or similar to extract frames
-        // For now, create dummy video data
-        let mut frames = Vec::new();
-        for _i in 0..self.max_frames {
-            // Create dummy frame (3 channels, 224x224 - typical video frame size)
-            let frame = torsh_tensor::creation::rand::<f32>(&[3, 224, 224])?;
-            frames.push(frame);
-        }
-
-        let fps = self.frame_rate.unwrap_or(30.0);
-        Ok(VideoFrames::new(frames, fps))
+    /// Decode video frames from `path`.
+    ///
+    /// Decoding compressed video containers (mp4/avi/mov/mkv/wmv/flv/webm)
+    /// requires a video codec (H.264/H.265/VP8/VP9/AV1 etc.). No pure-Rust
+    /// decoder for these codecs is part of the COOLJAPAN dependency set
+    /// (bundling one would mean either implementing a codec from scratch or
+    /// pulling in an FFI wrapper around libavcodec/ffmpeg, both out of scope
+    /// here and the latter forbidden by the no-FFI-by-default policy). We
+    /// therefore fail loudly instead of returning fabricated frames: a
+    /// dataset that silently yields random noise in place of real video is
+    /// far more dangerous than one that refuses to load, because it produces
+    /// a training/eval run that *looks* like it worked.
+    fn load_video(&self, path: &Path) -> Result<VideoFrames> {
+        Err(TorshError::NotImplemented(format!(
+            "VideoFolder: cannot decode {path:?} - torsh-data has no bundled video codec \
+             (pure-Rust, no-FFI policy). Decode frames externally (e.g. extract to images) \
+             and load them via a custom Dataset, or supply pre-decoded VideoFrames through \
+             a different data source."
+        )))
     }
 }
 

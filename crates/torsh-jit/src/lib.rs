@@ -205,6 +205,12 @@ pub enum JitError {
 
     #[error("Backend error: {0}")]
     BackendError(#[from] TorshError),
+
+    /// A requested capability is not implemented yet.
+    ///
+    /// Returned instead of fabricating a result that would look successful.
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
 }
 
 impl From<String> for JitError {
@@ -512,7 +518,13 @@ pub struct TensorRef {
 /// ```
 ///
 /// # Implementation Status
-/// Currently returns a placeholder module. Full tracing implementation requires:
+/// Not implemented: this function returns [`JitError::NotImplemented`] rather than
+/// an empty module that would execute nothing while looking like a success.
+/// Capturing a graph from `func` requires tensor operation interception, which the
+/// `TensorRef` placeholder type above cannot provide. Use [`script`] instead, which
+/// compiles a module that already knows its own [`ComputationGraph`].
+///
+/// A real implementation needs:
 /// - Tensor operation interception
 /// - Graph construction from traced operations
 /// - Type and shape inference
@@ -521,20 +533,13 @@ pub fn trace<F>(_func: F, _example_inputs: &[TensorRef]) -> JitResult<CompiledMo
 where
     F: Fn(&[TensorRef]) -> Vec<TensorRef>,
 {
-    // Create a placeholder compiled module
-    // Full implementation would:
-    // 1. Set up tracing context
-    // 2. Execute function with traced tensors
-    // 3. Build computation graph from traced operations
-    // 4. Optimize and compile the graph
-
-    // Return a minimal placeholder module
-    // Full implementation would build and compile the traced graph
-    Ok(CompiledModule {
-        graph: ComputationGraph::new(),
-        kernels: Vec::new(),
-        runtime: JitRuntime::new(JitConfig::default()),
-    })
+    Err(JitError::NotImplemented(
+        "JIT tracing is not implemented: capturing a graph requires tensor \
+         operation interception, which is not wired up yet. Refusing to return an \
+         empty module that would masquerade as a compiled one — use \
+         torsh_jit::script() with a ScriptableModule instead."
+            .to_string(),
+    ))
 }
 
 /// JIT script a module
@@ -934,13 +939,11 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_placeholder() {
-        // Test that trace returns a valid module (even if placeholder)
+    fn test_trace_refuses_instead_of_returning_empty_module() {
+        // Tracing is not implemented; it must report that rather than hand back an
+        // empty module that would silently execute nothing.
         let result = trace(|_inputs| vec![], &[]);
-        assert!(result.is_ok());
-
-        let module = result.unwrap();
-        assert_eq!(module.kernels.len(), 0); // Placeholder has no kernels
+        assert!(matches!(result, Err(JitError::NotImplemented(_))));
     }
 
     #[test]

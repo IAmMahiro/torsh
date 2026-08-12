@@ -19,13 +19,15 @@
 //! use torsh_data::dataloader::{DataLoader, simple_dataloader};
 //! use torsh_data::dataset::TensorDataset;
 //!
-//! // Using the builder pattern
+//! // Using the builder pattern. NOTE: `.build()` only ever produces a
+//! // sequential-order loader; it now returns an error if `.shuffle(true)` was
+//! // requested. Use `build_with_random_sampling()` (or `build_auto()`, which
+//! // dispatches on `.shuffle(..)`) to actually shuffle.
 //! let dataset = TensorDataset::new(vec![1, 2, 3, 4, 5]);
 //! let dataloader = DataLoader::builder(dataset)
 //!     .batch_size(2)
 //!     .num_workers(4)
-//!     .shuffle(true)
-//!     .build()?;
+//!     .build_with_random_sampling()?;
 //!
 //! for batch in dataloader.iter() {
 //!     // Process batch

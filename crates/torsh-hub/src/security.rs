@@ -119,34 +119,27 @@ impl SecurityManager {
         // Calculate file hash
         let file_hash = calculate_file_hash(model_path)?;
 
+        // Private key presence is guaranteed by the check above.
+        let private_key = key_pair.private_key.as_ref().ok_or_else(|| {
+            TorshError::General(GeneralError::InvalidArgument(
+                "Cannot sign with a verification-only key".to_string(),
+            ))
+        })?;
+
         // Create signature
         let signature = match key_pair.algorithm {
-            SignatureAlgorithm::RsaSha256 => sign_with_rsa_sha256(
-                &file_hash,
-                key_pair
-                    .private_key
-                    .as_ref()
-                    .expect("RSA private key required for signing"),
-            )?,
-            SignatureAlgorithm::Ed25519 => sign_with_ed25519(
-                &file_hash,
-                key_pair
-                    .private_key
-                    .as_ref()
-                    .expect("Ed25519 private key required for signing"),
-            )?,
-            SignatureAlgorithm::EcdsaP256 => sign_with_ecdsa_p256(
-                &file_hash,
-                key_pair
-                    .private_key
-                    .as_ref()
-                    .expect("ECDSA P256 private key required for signing"),
-            )?,
+            SignatureAlgorithm::RsaSha256 => sign_with_rsa_sha256(&file_hash, private_key)?,
+            SignatureAlgorithm::Ed25519 => sign_with_ed25519(&file_hash, private_key)?,
+            SignatureAlgorithm::EcdsaP256 => sign_with_ecdsa_p256(&file_hash, private_key)?,
         };
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system time should be after UNIX epoch")
+            .map_err(|e| {
+                TorshError::General(GeneralError::RuntimeError(format!(
+                    "System time is before UNIX epoch: {e}"
+                )))
+            })?
             .as_secs();
 
         Ok(ModelSignature {
@@ -291,73 +284,112 @@ pub fn verify_file_integrity<P: AsRef<Path>>(file_path: P, expected_hash: &str) 
     Ok(actual_hash == expected_hash)
 }
 
-// Placeholder implementations for cryptographic operations
-// In a real implementation, these would use proper cryptographic libraries
+// Cryptographic operations.
+//
+// Ed25519 is implemented for real using the pure-Rust `ed25519-dalek` crate
+// (RustCrypto ecosystem, per the COOLJAPAN Pure-Rust policy). RSA-SHA256 and
+// ECDSA-P256 are not implemented: rather than return a forgeable constant, the
+// helpers return `NotImplemented` so no caller can believe a model was signed
+// or verified with those algorithms.
+
+/// Ed25519 signatures are exactly 64 bytes.
+const ED25519_SIGNATURE_LEN: usize = 64;
 
 fn sign_with_rsa_sha256(_data: &str, _private_key: &[u8]) -> Result<String> {
-    // Placeholder: In real implementation, use RSA + SHA-256 signing
-    // This would use libraries like `rsa` and `sha2`
-    Ok("rsa_signature_placeholder".to_string())
+    Err(TorshError::NotImplemented(
+        "RSA-SHA256 signing is not implemented; use Ed25519 (SignatureAlgorithm::Ed25519)"
+            .to_string(),
+    ))
 }
 
 fn verify_rsa_sha256(_data: &str, _signature: &str, _public_key: &[u8]) -> Result<bool> {
-    // Placeholder: In real implementation, verify RSA + SHA-256 signature
-    Ok(_signature == "rsa_signature_placeholder")
+    Err(TorshError::NotImplemented(
+        "RSA-SHA256 verification is not implemented; use Ed25519 (SignatureAlgorithm::Ed25519)"
+            .to_string(),
+    ))
 }
 
-fn sign_with_ed25519(_data: &str, _private_key: &[u8]) -> Result<String> {
-    // Placeholder: In real implementation, use Ed25519 signing
-    // This would use libraries like `ed25519-dalek`
-    Ok("ed25519_signature_placeholder".to_string())
+/// Sign `data` with an Ed25519 private key (32 raw seed bytes), returning the
+/// hex-encoded 64-byte signature.
+fn sign_with_ed25519(data: &str, private_key: &[u8]) -> Result<String> {
+    let seed: [u8; 32] = private_key.try_into().map_err(|_| {
+        TorshError::General(GeneralError::InvalidArgument(format!(
+            "Ed25519 private key must be 32 bytes, got {}",
+            private_key.len()
+        )))
+    })?;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let signature = ed25519_dalek::Signer::sign(&signing_key, data.as_bytes());
+    Ok(hex::encode(signature.to_bytes()))
 }
 
-fn verify_ed25519(_data: &str, _signature: &str, _public_key: &[u8]) -> Result<bool> {
-    // Placeholder: In real implementation, verify Ed25519 signature
-    Ok(_signature == "ed25519_signature_placeholder")
+/// Verify a hex-encoded Ed25519 signature over `data` against a 32-byte public key.
+fn verify_ed25519(data: &str, signature: &str, public_key: &[u8]) -> Result<bool> {
+    let key_bytes: [u8; 32] = match public_key.try_into() {
+        Ok(k) => k,
+        Err(_) => return Ok(false),
+    };
+    let verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(&key_bytes) {
+        Ok(k) => k,
+        Err(_) => return Ok(false),
+    };
+    let sig_bytes = match hex::decode(signature) {
+        Ok(b) => b,
+        Err(_) => return Ok(false),
+    };
+    let sig_arr: [u8; ED25519_SIGNATURE_LEN] = match sig_bytes.as_slice().try_into() {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    Ok(ed25519_dalek::Verifier::verify(&verifying_key, data.as_bytes(), &sig).is_ok())
 }
 
 fn sign_with_ecdsa_p256(_data: &str, _private_key: &[u8]) -> Result<String> {
-    // Placeholder: In real implementation, use ECDSA P-256 signing
-    // This would use libraries like `p256` and `ecdsa`
-    Ok("ecdsa_signature_placeholder".to_string())
+    Err(TorshError::NotImplemented(
+        "ECDSA-P256 signing is not implemented; use Ed25519 (SignatureAlgorithm::Ed25519)"
+            .to_string(),
+    ))
 }
 
 fn verify_ecdsa_p256(_data: &str, _signature: &str, _public_key: &[u8]) -> Result<bool> {
-    // Placeholder: In real implementation, verify ECDSA P-256 signature
-    Ok(_signature == "ecdsa_signature_placeholder")
+    Err(TorshError::NotImplemented(
+        "ECDSA-P256 verification is not implemented; use Ed25519 (SignatureAlgorithm::Ed25519)"
+            .to_string(),
+    ))
 }
 
-fn generate_rsa_key_pair(key_id: String) -> Result<KeyPair> {
-    // Placeholder: In real implementation, generate RSA key pair
-    // This would use libraries like `rsa`
-    Ok(KeyPair {
-        key_id,
-        algorithm: SignatureAlgorithm::RsaSha256,
-        public_key: b"rsa_public_key_placeholder".to_vec(),
-        private_key: Some(b"rsa_private_key_placeholder".to_vec()),
-    })
+fn generate_rsa_key_pair(_key_id: String) -> Result<KeyPair> {
+    Err(TorshError::NotImplemented(
+        "RSA key generation is not implemented; use SignatureAlgorithm::Ed25519".to_string(),
+    ))
 }
 
+/// Generate a real Ed25519 key pair using the OS CSPRNG (`getrandom`, Pure Rust).
+///
+/// The private key is the 32-byte seed and the public key is the 32-byte
+/// verifying key, both unique per invocation.
 fn generate_ed25519_key_pair(key_id: String) -> Result<KeyPair> {
-    // Placeholder: In real implementation, generate Ed25519 key pair
-    // This would use libraries like `ed25519-dalek`
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).map_err(|e| {
+        TorshError::General(GeneralError::RuntimeError(format!(
+            "Failed to obtain entropy for Ed25519 key generation: {e}"
+        )))
+    })?;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let public_key = signing_key.verifying_key().to_bytes().to_vec();
     Ok(KeyPair {
         key_id,
         algorithm: SignatureAlgorithm::Ed25519,
-        public_key: b"ed25519_public_key_placeholder".to_vec(),
-        private_key: Some(b"ed25519_private_key_placeholder".to_vec()),
+        public_key,
+        private_key: Some(seed.to_vec()),
     })
 }
 
-fn generate_ecdsa_p256_key_pair(key_id: String) -> Result<KeyPair> {
-    // Placeholder: In real implementation, generate ECDSA P-256 key pair
-    // This would use libraries like `p256` and `ecdsa`
-    Ok(KeyPair {
-        key_id,
-        algorithm: SignatureAlgorithm::EcdsaP256,
-        public_key: b"ecdsa_public_key_placeholder".to_vec(),
-        private_key: Some(b"ecdsa_private_key_placeholder".to_vec()),
-    })
+fn generate_ecdsa_p256_key_pair(_key_id: String) -> Result<KeyPair> {
+    Err(TorshError::NotImplemented(
+        "ECDSA-P256 key generation is not implemented; use SignatureAlgorithm::Ed25519".to_string(),
+    ))
 }
 
 /// Security configuration for downloads and model loading
@@ -486,7 +518,22 @@ pub struct ResourceUsage {
     pub start_time: Option<SystemTime>,
 }
 
-/// Sandbox environment for model execution
+/// Cooperative sandbox environment for model execution.
+///
+/// # Enforcement model — read before relying on this for untrusted code
+///
+/// This is a **cooperative** sandbox, not OS-level isolation. Memory, thread,
+/// network and filesystem limits are enforced only when the executed code
+/// routes its resource use through [`ModelSandbox::record_memory_usage`],
+/// [`record_thread_creation`](ModelSandbox::record_thread_creation),
+/// [`record_network_request`](ModelSandbox::record_network_request) and
+/// [`record_file_access`](ModelSandbox::record_file_access) (which return errors
+/// when a configured limit is exceeded), together with
+/// [`check_limits`](ModelSandbox::check_limits). It does **not** install OS-level
+/// controls (`setrlimit`, job objects, seccomp, chroot/landlock) and therefore
+/// cannot contain an arbitrary untrusted native binary that bypasses these
+/// hooks. Applying hard OS limits would require platform FFI crates that are not
+/// currently workspace dependencies.
 pub struct ModelSandbox {
     config: SandboxConfig,
     usage: Arc<Mutex<ResourceUsage>>,
@@ -652,42 +699,53 @@ impl ModelSandbox {
         self.cleanup_limits();
     }
 
-    // Platform-specific implementations (simplified for demonstration)
+    // Resource-limit setup.
+    //
+    // This sandbox enforces limits *cooperatively*: memory, threads, network
+    // and filesystem access are checked in `record_memory_usage`,
+    // `record_thread_creation`, `record_network_request`, `record_file_access`
+    // and `check_limits`, which the hosted model code must route through. That
+    // is real, portable enforcement for cooperative callers but is NOT OS-level
+    // isolation of an arbitrary untrusted binary. Applying hard OS limits
+    // (setrlimit / job objects / seccomp / landlock) would require platform
+    // FFI crates that are not workspace dependencies, so we do not pretend to
+    // install them here — we only log the configured limits for observability.
     fn setup_memory_limits(&self) -> Result<()> {
-        // In a real implementation, this would use platform-specific APIs
-        // like setrlimit on Unix or SetProcessWorkingSetSize on Windows
-        println!("Setting up memory limits: {} bytes", self.config.max_memory);
+        tracing::debug!(
+            max_memory = self.config.max_memory,
+            "sandbox memory limit (cooperative enforcement via record_memory_usage/check_limits)"
+        );
         Ok(())
     }
 
     fn setup_thread_limits(&self) -> Result<()> {
-        // In a real implementation, this would limit thread creation
-        println!(
-            "Setting up thread limits: {} threads",
-            self.config.max_threads
+        tracing::debug!(
+            max_threads = self.config.max_threads,
+            "sandbox thread limit (cooperative enforcement via record_thread_creation/check_limits)"
         );
         Ok(())
     }
 
     fn setup_network_limits(&self) -> Result<()> {
         if !self.config.allow_network {
-            // In a real implementation, this would block network access
-            println!("Blocking network access");
+            tracing::debug!(
+                "sandbox network access disabled (cooperative enforcement via record_network_request)"
+            );
         }
         Ok(())
     }
 
     fn setup_filesystem_limits(&self) -> Result<()> {
         if !self.config.allow_filesystem {
-            // In a real implementation, this would use chroot or similar
-            println!("Restricting filesystem access");
+            tracing::debug!(
+                "sandbox filesystem access restricted (cooperative enforcement via record_file_access)"
+            );
         }
         Ok(())
     }
 
     fn cleanup_limits(&self) {
-        // Clean up any resources or restore original limits
-        println!("Cleaning up sandbox limits");
+        tracing::debug!("cleaning up sandbox resource tracking");
     }
 }
 
@@ -799,7 +857,14 @@ impl torsh_nn::Module for SandboxedModel {
     }
 }
 
-/// Create a sandboxed wrapper for any model
+/// Create a sandboxed wrapper for any model.
+///
+/// # Enforcement
+///
+/// The returned [`SandboxedModel`] uses a **cooperative** sandbox: limits are
+/// enforced only for code that routes resource use through the sandbox's
+/// `record_*`/`check_limits` hooks. It does not provide OS-level isolation of
+/// untrusted native code. See [`ModelSandbox`] for the full enforcement model.
 pub fn sandbox_model(
     model: Box<dyn torsh_nn::Module>,
     config: Option<SandboxConfig>,

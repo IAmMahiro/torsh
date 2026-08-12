@@ -2,9 +2,12 @@
 //!
 //! Implementation of multi-relational GNNs for heterogeneous graphs
 //! with different node types and edge types, as specified in TODO.md
-
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
+
 use crate::parameter::Parameter;
 use std::collections::HashMap;
 use torsh_tensor::{
@@ -97,22 +100,17 @@ impl HeteroGNN {
         edge_types: Vec<EdgeType>,
         out_features: usize,
         bias: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut node_transformations = HashMap::new();
         let mut biases = HashMap::new();
 
         // Create transformation matrices for each node type
         for (node_type, in_features) in &node_type_dims {
-            let weight = Parameter::new(
-                randn(&[*in_features, out_features])
-                    .expect("failed to create node transformation weights"),
-            );
+            let weight = Parameter::new(randn(&[*in_features, out_features])?);
             node_transformations.insert(node_type.clone(), weight);
 
             let bias_param = if bias {
-                Some(Parameter::new(
-                    zeros(&[out_features]).expect("failed to create bias tensor"),
-                ))
+                Some(Parameter::new(zeros(&[out_features])?))
             } else {
                 None
             };
@@ -123,14 +121,11 @@ impl HeteroGNN {
         let mut edge_transformations = HashMap::new();
         for edge_type in &edge_types {
             // Use output features as the message dimension
-            let weight = Parameter::new(
-                randn(&[out_features, out_features])
-                    .expect("failed to create edge transformation weights"),
-            );
+            let weight = Parameter::new(randn(&[out_features, out_features])?);
             edge_transformations.insert(edge_type.clone(), weight);
         }
 
-        Self {
+        Ok(Self {
             node_types: node_type_dims.keys().cloned().collect(),
             edge_types,
             node_transformations,
@@ -138,11 +133,11 @@ impl HeteroGNN {
             out_features,
             bias,
             biases,
-        }
+        })
     }
 
     /// Forward pass through heterogeneous GNN
-    pub fn forward(&self, hetero_graph: &HeteroGraphData) -> HeteroGraphData {
+    pub fn forward(&self, hetero_graph: &HeteroGraphData) -> Result<HeteroGraphData> {
         let mut output_features = HashMap::new();
 
         // Step 1: Transform node features for each node type
@@ -150,15 +145,11 @@ impl HeteroGNN {
         for node_type in &self.node_types {
             if let Some(features) = hetero_graph.node_features.get(node_type) {
                 if let Some(transform) = self.node_transformations.get(node_type) {
-                    let mut transformed = features
-                        .matmul(&transform.clone_data())
-                        .expect("operation should succeed");
+                    let mut transformed = features.matmul(&transform.clone_data())?;
 
                     // Add bias if present
                     if let Some(Some(bias)) = self.biases.get(node_type) {
-                        transformed = transformed
-                            .add(&bias.clone_data())
-                            .expect("operation should succeed");
+                        transformed = transformed.add(&bias.clone_data())?;
                     }
 
                     transformed_features.insert(node_type.clone(), transformed);
@@ -178,7 +169,7 @@ impl HeteroGNN {
                 self.edge_transformations.get(edge_type),
             ) {
                 // Get edge connections
-                let edge_flat = edge_index.to_vec().expect("conversion should succeed");
+                let edge_flat = edge_index.to_vec()?;
                 let num_edges = edge_flat.len() / 2;
 
                 if num_edges > 0 {
@@ -187,8 +178,7 @@ impl HeteroGNN {
 
                     // Initialize aggregated messages for destination nodes
                     let dst_num_nodes = hetero_graph.num_nodes.get(dst_type).unwrap_or(&0);
-                    let messages = zeros(&[*dst_num_nodes, self.out_features])
-                        .expect("failed to create messages tensor");
+                    let messages = zeros(&[*dst_num_nodes, self.out_features])?;
 
                     // Compute and aggregate messages
                     for edge_idx in 0..num_edges {
@@ -197,34 +187,20 @@ impl HeteroGNN {
 
                         // Extract source node features
                         let src_feat = src_features
-                            .slice_tensor(0, src_node, src_node + 1)
-                            .expect("failed to slice source node features")
-                            .squeeze_tensor(0)
-                            .expect("failed to squeeze source node features");
+                            .slice_tensor(0, src_node, src_node + 1)?
+                            .squeeze_tensor(0)?;
 
                         // Apply relation-specific transformation
                         let message = src_feat
-                            .unsqueeze_tensor(0)
-                            .expect("failed to unsqueeze source features")
-                            .matmul(&edge_transform.clone_data())
-                            .expect("failed to apply edge transformation")
-                            .squeeze_tensor(0)
-                            .expect("failed to squeeze message");
+                            .unsqueeze_tensor(0)?
+                            .matmul(&edge_transform.clone_data())?
+                            .squeeze_tensor(0)?;
 
                         // Aggregate to destination node
-                        let mut dst_slice = messages
-                            .slice_tensor(0, dst_node, dst_node + 1)
-                            .expect("failed to slice destination messages");
-                        let current_msg = dst_slice
-                            .squeeze_tensor(0)
-                            .expect("failed to squeeze destination message");
-                        let updated_msg =
-                            current_msg.add(&message).expect("operation should succeed");
-                        let _ = dst_slice.copy_(
-                            &updated_msg
-                                .unsqueeze_tensor(0)
-                                .expect("failed to unsqueeze updated message"),
-                        );
+                        let mut dst_slice = messages.slice_tensor(0, dst_node, dst_node + 1)?;
+                        let current_msg = dst_slice.squeeze_tensor(0)?;
+                        let updated_msg = current_msg.add(&message)?;
+                        let _ = dst_slice.copy_(&updated_msg.unsqueeze_tensor(0)?);
                     }
 
                     // Store aggregated messages
@@ -249,17 +225,14 @@ impl HeteroGNN {
                 let (_, _, dst_type) = edge_type;
                 if dst_type == node_type {
                     if let Some(messages) = aggregated_messages.get(edge_type) {
-                        node_output = node_output.add(messages).expect("operation should succeed");
+                        node_output = node_output.add(messages)?;
                     }
                 }
             }
 
             // Apply activation (ReLU)
-            let zero_tensor =
-                zeros(node_output.shape().dims()).expect("failed to create zero tensor for ReLU");
-            node_output = node_output
-                .maximum(&zero_tensor)
-                .expect("failed to apply ReLU activation");
+            let zero_tensor = zeros(node_output.shape().dims())?;
+            node_output = node_output.maximum(&zero_tensor)?;
 
             output_features.insert(node_type.clone(), node_output);
         }
@@ -271,7 +244,7 @@ impl HeteroGNN {
         output.edge_attributes = hetero_graph.edge_attributes.clone();
         output.num_nodes = hetero_graph.num_nodes.clone();
 
-        output
+        Ok(output)
     }
 
     /// Get all parameters for optimization
@@ -326,25 +299,16 @@ impl HeteroGAT {
         out_features: usize,
         heads: usize,
         dropout: f32,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut query_transforms = HashMap::new();
         let mut key_transforms = HashMap::new();
         let mut value_transforms = HashMap::new();
 
         // Create Q, K, V transformations for each node type
         for (node_type, in_features) in &node_type_dims {
-            let q = Parameter::new(
-                randn(&[*in_features, heads * out_features])
-                    .expect("failed to create query transformation weights"),
-            );
-            let k = Parameter::new(
-                randn(&[*in_features, heads * out_features])
-                    .expect("failed to create key transformation weights"),
-            );
-            let v = Parameter::new(
-                randn(&[*in_features, heads * out_features])
-                    .expect("failed to create value transformation weights"),
-            );
+            let q = Parameter::new(randn(&[*in_features, heads * out_features])?);
+            let k = Parameter::new(randn(&[*in_features, heads * out_features])?);
+            let v = Parameter::new(randn(&[*in_features, heads * out_features])?);
 
             query_transforms.insert(node_type.clone(), q);
             key_transforms.insert(node_type.clone(), k);
@@ -354,13 +318,11 @@ impl HeteroGAT {
         // Create relation-specific attention parameters
         let mut relation_attentions = HashMap::new();
         for edge_type in &edge_types {
-            let attention = Parameter::new(
-                randn(&[heads, 2 * out_features]).expect("failed to create attention weights"),
-            );
+            let attention = Parameter::new(randn(&[heads, 2 * out_features])?);
             relation_attentions.insert(edge_type.clone(), attention);
         }
 
-        Self {
+        Ok(Self {
             node_types: node_type_dims.keys().cloned().collect(),
             edge_types,
             query_transforms,
@@ -370,11 +332,11 @@ impl HeteroGAT {
             heads,
             out_features,
             dropout,
-        }
+        })
     }
 
     /// Forward pass with heterogeneous attention
-    pub fn forward(&self, hetero_graph: &HeteroGraphData) -> HeteroGraphData {
+    pub fn forward(&self, hetero_graph: &HeteroGraphData) -> Result<HeteroGraphData> {
         let mut output_features = HashMap::new();
 
         // Step 1: Compute Q, K, V for all node types
@@ -384,39 +346,27 @@ impl HeteroGAT {
 
         for node_type in &self.node_types {
             if let Some(features) = hetero_graph.node_features.get(node_type) {
-                let q = features
-                    .matmul(&self.query_transforms[node_type].clone_data())
-                    .expect("operation should succeed");
-                let k = features
-                    .matmul(&self.key_transforms[node_type].clone_data())
-                    .expect("operation should succeed");
-                let v = features
-                    .matmul(&self.value_transforms[node_type].clone_data())
-                    .expect("operation should succeed");
+                let q = features.matmul(&self.query_transforms[node_type].clone_data())?;
+                let k = features.matmul(&self.key_transforms[node_type].clone_data())?;
+                let v = features.matmul(&self.value_transforms[node_type].clone_data())?;
 
                 // Reshape for multi-head attention [num_nodes, heads, out_features]
                 let num_nodes = features.shape().dims()[0];
-                let q_reshaped = q
-                    .view(&[
-                        num_nodes as i32,
-                        self.heads as i32,
-                        self.out_features as i32,
-                    ])
-                    .expect("view should succeed");
-                let k_reshaped = k
-                    .view(&[
-                        num_nodes as i32,
-                        self.heads as i32,
-                        self.out_features as i32,
-                    ])
-                    .expect("view should succeed");
-                let v_reshaped = v
-                    .view(&[
-                        num_nodes as i32,
-                        self.heads as i32,
-                        self.out_features as i32,
-                    ])
-                    .expect("view should succeed");
+                let q_reshaped = q.view(&[
+                    num_nodes as i32,
+                    self.heads as i32,
+                    self.out_features as i32,
+                ])?;
+                let k_reshaped = k.view(&[
+                    num_nodes as i32,
+                    self.heads as i32,
+                    self.out_features as i32,
+                ])?;
+                let v_reshaped = v.view(&[
+                    num_nodes as i32,
+                    self.heads as i32,
+                    self.out_features as i32,
+                ])?;
 
                 queries.insert(node_type.clone(), q_reshaped);
                 keys.insert(node_type.clone(), k_reshaped);
@@ -427,8 +377,7 @@ impl HeteroGAT {
         // Step 2: Compute attention and aggregate for each edge type
         for dst_type in &self.node_types {
             let dst_num_nodes = hetero_graph.num_nodes.get(dst_type).unwrap_or(&0);
-            let aggregated_output = zeros(&[*dst_num_nodes, self.heads * self.out_features])
-                .expect("failed to create aggregated output tensor");
+            let aggregated_output = zeros(&[*dst_num_nodes, self.heads * self.out_features])?;
 
             // Aggregate from all edge types that target this node type
             for edge_type in &self.edge_types {
@@ -454,7 +403,7 @@ impl HeteroGAT {
                     // For simplicity, use mean aggregation with attention weights
                     // In a full implementation, this would compute proper attention scores
 
-                    let edge_flat = edge_index.to_vec().expect("conversion should succeed");
+                    let edge_flat = edge_index.to_vec()?;
                     let num_edges = edge_flat.len() / 2;
 
                     if num_edges > 0 {
@@ -468,27 +417,16 @@ impl HeteroGAT {
 
                             // Extract source value for aggregation
                             let src_value = src_values
-                                .slice_tensor(0, src_node, src_node + 1)
-                                .expect("failed to slice source values")
-                                .view(&[1, (self.heads * self.out_features) as i32])
-                                .expect("view should succeed")
-                                .squeeze_tensor(0)
-                                .expect("failed to squeeze source values");
+                                .slice_tensor(0, src_node, src_node + 1)?
+                                .view(&[1, (self.heads * self.out_features) as i32])?
+                                .squeeze_tensor(0)?;
 
                             // Add to destination (simple sum for now)
-                            let mut dst_slice = aggregated_output
-                                .slice_tensor(0, dst_node, dst_node + 1)
-                                .expect("failed to slice destination for aggregation");
-                            let current = dst_slice
-                                .squeeze_tensor(0)
-                                .expect("failed to squeeze destination slice");
-                            let updated =
-                                current.add(&src_value).expect("operation should succeed");
-                            let _ = dst_slice.copy_(
-                                &updated
-                                    .unsqueeze_tensor(0)
-                                    .expect("failed to unsqueeze updated destination"),
-                            );
+                            let mut dst_slice =
+                                aggregated_output.slice_tensor(0, dst_node, dst_node + 1)?;
+                            let current = dst_slice.squeeze_tensor(0)?;
+                            let updated = current.add(&src_value)?;
+                            let _ = dst_slice.copy_(&updated.unsqueeze_tensor(0)?);
                         }
                     }
                 }
@@ -504,7 +442,7 @@ impl HeteroGAT {
         output.edge_attributes = hetero_graph.edge_attributes.clone();
         output.num_nodes = hetero_graph.num_nodes.clone();
 
-        output
+        Ok(output)
     }
 
     /// Get parameters
@@ -551,50 +489,47 @@ impl KnowledgeGraphEmbedding {
         relation_types: Vec<String>,
         num_entities: HashMap<NodeType, usize>,
         embedding_dim: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut entity_embeddings = HashMap::new();
         let mut relation_embeddings = HashMap::new();
 
         // Create entity embeddings
         for entity_type in &entity_types {
             let num = num_entities.get(entity_type).unwrap_or(&100);
-            let embeddings = Parameter::new(
-                randn(&[*num, embedding_dim]).expect("failed to create entity embeddings"),
-            );
+            let embeddings = Parameter::new(randn(&[*num, embedding_dim])?);
             entity_embeddings.insert(entity_type.clone(), embeddings);
         }
 
         // Create relation embeddings
         for relation in &relation_types {
-            let embeddings = Parameter::new(
-                randn(&[embedding_dim, embedding_dim])
-                    .expect("failed to create relation embeddings"),
-            );
+            let embeddings = Parameter::new(randn(&[embedding_dim, embedding_dim])?);
             relation_embeddings.insert(relation.clone(), embeddings);
         }
 
-        Self {
+        Ok(Self {
             entity_types,
             relation_types,
             entity_embeddings,
             relation_embeddings,
             embedding_dim,
-        }
+        })
     }
 
     /// Get entity embedding
-    pub fn get_entity_embedding(&self, entity_type: &NodeType, entity_id: usize) -> Option<Tensor> {
+    pub fn get_entity_embedding(
+        &self,
+        entity_type: &NodeType,
+        entity_id: usize,
+    ) -> Result<Option<Tensor>> {
         if let Some(embeddings) = self.entity_embeddings.get(entity_type) {
-            Some(
+            Ok(Some(
                 embeddings
                     .clone_data()
-                    .slice_tensor(0, entity_id, entity_id + 1)
-                    .expect("failed to slice entity embedding")
-                    .squeeze_tensor(0)
-                    .expect("failed to squeeze entity embedding"),
-            )
+                    .slice_tensor(0, entity_id, entity_id + 1)?
+                    .squeeze_tensor(0)?,
+            ))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -606,32 +541,25 @@ impl KnowledgeGraphEmbedding {
         relation: &String,
         tail_type: &NodeType,
         tail_id: usize,
-    ) -> Option<f64> {
+    ) -> Result<Option<f64>> {
         if let (Some(head_emb), Some(tail_emb), Some(rel_emb)) = (
-            self.get_entity_embedding(head_type, head_id),
-            self.get_entity_embedding(tail_type, tail_id),
+            self.get_entity_embedding(head_type, head_id)?,
+            self.get_entity_embedding(tail_type, tail_id)?,
             self.relation_embeddings.get(relation),
         ) {
             // Simple TransE-style scoring: ||h + r - t||
             let head_plus_rel = head_emb
-                .unsqueeze_tensor(0)
-                .expect("failed to unsqueeze head embedding")
-                .matmul(&rel_emb.clone_data())
-                .expect("operation should succeed")
-                .squeeze_tensor(0)
-                .expect("failed to squeeze head plus relation");
+                .unsqueeze_tensor(0)?
+                .matmul(&rel_emb.clone_data())?
+                .squeeze_tensor(0)?;
 
-            let diff = head_plus_rel
-                .sub(&tail_emb)
-                .expect("operation should succeed");
-            let score_tensor = diff
-                .dot(&diff)
-                .expect("failed to compute dot product for score");
-            let score = score_tensor.to_vec().expect("conversion should succeed")[0] as f64;
+            let diff = head_plus_rel.sub(&tail_emb)?;
+            let score_tensor = diff.dot(&diff)?;
+            let score = score_tensor.to_vec()?[0] as f64;
 
-            Some(-score) // Negative distance as score
+            Ok(Some(-score)) // Negative distance as score
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -697,7 +625,7 @@ mod tests {
         let edge_types = vec![("user".to_string(), "likes".to_string(), "item".to_string())];
 
         let hetero_gnn = HeteroGNN::new(node_dims, edge_types, 8, true);
-        let params = hetero_gnn.parameters();
+        let params = hetero_gnn.expect("operation should succeed").parameters();
 
         // Should have transformations for 2 node types + 1 edge type + biases
         assert!(params.len() >= 4);
@@ -712,23 +640,28 @@ mod tests {
         num_entities.insert("person".to_string(), 10);
         num_entities.insert("company".to_string(), 5);
 
-        let kg_emb = KnowledgeGraphEmbedding::new(entity_types, relation_types, num_entities, 50);
+        let kg_emb = KnowledgeGraphEmbedding::new(entity_types, relation_types, num_entities, 50)
+            .expect("operation should succeed");
 
         // Test embedding retrieval
-        let person_emb = kg_emb.get_entity_embedding(&"person".to_string(), 0);
+        let person_emb = kg_emb
+            .get_entity_embedding(&"person".to_string(), 0)
+            .expect("operation should succeed");
         assert!(person_emb.is_some());
 
-        let emb = person_emb.expect("operation should succeed");
-        assert_eq!(emb.shape().dims(), &[50]);
+        let emb = person_emb;
+        assert_eq!(emb.expect("operation should succeed").shape().dims(), &[50]);
 
         // Test triple scoring
-        let score = kg_emb.triple_score(
-            &"person".to_string(),
-            0,
-            &"works_at".to_string(),
-            &"company".to_string(),
-            0,
-        );
+        let score = kg_emb
+            .triple_score(
+                &"person".to_string(),
+                0,
+                &"works_at".to_string(),
+                &"company".to_string(),
+                0,
+            )
+            .expect("operation should succeed");
         assert!(score.is_some());
         assert!(score.expect("operation should succeed").is_finite());
     }

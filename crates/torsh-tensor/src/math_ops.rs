@@ -59,7 +59,60 @@ use scirs2_core::chunking::{
 // TODO: profile_section macro not available in scirs2_core yet
 // use scirs2_core::profiling::profile_section;
 
-use crate::core_ops::{Operation, Tensor};
+use crate::core_ops::{Operation, Tensor, UnaryKind};
+#[cfg(feature = "simd")]
+use crate::simd_ops_f32::BinaryF32Op;
+use crate::storage::TensorStorage;
+
+impl<T: TensorElement> Tensor<T> {
+    /// Record `result` as a differentiable element-wise unary of `self`.
+    ///
+    /// Called at the end of the public activation/transcendental wrappers so
+    /// every dispatch path (SIMD, parallel, GPU, scalar) shares one recorded
+    /// derivative. A no-op when gradients are not being tracked.
+    pub(crate) fn record_unary(&self, mut result: Self, kind: UnaryKind) -> Self {
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = Operation::Unary {
+                input: Arc::new(self.clone()),
+                kind,
+            };
+        }
+        result
+    }
+}
+
+/// Element count from which a same-shape binary op dispatches to the hardware
+/// SIMD kernels of `scirs2_core::simd_ops::SimdUnifiedOps`.
+///
+/// Below this size the per-call dispatch and buffer acquisition dominate the
+/// arithmetic, so the generic path is faster.
+#[cfg(feature = "simd")]
+const SIMD_BINARY_THRESHOLD: usize = 1024;
+
+/// Element count from which the generic element-wise path fans out over
+/// `scirs2_core::parallel_ops` worker threads.
+///
+/// The same value as [`SIMD_BINARY_THRESHOLD`] on purpose: it leaves no size
+/// band in which neither the vector kernels nor the worker pool apply.
+#[cfg(feature = "parallel")]
+const PARALLEL_ELEMENTWISE_THRESHOLD: usize = 1024;
+
+/// Dispatch one of the f64 vector kernels of
+/// `scirs2_core::simd_ops::SimdUnifiedOps` into a caller-supplied buffer.
+///
+/// The op tag is shared with the f32 kernels (`BinaryF32Op`); only the element
+/// type differs. All three slices must have the same length.
+#[cfg(feature = "simd")]
+fn dispatch_f64_into(op: BinaryF32Op, a: &[f64], b: &[f64], out: &mut [f64]) {
+    use scirs2_core::simd_ops::SimdUnifiedOps;
+    match op {
+        BinaryF32Op::Add => <f64 as SimdUnifiedOps>::simd_add_into(a, b, out),
+        BinaryF32Op::Sub => <f64 as SimdUnifiedOps>::simd_sub_into(a, b, out),
+        BinaryF32Op::Mul => <f64 as SimdUnifiedOps>::simd_mul_into(a, b, out),
+        BinaryF32Op::Div => <f64 as SimdUnifiedOps>::simd_div_into(a, b, out),
+    }
+}
 
 // 🚀 Adaptive SIMD Selection System for Maximum Performance
 #[cfg(feature = "simd")]
@@ -292,6 +345,140 @@ fn compute_broadcast_index(
 }
 
 impl<T: TensorElement + Copy> Tensor<T> {
+    /// Whether two tensors read through the very same storage allocation.
+    ///
+    /// Binary ops borrow both operands out of storage instead of copying them,
+    /// and `RwLock::read` is not re-entrant: taking a guard on one buffer while
+    /// already holding one on the *same* buffer risks a dead-lock. Callers use
+    /// this to fall back to a materialised copy of the second operand — which
+    /// is what makes `t.add(&t)` and `t.add(&t.clone())` safe.
+    ///
+    /// Unlike [`Tensor::shares_storage`] this covers every storage variant,
+    /// including the two SIMD ones.
+    pub(crate) fn shares_storage_buffer(&self, other: &Self) -> bool {
+        match (&self.storage, &other.storage) {
+            (TensorStorage::InMemory(a), TensorStorage::InMemory(b)) => Arc::ptr_eq(a, b),
+            (TensorStorage::MemoryMapped(a), TensorStorage::MemoryMapped(b)) => Arc::ptr_eq(a, b),
+            #[cfg(feature = "simd")]
+            (TensorStorage::Aligned(a), TensorStorage::Aligned(b)) => Arc::ptr_eq(a, b),
+            #[cfg(feature = "simd")]
+            (TensorStorage::SimdOptimized(a), TensorStorage::SimdOptimized(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    /// Address of the storage allocation this tensor reads through.
+    ///
+    /// Used only to impose a total order on lock acquisition; the value is
+    /// never dereferenced.
+    fn storage_addr(&self) -> usize {
+        match &self.storage {
+            TensorStorage::InMemory(data) => Arc::as_ptr(data) as usize,
+            TensorStorage::MemoryMapped(storage) => Arc::as_ptr(storage) as usize,
+            #[cfg(feature = "simd")]
+            TensorStorage::Aligned(data) => Arc::as_ptr(data) as usize,
+            #[cfg(feature = "simd")]
+            TensorStorage::SimdOptimized(storage) => Arc::as_ptr(storage) as usize,
+        }
+    }
+
+    /// Run `f` against contiguous, view-ordered slices of both operands.
+    ///
+    /// Neither operand is copied while they live in different buffers: each
+    /// slice is borrowed straight out of storage for the duration of the
+    /// closure. Strided views are materialised in view order first (so the
+    /// closure can always index row-major).
+    ///
+    /// # Locking
+    /// Two operands that share one allocation take a single copy of `other`
+    /// rather than nesting guards on the same (non-re-entrant) lock, which is
+    /// what makes `t.add(&t)` and `t.add(&t.clone())` safe. Distinct buffers
+    /// are locked in ascending address order, so two threads running mirrored
+    /// operations (`a op b` and `b op a`) can never build an acquisition cycle.
+    pub(crate) fn with_operand_slices<R, F>(&self, other: &Self, f: F) -> Result<R>
+    where
+        F: FnOnce(&[T], &[T]) -> Result<R>,
+    {
+        if self.shares_storage_buffer(other) {
+            // Materialise before acquiring this tensor's guard, never inside it.
+            let other_data = other.to_vec()?;
+            return self.with_contiguous_data(|lhs| f(lhs, &other_data));
+        }
+        if self.storage_addr() <= other.storage_addr() {
+            self.with_contiguous_data(|lhs| other.with_contiguous_data(|rhs| f(lhs, rhs)))
+        } else {
+            other.with_contiguous_data(|rhs| self.with_contiguous_data(|lhs| f(lhs, rhs)))
+        }
+    }
+
+    /// Try the hardware-SIMD fast path for a same-shape binary operation.
+    ///
+    /// Returns `Ok(None)` when the operands are not eligible — different
+    /// shapes, fewer than [`SIMD_BINARY_THRESHOLD`] elements, or an element
+    /// type without a vector kernel — in which case the caller falls back to
+    /// [`Tensor::elementwise_operation`]. `f32` and `f64` both have real
+    /// AVX2/NEON kernels in `scirs2_core::simd_ops`.
+    ///
+    /// Allocation profile: zero copies of the operands and exactly one pooled
+    /// output buffer, which the kernel initialises in full.
+    #[cfg(feature = "simd")]
+    fn try_simd_binary(&self, other: &Self, op: BinaryF32Op) -> Result<Option<Self>> {
+        let n = self.numel();
+        if n < SIMD_BINARY_THRESHOLD || self.shape() != other.shape() {
+            return Ok(None);
+        }
+        let is_f32 = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>();
+        let is_f64 = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>();
+        if !is_f32 && !is_f64 {
+            return Ok(None);
+        }
+
+        let result_data = self.with_operand_slices(other, |a, b| {
+            if a.len() != n || b.len() != n {
+                return Err(TorshError::ShapeMismatch {
+                    expected: vec![n],
+                    got: vec![b.len()],
+                });
+            }
+            let mut buf = global_acquire_uninit::<T>(n);
+            {
+                let uninit = &mut buf.as_uninit_slice_mut()[..n];
+                // SAFETY: `MaybeUninit<T>` has the layout of `T`, and every
+                // kernel invoked below is store-only — `simd_*_into` writes all
+                // `n` outputs before anything reads them — so the buffer is
+                // fully initialised when this block ends. That is exactly why
+                // no zero-fill pass is needed here.
+                let out: &mut [T] =
+                    unsafe { std::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<T>(), n) };
+                if is_f32 {
+                    // SAFETY: the TypeId check above confirms `T == f32`, so
+                    // reinterpreting the same-layout slices is a no-op.
+                    unsafe {
+                        op.dispatch_into(
+                            std::slice::from_raw_parts(a.as_ptr().cast::<f32>(), n),
+                            std::slice::from_raw_parts(b.as_ptr().cast::<f32>(), n),
+                            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<f32>(), n),
+                        );
+                    }
+                } else {
+                    // SAFETY: the TypeId check above confirms `T == f64`.
+                    unsafe {
+                        dispatch_f64_into(
+                            op,
+                            std::slice::from_raw_parts(a.as_ptr().cast::<f64>(), n),
+                            std::slice::from_raw_parts(b.as_ptr().cast::<f64>(), n),
+                            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<f64>(), n),
+                        );
+                    }
+                }
+            }
+            Ok(buf.into_vec(n))
+        })?;
+
+        let result = Self::from_data(result_data, self.shape().dims().to_vec(), self.device)?;
+        Ok(Some(result))
+    }
+
     /// Add scalar to all elements in-place
     pub fn add_scalar_(&mut self, scalar: T) -> Result<()>
     where
@@ -338,11 +525,23 @@ impl<T: TensorElement + Copy> Tensor<T> {
     }
 
     /// Multiply all elements by scalar (returns new tensor)
+    ///
+    /// The result joins the autograd graph when the input requires gradients:
+    /// `d/dinput (input * s) = s`. Recording a dedicated scalar node keeps the
+    /// tape free of a full tensor of copies of the constant.
     pub fn mul_scalar(&self, scalar: T) -> Result<Self>
     where
         T: Copy + std::ops::Mul<Output = T>,
     {
-        self.map(|x| x * scalar)
+        let mut result = self.map(|x| x * scalar)?;
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = Operation::MulScalar {
+                input: Arc::new(self.clone()),
+                scalar,
+            };
+        }
+        Ok(result)
     }
 
     /// Divide all elements by scalar in-place
@@ -355,11 +554,22 @@ impl<T: TensorElement + Copy> Tensor<T> {
     }
 
     /// Divide all elements by scalar (returns new tensor)
+    ///
+    /// The result joins the autograd graph when the input requires gradients:
+    /// `d/dinput (input / s) = 1 / s`.
     pub fn div_scalar(&self, scalar: T) -> Result<Self>
     where
         T: Copy + std::ops::Div<Output = T>,
     {
-        self.map(|x| x / scalar)
+        let mut result = self.map(|x| x / scalar)?;
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = Operation::DivScalar {
+                input: Arc::new(self.clone()),
+                scalar,
+            };
+        }
+        Ok(result)
     }
 
     /// Element-wise addition with another tensor (supports broadcasting)
@@ -372,51 +582,25 @@ impl<T: TensorElement + Copy> Tensor<T> {
             return self.broadcast_add(other);
         }
 
-        // f32 SIMD fast path: runtime dispatch without cfg gates
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            let self_data = self.data()?;
-            if self_data.len() >= 1024 {
-                let other_data = other.data()?;
-                // Safety: TypeId confirmed T == f32; reinterpreting same-layout slices.
-                let a_f32: &[f32] = unsafe {
-                    std::slice::from_raw_parts(self_data.as_ptr() as *const f32, self_data.len())
+        // Hardware SIMD fast path (f32/f64, ≥ SIMD_BINARY_THRESHOLD elements),
+        // reading both operands in place and writing one pooled output buffer.
+        #[cfg(feature = "simd")]
+        if let Some(mut result) = self.try_simd_binary(other, BinaryF32Op::Add)? {
+            if crate::should_record_grad(self.requires_grad || other.requires_grad) {
+                result.requires_grad = true;
+                result.operation = Operation::Add {
+                    lhs: Arc::new(self.clone()),
+                    rhs: Arc::new(other.clone()),
                 };
-                let b_f32: &[f32] = unsafe {
-                    std::slice::from_raw_parts(other_data.as_ptr() as *const f32, other_data.len())
-                };
-                let n = self_data.len();
-                let mut buf = global_acquire_uninit::<f32>(n);
-                {
-                    let uninit = buf.as_uninit_slice_mut();
-                    for slot in uninit.iter_mut() {
-                        slot.write(0.0);
-                    }
-                }
-                let mut out = buf.into_vec(n);
-                crate::simd_ops_f32::add_into_f32(a_f32, b_f32, &mut out);
-                // Safety: T == f32 confirmed above; same size, alignment, and bit representation.
-                let result_data: Vec<T> = unsafe {
-                    let mut v = std::mem::ManuallyDrop::new(out);
-                    Vec::from_raw_parts(v.as_mut_ptr() as *mut T, v.len(), v.capacity())
-                };
-                let mut result =
-                    Self::from_data(result_data, self.shape().dims().to_vec(), self.device)?;
-                if self.requires_grad || other.requires_grad {
-                    result.requires_grad = true;
-                    result.operation = Operation::Add {
-                        lhs: Arc::new(self.clone()),
-                        rhs: Arc::new(other.clone()),
-                    };
-                }
-                return Ok(result);
             }
+            return Ok(result);
         }
 
         // Same shape - use optimized elementwise operation
         let mut result = self.elementwise_operation(other, |a, b| a + b)?;
 
         // Preserve gradient tracking
-        if self.requires_grad || other.requires_grad {
+        if crate::should_record_grad(self.requires_grad || other.requires_grad) {
             result.requires_grad = true;
             result.operation = Operation::Add {
                 lhs: Arc::new(self.clone()),
@@ -449,41 +633,40 @@ impl<T: TensorElement + Copy> Tensor<T> {
         // Compute the broadcasted shape
         let broadcast_shape = compute_broadcast_shape(self_shape, other_shape)?;
 
-        // Get data from both tensors
-        let self_data = self.data()?;
-        let other_data = other.data()?;
-
-        // Perform broadcasting addition
+        // Perform broadcasting addition, reading both operands in place.
         let total_elems: usize = broadcast_shape.iter().product();
-        let mut buf = global_acquire_uninit::<T>(total_elems);
-        let uninit = buf.as_uninit_slice_mut();
-        let mut count = 0;
+        let result_data = self.with_operand_slices(other, |self_data, other_data| {
+            let mut buf = global_acquire_uninit::<T>(total_elems);
+            let uninit = &mut buf.as_uninit_slice_mut()[..total_elems];
+            let mut count = 0;
 
-        for i in 0..total_elems {
-            let self_idx = compute_broadcast_index(i, &broadcast_shape, self_shape);
-            let other_idx = compute_broadcast_index(i, &broadcast_shape, other_shape);
+            for i in 0..total_elems {
+                let self_idx = compute_broadcast_index(i, &broadcast_shape, self_shape);
+                let other_idx = compute_broadcast_index(i, &broadcast_shape, other_shape);
 
-            let self_val = *self_data
-                .get(self_idx)
-                .ok_or_else(|| TorshError::IndexError {
-                    index: self_idx,
-                    size: self_data.len(),
-                })?;
-            let other_val = *other_data
-                .get(other_idx)
-                .ok_or_else(|| TorshError::IndexError {
-                    index: other_idx,
-                    size: other_data.len(),
-                })?;
-            uninit[count].write(self_val + other_val);
-            count += 1;
-        }
+                let self_val = *self_data
+                    .get(self_idx)
+                    .ok_or_else(|| TorshError::IndexError {
+                        index: self_idx,
+                        size: self_data.len(),
+                    })?;
+                let other_val =
+                    *other_data
+                        .get(other_idx)
+                        .ok_or_else(|| TorshError::IndexError {
+                            index: other_idx,
+                            size: other_data.len(),
+                        })?;
+                uninit[count].write(self_val + other_val);
+                count += 1;
+            }
 
-        let result_data = buf.into_vec(count);
+            Ok(buf.into_vec(count))
+        })?;
         let mut result = Self::from_data(result_data, broadcast_shape, self.device)?;
 
         // Preserve gradient tracking
-        if self.requires_grad || other.requires_grad {
+        if crate::should_record_grad(self.requires_grad || other.requires_grad) {
             result.requires_grad = true;
             result.operation = Operation::Add {
                 lhs: Arc::new(self.clone()),
@@ -499,50 +682,24 @@ impl<T: TensorElement + Copy> Tensor<T> {
     where
         T: std::ops::Sub<Output = T>,
     {
-        // f32 SIMD fast path: runtime dispatch without cfg gates
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>()
-            && self.shape() == other.shape()
-        {
-            let self_data = self.data()?;
-            if self_data.len() >= 1024 {
-                let other_data = other.data()?;
-                let a_f32: &[f32] = unsafe {
-                    std::slice::from_raw_parts(self_data.as_ptr() as *const f32, self_data.len())
+        // Hardware SIMD fast path (f32/f64, ≥ SIMD_BINARY_THRESHOLD elements),
+        // reading both operands in place and writing one pooled output buffer.
+        #[cfg(feature = "simd")]
+        if let Some(mut result) = self.try_simd_binary(other, BinaryF32Op::Sub)? {
+            if crate::should_record_grad(self.requires_grad || other.requires_grad) {
+                result.requires_grad = true;
+                result.operation = crate::Operation::Sub {
+                    lhs: Arc::new(self.clone()),
+                    rhs: Arc::new(other.clone()),
                 };
-                let b_f32: &[f32] = unsafe {
-                    std::slice::from_raw_parts(other_data.as_ptr() as *const f32, other_data.len())
-                };
-                let n = self_data.len();
-                let mut buf = global_acquire_uninit::<f32>(n);
-                {
-                    let uninit = buf.as_uninit_slice_mut();
-                    for slot in uninit.iter_mut() {
-                        slot.write(0.0);
-                    }
-                }
-                let mut out = buf.into_vec(n);
-                crate::simd_ops_f32::sub_into_f32(a_f32, b_f32, &mut out);
-                let result_data: Vec<T> = unsafe {
-                    let mut v = std::mem::ManuallyDrop::new(out);
-                    Vec::from_raw_parts(v.as_mut_ptr() as *mut T, v.len(), v.capacity())
-                };
-                let mut result =
-                    Self::from_data(result_data, self.shape().dims().to_vec(), self.device)?;
-                if self.requires_grad || other.requires_grad {
-                    result.requires_grad = true;
-                    result.operation = crate::Operation::Sub {
-                        lhs: Arc::new(self.clone()),
-                        rhs: Arc::new(other.clone()),
-                    };
-                }
-                return Ok(result);
             }
+            return Ok(result);
         }
 
         let mut result = self.elementwise_operation(other, |a, b| a - b)?;
 
         // Propagate requires_grad and record operation for autograd
-        if self.requires_grad || other.requires_grad {
+        if crate::should_record_grad(self.requires_grad || other.requires_grad) {
             result.requires_grad = true;
             result.operation = crate::Operation::Sub {
                 lhs: Arc::new(self.clone()),
@@ -553,80 +710,80 @@ impl<T: TensorElement + Copy> Tensor<T> {
         Ok(result)
     }
 
-    /// Element-wise multiplication with another tensor
+    /// Element-wise multiplication with another tensor (supports broadcasting).
+    ///
+    /// When either operand requires gradients the result records
+    /// `Operation::Mul` with the *un-broadcast* operands, so backward can apply
+    /// `d/dlhs = rhs`, `d/drhs = lhs` and fold each gradient back to its
+    /// operand's own shape.
     pub fn mul(&self, other: &Self) -> Result<Self>
     where
         T: std::ops::Mul<Output = T>,
     {
-        // f32 SIMD fast path: runtime dispatch without cfg gates
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>()
-            && self.shape() == other.shape()
-        {
-            let self_data = self.data()?;
-            if self_data.len() >= 1024 {
-                let other_data = other.data()?;
-                let a_f32: &[f32] = unsafe {
-                    std::slice::from_raw_parts(self_data.as_ptr() as *const f32, self_data.len())
+        // Hardware SIMD fast path (f32/f64, ≥ SIMD_BINARY_THRESHOLD elements),
+        // reading both operands in place and writing one pooled output buffer.
+        #[cfg(feature = "simd")]
+        if let Some(mut result) = self.try_simd_binary(other, BinaryF32Op::Mul)? {
+            if crate::should_record_grad(self.requires_grad || other.requires_grad) {
+                result.requires_grad = true;
+                result.operation = crate::Operation::Mul {
+                    lhs: Arc::new(self.clone()),
+                    rhs: Arc::new(other.clone()),
                 };
-                let b_f32: &[f32] = unsafe {
-                    std::slice::from_raw_parts(other_data.as_ptr() as *const f32, other_data.len())
-                };
-                let n = self_data.len();
-                let mut buf = global_acquire_uninit::<f32>(n);
-                {
-                    let uninit = buf.as_uninit_slice_mut();
-                    for slot in uninit.iter_mut() {
-                        slot.write(0.0);
-                    }
-                }
-                let mut out = buf.into_vec(n);
-                crate::simd_ops_f32::mul_into_f32(a_f32, b_f32, &mut out);
-                let result_data: Vec<T> = unsafe {
-                    let mut v = std::mem::ManuallyDrop::new(out);
-                    Vec::from_raw_parts(v.as_mut_ptr() as *mut T, v.len(), v.capacity())
-                };
-                return Self::from_data(result_data, self.shape().dims().to_vec(), self.device);
             }
+            return Ok(result);
         }
-        self.elementwise_operation(other, |a, b| a * b)
+
+        let mut result = self.elementwise_operation(other, |a, b| a * b)?;
+
+        // Propagate requires_grad and record the operation for autograd
+        if crate::should_record_grad(self.requires_grad || other.requires_grad) {
+            result.requires_grad = true;
+            result.operation = crate::Operation::Mul {
+                lhs: Arc::new(self.clone()),
+                rhs: Arc::new(other.clone()),
+            };
+        }
+
+        Ok(result)
     }
 
-    /// Element-wise division with another tensor
+    /// Element-wise division with another tensor (supports broadcasting).
+    ///
+    /// When either operand requires gradients the result records
+    /// `Operation::Div` with the *un-broadcast* operands, so backward can apply
+    /// `d/dlhs = 1 / rhs`, `d/drhs = -lhs / rhs²` and fold each gradient back to
+    /// its operand's own shape.
     pub fn div(&self, other: &Self) -> Result<Self>
     where
         T: std::ops::Div<Output = T>,
     {
-        // f32 SIMD fast path: runtime dispatch without cfg gates
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>()
-            && self.shape() == other.shape()
-        {
-            let self_data = self.data()?;
-            if self_data.len() >= 1024 {
-                let other_data = other.data()?;
-                let a_f32: &[f32] = unsafe {
-                    std::slice::from_raw_parts(self_data.as_ptr() as *const f32, self_data.len())
+        // Hardware SIMD fast path (f32/f64, ≥ SIMD_BINARY_THRESHOLD elements),
+        // reading both operands in place and writing one pooled output buffer.
+        #[cfg(feature = "simd")]
+        if let Some(mut result) = self.try_simd_binary(other, BinaryF32Op::Div)? {
+            if crate::should_record_grad(self.requires_grad || other.requires_grad) {
+                result.requires_grad = true;
+                result.operation = crate::Operation::Div {
+                    lhs: Arc::new(self.clone()),
+                    rhs: Arc::new(other.clone()),
                 };
-                let b_f32: &[f32] = unsafe {
-                    std::slice::from_raw_parts(other_data.as_ptr() as *const f32, other_data.len())
-                };
-                let n = self_data.len();
-                let mut buf = global_acquire_uninit::<f32>(n);
-                {
-                    let uninit = buf.as_uninit_slice_mut();
-                    for slot in uninit.iter_mut() {
-                        slot.write(0.0);
-                    }
-                }
-                let mut out = buf.into_vec(n);
-                crate::simd_ops_f32::div_into_f32(a_f32, b_f32, &mut out);
-                let result_data: Vec<T> = unsafe {
-                    let mut v = std::mem::ManuallyDrop::new(out);
-                    Vec::from_raw_parts(v.as_mut_ptr() as *mut T, v.len(), v.capacity())
-                };
-                return Self::from_data(result_data, self.shape().dims().to_vec(), self.device);
             }
+            return Ok(result);
         }
-        self.elementwise_operation(other, |a, b| a / b)
+
+        let mut result = self.elementwise_operation(other, |a, b| a / b)?;
+
+        // Propagate requires_grad and record the operation for autograd
+        if crate::should_record_grad(self.requires_grad || other.requires_grad) {
+            result.requires_grad = true;
+            result.operation = crate::Operation::Div {
+                lhs: Arc::new(self.clone()),
+                rhs: Arc::new(other.clone()),
+            };
+        }
+
+        Ok(result)
     }
 
     /// Handle broadcasting binary operations
@@ -644,31 +801,42 @@ impl<T: TensorElement + Copy> Tensor<T> {
         // Compute the broadcast result shape
         let broadcast_shape = BroadcastOps::compute_broadcast_shape(self_shape, other_shape)?;
 
-        let self_data = self.data()?;
-        let other_data = other.data()?;
-
         let total_elements = broadcast_shape.iter().product::<usize>();
-        let mut buf = global_acquire_uninit::<T>(total_elements);
-        let uninit = buf.as_uninit_slice_mut();
-        let mut count = 0;
+        let result_data = self.with_operand_slices(other, |self_data, other_data| {
+            let mut buf = global_acquire_uninit::<T>(total_elements);
+            let uninit = &mut buf.as_uninit_slice_mut()[..total_elements];
+            let mut count = 0;
 
-        // Generate all possible indices for the broadcast shape
-        let mut indices = vec![0; broadcast_shape.len()];
-        for _ in 0..total_elements {
-            // Map broadcast indices to original tensor indices
-            let self_idx = self.compute_broadcast_index(&indices, self_shape, &broadcast_shape)?;
-            let other_idx =
-                other.compute_broadcast_index(&indices, other_shape, &broadcast_shape)?;
+            // Generate all possible indices for the broadcast shape
+            let mut indices = vec![0; broadcast_shape.len()];
+            for _ in 0..total_elements {
+                // Map broadcast indices to original tensor indices
+                let self_idx =
+                    self.compute_broadcast_index(&indices, self_shape, &broadcast_shape)?;
+                let other_idx =
+                    other.compute_broadcast_index(&indices, other_shape, &broadcast_shape)?;
 
-            let result = op(self_data[self_idx], other_data[other_idx]);
-            uninit[count].write(result);
-            count += 1;
+                let lhs = *self_data
+                    .get(self_idx)
+                    .ok_or_else(|| TorshError::IndexError {
+                        index: self_idx,
+                        size: self_data.len(),
+                    })?;
+                let rhs = *other_data
+                    .get(other_idx)
+                    .ok_or_else(|| TorshError::IndexError {
+                        index: other_idx,
+                        size: other_data.len(),
+                    })?;
+                uninit[count].write(op(lhs, rhs));
+                count += 1;
 
-            // Increment indices (like an odometer)
-            Self::increment_indices(&mut indices, &broadcast_shape);
-        }
+                // Increment indices (like an odometer)
+                Self::increment_indices(&mut indices, &broadcast_shape);
+            }
 
-        let result_data = buf.into_vec(count);
+            Ok(buf.into_vec(count))
+        })?;
         Self::from_data(result_data, broadcast_shape, self.device)
     }
 
@@ -708,7 +876,16 @@ impl<T: TensorElement + Copy> Tensor<T> {
         Ok(flat_index)
     }
 
-    /// Helper function for element-wise operations with SIMD optimization
+    /// Generic element-wise binary operation over two same-shape tensors.
+    ///
+    /// Both operands are read in place (no defensive copies) and the result is
+    /// written into a single pooled buffer. Tensors with at least
+    /// [`PARALLEL_ELEMENTWISE_THRESHOLD`] elements are split into
+    /// cache-sized chunks across `scirs2_core::parallel_ops` workers; smaller
+    /// ones run a single vectorisable pass.
+    ///
+    /// Element types with a hardware kernel (`f32`, `f64`) reach this function
+    /// only below the SIMD threshold — see [`Tensor::try_simd_binary`].
     fn elementwise_operation<F>(&self, other: &Self, op: F) -> Result<Self>
     where
         F: Fn(T, T) -> T + Send + Sync,
@@ -718,94 +895,56 @@ impl<T: TensorElement + Copy> Tensor<T> {
             return self.broadcast_binary_op(other, op);
         }
 
-        let self_data = self.data()?;
-        let other_data = other.data()?;
-
-        // ✅ SciRS2 Breakthrough SIMD Optimization - 14.17x Performance for large tensors
-        #[cfg(feature = "simd")]
-        {
-            if self_data.len() > 1000 {
-                // Use hyperoptimized SIMD for large tensors (14.17x faster than scalar)
-                let result_data = self.simd_elementwise_operation(&self_data, &other_data, op)?;
-                return Self::from_data(result_data, self.shape().dims().to_vec(), self.device);
+        let n = self.numel();
+        let device = self.device;
+        let result_data = self.with_operand_slices(other, |a, b| {
+            if a.len() != n || b.len() != n {
+                return Err(TorshError::ShapeMismatch {
+                    expected: vec![n],
+                    got: vec![b.len()],
+                });
             }
-        }
 
-        // ✅ SciRS2 Intelligent Parallel Processing - Operation-aware adaptive chunking (15-30% improvement)
-        #[cfg(feature = "parallel")]
-        {
-            if self_data.len() > 100 {
-                // Use intelligent chunking system for optimal performance based on operation type
-                let paired_data: Vec<(T, T)> = self_data
-                    .iter()
-                    .zip(other_data.iter())
-                    .map(|(&a, &b)| (a, b))
-                    .collect();
-                let result_data = intelligent_parallel_process(
-                    paired_data,
-                    TensorOpType::ElementWise, // Element-wise operations get specialized chunking
-                    self.device.clone(),
-                    |(a, b)| op(a, b),
-                );
-                return Self::from_data(result_data, self.shape().dims().to_vec(), self.device);
-            }
-        }
+            let mut buf = global_acquire_uninit::<T>(n);
+            {
+                let uninit = &mut buf.as_uninit_slice_mut()[..n];
 
-        // Fallback to sequential processing for small tensors
-        let result_data: Vec<T> = self_data
-            .iter()
-            .zip(other_data.iter())
-            .map(|(&a, &b)| op(a, b))
-            .collect();
-
-        Self::from_data(result_data, self.shape().dims().to_vec(), self.device)
-    }
-
-    /// SIMD-optimized element-wise operation for large tensors
-    #[cfg(feature = "simd")]
-    #[allow(dead_code)]
-    fn simd_elementwise_operation<F>(&self, data_a: &[T], data_b: &[T], op: F) -> Result<Vec<T>>
-    where
-        F: Fn(T, T) -> T + Send + Sync,
-        T: TensorElement,
-    {
-        // ✅ SciRS2 Hyperoptimized SIMD Implementation - 14.17x Performance
-        #[cfg(feature = "simd")]
-        {
-            // For f32, use the breakthrough aligned SIMD operations
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-                let _a_f32 = unsafe { std::mem::transmute::<&[T], &[f32]>(data_a) };
-                let _b_f32 = unsafe { std::mem::transmute::<&[T], &[f32]>(data_b) };
-
-                // Simplified parallel processing - avoid unsafe transmute for generic types
-                // Direct conversion back to generic processing since we can't safely transmute T
-                // ✅ SciRS2 POLICY: Use scirs2_core::parallel_ops instead of direct rayon
+                // Operation-aware chunking: the chunk config that used to be
+                // computed and discarded now actually sizes the work units.
                 #[cfg(feature = "parallel")]
                 {
-                    use scirs2_core::parallel_ops::*;
-                    return Ok(data_a
-                        .par_iter()
-                        .zip(data_b.par_iter())
-                        .map(|(&a, &b)| op(a, b))
-                        .collect());
+                    if n >= PARALLEL_ELEMENTWISE_THRESHOLD {
+                        use scirs2_core::parallel_ops::*;
+                        let config = create_optimal_chunk_config(
+                            n,
+                            TensorOpType::ElementWise,
+                            device,
+                            false,
+                        );
+                        let chunk = config.max_chunk_size.max(config.min_chunk_size).max(1);
+                        uninit
+                            .par_chunks_mut(chunk)
+                            .zip(a.par_chunks(chunk))
+                            .zip(b.par_chunks(chunk))
+                            .for_each(|((out_chunk, a_chunk), b_chunk)| {
+                                for (slot, (&x, &y)) in
+                                    out_chunk.iter_mut().zip(a_chunk.iter().zip(b_chunk.iter()))
+                                {
+                                    slot.write(op(x, y));
+                                }
+                            });
+                        return Ok(buf.into_vec(n));
+                    }
                 }
-                #[cfg(not(feature = "parallel"))]
-                {
-                    return Ok(data_a
-                        .iter()
-                        .zip(data_b.iter())
-                        .map(|(&a, &b)| op(a, b))
-                        .collect());
+
+                for (slot, (&x, &y)) in uninit.iter_mut().zip(a.iter().zip(b.iter())) {
+                    slot.write(op(x, y));
                 }
             }
-        }
+            Ok(buf.into_vec(n))
+        })?;
 
-        // Fallback to scalar operation for other types or non-SIMD builds
-        Ok(data_a
-            .iter()
-            .zip(data_b.iter())
-            .map(|(&a, &b)| op(a, b))
-            .collect())
+        Self::from_data(result_data, self.shape().dims().to_vec(), device)
     }
 }
 
@@ -1000,6 +1139,16 @@ impl<T: TensorElement + Copy> Tensor<T> {
     where
         T: torsh_core::dtype::FloatElement,
     {
+        let result = self.sigmoid_forward()?;
+        Ok(self.record_unary(result, UnaryKind::Sigmoid))
+    }
+
+    /// Forward-only sigmoid (all dispatch paths); autograd is recorded by the
+    /// public [`Tensor::sigmoid`] wrapper.
+    fn sigmoid_forward(&self) -> Result<Self>
+    where
+        T: torsh_core::dtype::FloatElement,
+    {
         // GPU fast path: f32 CUDA tensors dispatch to oxicuda's ComputeBackend.
         // Declines to None (CPU fallback) unless a GPU backend is active.
         #[cfg(feature = "gpu")]
@@ -1041,36 +1190,62 @@ impl<T: TensorElement + Copy> Tensor<T> {
     /// SIMD-optimized sigmoid activation function for f32 tensors
     #[cfg(feature = "simd")]
     fn simd_sigmoid_f32(&self) -> Result<Self> {
+        self.simd_activation_f32(adaptive_simd::adaptive_simd_sigmoid_f32)
+    }
+
+    /// Shared driver for the f32 SIMD activations.
+    ///
+    /// Reads the operand straight out of storage instead of copying it with
+    /// `data()`, and reinterprets the kernel's result buffer as `Vec<T>` in a
+    /// single step rather than transmuting element by element. Only the one
+    /// buffer produced by the kernel is allocated.
+    ///
+    /// # Safety contract
+    /// Callers must have established `T == f32` (the `TypeId` guards in
+    /// [`Tensor::relu`] and [`Tensor::sigmoid`] do so).
+    #[cfg(feature = "simd")]
+    fn simd_activation_f32<K>(&self, kernel: K) -> Result<Self>
+    where
+        K: Fn(&scirs2_core::ndarray::ArrayView1<f32>) -> Array1<f32>,
+    {
         use scirs2_core::ndarray::ArrayView1;
 
-        let data = self.data()?;
+        let numel = self.numel();
+        let result_data: Vec<T> = self.with_contiguous_data(|data| {
+            // SAFETY: the caller's TypeId guard confirms `T == f32`, so the
+            // slice can be reinterpreted without copying.
+            let data_f32: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<f32>(), numel) };
+            let result_array = kernel(&ArrayView1::from(data_f32));
+            let (values, _offset) = result_array.into_raw_vec_and_offset();
+            // SAFETY: `T == f32`, so the buffer is already a valid `Vec<T>`;
+            // reinterpreting it whole avoids a per-element `transmute_copy`
+            // and a second allocation.
+            Ok(unsafe {
+                let mut values = std::mem::ManuallyDrop::new(values);
+                Vec::from_raw_parts(
+                    values.as_mut_ptr().cast::<T>(),
+                    values.len(),
+                    values.capacity(),
+                )
+            })
+        })?;
 
-        // Cast to f32 for SIMD operations
-        let data_f32: &[f32] =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len()) };
-
-        // Create ArrayView1 for SIMD function
-        let data_view = ArrayView1::from(data_f32);
-
-        // Use scirs2_core SIMD-accelerated sigmoid
-        let result_array = adaptive_simd::adaptive_simd_sigmoid_f32(&data_view);
-
-        // Convert result back to T type
-        let result_vec: Vec<T> = result_array
-            .to_vec()
-            .into_iter()
-            .map(|f| unsafe { std::mem::transmute_copy::<f32, T>(&f) })
-            .collect();
-
-        Self::from_data(
-            result_vec,
-            self.shape().dims().to_vec(),
-            self.device.clone(),
-        )
+        Self::from_data(result_data, self.shape().dims().to_vec(), self.device)
     }
 
     /// ReLU activation function (Rectified Linear Unit) with SIMD optimization
     pub fn relu(&self) -> Result<Self>
+    where
+        T: std::cmp::PartialOrd + scirs2_core::numeric::Zero,
+    {
+        let result = self.relu_forward()?;
+        Ok(self.record_unary(result, UnaryKind::Relu))
+    }
+
+    /// Forward-only ReLU (all dispatch paths); autograd is recorded by the
+    /// public [`Tensor::relu`] wrapper.
+    fn relu_forward(&self) -> Result<Self>
     where
         T: std::cmp::PartialOrd + scirs2_core::numeric::Zero,
     {
@@ -1108,32 +1283,7 @@ impl<T: TensorElement + Copy> Tensor<T> {
     /// SIMD-optimized ReLU activation function for f32 tensors
     #[cfg(feature = "simd")]
     fn simd_relu_f32(&self) -> Result<Self> {
-        use scirs2_core::ndarray::ArrayView1;
-
-        let data = self.data()?;
-
-        // Cast to f32 for SIMD operations
-        let data_f32: &[f32] =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len()) };
-
-        // Create ArrayView1 for SIMD function
-        let data_view = ArrayView1::from(data_f32);
-
-        // Use scirs2_core SIMD-accelerated ReLU
-        let result_array = adaptive_simd::adaptive_simd_relu_f32(&data_view);
-
-        // Convert result back to T type
-        let result_vec: Vec<T> = result_array
-            .to_vec()
-            .into_iter()
-            .map(|f| unsafe { std::mem::transmute_copy::<f32, T>(&f) })
-            .collect();
-
-        Self::from_data(
-            result_vec,
-            self.shape().dims().to_vec(),
-            self.device.clone(),
-        )
+        self.simd_activation_f32(adaptive_simd::adaptive_simd_relu_f32)
     }
 
     /// SciRS2 Intelligent parallel map operation for medium-sized tensors with operation-aware chunking
@@ -1465,15 +1615,10 @@ impl<T: TensorElement + Copy + std::ops::Mul<Output = T>> Tensor<T> {
             return Ok(self);
         }
 
+        // Generic path: one copy-on-write promotion, then a single locked pass
+        // over the buffer (`apply_`) instead of a lock pair per element.
         let zero = <T as scirs2_core::numeric::Zero>::zero();
-        let len = self.storage.len();
-
-        for i in 0..len {
-            let current = self.storage.get(i)?;
-            if current < zero {
-                self.storage.set(i, zero)?;
-            }
-        }
+        self.apply_(|x| if x < zero { zero } else { x })?;
 
         Ok(self)
     }
@@ -1492,14 +1637,9 @@ impl<T: TensorElement + Copy + std::ops::Mul<Output = T>> Tensor<T> {
             ));
         }
 
+        // One copy-on-write promotion, then a single locked pass.
         let one = <T as scirs2_core::numeric::One>::one();
-        let len = self.storage.len();
-
-        for i in 0..len {
-            let x = self.storage.get(i)?;
-            let sigmoid_val = one / (one + (-x).exp());
-            self.storage.set(i, sigmoid_val)?;
-        }
+        self.apply_(|x| one / (one + (-x).exp()))?;
 
         Ok(self)
     }
@@ -1518,12 +1658,8 @@ impl<T: TensorElement + Copy + std::ops::Mul<Output = T>> Tensor<T> {
             ));
         }
 
-        let len = self.storage.len();
-
-        for i in 0..len {
-            let x = self.storage.get(i)?;
-            self.storage.set(i, x.tanh())?;
-        }
+        // One copy-on-write promotion, then a single locked pass.
+        self.apply_(|x| x.tanh())?;
 
         Ok(self)
     }
@@ -1542,21 +1678,28 @@ impl<T: TensorElement + Copy + std::ops::Mul<Output = T>> Tensor<T> {
             ));
         }
 
-        let len = self.storage.len();
-        let pi = T::from(std::f64::consts::PI).expect("numeric conversion should succeed");
-        let two = T::from(2.0).expect("numeric conversion should succeed");
+        // Constants of the tanh GELU approximation. `T::from` is fallible for
+        // exotic element types, so it is reported rather than unwrapped.
+        let constant = |value: f64| -> Result<T> {
+            T::from(value).ok_or_else(|| {
+                TorshError::InvalidArgument(format!(
+                    "gelu_: element type cannot represent the constant {value}"
+                ))
+            })
+        };
+        let pi = constant(std::f64::consts::PI)?;
+        let two = constant(2.0)?;
         let sqrt_2_over_pi = (two / pi).sqrt();
-        let point_044715 = T::from(0.044715).expect("numeric conversion should succeed");
+        let point_044715 = constant(0.044715)?;
         let one = <T as scirs2_core::numeric::One>::one();
-        let half = T::from(0.5).expect("numeric conversion should succeed");
+        let half = constant(0.5)?;
 
-        for i in 0..len {
-            let x = self.storage.get(i)?;
+        // One copy-on-write promotion, then a single locked pass.
+        self.apply_(|x| {
             let x_cubed = x * x * x;
             let tanh_input = sqrt_2_over_pi * (x + point_044715 * x_cubed);
-            let gelu_val = half * x * (one + tanh_input.tanh());
-            self.storage.set(i, gelu_val)?;
-        }
+            half * x * (one + tanh_input.tanh())
+        })?;
 
         Ok(self)
     }
@@ -1590,15 +1733,9 @@ impl<T: TensorElement + Copy + std::ops::Mul<Output = T>> Tensor<T> {
             return Ok(self);
         }
 
+        // One copy-on-write promotion, then a single locked pass.
         let zero = <T as scirs2_core::numeric::Zero>::zero();
-        let len = self.storage.len();
-
-        for i in 0..len {
-            let x = self.storage.get(i)?;
-            if x < zero {
-                self.storage.set(i, negative_slope * x)?;
-            }
-        }
+        self.apply_(|x| if x < zero { negative_slope * x } else { x })?;
 
         Ok(self)
     }
@@ -1633,19 +1770,16 @@ impl<T: TensorElement + Copy + std::ops::Mul<Output = T>> Tensor<T> {
             return Ok(self);
         }
 
-        let len = self.storage.len();
-
-        for i in 0..len {
-            let x = self.storage.get(i)?;
-            let clamped = if x < min {
+        // One copy-on-write promotion, then a single locked pass.
+        self.apply_(|x| {
+            if x < min {
                 min
             } else if x > max {
                 max
             } else {
                 x
-            };
-            self.storage.set(i, clamped)?;
-        }
+            }
+        })?;
 
         Ok(self)
     }

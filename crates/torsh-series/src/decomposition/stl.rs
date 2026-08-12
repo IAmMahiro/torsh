@@ -16,10 +16,18 @@ pub struct STLResult {
 }
 
 /// Seasonal-Trend decomposition using LOESS (STL)
+///
+/// This wrapper exposes the `period` and `robust` parameters accepted by
+/// [`scirs2_series::decomposition::stl_decomposition`]. The underlying
+/// scirs2-series `STLOptions` (as of the 0.6.x series) does not expose
+/// LOESS polynomial-degree knobs for the trend/seasonal smoothers, so this
+/// type intentionally does not accept `trend_deg`/`seasonal_deg`
+/// parameters -- carrying unused fields for them would misrepresent what
+/// this wrapper can actually configure. If scirs2-series later grows
+/// degree parameters, add `trend_deg`/`seasonal_deg` builder methods here
+/// and map them onto the new `STLOptions` fields.
 pub struct STLDecomposition {
     period: usize,
-    seasonal_deg: usize,
-    _trend_deg: usize,
     robust: bool,
 }
 
@@ -28,8 +36,6 @@ impl STLDecomposition {
     pub fn new(period: usize) -> Self {
         Self {
             period,
-            seasonal_deg: 1,
-            _trend_deg: 1,
             robust: false,
         }
     }
@@ -53,11 +59,14 @@ impl STLDecomposition {
         })?;
         let ts_array = Array1::from_vec(data);
 
-        // Configure STL options
+        // Configure STL options.
+        // n_inner matches scirs2_series::STLOptions::default()'s inner-loop
+        // count; this crate does not expose a seasonal-degree knob (see the
+        // struct doc comment), so it is not conditional on anything here.
         let options = STLOptions {
             trend_window: ((series.len() / 10).max(3) | 1).max(3), // Ensure odd and >= 3
             seasonal_window: ((self.period / 2) | 1).max(3),       // Ensure odd and >= 3
-            n_inner: if self.seasonal_deg > 0 { 2 } else { 1 },
+            n_inner: 2,
             n_outer: if self.robust { 15 } else { 1 },
             robust: self.robust,
         };
@@ -125,7 +134,6 @@ mod tests {
     fn test_stl_decomposition_creation() {
         let stl = STLDecomposition::new(12);
         assert_eq!(stl.period, 12);
-        assert_eq!(stl.seasonal_deg, 1);
         assert!(!stl.robust);
     }
 

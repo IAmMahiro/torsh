@@ -1,70 +1,36 @@
 //! Gradient computation mode management
-
-use once_cell::sync::Lazy;
-use parking_lot::RwLock;
-use std::sync::Arc;
-
-/// Global gradient mode state
-#[derive(Debug, Clone)]
-struct GradMode {
-    /// Stack of gradient states for nested contexts
-    enabled_stack: Vec<bool>,
-    /// Current gradient enabled state
-    current_enabled: bool,
-}
-
-impl GradMode {
-    fn new() -> Self {
-        Self {
-            enabled_stack: Vec::new(),
-            current_enabled: true, // Default: gradients enabled
-        }
-    }
-
-    fn push(&mut self, enabled: bool) {
-        self.enabled_stack.push(self.current_enabled);
-        self.current_enabled = enabled;
-    }
-
-    fn pop(&mut self) {
-        if let Some(prev_enabled) = self.enabled_stack.pop() {
-            self.current_enabled = prev_enabled;
-        }
-    }
-
-    fn is_enabled(&self) -> bool {
-        self.current_enabled
-    }
-
-    fn set_enabled(&mut self, enabled: bool) {
-        self.current_enabled = enabled;
-        // Clear stack when explicitly setting
-        self.enabled_stack.clear();
-    }
-}
-
-/// Global gradient mode state
-static GRAD_MODE: Lazy<Arc<RwLock<GradMode>>> =
-    Lazy::new(|| Arc::new(RwLock::new(GradMode::new())));
+//!
+//! The mode itself lives in [`torsh_core::grad_mode`], not here. `torsh-tensor`
+//! sits *below* this crate in the dependency graph, so a flag owned by
+//! `torsh-autograd` could never be read by the tensor operations that decide
+//! whether to record a graph node — which is exactly why `no_grad()` used to be
+//! inert. The state was therefore moved down to `torsh-core`, which both crates
+//! depend on; everything in this module is a thin re-export so the
+//! `torsh_autograd::grad_mode::*` API is unchanged.
 
 /// Check if gradient computation is currently enabled
+///
+/// Tensor operations consult this before recording an autograd node, so a
+/// `false` result genuinely suppresses graph construction.
 pub fn is_grad_enabled() -> bool {
-    GRAD_MODE.read().is_enabled()
+    torsh_core::grad_mode::is_grad_enabled()
 }
 
 /// Set gradient computation mode
+///
+/// Clears any nesting established by [`push_grad_enabled`].
 pub fn set_grad_enabled(enabled: bool) {
-    GRAD_MODE.write().set_enabled(enabled);
+    torsh_core::grad_mode::set_grad_enabled(enabled);
 }
 
 /// Push a new gradient state onto the stack
 pub fn push_grad_enabled(enabled: bool) {
-    GRAD_MODE.write().push(enabled);
+    torsh_core::grad_mode::push_grad_enabled(enabled);
 }
 
 /// Pop the most recent gradient state from the stack
 pub fn pop_grad_enabled() {
-    GRAD_MODE.write().pop();
+    torsh_core::grad_mode::pop_grad_enabled();
 }
 
 /// Execute a function with a specific gradient mode
@@ -72,10 +38,7 @@ pub fn with_grad_mode<F, R>(enabled: bool, f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    push_grad_enabled(enabled);
-    let result = f();
-    pop_grad_enabled();
-    result
+    torsh_core::grad_mode::with_grad_mode(enabled, f)
 }
 
 /// Inference mode guard - disables both gradient computation and graph building for zero overhead
@@ -646,39 +609,6 @@ pub mod lazy {
         f()
     }
 }
-
-/* TODO: Re-enable gradient clipping once tensor integration is complete
-/// Gradient clipping utilities
-pub mod clip {
-    use torsh_core::dtype::FloatElement;
-    // use torsh_tensor::Tensor;  // Commented out to avoid circular dependency
-    // use crate::AutogradTensor; // Commented out - trait is generic
-    // Temporarily disable scirs2 integration
-    // use scirs2::autograd::tensor_ops as T;
-
-    /// Clip gradients by global norm
-    pub fn clip_grad_norm<T: FloatElement>(
-        tensors: &mut [Tensor<T>],
-        max_norm: f32,
-        norm_type: f32,
-    ) -> f32 {
-        // Temporarily disabled - would use scirs2 for gradient computation
-        let _ = (tensors, max_norm, norm_type); // Suppress unused warnings
-
-        // TODO: Implement proper gradient clipping when scirs2 integration is ready
-        // For now, return a placeholder value
-        0.0
-    }
-
-    /// Clip gradients by value
-    pub fn clip_grad_value<T: FloatElement>(tensors: &mut [Tensor<T>], clip_value: f32) {
-        // Temporarily disabled - would use scirs2 for gradient computation
-        let _ = (tensors, clip_value); // Suppress unused warnings
-
-        // TODO: Implement proper gradient clipping when scirs2 integration is ready
-    }
-}
-*/
 
 /// Enable gradient computation context guard
 pub struct EnableGradGuard {

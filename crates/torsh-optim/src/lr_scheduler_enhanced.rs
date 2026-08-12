@@ -143,11 +143,7 @@ impl<O: Optimizer> LRScheduler for PolynomialDecayWithWarmup<O> {
             .collect();
 
         // Update optimizer with new learning rate
-        for (i, &lr) in new_lrs.iter().enumerate() {
-            if i == 0 {
-                self.base.optimizer.set_lr(lr);
-            }
-        }
+        self.base.optimizer.set_lrs(&new_lrs);
 
         self.base.last_lr = new_lrs;
         Ok(())
@@ -168,6 +164,10 @@ impl<O: Optimizer> LRScheduler for PolynomialDecayWithWarmup<O> {
     fn reset(&mut self) {
         self.base.last_epoch = 0;
         self.base.last_lr = self.base.base_lrs.clone();
+        // Push the base rates back onto the optimizer so a reset actually
+        // restores them (per group, not broadcast).
+        let base_lrs = self.base.base_lrs.clone();
+        self.base.optimizer.set_lrs(&base_lrs);
     }
 
     fn state_dict(&self) -> SchedulerState {
@@ -408,11 +408,7 @@ impl<O: Optimizer> AdaptiveLRScheduler<O> {
         }
 
         // Update optimizer with new learning rate
-        for (i, &lr) in new_lrs.iter().enumerate() {
-            if i == 0 {
-                self.base.optimizer.set_lr(lr);
-            }
-        }
+        self.base.optimizer.set_lrs(&new_lrs);
 
         self.base.last_lr = new_lrs;
     }
@@ -486,6 +482,10 @@ impl<O: Optimizer> LRScheduler for AdaptiveLRScheduler<O> {
     fn reset(&mut self) {
         self.base.last_epoch = 0;
         self.base.last_lr = self.base.base_lrs.clone();
+        // Push the base rates back onto the optimizer so a reset actually
+        // restores them (per group, not broadcast).
+        let base_lrs = self.base.base_lrs.clone();
+        self.base.optimizer.set_lrs(&base_lrs);
         self.steps_since_change = 0;
         self.best_metric = None;
         self.patience_counter = 0;
@@ -656,11 +656,7 @@ impl<O: Optimizer> LRScheduler for CosineAnnealingWarmRestartsWithWarmup<O> {
             .collect();
 
         // Update optimizer with new learning rate
-        for (i, &lr) in new_lrs.iter().enumerate() {
-            if i == 0 {
-                self.base.optimizer.set_lr(lr);
-            }
-        }
+        self.base.optimizer.set_lrs(&new_lrs);
 
         self.base.last_lr = new_lrs;
         Ok(())
@@ -681,6 +677,10 @@ impl<O: Optimizer> LRScheduler for CosineAnnealingWarmRestartsWithWarmup<O> {
     fn reset(&mut self) {
         self.base.last_epoch = 0;
         self.base.last_lr = self.base.base_lrs.clone();
+        // Push the base rates back onto the optimizer so a reset actually
+        // restores them (per group, not broadcast).
+        let base_lrs = self.base.base_lrs.clone();
+        self.base.optimizer.set_lrs(&base_lrs);
         self.current_t = self.t_0;
         self.steps_since_restart = 0;
         self.restart_count = 0;

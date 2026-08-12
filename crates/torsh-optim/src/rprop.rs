@@ -182,7 +182,7 @@ impl Optimizer for Rprop {
                 // Apply update
                 drop(param_read);
                 let mut param_write = param.write();
-                *param_write = param_write.sub(&update)?;
+                crate::param_update::sub_assign(&mut param_write, &update)?;
             }
         }
 

@@ -7,9 +7,11 @@ use torsh_core::{
     device::DeviceType,
     error::{Result, TorshError},
 };
-use torsh_tensor::{
-    creation::{ones, zeros},
-    Tensor,
+use torsh_tensor::{creation::zeros, Tensor};
+
+use crate::iir_design::{
+    bessel_ap, bilinear, butter_ap, cheb1_ap, cheb2_ap, digital_response, ellip_ap, lp2bp, lp2bs,
+    lp2hp, lp2lp, prewarp, roots_descending, zpk2tf, Zpk,
 };
 
 // Use SciRS2 ecosystem for basic functionality where available
@@ -55,217 +57,176 @@ impl IIRFilterDesigner {
         Self { sample_rate }
     }
 
-    /// Design a Butterworth filter using bilinear transform
+    /// Design a Butterworth filter using the analog prototype and bilinear transform.
+    ///
+    /// The magnitude response is -3 dB at every requested cutoff frequency and
+    /// rolls off at 20·`order` dB/decade.
     pub fn butterworth(
         &self,
         order: usize,
         cutoff: &[f32],
         filter_type: FilterType,
     ) -> Result<DigitalFilter> {
+        self.from_prototype(butter_ap(order)?, cutoff, filter_type)
+    }
+
+    /// Design a Chebyshev type I filter.
+    ///
+    /// `ripple_db` is the peak-to-peak passband ripple; the magnitude equals
+    /// `-ripple_db` dB exactly at the requested passband edge.
+    pub fn chebyshev1(
+        &self,
+        order: usize,
+        ripple_db: f32,
+        cutoff: &[f32],
+        filter_type: FilterType,
+    ) -> Result<DigitalFilter> {
+        self.from_prototype(cheb1_ap(order, ripple_db as f64)?, cutoff, filter_type)
+    }
+
+    /// Design a Chebyshev type II (inverse Chebyshev) filter.
+    ///
+    /// `attenuation_db` is the stopband attenuation; the magnitude equals
+    /// `-attenuation_db` dB at the requested cutoff, which is the *stopband*
+    /// edge for this filter family (matching `scipy.signal.cheby2`).
+    pub fn chebyshev2(
+        &self,
+        order: usize,
+        attenuation_db: f32,
+        cutoff: &[f32],
+        filter_type: FilterType,
+    ) -> Result<DigitalFilter> {
+        self.from_prototype(cheb2_ap(order, attenuation_db as f64)?, cutoff, filter_type)
+    }
+
+    /// Design an elliptic (Cauer) filter.
+    ///
+    /// `ripple_db` is the passband ripple and `attenuation_db` the stopband
+    /// attenuation; the magnitude equals `-ripple_db` dB at the requested
+    /// passband edge (matching `scipy.signal.ellip`).
+    pub fn elliptic(
+        &self,
+        order: usize,
+        ripple_db: f32,
+        attenuation_db: f32,
+        cutoff: &[f32],
+        filter_type: FilterType,
+    ) -> Result<DigitalFilter> {
+        self.from_prototype(
+            ellip_ap(order, ripple_db as f64, attenuation_db as f64)?,
+            cutoff,
+            filter_type,
+        )
+    }
+
+    /// Design a Bessel (Thomson) filter with maximally flat group delay.
+    ///
+    /// The prototype is magnitude-normalised, so the response is -3 dB at the
+    /// requested cutoff (`scipy.signal.bessel(..., norm="mag")`).
+    pub fn bessel(
+        &self,
+        order: usize,
+        cutoff: &[f32],
+        filter_type: FilterType,
+    ) -> Result<DigitalFilter> {
+        self.from_prototype(bessel_ap(order)?, cutoff, filter_type)
+    }
+
+    /// Validate the requested band edges and normalise them to Nyquist.
+    fn normalized_cutoffs(&self, cutoff: &[f32], filter_type: FilterType) -> Result<Vec<f64>> {
+        if self.sample_rate <= 0.0 {
+            return Err(TorshError::InvalidArgument(
+                "Sample rate must be positive".to_string(),
+            ));
+        }
         if cutoff.is_empty() {
             return Err(TorshError::InvalidArgument(
                 "Cutoff frequencies cannot be empty".to_string(),
             ));
         }
 
-        // Validate cutoff frequencies
+        let expected = match filter_type {
+            FilterType::Lowpass | FilterType::Highpass => 1,
+            FilterType::Bandpass | FilterType::Bandstop => 2,
+        };
+        if cutoff.len() != expected {
+            return Err(TorshError::InvalidArgument(format!(
+                "{:?} filter requires exactly {} cutoff frequency/frequencies, got {}",
+                filter_type,
+                expected,
+                cutoff.len()
+            )));
+        }
+
         let nyquist = self.sample_rate / 2.0;
         for &freq in cutoff {
-            if freq <= 0.0 || freq >= nyquist {
+            if !(freq > 0.0 && freq < nyquist) {
                 return Err(TorshError::InvalidArgument(format!(
                     "Cutoff frequency {} must be between 0 and Nyquist frequency {}",
                     freq, nyquist
                 )));
             }
         }
+        if expected == 2 && cutoff[0] >= cutoff[1] {
+            return Err(TorshError::InvalidArgument(
+                "Low cutoff frequency must be less than high cutoff frequency".to_string(),
+            ));
+        }
 
-        match filter_type {
-            FilterType::Lowpass => {
-                if cutoff.len() != 1 {
-                    return Err(TorshError::InvalidArgument(
-                        "Lowpass filter requires exactly one cutoff frequency".to_string(),
-                    ));
+        Ok(cutoff.iter().map(|&f| (f / nyquist) as f64).collect())
+    }
+
+    /// Apply the frequency transformation and bilinear transform to an analog
+    /// prototype, producing a digital filter for this designer's sample rate.
+    fn from_prototype(
+        &self,
+        prototype: Zpk,
+        cutoff: &[f32],
+        filter_type: FilterType,
+    ) -> Result<DigitalFilter> {
+        let wn = self.normalized_cutoffs(cutoff, filter_type)?;
+
+        let analog = match filter_type {
+            FilterType::Lowpass => lp2lp(&prototype, prewarp(wn[0]))?,
+            FilterType::Highpass => lp2hp(&prototype, prewarp(wn[0]))?,
+            FilterType::Bandpass | FilterType::Bandstop => {
+                let low = prewarp(wn[0]);
+                let high = prewarp(wn[1]);
+                let centre = (low * high).sqrt();
+                let bandwidth = high - low;
+                if matches!(filter_type, FilterType::Bandpass) {
+                    lp2bp(&prototype, centre, bandwidth)?
+                } else {
+                    lp2bs(&prototype, centre, bandwidth)?
                 }
-                self.design_butterworth_lowpass(order, cutoff[0])
             }
-            FilterType::Highpass => {
-                if cutoff.len() != 1 {
-                    return Err(TorshError::InvalidArgument(
-                        "Highpass filter requires exactly one cutoff frequency".to_string(),
-                    ));
-                }
-                self.design_butterworth_highpass(order, cutoff[0])
-            }
-            FilterType::Bandpass => {
-                if cutoff.len() != 2 {
-                    return Err(TorshError::InvalidArgument(
-                        "Bandpass filter requires exactly two cutoff frequencies".to_string(),
-                    ));
-                }
-                self.design_butterworth_bandpass(order, cutoff[0], cutoff[1])
-            }
-            FilterType::Bandstop => {
-                if cutoff.len() != 2 {
-                    return Err(TorshError::InvalidArgument(
-                        "Bandstop filter requires exactly two cutoff frequencies".to_string(),
-                    ));
-                }
-                self.design_butterworth_bandstop(order, cutoff[0], cutoff[1])
-            }
-        }
-    }
+        };
 
-    /// Design a Chebyshev Type I filter (simplified implementation)
-    pub fn chebyshev1(
-        &self,
-        order: usize,
-        ripple_db: f32,
-        _cutoff: &[f32],
-        _filter_type: FilterType,
-    ) -> Result<DigitalFilter> {
-        // Simplified implementation - in production would implement actual Chebyshev design
-        let num = zeros(&[order + 1])?;
-        let mut den = ones(&[order + 1])?;
-        den.set_1d(0, 1.0)?;
-        if order > 0 {
-            den.set_1d(1, 0.1 * ripple_db)?;
-        }
-        Ok(DigitalFilter::new(num, den))
-    }
+        let digital = bilinear(&analog, 2.0)?;
+        let (b, a) = zpk2tf(&digital);
 
-    /// Design a Chebyshev Type II filter (simplified implementation)
-    pub fn chebyshev2(
-        &self,
-        order: usize,
-        attenuation_db: f32,
-        _cutoff: &[f32],
-        _filter_type: FilterType,
-    ) -> Result<DigitalFilter> {
-        // Simplified implementation
-        let num = zeros(&[order + 1])?;
-        let mut den = ones(&[order + 1])?;
-        den.set_1d(0, 1.0)?;
-        if order > 0 {
-            den.set_1d(1, 0.1 * attenuation_db)?;
-        }
-        Ok(DigitalFilter::new(num, den))
-    }
-
-    /// Design an Elliptic (Cauer) filter (simplified implementation)
-    pub fn elliptic(
-        &self,
-        order: usize,
-        ripple_db: f32,
-        attenuation_db: f32,
-        _cutoff: &[f32],
-        _filter_type: FilterType,
-    ) -> Result<DigitalFilter> {
-        // Simplified implementation
-        let num = zeros(&[order + 1])?;
-        let mut den = ones(&[order + 1])?;
-        den.set_1d(0, 1.0)?;
-        if order > 0 {
-            den.set_1d(1, 0.1 * (ripple_db + attenuation_db))?;
-        }
-        Ok(DigitalFilter::new(num, den))
-    }
-
-    /// Design a Bessel filter (simplified implementation)
-    pub fn bessel(
-        &self,
-        order: usize,
-        _cutoff: &[f32],
-        _filter_type: FilterType,
-    ) -> Result<DigitalFilter> {
-        // Simplified implementation
-        let num = zeros(&[order + 1])?;
-        let den = ones(&[order + 1])?;
-        Ok(DigitalFilter::new(num, den))
-    }
-
-    // Private helper methods for actual DSP implementations
-    fn design_butterworth_lowpass(&self, order: usize, cutoff: f32) -> Result<DigitalFilter> {
-        // Normalized cutoff frequency (0 to 1, where 1 is Nyquist)
-        let wc = cutoff / (self.sample_rate / 2.0);
-
-        // For simplicity, create a basic lowpass implementation
-        // In production, this would use proper pole placement and bilinear transform
-        let mut num_coeffs = vec![0.0f32; order + 1];
-        let mut den_coeffs = vec![0.0f32; order + 1];
-
-        // Simple lowpass coefficients - gain at DC
-        num_coeffs[0] = wc.powi(order as i32);
-
-        // Simple denominator with roots distributed for lowpass characteristic
-        den_coeffs[0] = 1.0;
-        for i in 1..=order {
-            den_coeffs[i] = 0.1 / (i as f32);
+        let a0 = a.first().copied().unwrap_or(0.0);
+        if a0.abs() < 1e-300 || !a0.is_finite() {
+            return Err(TorshError::ComputeError(
+                "Filter design produced a degenerate denominator".to_string(),
+            ));
         }
 
-        let numerator = Tensor::from_data(num_coeffs, vec![order + 1], DeviceType::Cpu)?;
-        let denominator = Tensor::from_data(den_coeffs, vec![order + 1], DeviceType::Cpu)?;
-
-        Ok(DigitalFilter::new(numerator, denominator))
-    }
-
-    fn design_butterworth_highpass(&self, order: usize, cutoff: f32) -> Result<DigitalFilter> {
-        // Normalized cutoff frequency
-        let wc = cutoff / (self.sample_rate / 2.0);
-
-        // Simple highpass implementation
-        let mut num_coeffs = vec![0.0f32; order + 1];
-        let mut den_coeffs = vec![0.0f32; order + 1];
-
-        // Highpass has alternating signs
-        for i in 0..=order {
-            if i % 2 == 0 {
-                num_coeffs[i] = 1.0 / (order + 1) as f32;
-            } else {
-                num_coeffs[i] = -1.0 / (order + 1) as f32;
-            }
+        let num_coeffs: Vec<f32> = b.iter().map(|c| (c / a0) as f32).collect();
+        let den_coeffs: Vec<f32> = a.iter().map(|c| (c / a0) as f32).collect();
+        if num_coeffs
+            .iter()
+            .chain(den_coeffs.iter())
+            .any(|c| !c.is_finite())
+        {
+            return Err(TorshError::ComputeError(
+                "Filter design produced non-finite coefficients".to_string(),
+            ));
         }
 
-        den_coeffs[0] = 1.0;
-        for i in 1..=order {
-            den_coeffs[i] = 0.1 * wc / (i as f32);
-        }
-
-        let numerator = Tensor::from_data(num_coeffs, vec![order + 1], DeviceType::Cpu)?;
-        let denominator = Tensor::from_data(den_coeffs, vec![order + 1], DeviceType::Cpu)?;
-
-        Ok(DigitalFilter::new(numerator, denominator))
-    }
-
-    fn design_butterworth_bandpass(
-        &self,
-        _order: usize,
-        _low_cutoff: f32,
-        _high_cutoff: f32,
-    ) -> Result<DigitalFilter> {
-        // Simplified bandpass implementation
-        let num_coeffs = vec![0.0, 1.0, 0.0];
-        let den_coeffs = vec![1.0, 0.0, 0.1];
-
-        let numerator = Tensor::from_data(num_coeffs, vec![3], DeviceType::Cpu)?;
-        let denominator = Tensor::from_data(den_coeffs, vec![3], DeviceType::Cpu)?;
-
-        Ok(DigitalFilter::new(numerator, denominator))
-    }
-
-    fn design_butterworth_bandstop(
-        &self,
-        _order: usize,
-        _low_cutoff: f32,
-        _high_cutoff: f32,
-    ) -> Result<DigitalFilter> {
-        // Simplified bandstop implementation
-        let num_coeffs = vec![1.0, 0.0, 1.0];
-        let den_coeffs = vec![1.0, 0.0, 0.1];
-
-        let numerator = Tensor::from_data(num_coeffs, vec![3], DeviceType::Cpu)?;
-        let denominator = Tensor::from_data(den_coeffs, vec![3], DeviceType::Cpu)?;
-
-        Ok(DigitalFilter::new(numerator, denominator))
+        let numerator = Tensor::from_data(num_coeffs, vec![b.len()], DeviceType::Cpu)?;
+        let denominator = Tensor::from_data(den_coeffs, vec![a.len()], DeviceType::Cpu)?;
+        Ok(DigitalFilter::new(numerator, denominator, self.sample_rate))
     }
 }
 
@@ -567,14 +528,11 @@ impl FIRFilterDesigner {
                         + 0.08 * (4.0 * PI * i as f32 / (n - 1) as f32).cos()
                 }
                 FIRWindow::Kaiser => {
-                    // Simplified Kaiser window (beta = 8.6)
+                    // Kaiser window with the customary beta = 8.6 (~60 dB sidelobes)
                     let beta = 8.6f32;
                     let arg = 2.0 * i as f32 / (n - 1) as f32 - 1.0;
-                    let bessel_arg = beta * (1.0 - arg * arg).sqrt().max(0.0);
-                    // Simplified Bessel function approximation
-                    let bessel_i0 = 1.0 + (bessel_arg / 2.0).powi(2) / 4.0;
-                    let bessel_i0_beta = 1.0 + (beta / 2.0).powi(2) / 4.0;
-                    bessel_i0 / bessel_i0_beta
+                    let bessel_arg = beta * (1.0 - arg * arg).max(0.0).sqrt();
+                    modified_bessel_i0(bessel_arg) / modified_bessel_i0(beta)
                 }
             };
 
@@ -585,18 +543,70 @@ impl FIRFilterDesigner {
     }
 }
 
+/// Modified Bessel function of the first kind, order zero.
+///
+/// Evaluated with the standard power series, which converges quickly for the
+/// argument range used by window functions.
+fn modified_bessel_i0(x: f32) -> f32 {
+    let mut sum = 1.0f32;
+    let mut term = 1.0f32;
+    let x_half_sq = (x / 2.0) * (x / 2.0);
+    for k in 1..60 {
+        term *= x_half_sq / (k * k) as f32;
+        sum += term;
+        if term < 1e-9 * sum {
+            break;
+        }
+    }
+    sum
+}
+
 /// Digital filter implementation
 pub struct DigitalFilter {
     numerator: Tensor<f32>,
     denominator: Tensor<f32>,
+    sample_rate: f32,
 }
 
 impl DigitalFilter {
-    fn new(numerator: Tensor<f32>, denominator: Tensor<f32>) -> Self {
+    fn new(numerator: Tensor<f32>, denominator: Tensor<f32>, sample_rate: f32) -> Self {
         Self {
             numerator,
             denominator,
+            sample_rate,
         }
+    }
+
+    /// Feedforward (numerator) coefficients `b[0..=M]`.
+    pub fn numerator(&self) -> &Tensor<f32> {
+        &self.numerator
+    }
+
+    /// Feedback (denominator) coefficients `a[0..=N]`, normalised so `a[0] = 1`.
+    pub fn denominator(&self) -> &Tensor<f32> {
+        &self.denominator
+    }
+
+    /// Sample rate (Hz) the filter was designed for.
+    pub fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+
+    /// Coefficients as plain `f64` vectors `(b, a)`.
+    fn coefficient_vectors(&self) -> Result<(Vec<f64>, Vec<f64>)> {
+        let b = self
+            .numerator
+            .to_vec()?
+            .into_iter()
+            .map(|v| v as f64)
+            .collect();
+        let a = self
+            .denominator
+            .to_vec()?
+            .into_iter()
+            .map(|v| v as f64)
+            .collect();
+        Ok((b, a))
     }
 
     /// Apply the IIR filter to a signal using Direct Form II implementation
@@ -689,21 +699,22 @@ impl DigitalFilter {
         Ok(output)
     }
 
-    /// Get the frequency response of the filter
+    /// Frequency response of the filter, evaluated exactly.
+    ///
+    /// `frequencies` are given in Hz and evaluated as
+    /// `H(e^{j 2 pi f / fs})` using the filter's design sample rate.
+    /// Returns `(magnitude, phase_in_radians)`.
     pub fn frequency_response(&self, frequencies: &[f32]) -> Result<(Tensor<f32>, Tensor<f32>)> {
         let n_freqs = frequencies.len();
         let mut magnitude = zeros(&[n_freqs])?;
         let mut phase = zeros(&[n_freqs])?;
+        let (b, a) = self.coefficient_vectors()?;
+        let nyquist = (self.sample_rate / 2.0) as f64;
 
-        // Simplified frequency response computation
-        // In production, would implement proper complex arithmetic
         for (i, &freq) in frequencies.iter().enumerate() {
-            let normalized_freq = freq / (self.numerator.shape().dims()[0] as f32);
-            let mag = 1.0 / (1.0 + normalized_freq); // Simplified response
-            let ph = -normalized_freq; // Simplified phase
-
-            magnitude.set_1d(i, mag)?;
-            phase.set_1d(i, ph)?;
+            let response = digital_response(&b, &a, freq as f64 / nyquist);
+            magnitude.set_1d(i, response.norm() as f32)?;
+            phase.set_1d(i, response.arg() as f32)?;
         }
 
         Ok((magnitude, phase))
@@ -721,35 +732,44 @@ impl DigitalFilter {
         self.filter(&impulse)
     }
 
-    /// Get the group delay of the filter
+    /// Group delay of the filter in samples, for `frequencies` given in Hz.
+    ///
+    /// Computed as `-d(arg H)/d(omega)` with a central difference on the
+    /// unwrapped phase, which is exact to second order in the step size.
     pub fn group_delay(&self, frequencies: &[f32]) -> Result<Tensor<f32>> {
         let mut delay = zeros(&[frequencies.len()])?;
+        let (b, a) = self.coefficient_vectors()?;
+        let nyquist = (self.sample_rate / 2.0) as f64;
+        // Step in normalised frequency (1.0 == Nyquist == pi rad/sample).
+        let step = 1e-4f64;
 
-        // Simplified group delay computation
-        let num_order = self.numerator.shape().dims()[0] - 1;
-        let den_order = self.denominator.shape().dims()[0] - 1;
-        let avg_delay = (num_order + den_order) as f32 / 2.0;
-
-        for i in 0..frequencies.len() {
-            delay.set_1d(i, avg_delay)?;
+        for (i, &freq) in frequencies.iter().enumerate() {
+            let centre = freq as f64 / nyquist;
+            let lower = digital_response(&b, &a, centre - step).arg();
+            let upper = digital_response(&b, &a, centre + step).arg();
+            // Unwrap the phase difference into (-pi, pi].
+            let mut diff = upper - lower;
+            while diff > std::f64::consts::PI {
+                diff -= 2.0 * std::f64::consts::PI;
+            }
+            while diff <= -std::f64::consts::PI {
+                diff += 2.0 * std::f64::consts::PI;
+            }
+            let d_omega = 2.0 * step * std::f64::consts::PI;
+            delay.set_1d(i, (-diff / d_omega) as f32)?;
         }
 
         Ok(delay)
     }
 
-    /// Check if filter is stable (simplified check)
+    /// Check filter stability by locating the poles inside the unit circle.
     pub fn is_stable(&self) -> Result<bool> {
-        // Simplified stability check - in production would check pole locations
-        let den_len = self.denominator.shape().dims()[0];
-        let mut sum = 0.0f32;
-
-        for i in 1..den_len {
-            let coeff: f32 = self.denominator.get_1d(i)?;
-            sum += coeff.abs();
+        let (_, a) = self.coefficient_vectors()?;
+        if a.len() <= 1 {
+            return Ok(true);
         }
-
-        let a0: f32 = self.denominator.get_1d(0)?;
-        Ok(sum < a0.abs())
+        let poles = roots_descending(&a)?;
+        Ok(poles.iter().all(|p| p.norm() < 1.0 - 1e-9))
     }
 }
 

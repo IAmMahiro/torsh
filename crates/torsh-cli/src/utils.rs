@@ -53,7 +53,7 @@ pub mod output {
             "json" => {
                 serde_json::to_string_pretty(data).with_context(|| "Failed to serialize to JSON")
             }
-            "yaml" => serde_yaml::to_string(data).with_context(|| "Failed to serialize to YAML"),
+            "yaml" => serde_norway::to_string(data).with_context(|| "Failed to serialize to YAML"),
             "table" => {
                 // For table format, we'll need to implement custom formatting
                 // This is a simplified version
@@ -714,7 +714,7 @@ pub mod network {
         output_path: &Path,
         show_progress: bool,
     ) -> Result<()> {
-        let client = reqwest::Client::new();
+        let client = crate::tls::client_builder()?.build()?;
         let response = client.get(url).send().await?;
 
         let total_size = response.content_length().unwrap_or(0);
@@ -760,7 +760,11 @@ pub mod network {
 
     /// Check if URL is accessible
     pub async fn check_url_accessible(url: &str) -> bool {
-        let client = reqwest::Client::new();
+        let client = match crate::tls::client_builder().and_then(|b| b.build().map_err(Into::into))
+        {
+            Ok(client) => client,
+            Err(_) => return false,
+        };
         client.head(url).send().await.is_ok()
     }
 }

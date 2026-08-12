@@ -392,26 +392,26 @@ async fn load_config_from_file(path: &Path) -> Result<Config> {
         .await
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-    let config =
-        match path.extension().and_then(|ext| ext.to_str()) {
-            Some("yaml") | Some("yml") => serde_yaml::from_str(&content)
-                .with_context(|| "Failed to parse YAML configuration")?,
-            Some("json") => serde_json::from_str(&content)
-                .with_context(|| "Failed to parse JSON configuration")?,
-            Some("toml") => {
-                toml::from_str(&content).with_context(|| "Failed to parse TOML configuration")?
+    let config = match path.extension().and_then(|ext| ext.to_str()) {
+        Some("yaml") | Some("yml") => serde_norway::from_str(&content)
+            .with_context(|| "Failed to parse YAML configuration")?,
+        Some("json") => {
+            serde_json::from_str(&content).with_context(|| "Failed to parse JSON configuration")?
+        }
+        Some("toml") => {
+            toml::from_str(&content).with_context(|| "Failed to parse TOML configuration")?
+        }
+        _ => {
+            // Try to detect format
+            if content.trim_start().starts_with('{') {
+                serde_json::from_str(&content)
+                    .with_context(|| "Failed to parse JSON configuration")?
+            } else {
+                serde_norway::from_str(&content)
+                    .with_context(|| "Failed to parse YAML configuration")?
             }
-            _ => {
-                // Try to detect format
-                if content.trim_start().starts_with('{') {
-                    serde_json::from_str(&content)
-                        .with_context(|| "Failed to parse JSON configuration")?
-                } else {
-                    serde_yaml::from_str(&content)
-                        .with_context(|| "Failed to parse YAML configuration")?
-                }
-            }
-        };
+        }
+    };
 
     Ok(config)
 }
@@ -425,7 +425,7 @@ pub async fn save_config(config: &Config, path: &Path) -> Result<()> {
             .with_context(|| "Failed to serialize configuration to TOML")?,
         _ => {
             // Default to YAML
-            serde_yaml::to_string(config)
+            serde_norway::to_string(config)
                 .with_context(|| "Failed to serialize configuration to YAML")?
         }
     };
@@ -487,8 +487,8 @@ mod tests {
         let config = Config::default();
 
         // Test YAML serialization
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        let parsed: Config = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_norway::to_string(&config).unwrap();
+        let parsed: Config = serde_norway::from_str(&yaml).unwrap();
         assert_eq!(config.general.default_device, parsed.general.default_device);
 
         // Test JSON serialization

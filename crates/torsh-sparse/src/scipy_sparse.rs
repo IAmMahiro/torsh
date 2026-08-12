@@ -238,8 +238,14 @@ impl ScipySparseIntegration {
                 let col_indices = &data.indices;
                 let values: Vec<f32> = data.data.iter().map(|&v| v as f32).collect();
 
-                let csr =
-                    CsrTensor::from_raw_parts(row_ptr.clone(), col_indices.clone(), values, shape)?;
+                // SciPy does not guarantee canonical (sorted, duplicate-free)
+                // CSR arrays, so normalise instead of asserting.
+                let csr = CsrTensor::from_unsorted_parts(
+                    row_ptr.clone(),
+                    col_indices.clone(),
+                    values,
+                    shape,
+                )?;
 
                 Ok(Box::new(csr))
             }
@@ -248,8 +254,14 @@ impl ScipySparseIntegration {
                 let row_indices = &data.indices;
                 let values: Vec<f32> = data.data.iter().map(|&v| v as f32).collect();
 
-                let csc =
-                    CscTensor::from_raw_parts(col_ptr.clone(), row_indices.clone(), values, shape)?;
+                // SciPy does not guarantee canonical (sorted, duplicate-free)
+                // CSC arrays, so normalise instead of asserting.
+                let csc = CscTensor::from_unsorted_parts(
+                    col_ptr.clone(),
+                    row_indices.clone(),
+                    values,
+                    shape,
+                )?;
 
                 Ok(Box::new(csc))
             }

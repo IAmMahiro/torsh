@@ -206,7 +206,7 @@ impl<O: Optimizer> MixedPrecisionOptimizer<O> {
             if let Some(master_weight) = self.master_weights.get(&param_id) {
                 // Copy fp32 master weight back to fp16 parameter
                 let param_fp16 = master_weight.to_dtype(param.dtype())?;
-                *param = param_fp16;
+                crate::param_update::assign(&mut param, &param_fp16)?;
             }
         }
 

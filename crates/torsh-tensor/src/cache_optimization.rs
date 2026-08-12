@@ -6,6 +6,7 @@ use crate::{Tensor, TensorStorage};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use torsh_core::sync::MutexExt;
 use torsh_core::{
     dtype::TensorElement,
     error::{Result, TorshError},
@@ -373,8 +374,8 @@ impl TensorMemoryPool {
 
     /// Allocate memory from pool or create new
     pub fn allocate(&self, size_bytes: usize) -> Vec<u8> {
-        let mut pool = self.pool.lock().expect("lock should not be poisoned");
-        let mut stats = self.stats.lock().expect("lock should not be poisoned");
+        let mut pool = self.pool.lock_or_recover();
+        let mut stats = self.stats.lock_or_recover();
 
         stats.allocations += 1;
 
@@ -384,10 +385,7 @@ impl TensorMemoryPool {
         if let Some(pool_vec) = pool.get_mut(&rounded_size) {
             if let Some(memory) = pool_vec.pop() {
                 stats.cache_hits += 1;
-                let mut current_size = self
-                    .current_pool_size
-                    .lock()
-                    .expect("lock should not be poisoned");
+                let mut current_size = self.current_pool_size.lock_or_recover();
                 *current_size -= rounded_size;
                 return memory;
             }
@@ -400,12 +398,9 @@ impl TensorMemoryPool {
     /// Return memory to pool
     pub fn deallocate(&self, mut memory: Vec<u8>) {
         let size = memory.len();
-        let mut pool = self.pool.lock().expect("lock should not be poisoned");
-        let mut stats = self.stats.lock().expect("lock should not be poisoned");
-        let mut current_size = self
-            .current_pool_size
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut pool = self.pool.lock_or_recover();
+        let mut stats = self.stats.lock_or_recover();
+        let mut current_size = self.current_pool_size.lock_or_recover();
 
         stats.deallocations += 1;
 
@@ -424,19 +419,13 @@ impl TensorMemoryPool {
 
     /// Get pool statistics
     pub fn get_statistics(&self) -> PoolStatistics {
-        self.stats
-            .lock()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.stats.lock_or_recover().clone()
     }
 
     /// Clear the entire pool
     pub fn clear(&self) {
-        let mut pool = self.pool.lock().expect("lock should not be poisoned");
-        let mut current_size = self
-            .current_pool_size
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut pool = self.pool.lock_or_recover();
+        let mut current_size = self.current_pool_size.lock_or_recover();
 
         pool.clear();
         *current_size = 0;
@@ -464,11 +453,8 @@ impl MemoryPressureMonitor {
 
     /// Record memory usage sample
     pub fn record_usage(&self, bytes_used: usize) {
-        let mut samples = self.samples.lock().expect("lock should not be poisoned");
-        let mut pressure = self
-            .pressure_level
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut samples = self.samples.lock_or_recover();
+        let mut pressure = self.pressure_level.lock_or_recover();
 
         let now = Instant::now();
         samples.push((now, bytes_used));
@@ -488,10 +474,7 @@ impl MemoryPressureMonitor {
 
     /// Get current memory pressure level
     pub fn get_pressure_level(&self) -> f64 {
-        *self
-            .pressure_level
-            .lock()
-            .expect("lock should not be poisoned")
+        *self.pressure_level.lock_or_recover()
     }
 
     /// Check if system is under high memory pressure

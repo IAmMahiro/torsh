@@ -7,8 +7,14 @@ use torsh_tensor::Tensor;
 
 /// Trait for clustering algorithm results
 pub trait ClusteringResult: Clone + std::fmt::Debug {
-    /// Get cluster labels for each data point
-    fn labels(&self) -> &Tensor;
+    /// Get cluster labels for each data point, if available.
+    ///
+    /// Most algorithms always have labels, but online/incremental results
+    /// may not (e.g. before any batch has been processed), so this is
+    /// fallible rather than panicking. Concrete result types that always
+    /// have labels additionally expose an inherent `labels(&self) -> &Tensor`
+    /// method for convenient unwrapped access.
+    fn labels(&self) -> Option<&Tensor>;
 
     /// Get number of clusters found
     fn n_clusters(&self) -> usize;

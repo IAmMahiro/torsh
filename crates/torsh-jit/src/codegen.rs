@@ -4,27 +4,15 @@ use crate::graph::{ComputationGraph, Node, NodeId, Operation};
 use crate::{CompiledKernel, JitError, JitResult, KernelMetadata, TensorDesc};
 use torsh_core::DeviceType;
 
-#[cfg(feature = "cranelift-backend")]
-use cranelift::prelude::*;
-
 /// Code generator for different backends
 pub struct CodeGenerator {
     device: DeviceType,
-    #[cfg(feature = "cranelift-backend")]
-    cranelift: Option<CraneliftBackend>,
 }
 
 impl CodeGenerator {
     /// Create a new code generator for the target device
     pub fn new(device: DeviceType) -> Self {
-        Self {
-            device,
-            #[cfg(feature = "cranelift-backend")]
-            cranelift: match device {
-                DeviceType::Cpu => Some(CraneliftBackend::new()),
-                _ => None,
-            },
-        }
+        Self { device }
     }
 
     /// Generate code for the computation graph
@@ -41,14 +29,35 @@ impl CodeGenerator {
     }
 
     /// Generate CPU code
+    ///
+    /// With the `cranelift-backend` feature the graph is lowered to IR and compiled
+    /// by [`crate::cranelift_backend::CraneliftCodeGen`], which emits real machine
+    /// code and refuses when the compiler produces nothing. Without the feature the
+    /// interpreter encoding is used instead.
     fn generate_cpu(&self, graph: &ComputationGraph) -> JitResult<Vec<CompiledKernel>> {
         #[cfg(feature = "cranelift-backend")]
-        if let Some(ref backend) = self.cranelift {
-            return backend.generate(graph);
+        {
+            let ir_module = crate::lowering::lower_graph_to_ir(graph, "cpu_kernel".to_string())?;
+            let mut codegen = crate::cranelift_backend::CraneliftCodeGen::new()?;
+            let kernels = codegen.generate(&ir_module)?;
+
+            // A kernel without code is not a kernel: reject it rather than handing
+            // the caller something that looks compiled but executes nothing.
+            if let Some(empty) = kernels.iter().find(|kernel| kernel.code.is_empty()) {
+                return Err(JitError::CodeGenError(format!(
+                    "Cranelift returned kernel '{}' with no machine code",
+                    empty.id
+                )));
+            }
+
+            Ok(kernels)
         }
 
         // Fallback to interpreter mode
-        self.generate_interpreter(graph)
+        #[cfg(not(feature = "cranelift-backend"))]
+        {
+            self.generate_interpreter(graph)
+        }
     }
 
     /// Generate CUDA code
@@ -347,85 +356,6 @@ impl CodeGenerator {
         };
 
         Ok(vec![op_code])
-    }
-}
-
-#[cfg(feature = "cranelift-backend")]
-struct CraneliftBackend {
-    _builder_context: FunctionBuilderContext,
-    _ctx: codegen::Context,
-}
-
-#[cfg(feature = "cranelift-backend")]
-impl CraneliftBackend {
-    fn new() -> Self {
-        let mut flag_builder = settings::builder();
-        flag_builder
-            .set("use_colocated_libcalls", "false")
-            .expect("setting should be valid");
-        flag_builder
-            .set("is_pic", "false")
-            .expect("setting should be valid");
-        let isa_builder = cranelift_native::builder().expect("native builder should succeed");
-        let isa = isa_builder
-            .finish(settings::Flags::new(flag_builder))
-            .expect("ISA creation should succeed");
-
-        let mut ctx = codegen::Context::new();
-        ctx.func.signature.call_conv = isa.default_call_conv();
-
-        Self {
-            _builder_context: FunctionBuilderContext::new(),
-            _ctx: ctx,
-        }
-    }
-
-    fn generate(&self, graph: &ComputationGraph) -> JitResult<Vec<CompiledKernel>> {
-        let mut kernels = Vec::new();
-
-        // Group nodes into kernels based on fusion information
-        let kernel_groups = self.identify_kernel_groups(graph)?;
-
-        // Generate code for each kernel
-        for (kernel_id, nodes) in kernel_groups.iter().enumerate() {
-            let kernel = self.generate_kernel(graph, kernel_id, nodes)?;
-            kernels.push(kernel);
-        }
-
-        Ok(kernels)
-    }
-
-    fn identify_kernel_groups(&self, graph: &ComputationGraph) -> JitResult<Vec<Vec<NodeId>>> {
-        // For now, each node is its own kernel
-        // In a real implementation, this would use fusion information
-        let order = graph
-            .topological_sort()
-            .map_err(|e| JitError::GraphError(format!("{:?}", e)))?;
-
-        Ok(order.into_iter().map(|n| vec![n]).collect())
-    }
-
-    fn generate_kernel(
-        &self,
-        _graph: &ComputationGraph,
-        kernel_id: usize,
-        nodes: &[NodeId],
-    ) -> JitResult<CompiledKernel> {
-        // TODO: Implement actual Cranelift code generation
-
-        // For now, return a placeholder
-        Ok(CompiledKernel {
-            id: format!("cranelift_kernel_{}", kernel_id),
-            source_nodes: nodes.to_vec(),
-            code: vec![],
-            metadata: KernelMetadata {
-                inputs: vec![],
-                outputs: vec![],
-                shared_memory: 0,
-                block_size: (1, 1, 1),
-                grid_size: (1, 1, 1),
-            },
-        })
     }
 }
 

@@ -26,7 +26,285 @@ use alloc::vec::Vec;
 
 use scirs2_core::parallel_ops::*;
 
-/// Quantize a tensor using specified configuration
+/// Quantization parameters describing how a quantized tensor can be inverted.
+///
+/// Per-channel and group-wise schemes need one scale/zero-point pair *per
+/// channel* (or per group); collapsing them to a single pair — as the legacy
+/// `(Tensor, f32, i32)` return type is forced to do — makes dequantization
+/// impossible for every channel but the first. [`QuantizedTensor`] keeps the
+/// full parameter set so the transform stays invertible.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QParams {
+    /// A single scale/zero-point pair for the whole tensor.
+    PerTensor {
+        /// Quantization step size.
+        scale: f32,
+        /// Integer code mapped to the real value zero.
+        zero_point: i32,
+    },
+    /// One scale/zero-point pair per channel along `axis`.
+    PerChannel {
+        /// Channel axis the parameters are indexed by.
+        axis: usize,
+        /// Per-channel step sizes (length == `shape[axis]`).
+        scales: Vec<f32>,
+        /// Per-channel zero points (length == `shape[axis]`).
+        zero_points: Vec<i32>,
+    },
+    /// One scale/zero-point pair per contiguous group of channels along `axis`.
+    PerGroup {
+        /// Channel axis the groups are formed along.
+        axis: usize,
+        /// Number of channels per group.
+        group_size: usize,
+        /// Per-group step sizes.
+        scales: Vec<f32>,
+        /// Per-group zero points.
+        zero_points: Vec<i32>,
+    },
+}
+
+impl QParams {
+    /// Scale of the first channel/group, for interoperability with the legacy
+    /// scalar-returning API. Only exact for [`QParams::PerTensor`].
+    pub fn representative_scale(&self) -> f32 {
+        match self {
+            QParams::PerTensor { scale, .. } => *scale,
+            QParams::PerChannel { scales, .. } | QParams::PerGroup { scales, .. } => {
+                scales.first().copied().unwrap_or(1.0)
+            }
+        }
+    }
+
+    /// Zero point of the first channel/group. Only exact for
+    /// [`QParams::PerTensor`].
+    pub fn representative_zero_point(&self) -> i32 {
+        match self {
+            QParams::PerTensor { zero_point, .. } => *zero_point,
+            QParams::PerChannel { zero_points, .. } | QParams::PerGroup { zero_points, .. } => {
+                zero_points.first().copied().unwrap_or(0)
+            }
+        }
+    }
+}
+
+/// A quantized tensor bundled with the complete parameter set needed to invert
+/// the quantization.
+#[derive(Debug, Clone)]
+pub struct QuantizedTensor {
+    /// Integer codes stored in an `f32` tensor (values are exact integers).
+    pub tensor: Tensor,
+    /// Parameters required for dequantization.
+    pub params: QParams,
+    /// Target integer dtype the codes belong to.
+    pub dtype: DType,
+}
+
+impl QuantizedTensor {
+    /// Dequantize back to floating point using the full parameter set.
+    pub fn dequantize(&self) -> TorshResult<Tensor> {
+        match &self.params {
+            QParams::PerTensor { scale, zero_point } => {
+                dequantize_per_tensor_affine(&self.tensor, *scale, *zero_point)
+            }
+            QParams::PerChannel {
+                axis,
+                scales,
+                zero_points,
+            } => dequantize_per_channel(&self.tensor, *axis, scales, zero_points),
+            QParams::PerGroup {
+                axis,
+                group_size,
+                scales,
+                zero_points,
+            } => dequantize_per_group(&self.tensor, *axis, *group_size, scales, zero_points),
+        }
+    }
+}
+
+/// Row-major strides for a shape.
+fn row_major_strides(shape: &[usize]) -> Vec<usize> {
+    let mut strides = vec![1usize; shape.len()];
+    for i in (0..shape.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * shape[i + 1];
+    }
+    strides
+}
+
+/// Dequantize a tensor quantized with one scale/zero-point per channel.
+pub fn dequantize_per_channel(
+    tensor: &Tensor,
+    axis: usize,
+    scales: &[f32],
+    zero_points: &[i32],
+) -> TorshResult<Tensor> {
+    let binding = tensor.shape();
+    let shape = binding.dims();
+
+    if axis >= shape.len() {
+        return Err(TorshError::InvalidArgument(
+            "Axis out of bounds".to_string(),
+        ));
+    }
+    if scales.len() != shape[axis] || zero_points.len() != shape[axis] {
+        return Err(TorshError::InvalidArgument(
+            "Scales and zero_points length must match channel size".to_string(),
+        ));
+    }
+
+    let data = tensor.data()?;
+    let strides = row_major_strides(shape);
+    let dequantized: Vec<f32> = data
+        .iter()
+        .enumerate()
+        .map(|(idx, &q)| {
+            let channel = (idx / strides[axis]) % shape[axis];
+            (q - zero_points[channel] as f32) * scales[channel]
+        })
+        .collect();
+
+    Tensor::from_data(dequantized, shape.to_vec(), tensor.device())
+}
+
+/// Dequantize a tensor quantized with one scale/zero-point per channel group.
+pub fn dequantize_per_group(
+    tensor: &Tensor,
+    axis: usize,
+    group_size: usize,
+    scales: &[f32],
+    zero_points: &[i32],
+) -> TorshResult<Tensor> {
+    let binding = tensor.shape();
+    let shape = binding.dims();
+
+    if axis >= shape.len() {
+        return Err(TorshError::InvalidArgument(
+            "Axis out of bounds".to_string(),
+        ));
+    }
+    if group_size == 0 {
+        return Err(TorshError::InvalidArgument(
+            "Group size must be greater than 0".to_string(),
+        ));
+    }
+
+    let num_groups = shape[axis].div_ceil(group_size);
+    if scales.len() != num_groups || zero_points.len() != num_groups {
+        return Err(TorshError::InvalidArgument(
+            "Scales and zero_points length must match the number of groups".to_string(),
+        ));
+    }
+
+    let data = tensor.data()?;
+    let strides = row_major_strides(shape);
+    let dequantized: Vec<f32> = data
+        .iter()
+        .enumerate()
+        .map(|(idx, &q)| {
+            let group = ((idx / strides[axis]) % shape[axis]) / group_size;
+            (q - zero_points[group] as f32) * scales[group]
+        })
+        .collect();
+
+    Tensor::from_data(dequantized, shape.to_vec(), tensor.device())
+}
+
+/// Quantize a tensor using the supplied configuration, preserving the complete
+/// per-channel / per-group parameter set.
+///
+/// Prefer this over [`quantize_with_config`] whenever the configuration uses a
+/// per-channel, INT4-per-channel or group-wise scheme: the scalar-returning
+/// variant can only report the first channel's parameters, which cannot invert
+/// the other channels.
+pub fn quantize_with_config_full(
+    tensor: &Tensor,
+    config: &QuantConfig,
+) -> TorshResult<QuantizedTensor> {
+    config.validate()?;
+
+    let (quantized, params) = match config.scheme {
+        QScheme::PerTensorAffine | QScheme::PerTensorSymmetric => {
+            let (quantized, scale, zero_point) =
+                quantize_tensor_auto(tensor, config.dtype, config.scheme)?;
+            (quantized, QParams::PerTensor { scale, zero_point })
+        }
+        QScheme::PerChannelAffine | QScheme::PerChannelSymmetric => {
+            let axis = config.ch_axis.unwrap_or(0);
+            let (quantized, scales, zero_points) =
+                quantize_per_channel_auto(tensor, axis, config.dtype, config.scheme)?;
+            (
+                quantized,
+                QParams::PerChannel {
+                    axis,
+                    scales,
+                    zero_points,
+                },
+            )
+        }
+        QScheme::GroupWise => {
+            let axis = config.ch_axis.unwrap_or(0);
+            let group_size = config.group_size.unwrap_or(32);
+            let (quantized, scales, zero_points) =
+                crate::specialized::quantize_group_wise_full(tensor, axis, group_size, config)?;
+            (
+                quantized,
+                QParams::PerGroup {
+                    axis,
+                    group_size,
+                    scales,
+                    zero_points,
+                },
+            )
+        }
+        QScheme::Int4PerTensor => {
+            let (quantized, scale, zero_point) =
+                crate::specialized::quantize_int4_per_tensor(tensor, config)?;
+            (quantized, QParams::PerTensor { scale, zero_point })
+        }
+        QScheme::Int4PerChannel => {
+            let axis = config.ch_axis.unwrap_or(0);
+            let (quantized, scales, zero_points) =
+                crate::specialized::quantize_int4_per_channel_full(tensor, axis, config)?;
+            (
+                quantized,
+                QParams::PerChannel {
+                    axis,
+                    scales,
+                    zero_points,
+                },
+            )
+        }
+        QScheme::Binary => {
+            let (quantized, scale, zero_point) = crate::specialized::quantize_binary(tensor)?;
+            (quantized, QParams::PerTensor { scale, zero_point })
+        }
+        QScheme::Ternary => {
+            let (quantized, scale, zero_point) = crate::specialized::quantize_ternary(tensor)?;
+            (quantized, QParams::PerTensor { scale, zero_point })
+        }
+        QScheme::MixedPrecision => {
+            return Err(TorshError::InvalidArgument(
+                "Mixed precision quantization requires specialized API".to_string(),
+            ));
+        }
+    };
+
+    Ok(QuantizedTensor {
+        tensor: quantized,
+        params,
+        dtype: config.dtype,
+    })
+}
+
+/// Quantize a tensor using specified configuration.
+///
+/// # Parameter loss for per-channel schemes
+///
+/// The scalar `(scale, zero_point)` return type can only carry a single
+/// parameter pair. For `PerChannelAffine`, `PerChannelSymmetric`,
+/// `Int4PerChannel` and `GroupWise` the returned pair belongs to the **first**
+/// channel/group only and will not dequantize the remaining ones. Use
+/// [`quantize_with_config_full`] for those schemes.
 pub fn quantize_with_config(
     tensor: &Tensor,
     config: &QuantConfig,
@@ -70,9 +348,9 @@ pub fn quantize_per_tensor(
     tensor: &Tensor,
     scale: f32,
     zero_point: i32,
-    _dtype: DType,
+    dtype: DType,
 ) -> TorshResult<Tensor> {
-    let (quantized, _, _) = quantize_per_tensor_affine(tensor, scale, zero_point)?;
+    let (quantized, _, _) = quantize_per_tensor_affine_dtype(tensor, scale, zero_point, dtype)?;
     Ok(quantized)
 }
 
@@ -119,7 +397,7 @@ pub fn quantize_tensor_auto(
         }
     };
 
-    quantize_per_tensor_affine(tensor, scale, zero_point)
+    quantize_per_tensor_affine_dtype(tensor, scale, zero_point, dtype)
 }
 
 /// Auto-quantize a tensor using per-channel scheme
@@ -273,11 +551,29 @@ pub fn quantize_per_tensor_affine_i8(
     Ok((quantized_tensor, scale, zero_point))
 }
 
-/// Quantize a tensor using per-tensor affine quantization
+/// Quantize a tensor using per-tensor affine quantization into the `I8` range.
+///
+/// This is the `DType::I8` specialisation of
+/// [`quantize_per_tensor_affine_dtype`]; use that function to target `U8`,
+/// `I16` or `I32`, whose ranges differ.
 pub fn quantize_per_tensor_affine(
     tensor: &Tensor,
     scale: f32,
     zero_point: i32,
+) -> TorshResult<(Tensor, f32, i32)> {
+    quantize_per_tensor_affine_dtype(tensor, scale, zero_point, DType::I8)
+}
+
+/// Quantize a tensor using per-tensor affine quantization for a specific target dtype.
+///
+/// The quantized codes are clamped to the target dtype's range (`[0, 255]` for
+/// `U8`, `[-128, 127]` for `I8`, ...) rather than always to the `I8` range, and
+/// the zero point is validated against that same range.
+pub fn quantize_per_tensor_affine_dtype(
+    tensor: &Tensor,
+    scale: f32,
+    zero_point: i32,
+    dtype: DType,
 ) -> TorshResult<(Tensor, f32, i32)> {
     let data = tensor.data()?;
 
@@ -287,21 +583,31 @@ pub fn quantize_per_tensor_affine(
         ));
     }
 
+    let (qmin, qmax) = get_dtype_range(dtype);
+    if !(qmin..=qmax).contains(&zero_point) {
+        return Err(TorshError::InvalidArgument(format!(
+            "Zero point {zero_point} must be in range [{qmin}, {qmax}] for {dtype:?}"
+        )));
+    }
+
     // Use SIMD-accelerated quantization when available and beneficial
     let mut quantized_data = vec![0.0f32; data.len()];
     if data.len() > 64 && crate::simd_ops::is_simd_available() {
         // Use SIMD for larger tensors
-        crate::simd_ops::quantize_per_tensor_affine_simd(
+        crate::simd_ops::quantize_per_tensor_affine_simd_range(
             &data,
             scale,
             zero_point,
+            qmin,
+            qmax,
             &mut quantized_data,
         )?;
     } else {
         // Fallback to scalar implementation for small tensors
+        let (qmin_f, qmax_f) = (qmin as f32, qmax as f32);
         for (i, &x) in data.iter().enumerate() {
             let quantized = (x / scale).round() + zero_point as f32;
-            quantized_data[i] = quantized.clamp(-128.0, 127.0);
+            quantized_data[i] = quantized.clamp(qmin_f, qmax_f);
         }
     }
 
@@ -393,7 +699,15 @@ pub fn calculate_affine_quantization_params(
     Ok((scale, zero_point))
 }
 
-/// Calculate symmetric quantization parameters (scale only, zero_point = 0)
+/// Calculate symmetric quantization parameters.
+///
+/// The scale is `max(|min|, |max|) / (qmax - zero_point)`.
+///
+/// * For signed targets (`I8`, `I16`, `I32`) the zero point is `0`, so the
+///   scale reduces to `max_abs / qmax`.
+/// * For unsigned targets (`U8`) a zero point of `0` would clip every negative
+///   value; the zero point is therefore placed at the midpoint of the range
+///   (`128` for `U8`), matching PyTorch's `quint8` symmetric convention.
 pub fn calculate_symmetric_quantization_params(
     min_val: f32,
     max_val: f32,
@@ -405,18 +719,27 @@ pub fn calculate_symmetric_quantization_params(
         ));
     }
 
-    let (_qmin, qmax) = get_dtype_range(dtype);
+    let (qmin, qmax) = get_dtype_range(dtype);
     let abs_max = min_val.abs().max(max_val.abs());
+
+    // Unsigned target types cannot represent negative codes, so the symmetric
+    // zero is placed at the midpoint of the range (the PyTorch `quint8`
+    // convention: zero_point = 128 for U8) instead of at 0.
+    let zero_point = if qmin >= 0 {
+        (((qmin as i64) + (qmax as i64) + 1) / 2) as i32
+    } else {
+        0
+    };
 
     // Handle edge case where range is zero
     if abs_max < f32::EPSILON {
-        return Ok((1.0, 0));
+        return Ok((1.0, zero_point));
     }
 
     // For symmetric quantization, we use the maximum absolute value
-    // and map it to the maximum quantized range
-    let scale = abs_max / qmax as f32;
-    let zero_point = 0; // Symmetric quantization always has zero_point = 0
+    // and map it to the largest magnitude representable above the zero point.
+    let positive_headroom = (qmax - zero_point).max(1) as f32;
+    let scale = abs_max / positive_headroom;
 
     Ok((scale, zero_point))
 }

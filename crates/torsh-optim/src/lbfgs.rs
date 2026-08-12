@@ -141,11 +141,12 @@ impl LBFGS {
                 let param_size = param_shape.numel();
 
                 let param_data = &flat_data[offset..offset + param_size];
-                *param_write = Tensor::from_data(
+                let new_values = Tensor::from_data(
                     param_data.to_vec(),
                     param_shape.dims().to_vec(),
                     param_write.device(),
                 )?;
+                crate::param_update::assign(&mut param_write, &new_values)?;
 
                 offset += param_size;
             }

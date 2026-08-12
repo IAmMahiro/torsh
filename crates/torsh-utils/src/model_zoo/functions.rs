@@ -129,10 +129,19 @@ mod tests {
             .expect("dependency resolution should succeed");
         assert!(!deps.is_empty());
         assert!(deps.iter().any(|d| d.name == "torsh-vision"));
-        let synced = zoo
-            .sync_with_huggingface(Some("microsoft"))
-            .expect("operation should succeed");
-        assert!(!synced.is_empty());
+        #[cfg(feature = "reqwest")]
+        {
+            let synced = zoo
+                .sync_with_huggingface(Some("microsoft"))
+                .expect("operation should succeed");
+            assert!(!synced.is_empty());
+        }
+        #[cfg(not(feature = "reqwest"))]
+        {
+            // Without the `reqwest` feature there is no network stack, so the
+            // sync must return an honest error rather than fabricated models.
+            assert!(zoo.sync_with_huggingface(Some("microsoft")).is_err());
+        }
     }
     #[test]
     fn test_model_recommendations() {

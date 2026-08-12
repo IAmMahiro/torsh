@@ -58,6 +58,11 @@ impl<T> ZeroCopyTensor<T> {
     ///
     /// This creates a view into the provided slice without copying data.
     /// The slice must remain valid for the lifetime of the tensor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data.len()` doesn't match the product of `shape`. See
+    /// [`Self::try_from_slice`] for a non-panicking variant.
     pub fn from_slice(data: &[T], shape: Vec<usize>) -> Self {
         let capacity = shape.iter().product();
         assert_eq!(
@@ -76,10 +81,36 @@ impl<T> ZeroCopyTensor<T> {
         }
     }
 
+    /// Fallible variant of [`Self::from_slice`] that returns an error instead
+    /// of panicking when `data.len()` doesn't match the product of `shape`.
+    pub fn try_from_slice(data: &[T], shape: Vec<usize>) -> Result<Self> {
+        let capacity = shape.iter().product();
+        if data.len() != capacity {
+            return Err(TorshError::InvalidArgument(format!(
+                "Data length must match tensor capacity: got {} elements, shape {shape:?} needs {capacity}",
+                data.len()
+            )));
+        }
+
+        let stride = Self::compute_stride(&shape);
+        Ok(Self {
+            data_ptr: data.as_ptr(),
+            shape,
+            stride,
+            capacity,
+            owned: false,
+        })
+    }
+
     /// Create a zero-copy tensor by taking ownership of a Vec
     ///
     /// This transfers ownership of the Vec's memory to the tensor,
     /// avoiding the need to copy data.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data.len()` doesn't match the product of `shape`. See
+    /// [`Self::try_from_vec`] for a non-panicking variant.
     pub fn from_vec(data: Vec<T>, shape: Vec<usize>) -> Self {
         let capacity = shape.iter().product();
         assert_eq!(
@@ -99,6 +130,30 @@ impl<T> ZeroCopyTensor<T> {
             capacity,
             owned: true,
         }
+    }
+
+    /// Fallible variant of [`Self::from_vec`] that returns an error instead of
+    /// panicking when `data.len()` doesn't match the product of `shape`.
+    pub fn try_from_vec(data: Vec<T>, shape: Vec<usize>) -> Result<Self> {
+        let capacity = shape.iter().product();
+        if data.len() != capacity {
+            return Err(TorshError::InvalidArgument(format!(
+                "Data length must match tensor capacity: got {} elements, shape {shape:?} needs {capacity}",
+                data.len()
+            )));
+        }
+
+        let stride = Self::compute_stride(&shape);
+        let data_ptr = data.as_ptr();
+        mem::forget(data); // Transfer ownership to the tensor
+
+        Ok(Self {
+            data_ptr,
+            shape,
+            stride,
+            capacity,
+            owned: true,
+        })
     }
 
     /// Get the shape of the tensor

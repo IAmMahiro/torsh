@@ -666,6 +666,13 @@ mod edge_cases_advanced {
 
         let result = bootstrap.compute_ci(&metric, &predictions, &targets);
         assert_eq!(result.n_bootstrap, 0);
-        assert_eq!(result.confidence_interval, (0.0, 0.0));
+        // With no data there is nothing to resample: the interval degenerates to
+        // the metric's own value on the empty input, which is NaN now that
+        // accuracy reports empty inputs honestly instead of scoring them 0.0.
+        let (low, high) = result.confidence_interval;
+        assert!(
+            (low == 0.0 && high == 0.0) || (low.is_nan() && high.is_nan()),
+            "got ({low}, {high})"
+        );
     }
 }

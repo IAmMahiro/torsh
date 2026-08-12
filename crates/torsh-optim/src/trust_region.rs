@@ -84,13 +84,29 @@ pub enum SubproblemSolver {
     TwoDSubspace,
 }
 
+/// Objective function evaluated at a flattened parameter vector.
+///
+/// A trust region method accepts or rejects a step by comparing the decrease the
+/// quadratic model predicted with the decrease the objective actually delivered,
+/// so it needs to evaluate the objective at candidate points — exactly like
+/// PyTorch's `LBFGS.step(closure)`.
+pub type ObjectiveFn = Arc<dyn Fn(&Tensor) -> Result<f32> + Send + Sync>;
+
 /// Trust region method implementation
+///
+/// # Objective closure
+///
+/// [`TrustRegionMethod::step`] cannot decide whether to accept a step without
+/// evaluating the objective, so an objective closure must be registered with
+/// [`TrustRegionMethod::set_objective`] before stepping. Without one, `step`
+/// returns an error rather than inventing a reduction ratio.
 pub struct TrustRegionMethod {
     param_groups: Vec<ParamGroup>,
     state: HashMap<String, HashMap<String, Tensor>>,
     step_count: usize,
     config: TrustRegionConfig,
     solver: SubproblemSolver,
+    objective: Option<ObjectiveFn>,
 }
 
 impl TrustRegionMethod {
@@ -109,7 +125,25 @@ impl TrustRegionMethod {
             step_count: 0,
             config: config.unwrap_or_default(),
             solver: solver.unwrap_or(SubproblemSolver::Dogleg),
+            objective: None,
         }
+    }
+
+    /// Register the objective function used to measure the actual decrease.
+    ///
+    /// The closure receives the flattened parameter vector (in the same layout
+    /// [`TrustRegionMethod`] uses internally) and returns the objective value at
+    /// that point.
+    pub fn set_objective<F>(&mut self, objective: F)
+    where
+        F: Fn(&Tensor) -> Result<f32> + Send + Sync + 'static,
+    {
+        self.objective = Some(Arc::new(objective));
+    }
+
+    /// Remove a previously registered objective function.
+    pub fn clear_objective(&mut self) {
+        self.objective = None;
     }
 
     pub fn builder() -> TrustRegionBuilder {
@@ -180,11 +214,12 @@ impl TrustRegionMethod {
                 let param_size = param_shape.numel();
 
                 let param_data = &flat_data[offset..offset + param_size];
-                *param_write = Tensor::from_data(
+                let new_values = Tensor::from_data(
                     param_data.to_vec(),
                     param_shape.dims().to_vec(),
                     param_write.device(),
                 )?;
+                crate::param_update::assign(&mut param_write, &new_values)?;
 
                 offset += param_size;
             }
@@ -387,19 +422,35 @@ impl TrustRegionMethod {
         }
     }
 
-    /// Compute model decrease (simplified)
-    fn model_decrease(&self, grad: &Tensor, step: &Tensor) -> Result<f32> {
-        // m(0) - m(s) ≈ -g^T s - 0.5 s^T H s
-        // Simplified: just use -g^T s
-        let decrease = -grad.dot(step)?.item()?;
+    /// Decrease predicted by the quadratic model: `m(0) - m(s) = -g^T s - 0.5 s^T H s`.
+    ///
+    /// This is the same model the subproblem solvers minimise, so the ratio
+    /// formed against it is the standard trust-region reduction ratio. `H` is the
+    /// diagonal approximation returned by `approximate_hessian`.
+    fn model_decrease(&self, grad: &Tensor, step: &Tensor, hessian_diag: &Tensor) -> Result<f32> {
+        let linear_term = grad.dot(step)?.item()?;
+        let hessian_step = step.mul_op(hessian_diag)?;
+        let quadratic_term = step.dot(&hessian_step)?.item()?;
+        let decrease = -linear_term - 0.5 * quadratic_term;
         Ok(decrease.max(0.0))
     }
 
-    /// Compute actual function decrease (placeholder)
-    fn actual_decrease(&self, _old_params: &Tensor, _new_params: &Tensor) -> Result<f32> {
-        // This would evaluate the actual function at both points
-        // For now, return a placeholder value
-        Ok(0.5) // Placeholder
+    /// Decrease the objective actually delivered: `f(x) - f(x + s)`.
+    ///
+    /// # Errors
+    /// Returns an error if no objective closure has been registered — the actual
+    /// decrease cannot be measured without evaluating the objective, and
+    /// returning a made-up constant would silently defeat the trust-region logic
+    /// that consumes it.
+    fn actual_decrease(&self, old_params: &Tensor, new_params: &Tensor) -> Result<f32> {
+        let objective = self.objective.as_ref().ok_or_else(|| {
+            TorshError::InvalidArgument(
+                "TrustRegionMethod requires an objective function to measure the actual \
+                 decrease; register one with `set_objective` before calling `step`"
+                    .to_string(),
+            )
+        })?;
+        Ok(objective(old_params)? - objective(new_params)?)
     }
 
     /// Update trust region radius
@@ -477,6 +528,10 @@ impl Optimizer for TrustRegionMethod {
             }
         };
 
+        // Diagonal Hessian approximation shared by the subproblem solvers and the
+        // predicted-decrease computation, so both use the same model.
+        let hessian_diag = self.approximate_hessian(&current_grad)?;
+
         // Trust region iteration
         for _iter in 0..self.config.max_iter {
             // Solve trust region subproblem
@@ -492,7 +547,7 @@ impl Optimizer for TrustRegionMethod {
             let new_params = current_params.add(&step)?;
 
             // Compute reduction ratio
-            let model_dec = self.model_decrease(&current_grad, &step)?;
+            let model_dec = self.model_decrease(&current_grad, &step, &hessian_diag)?;
             let actual_dec = self.actual_decrease(&current_params, &new_params)?;
 
             let reduction_ratio = if model_dec > 1e-12 {

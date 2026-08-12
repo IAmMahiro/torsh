@@ -275,41 +275,59 @@ pub struct CooIndices {
 
 impl CooIndices {
     /// Create new COO indices for 2D tensor
-    pub fn new_2d(rows: Vec<usize>, cols: Vec<usize>) -> Self {
-        assert_eq!(
-            rows.len(),
-            cols.len(),
-            "Row and column indices must have same length"
-        );
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TorshError::InvalidArgument`] if `rows` and `cols` have
+    /// different lengths. COO indices are frequently built from deserialized
+    /// or user-supplied data, so malformed input is reported as an error
+    /// rather than aborting the process.
+    pub fn new_2d(rows: Vec<usize>, cols: Vec<usize>) -> Result<Self, TorshError> {
+        if rows.len() != cols.len() {
+            return Err(TorshError::InvalidArgument(format!(
+                "Row and column indices must have same length: got {} rows, {} cols",
+                rows.len(),
+                cols.len()
+            )));
+        }
 
-        Self {
+        Ok(Self {
             rows,
             cols,
             extra_dims: Vec::new(),
-        }
+        })
     }
 
     /// Create new COO indices for N-D tensor
-    pub fn new_nd(indices: Vec<Vec<usize>>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TorshError::InvalidArgument`] if any per-dimension index
+    /// vector has a length different from the first, or if fewer than two
+    /// dimensions are provided.
+    pub fn new_nd(indices: Vec<Vec<usize>>) -> Result<Self, TorshError> {
         let nnz = indices.first().map_or(0, |dim| dim.len());
 
         // Validate all dimensions have same length
         for (i, dim_indices) in indices.iter().enumerate() {
-            assert_eq!(
-                dim_indices.len(),
-                nnz,
-                "Dimension {} indices length mismatch: expected {}, got {}",
-                i,
-                nnz,
-                dim_indices.len()
-            );
+            if dim_indices.len() != nnz {
+                return Err(TorshError::InvalidArgument(format!(
+                    "Dimension {} indices length mismatch: expected {}, got {}",
+                    i,
+                    nnz,
+                    dim_indices.len()
+                )));
+            }
         }
 
         if indices.len() < 2 {
-            panic!("N-D tensor must have at least 2 dimensions");
+            return Err(TorshError::InvalidArgument(format!(
+                "N-D tensor must have at least 2 dimensions, got {}",
+                indices.len()
+            )));
         }
 
-        Self {
+        Ok(Self {
             rows: indices[0].clone(),
             cols: indices[1].clone(),
             extra_dims: if indices.len() > 2 {
@@ -317,7 +335,7 @@ impl CooIndices {
             } else {
                 Vec::new()
             },
-        }
+        })
     }
 
     /// Get number of non-zero elements
@@ -400,34 +418,53 @@ pub struct CsrIndices {
 
 impl CsrIndices {
     /// Create new CSR indices
-    pub fn new(row_ptrs: Vec<usize>, col_indices: Vec<usize>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TorshError::InvalidArgument`] if `row_ptrs` is inconsistent
+    /// with `col_indices` (the last row pointer must equal `col_indices.len()`)
+    /// or if `row_ptrs` is not non-decreasing. CSR indices are frequently
+    /// built from deserialized or user-supplied data, so malformed input is
+    /// reported as an error rather than aborting the process.
+    pub fn new(row_ptrs: Vec<usize>, col_indices: Vec<usize>) -> Result<Self, TorshError> {
         // Validate structure
         let nnz = col_indices.len();
-        let _nrows = row_ptrs.len().saturating_sub(1);
 
-        assert_eq!(
-            *row_ptrs.last().unwrap_or(&0),
-            nnz,
-            "Last row pointer must equal nnz"
-        );
+        let last_ptr = *row_ptrs.last().unwrap_or(&0);
+        if last_ptr != nnz {
+            return Err(TorshError::InvalidArgument(format!(
+                "Last row pointer must equal nnz: expected {}, got {}",
+                nnz, last_ptr
+            )));
+        }
 
         // Validate row pointers are non-decreasing
         for i in 1..row_ptrs.len() {
-            assert!(
-                row_ptrs[i] >= row_ptrs[i - 1],
-                "Row pointers must be non-decreasing"
-            );
+            if row_ptrs[i] < row_ptrs[i - 1] {
+                return Err(TorshError::InvalidArgument(format!(
+                    "Row pointers must be non-decreasing: row_ptrs[{}]={} < row_ptrs[{}]={}",
+                    i,
+                    row_ptrs[i],
+                    i - 1,
+                    row_ptrs[i - 1]
+                )));
+            }
         }
 
-        Self {
+        Ok(Self {
             row_ptrs,
             col_indices,
-        }
+        })
     }
 
     /// Convert from COO format
-    pub fn from_coo(coo: &CooIndices, nrows: usize) -> Self {
-        let _nnz = coo.nnz();
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TorshError::InvalidArgument`] if `coo` contains row indices
+    /// that are out of bounds for `nrows` in a way that makes the resulting
+    /// CSR structure inconsistent (see [`CsrIndices::new`]).
+    pub fn from_coo(coo: &CooIndices, nrows: usize) -> Result<Self, TorshError> {
         let mut row_ptrs = vec![0; nrows + 1];
 
         // Count elements per row
@@ -597,7 +634,7 @@ impl SparseStorage for CooStorage {
         }
 
         let nrows = self.shape.dims()[0];
-        let csr_indices = CsrIndices::from_coo(&self.indices, nrows);
+        let csr_indices = CsrIndices::from_coo(&self.indices, nrows)?;
 
         Ok(Arc::new(CsrStorage {
             metadata: {
@@ -708,7 +745,7 @@ impl SparseStorage for CsrStorage {
             }
         }
 
-        let coo_indices = CooIndices::new_2d(rows, cols);
+        let coo_indices = CooIndices::new_2d(rows, cols)?;
 
         Ok(Arc::new(CooStorage {
             metadata: {
@@ -875,14 +912,14 @@ pub mod utils {
             1 => {
                 let rows: Vec<usize> = indices.iter().map(|idx| idx[0]).collect();
                 let cols = vec![0; rows.len()]; // Dummy column for 1D
-                let coo_indices = CooIndices::new_2d(rows, cols);
+                let coo_indices = CooIndices::new_2d(rows, cols)?;
                 CooStorage::new(coo_indices, value_bytes, dtype, shape.clone())
                     .map(|storage| Arc::new(storage) as Arc<dyn SparseStorage>)
             }
             2 => {
                 let rows: Vec<usize> = indices.iter().map(|idx| idx[0]).collect();
                 let cols: Vec<usize> = indices.iter().map(|idx| idx[1]).collect();
-                let coo_indices = CooIndices::new_2d(rows, cols);
+                let coo_indices = CooIndices::new_2d(rows, cols)?;
                 CooStorage::new(coo_indices, value_bytes, dtype, shape.clone())
                     .map(|storage| Arc::new(storage) as Arc<dyn SparseStorage>)
             }
@@ -890,7 +927,7 @@ pub mod utils {
                 let transposed_indices: Vec<Vec<usize>> = (0..dims.len())
                     .map(|dim| indices.iter().map(|idx| idx[dim]).collect())
                     .collect();
-                let coo_indices = CooIndices::new_nd(transposed_indices);
+                let coo_indices = CooIndices::new_nd(transposed_indices)?;
                 CooStorage::new(coo_indices, value_bytes, dtype, shape.clone())
                     .map(|storage| Arc::new(storage) as Arc<dyn SparseStorage>)
             }
@@ -988,7 +1025,8 @@ mod tests {
         let rows = vec![0, 1, 2, 1];
         let cols = vec![1, 0, 2, 2];
 
-        let indices = CooIndices::new_2d(rows.clone(), cols.clone());
+        let indices =
+            CooIndices::new_2d(rows.clone(), cols.clone()).expect("new_2d should succeed");
 
         assert_eq!(indices.nnz(), 4);
         assert_eq!(indices.ndim(), 2);
@@ -1001,7 +1039,8 @@ mod tests {
         let mut indices = CooIndices::new_2d(
             vec![2, 1, 0, 1], // rows
             vec![0, 2, 1, 0], // cols
-        );
+        )
+        .expect("new_2d should succeed");
 
         assert!(!indices.is_sorted());
 
@@ -1018,9 +1057,10 @@ mod tests {
         let coo_indices = CooIndices::new_2d(
             vec![0, 0, 1, 2, 2], // rows
             vec![1, 2, 0, 1, 2], // cols
-        );
+        )
+        .expect("new_2d should succeed");
 
-        let csr_indices = CsrIndices::from_coo(&coo_indices, 3);
+        let csr_indices = CsrIndices::from_coo(&coo_indices, 3).expect("from_coo should succeed");
 
         assert_eq!(csr_indices.nrows(), 3);
         assert_eq!(csr_indices.nnz(), 5);
@@ -1030,7 +1070,7 @@ mod tests {
 
     #[test]
     fn test_coo_storage_creation() {
-        let indices = CooIndices::new_2d(vec![0, 1], vec![1, 0]);
+        let indices = CooIndices::new_2d(vec![0, 1], vec![1, 0]).expect("new_2d should succeed");
         let values = [1.0_f32.to_ne_bytes(), 2.0_f32.to_ne_bytes()].concat();
         let shape = Shape::new(vec![2, 2]);
 
@@ -1044,7 +1084,7 @@ mod tests {
 
     #[test]
     fn test_format_conversion() {
-        let indices = CooIndices::new_2d(vec![0, 1], vec![1, 0]);
+        let indices = CooIndices::new_2d(vec![0, 1], vec![1, 0]).expect("new_2d should succeed");
         let values = [1.0_f32.to_ne_bytes(), 2.0_f32.to_ne_bytes()].concat();
         let shape = Shape::new(vec![2, 2]);
 

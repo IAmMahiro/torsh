@@ -154,15 +154,28 @@ impl PackageExporter {
         zip.add_file(&archive_path, &resource.data)
             .map_err(|e| TorshError::IoError(e.to_string()))?;
 
-        // Write metadata if present
-        if !resource.metadata.is_empty() {
-            let metadata_path = format!("{}.metadata", archive_path);
-            let metadata_json = serde_json::to_string(&resource.metadata)
-                .map_err(|e| TorshError::SerializationError(e.to_string()))?;
+        // Always persist a `.metadata` side-file recording the resource's
+        // exact `ResourceType` under a reserved key (F240 fix): the archive
+        // path prefix above is ambiguous for every type that falls into the
+        // `resources/` fallback (License/Binary/Text/Metadata all collapse
+        // to that same prefix), and even the dedicated prefixes
+        // (`models/`, `config/`, ...) are stripped back off by
+        // `PackageImporter::strip_type_classification_prefix` when
+        // recovering the resource's original name. Recording the type
+        // explicitly makes import authoritative instead of re-guessing it
+        // from the path prefix or file extension, which can silently
+        // change a resource's type across a roundtrip.
+        let mut metadata_to_write = resource.metadata.clone();
+        metadata_to_write.insert(
+            crate::resources::RESOURCE_TYPE_METADATA_KEY.to_string(),
+            resource.resource_type.as_tag().to_string(),
+        );
+        let metadata_path = format!("{}.metadata", archive_path);
+        let metadata_json = serde_json::to_string(&metadata_to_write)
+            .map_err(|e| TorshError::SerializationError(e.to_string()))?;
 
-            zip.add_file(&metadata_path, metadata_json.as_bytes())
-                .map_err(|e| TorshError::IoError(e.to_string()))?;
-        }
+        zip.add_file(&metadata_path, metadata_json.as_bytes())
+            .map_err(|e| TorshError::IoError(e.to_string()))?;
 
         Ok(())
     }

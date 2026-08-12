@@ -2,6 +2,17 @@
 
 Welcome to ToRSh! This directory contains a comprehensive collection of examples and tutorials to help you learn and master the ToRSh deep learning framework.
 
+> **⚠️ Build status (0.2.0).** These files live in the workspace-root `examples/`
+> directory, which is **not** part of any crate's build (the root manifest is a
+> virtual workspace), so `cargo run --example` does not currently pick them up.
+> Most predate the 0.2.0 API and need updates (e.g. `randn`/`arange` are free
+> functions rather than `Tensor` associated functions, `set_requires_grad` was
+> removed in favor of the `requires_grad_(bool)` builder with `requires_grad()`
+> as a getter, and most tensor ops return `Result` so calls must be
+> `?`-propagated rather than method-chained). They are
+> retained as learning references; wiring them into `crates/torsh/examples/` as
+> compiled, CI-checked targets is tracked as follow-up work.
+
 ## 🎓 Learning Path for Beginners
 
 If you're new to ToRSh or tensor computing, follow this progressive learning path:

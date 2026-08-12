@@ -332,12 +332,29 @@
 use torsh_core::{Result as TorshResult, TorshError};
 use torsh_tensor::Tensor;
 
-/// Resize tensor using different interpolation methods
+/// Interpolation modes for resizing.
+///
+/// Re-exported from [`crate::interpolation`] so that a mode selected for
+/// [`resize`] is the very same type accepted by `grid_sample` and `interp2d`;
+/// the crate deliberately has a single interpolation mode enum.
+pub use crate::interpolation::InterpolationMode;
+
+/// Resize tensor using different interpolation methods.
+///
+/// # Arguments
+/// * `input` - Image tensor with at least three dimensions (`.., C, H, W`)
+/// * `size` - Target `(height, width)`
+/// * `mode` - Interpolation kernel. `Nearest`, `Linear`/`Bilinear`,
+///   `Cubic`/`Bicubic` and `Area` are implemented; `Spline` and `Lanczos` are
+///   rejected with an error rather than silently downgraded.
+/// * `_antialias` - Accepted for PyTorch API compatibility and currently has no
+///   effect: no pre-filtering is applied when downsampling. Use `Area`, which
+///   averages over the full source box, when aliasing matters.
 pub fn resize(
     input: &Tensor,
     size: (usize, usize),
     mode: InterpolationMode,
-    antialias: bool,
+    _antialias: bool,
 ) -> TorshResult<Tensor> {
     let shape = input.shape();
     if shape.ndim() < 3 {
@@ -384,7 +401,7 @@ pub fn resize(
                 }
             }
         }
-        InterpolationMode::Bilinear => {
+        InterpolationMode::Bilinear | InterpolationMode::Linear => {
             for b in 0..batch_size {
                 for c in 0..channels {
                     for oh in 0..out_height {
@@ -431,9 +448,65 @@ pub fn resize(
                 }
             }
         }
-        InterpolationMode::Bicubic | InterpolationMode::Area => {
-            // Simplified implementation - use bilinear for now
-            return resize(input, size, InterpolationMode::Bilinear, antialias);
+        InterpolationMode::Bicubic | InterpolationMode::Cubic => {
+            // Separable 4x4 cubic convolution over each channel plane.
+            let plane = in_height * in_width;
+            for b in 0..batch_size {
+                for c in 0..channels {
+                    let base = (b * channels + c) * plane;
+                    let source = &input_data[base..base + plane];
+                    for oh in 0..out_height {
+                        let fh = (oh as f32 + 0.5) * scale_h - 0.5;
+                        for ow in 0..out_width {
+                            let fw = (ow as f32 + 0.5) * scale_w - 0.5;
+                            let value = crate::interpolation::sample_bicubic(
+                                source, in_width, in_height, fw, fh,
+                            );
+                            let out_idx = ((b * channels + c) * out_height + oh) * out_width + ow;
+                            output_data[out_idx] = value;
+                        }
+                    }
+                }
+            }
+        }
+        InterpolationMode::Area => {
+            // Average over the source box each output pixel covers, which is what
+            // `torch.nn.functional.interpolate(mode="area")` does.
+            for b in 0..batch_size {
+                for c in 0..channels {
+                    for oh in 0..out_height {
+                        let h_start = (oh as f32 * scale_h).floor() as usize;
+                        let h_end = (((oh + 1) as f32 * scale_h).ceil() as usize)
+                            .clamp(h_start + 1, in_height);
+                        for ow in 0..out_width {
+                            let w_start = (ow as f32 * scale_w).floor() as usize;
+                            let w_end = (((ow + 1) as f32 * scale_w).ceil() as usize)
+                                .clamp(w_start + 1, in_width);
+
+                            let mut sum = 0.0f32;
+                            let mut count = 0usize;
+                            for ih in h_start..h_end {
+                                for iw in w_start..w_end {
+                                    let in_idx =
+                                        ((b * channels + c) * in_height + ih) * in_width + iw;
+                                    sum += input_data[in_idx];
+                                    count += 1;
+                                }
+                            }
+
+                            let out_idx = ((b * channels + c) * out_height + oh) * out_width + ow;
+                            output_data[out_idx] =
+                                if count == 0 { 0.0 } else { sum / count as f32 };
+                        }
+                    }
+                }
+            }
+        }
+        InterpolationMode::Spline | InterpolationMode::Lanczos => {
+            return Err(TorshError::invalid_argument_with_context(
+                &format!("resize does not support {:?} interpolation", mode),
+                "resize",
+            ));
         }
     }
 
@@ -441,15 +514,6 @@ pub fn resize(
     output_shape.extend_from_slice(&[channels, out_height, out_width]);
 
     Tensor::from_data(output_data, output_shape, input.device())
-}
-
-/// Interpolation modes for resizing
-#[derive(Debug, Clone, Copy)]
-pub enum InterpolationMode {
-    Nearest,
-    Bilinear,
-    Bicubic,
-    Area,
 }
 
 /// Apply Gaussian blur to image tensor

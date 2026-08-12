@@ -69,8 +69,13 @@ pub trait DimList: Sized {
     /// Convert to runtime array
     fn to_array() -> Vec<usize>;
 
-    /// Get dimension at index (panics if out of bounds)
-    fn get_dim(index: usize) -> usize;
+    /// Get dimension at index
+    ///
+    /// Returns `None` if `index` is out of bounds for this dimension list.
+    /// Since the index is a runtime value while the shape is type-level, the
+    /// type system cannot rule out an out-of-range index at compile time, so
+    /// this reports the failure through the return type rather than panicking.
+    fn get_dim(index: usize) -> Option<usize>;
 }
 
 /// Empty dimension list (scalar or end of list)
@@ -82,8 +87,8 @@ impl DimList for () {
         vec![]
     }
 
-    fn get_dim(_index: usize) -> usize {
-        panic!("Index out of bounds")
+    fn get_dim(_index: usize) -> Option<usize> {
+        None
     }
 }
 
@@ -98,9 +103,9 @@ impl<const N: usize, Tail: DimList> DimList for (Dim<N>, Tail) {
         result
     }
 
-    fn get_dim(index: usize) -> usize {
+    fn get_dim(index: usize) -> Option<usize> {
         if index == 0 {
-            N
+            Some(N)
         } else {
             Tail::get_dim(index - 1)
         }

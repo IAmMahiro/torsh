@@ -119,16 +119,62 @@ impl LSTMForecaster {
         Ok(prediction)
     }
 
-    /// Train the model
-    pub fn fit(&mut self, _series: &TimeSeries, _epochs: usize, _learning_rate: f32) {
-        // TODO: Implement training loop when full autograd system is available
-        // For now, this is a placeholder for the training interface
-        // Training would involve:
-        // 1. Creating sequences from the time series
-        // 2. Forward pass through the network
-        // 3. Computing loss (MSE for regression)
-        // 4. Backward pass and parameter updates
-        // 5. Iterating for specified epochs
+    /// Train the model on `series` with gradient descent on the mean squared error.
+    ///
+    /// The series is windowed into `(input, target)` pairs of length
+    /// [`sequence_length`](Self::with_sequence_length); every epoch runs a full
+    /// forward pass through the LSTM recurrence and the linear read-out,
+    /// backpropagates the error through time and updates all recurrent and
+    /// read-out weights in place, so subsequent [`forward`](Self::forward) and
+    /// [`forecast`](Self::forecast) calls use the trained parameters.
+    ///
+    /// Training is performed without dropout, and — like
+    /// `torsh_nn::layers::recurrent::LSTM::forward`, which evaluates only the
+    /// first layer — it updates the first LSTM layer plus the read-out, i.e.
+    /// exactly the parameters the forward pass depends on.
+    ///
+    /// # Arguments
+    ///
+    /// * `series` - training series (must be longer than `sequence_length`)
+    /// * `epochs` - number of full passes over the training windows
+    /// * `learning_rate` - gradient-descent step size
+    ///
+    /// # Returns
+    ///
+    /// The mean squared error measured at the start of each epoch, so callers
+    /// can verify convergence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the series is too short for a single window, if the
+    /// hyper-parameters are invalid, or if training diverges to a non-finite
+    /// loss.
+    pub fn fit(
+        &mut self,
+        series: &TimeSeries,
+        epochs: usize,
+        learning_rate: f32,
+    ) -> Result<Vec<f32>> {
+        if epochs == 0 {
+            return Err(torsh_core::error::TorshError::InvalidArgument(
+                "LSTMForecaster::fit requires at least one epoch".to_string(),
+            ));
+        }
+        if !(learning_rate > 0.0) || !learning_rate.is_finite() {
+            return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                "LSTMForecaster::fit requires a positive, finite learning rate, got {learning_rate}"
+            )));
+        }
+
+        let (inputs, targets) = self.create_sequences(series)?;
+        crate::forecast::lstm_bptt::train_lstm_readout(
+            &self.lstm,
+            &self.output_layer,
+            &inputs,
+            &targets,
+            epochs,
+            learning_rate,
+        )
     }
 
     /// Forecast future values

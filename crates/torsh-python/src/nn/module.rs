@@ -56,9 +56,16 @@ impl PyModule {
         // Subclasses should implement actual gradient zeroing
     }
 
-    /// Make module callable (forward pass)
-    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
-        self.forward(input)
+    /// Make module callable (forward pass).
+    ///
+    /// Dispatches dynamically through Python attribute lookup so that the
+    /// most-derived `forward` runs — the Rust subclass override (Linear,
+    /// Conv2d, ...) or a user-defined Python `nn.Module` subclass — instead of
+    /// resolving statically to this base `forward` (which is unimplemented).
+    #[pyo3(signature = (input))]
+    fn __call__(slf: &Bound<'_, Self>, input: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let forward = slf.getattr("forward")?;
+        Ok(forward.call1((input,))?.unbind())
     }
 
     /// Forward pass - must be implemented by subclasses

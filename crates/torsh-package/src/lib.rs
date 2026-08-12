@@ -189,8 +189,9 @@ pub use utils::export_module;
 pub use utils::{
     calculate_checksum, calculate_hash, estimate_compression_ratio, format_file_size,
     get_file_extension, get_relative_path, import_module, is_safe_path, normalize_path,
-    parse_content_type, sanitize_filename, validate_package_metadata, validate_package_name,
-    validate_resource_path, validate_version, verify_checksum, MemoryStats, PerformanceTimer,
+    parse_content_type, sanitize_archive_entry_path, sanitize_filename, validate_package_metadata,
+    validate_package_name, validate_resource_path, validate_version, verify_checksum, MemoryStats,
+    PerformanceTimer,
 };
 pub use version::{CompatibilityChecker, PackageVersion, VersionComparator, VersionRequirement};
 pub use vulnerability::{

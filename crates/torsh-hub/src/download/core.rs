@@ -5,7 +5,7 @@
 //! the foundation for more specialized download features.
 
 use futures::stream::{self, StreamExt};
-use reqwest::{blocking::Client as BlockingClient, Client};
+use reqwest::Client;
 use std::fs::{self, File};
 use std::io::{self, Read, SeekFrom, Write};
 use std::path::Path;
@@ -18,7 +18,83 @@ use torsh_core::error::{Result, TorshError};
 
 // Import from our validation and config modules
 use super::config::ParallelDownloadConfig;
-use super::validation::validate_url;
+use super::validation::{validate_url, verify_file_integrity, HashAlgorithm};
+
+/// Verify a completed (blocking) download against an optional expected
+/// SHA-256 hash, then move the temp file to its final destination.
+///
+/// This is the fail-closed integrity gate every synchronous download path
+/// funnels through before a downloaded file becomes visible at `dest_path`:
+///
+/// * `expected_hash` is `Some(hash)` — the temp file's SHA-256 is computed
+///   and compared against `hash` (case-insensitively). On mismatch, or if
+///   hashing itself fails, the temp file is deleted and an `Err` is
+///   returned; the rename to `dest_path` never happens, so a corrupted or
+///   tampered download can never appear at the final path.
+/// * `expected_hash` is `None` — no verification is performed and the file
+///   is renamed into place as before. This is the documented behavior when
+///   no checksum is available for the source (e.g. an arbitrary
+///   caller-supplied URL with no registry metadata); callers that do have a
+///   checksum (see [`crate::model_info::ModelInfo::download_files`]) should
+///   always pass it.
+fn finalize_download_sync(
+    temp_path: &Path,
+    dest_path: &Path,
+    url: &str,
+    expected_hash: Option<&str>,
+) -> Result<()> {
+    if let Some(hash) = expected_hash {
+        let matches = verify_file_integrity(temp_path, Some(hash), None, HashAlgorithm::Sha256)?;
+        if !matches {
+            let _ = fs::remove_file(temp_path);
+            return Err(TorshError::IoError(format!(
+                "SHA-256 integrity check failed for '{}': downloaded content does not match the \
+                 expected hash (possible corruption or tampering); temporary file removed",
+                url
+            )));
+        }
+    }
+
+    fs::rename(temp_path, dest_path)?;
+    Ok(())
+}
+
+/// Async counterpart of [`finalize_download_sync`], used by the
+/// chunked/streaming download paths.
+///
+/// Hashing runs on a blocking-thread-pool task ([`tokio::task::spawn_blocking`])
+/// so verifying a large download does not stall the async executor. See
+/// [`finalize_download_sync`] for the exact fail-closed/absent-hash semantics
+/// (identical here).
+async fn finalize_download_async(
+    temp_path: &Path,
+    dest_path: &Path,
+    url: &str,
+    expected_hash: Option<&str>,
+) -> Result<()> {
+    if let Some(hash) = expected_hash {
+        let verify_path = temp_path.to_path_buf();
+        let hash_owned = hash.to_string();
+        let verify_result: Result<bool> = tokio::task::spawn_blocking(move || {
+            verify_file_integrity(&verify_path, Some(&hash_owned), None, HashAlgorithm::Sha256)
+        })
+        .await
+        .map_err(|e| TorshError::IoError(format!("Integrity verification task failed: {}", e)))?;
+        let matches = verify_result?;
+
+        if !matches {
+            let _ = tokio::fs::remove_file(temp_path).await;
+            return Err(TorshError::IoError(format!(
+                "SHA-256 integrity check failed for '{}': downloaded content does not match the \
+                 expected hash (possible corruption or tampering); temporary file removed",
+                url
+            )));
+        }
+    }
+
+    tokio::fs::rename(temp_path, dest_path).await?;
+    Ok(())
+}
 
 /// Download a file with optional progress reporting (synchronous version)
 ///
@@ -31,10 +107,18 @@ use super::validation::validate_url;
 /// * `url` - The URL to download from
 /// * `dest_path` - The destination file path
 /// * `progress` - Whether to display download progress
+/// * `expected_hash` - Optional expected SHA-256 hash (hex string, case
+///   insensitive) of the downloaded file. When `Some`, the download is
+///   verified against it before being moved to `dest_path`, and the
+///   temporary file is deleted and an `Err` returned on mismatch (fail
+///   closed). When `None`, no integrity verification is performed — this is
+///   the right choice only when no checksum is available for `url`.
 ///
 /// # Returns
-/// * `Ok(())` if the download succeeded
-/// * `Err(TorshError)` if the download failed
+/// * `Ok(())` if the download succeeded (and, when `expected_hash` was
+///   supplied, its integrity was verified)
+/// * `Err(TorshError)` if the download failed, or if `expected_hash` was
+///   supplied and did not match the downloaded content
 ///
 /// # Examples
 /// ```rust,no_run
@@ -44,10 +128,16 @@ use super::validation::validate_url;
 /// let result = download_file(
 ///     "https://example.com/file.txt",
 ///     &std::env::temp_dir().join("downloaded_file.txt"),
-///     true
+///     true,
+///     None,
 /// );
 /// ```
-pub fn download_file(url: &str, dest_path: &Path, progress: bool) -> Result<()> {
+pub fn download_file(
+    url: &str,
+    dest_path: &Path,
+    progress: bool,
+    expected_hash: Option<&str>,
+) -> Result<()> {
     // Validate URL before attempting download
     validate_url(url)?;
 
@@ -57,7 +147,7 @@ pub fn download_file(url: &str, dest_path: &Path, progress: bool) -> Result<()> 
     }
 
     // Create HTTP client
-    let client = BlockingClient::builder()
+    let client = crate::tls::blocking_client_builder()?
         .user_agent("torsh-hub/0.1.0-alpha.2")
         .timeout(std::time::Duration::from_secs(300))
         .build()
@@ -120,8 +210,8 @@ pub fn download_file(url: &str, dest_path: &Path, progress: bool) -> Result<()> 
         println!(); // New line after progress
     }
 
-    // Move temporary file to final destination
-    fs::rename(&temp_path, dest_path)?;
+    // Verify integrity (if requested) and move temporary file to final destination
+    finalize_download_sync(&temp_path, dest_path, url, expected_hash)?;
 
     Ok(())
 }
@@ -137,6 +227,11 @@ pub fn download_file(url: &str, dest_path: &Path, progress: bool) -> Result<()> 
 /// * `dest_path` - The destination file path
 /// * `max_retries` - Maximum number of retry attempts
 /// * `progress` - Whether to display download progress
+/// * `expected_hash` - Optional expected SHA-256 hash; see
+///   [`download_file`] for the exact fail-closed/absent-hash semantics.
+///   Applied on every attempt, so a mismatching hash makes every retry fail
+///   too (retries only help with transient network errors, not a
+///   consistently wrong/tampered source).
 ///
 /// # Returns
 /// * `Ok(())` if the download succeeded (possibly after retries)
@@ -151,7 +246,8 @@ pub fn download_file(url: &str, dest_path: &Path, progress: bool) -> Result<()> 
 ///     "https://example.com/file.txt",
 ///     &std::env::temp_dir().join("downloaded_file.txt"),
 ///     3,  // max 3 retries
-///     true
+///     true,
+///     None,
 /// );
 /// ```
 pub fn download_with_retry(
@@ -159,6 +255,7 @@ pub fn download_with_retry(
     dest_path: &Path,
     max_retries: usize,
     progress: bool,
+    expected_hash: Option<&str>,
 ) -> Result<()> {
     let mut last_error = None;
 
@@ -168,7 +265,7 @@ pub fn download_with_retry(
             std::thread::sleep(std::time::Duration::from_secs(2u64.pow(attempt as u32)));
         }
 
-        match download_file(url, dest_path, progress) {
+        match download_file(url, dest_path, progress, expected_hash) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 last_error = Some(e);
@@ -220,6 +317,10 @@ pub fn print_progress(current: u64, total: u64) {
 /// * `dest_path` - The destination file path
 /// * `config` - Download configuration (chunk size, concurrency, etc.)
 /// * `progress` - Whether to display download progress
+/// * `expected_hash` - Optional expected SHA-256 hash; see
+///   [`download_file`] for the exact fail-closed/absent-hash semantics.
+///   Verified once against the fully assembled file, regardless of whether
+///   the chunked or simple path is taken internally.
 ///
 /// # Returns
 /// * `Ok(())` if the download succeeded
@@ -238,7 +339,8 @@ pub fn print_progress(current: u64, total: u64) {
 ///     "https://example.com/large_file.zip",
 ///     &std::env::temp_dir().join("large_file.zip"),
 ///     config,
-///     true
+///     true,
+///     None,
 /// ).await?;
 /// # Ok(())
 /// # }
@@ -248,6 +350,7 @@ pub async fn download_file_parallel(
     dest_path: &Path,
     config: ParallelDownloadConfig,
     progress: bool,
+    expected_hash: Option<&str>,
 ) -> Result<()> {
     // Validate URL before attempting download
     validate_url(url)?;
@@ -258,7 +361,7 @@ pub async fn download_file_parallel(
     }
 
     // Create async HTTP client
-    let client = Client::builder()
+    let client = crate::tls::client_builder()?
         .user_agent("torsh-hub/0.1.0-alpha.2")
         .timeout(Duration::from_secs(config.timeout_seconds))
         .build()
@@ -289,14 +392,23 @@ pub async fn download_file_parallel(
     if let Some(size) = total_size {
         if supports_range && size > config.chunk_size as u64 * 2 {
             // Use chunked parallel download for large files that support ranges
-            download_file_chunked(&client, url, dest_path, size, config, progress).await
+            download_file_chunked(
+                &client,
+                url,
+                dest_path,
+                size,
+                config,
+                progress,
+                expected_hash,
+            )
+            .await
         } else {
             // Use simple download for small files or servers that don't support ranges
-            download_file_simple(&client, url, dest_path, progress).await
+            download_file_simple(&client, url, dest_path, progress, expected_hash).await
         }
     } else {
         // Unknown size, use simple download
-        download_file_simple(&client, url, dest_path, progress).await
+        download_file_simple(&client, url, dest_path, progress, expected_hash).await
     }
 }
 
@@ -321,6 +433,7 @@ async fn download_file_chunked(
     total_size: u64,
     config: ParallelDownloadConfig,
     progress: bool,
+    expected_hash: Option<&str>,
 ) -> Result<()> {
     let chunk_size = config.chunk_size as u64;
     let num_chunks = total_size.div_ceil(chunk_size);
@@ -404,8 +517,8 @@ async fn download_file_chunked(
         println!(); // New line after progress
     }
 
-    // Move temporary file to final destination
-    tokio::fs::rename(&temp_path, dest_path).await?;
+    // Verify integrity (if requested) and move temporary file to final destination
+    finalize_download_async(&temp_path, dest_path, url, expected_hash).await?;
 
     Ok(())
 }
@@ -530,6 +643,7 @@ async fn download_file_simple(
     url: &str,
     dest_path: &Path,
     progress: bool,
+    expected_hash: Option<&str>,
 ) -> Result<()> {
     // Start download
     let response = client
@@ -583,8 +697,8 @@ async fn download_file_simple(
         println!(); // New line after progress
     }
 
-    // Move temporary file to final destination
-    tokio::fs::rename(&temp_path, dest_path).await?;
+    // Verify integrity (if requested) and move temporary file to final destination
+    finalize_download_async(&temp_path, dest_path, url, expected_hash).await?;
 
     Ok(())
 }

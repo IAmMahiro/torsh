@@ -2,6 +2,8 @@
 
 use crate::{FxGraph, Node, TorshResult};
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
+use std::collections::HashSet;
 use torsh_core::error::TorshError;
 
 /// Pattern matcher for subgraphs
@@ -216,16 +218,77 @@ impl SubgraphRewriter {
     }
 
     /// Apply a specific pattern to the graph
+    ///
+    /// Matches are recomputed after every rewrite: applying one rewrite rebuilds the
+    /// graph, which would leave any previously collected `NodeIndex` dangling.
     fn apply_pattern(&self, graph: &mut FxGraph, pattern: &SubgraphPattern) -> TorshResult<usize> {
         let matcher = PatternMatcher::new(pattern.clone());
-        let matches = matcher.find_matches(graph);
-        let match_count = matches.len();
+        let mut replacements = 0;
+        // The replacement operation never matches the pattern's first operation, so
+        // this terminates; the budget only guards against pathological patterns.
+        let mut budget = graph.node_count() + 1;
 
-        for pattern_match in matches {
-            self.replace_match(graph, &pattern_match)?;
+        while budget > 0 {
+            budget -= 1;
+
+            let next_match = matcher
+                .find_matches(graph)
+                .into_iter()
+                .find(|candidate| Self::is_legal_match(graph, candidate));
+
+            match next_match {
+                Some(pattern_match) => {
+                    self.replace_match(graph, &pattern_match)?;
+                    replacements += 1;
+                }
+                None => break,
+            }
         }
 
-        Ok(match_count)
+        Ok(replacements)
+    }
+
+    /// Check that a match can be fused without changing the meaning of the graph
+    ///
+    /// A match is legal when it is a simple chain of distinct nodes whose length
+    /// equals the pattern length, every consecutive pair is connected, and no node
+    /// except the last one is consumed from outside the match (fusing a value that
+    /// other operations still read would silently feed them the fused result).
+    fn is_legal_match(graph: &FxGraph, pattern_match: &PatternMatch) -> bool {
+        let nodes = &pattern_match.nodes;
+        if nodes.len() != pattern_match.pattern.operations.len() || nodes.is_empty() {
+            return false;
+        }
+
+        let unique: HashSet<NodeIndex> = nodes.iter().copied().collect();
+        if unique.len() != nodes.len() {
+            return false;
+        }
+
+        for (position, &node_idx) in nodes.iter().enumerate() {
+            match graph.get_node(node_idx) {
+                Some(Node::Call(op_name, _))
+                    if *op_name == pattern_match.pattern.operations[position] => {}
+                _ => return false,
+            }
+
+            if position + 1 < nodes.len() {
+                let next_idx = nodes[position + 1];
+                if graph.graph.find_edge(node_idx, next_idx).is_none() {
+                    return false;
+                }
+                // Everything the fused nodes produce is consumed inside the match.
+                let consumers: HashSet<NodeIndex> = graph
+                    .graph
+                    .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
+                    .collect();
+                if consumers.len() != 1 || !consumers.contains(&next_idx) {
+                    return false;
+                }
+            }
+        }
+
+        true
     }
 
     /// Replace a matched pattern with the replacement operation
@@ -235,41 +298,59 @@ impl SubgraphRewriter {
         }
 
         let first_node_idx = pattern_match.nodes[0];
-        let _last_node_idx = *pattern_match
-            .nodes
-            .last()
-            .expect("pattern_match.nodes should not be empty");
+        let matched: HashSet<NodeIndex> = pattern_match.nodes.iter().copied().collect();
 
         // Get the arguments from the first node
-        let args = if let Some(Node::Call(_, args)) = graph.get_node(first_node_idx) {
+        let mut args = if let Some(Node::Call(_, args)) = graph.get_node(first_node_idx) {
             args.clone()
         } else {
             vec![]
         };
 
-        // Replace the first node with the fused operation
-        graph.graph[first_node_idx] = Node::Call(pattern_match.pattern.replacement.clone(), args);
-
-        // Remove intermediate nodes (keeping first, removing rest)
+        // Rewire the folded nodes' external neighbours onto the fused node before
+        // anything is deleted: incoming edges from outside the pattern (weights,
+        // running statistics, ...) are real inputs of the fused operation and must
+        // not be dropped along with the node that used to consume them.
         for &node_idx in &pattern_match.nodes[1..] {
-            // Redirect edges from the removed node to the fused node
-            let successors: Vec<_> = graph
+            let incoming: Vec<(NodeIndex, crate::Edge)> = graph
                 .graph
-                .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
+                .edges_directed(node_idx, petgraph::Direction::Incoming)
+                .filter(|edge| !matched.contains(&edge.source()))
+                .map(|edge| (edge.source(), edge.weight().clone()))
                 .collect();
-
-            for successor_idx in successors {
-                // Find the edge between node_idx and successor_idx
-                if let Some(edge_idx) = graph.graph.find_edge(node_idx, successor_idx) {
-                    let edge = graph.graph[edge_idx].clone();
-                    // Remove old edge and add new edge from fused node
-                    graph.graph.remove_edge(edge_idx);
-                    graph.graph.add_edge(first_node_idx, successor_idx, edge);
+            for (source_idx, weight) in incoming {
+                if !args.contains(&weight.name) {
+                    args.push(weight.name.clone());
+                }
+                if graph.graph.find_edge(source_idx, first_node_idx).is_none() {
+                    graph.graph.add_edge(source_idx, first_node_idx, weight);
                 }
             }
 
-            // Remove the node
-            graph.graph.remove_node(node_idx);
+            let outgoing: Vec<(NodeIndex, crate::Edge)> = graph
+                .graph
+                .edges_directed(node_idx, petgraph::Direction::Outgoing)
+                .filter(|edge| !matched.contains(&edge.target()))
+                .map(|edge| (edge.target(), edge.weight().clone()))
+                .collect();
+            for (target_idx, weight) in outgoing {
+                if graph.graph.find_edge(first_node_idx, target_idx).is_none() {
+                    graph.graph.add_edge(first_node_idx, target_idx, weight);
+                }
+            }
+
+            // The fused node now produces what this node produced.
+            graph.redirect_boundary_node(node_idx, first_node_idx);
+        }
+
+        // Replace the first node with the fused operation
+        graph.graph[first_node_idx] = Node::Call(pattern_match.pattern.replacement.clone(), args);
+
+        // Remove the folded nodes in one batch through FxGraph, which keeps the
+        // input/output lists valid.
+        let to_remove: HashSet<NodeIndex> = pattern_match.nodes[1..].iter().copied().collect();
+        if !to_remove.is_empty() {
+            graph.remove_nodes(&to_remove);
         }
 
         Ok(())

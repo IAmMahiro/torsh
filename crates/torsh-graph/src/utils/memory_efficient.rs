@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 use super::tensor_to_vec2;
 use crate::GraphData;
 use torsh_core::device::DeviceType;
+use torsh_core::error::Result;
 use torsh_tensor::{
     creation::{from_vec, zeros},
     Tensor,
@@ -56,16 +57,14 @@ impl SparseGraph {
     /// The matrix is interpreted as a `rows x cols` tensor; `num_nodes` is taken
     /// from the number of rows. Entries are scanned in row-major order so the
     /// resulting `edge_list` is sorted by `(row, col)`.
-    pub fn from_dense(adjacency: &Tensor, threshold: f32) -> Self {
+    pub fn from_dense(adjacency: &Tensor, threshold: f32) -> Result<Self> {
         let shape = adjacency.shape();
         let dims = shape.dims();
-        let rows = dims[0];
+        let rows = dims.first().copied().unwrap_or(0);
         let cols = if dims.len() > 1 { dims[1] } else { 1 };
         let num_nodes = rows;
 
-        let data = adjacency
-            .to_vec()
-            .expect("dense adjacency tensor must be convertible to a vector");
+        let data = adjacency.to_vec()?;
 
         let mut edge_list = Vec::new();
         let mut edge_weights = Vec::new();
@@ -82,13 +81,13 @@ impl SparseGraph {
         }
 
         let num_edges = edge_list.len();
-        Self {
+        Ok(Self {
             edge_list,
             node_features: None,
             edge_weights: Some(edge_weights),
             num_nodes,
             num_edges,
-        }
+        })
     }
 
     /// Convert the stored coordinates into a `[2, num_edges]` edge-index tensor.
@@ -96,9 +95,9 @@ impl SparseGraph {
     /// The first row holds source indices and the second holds destinations,
     /// matching the convention used by [`GraphData`]. An empty graph yields a
     /// `[2, 0]` tensor.
-    pub fn to_edge_index(&self) -> Tensor {
+    pub fn to_edge_index(&self) -> Result<Tensor> {
         if self.edge_list.is_empty() {
-            return zeros(&[2, 0]).expect("zeros([2, 0]) is a valid empty edge index");
+            return Ok(zeros(&[2, 0])?);
         }
 
         let mut edge_vec = Vec::with_capacity(2 * self.edge_list.len());
@@ -109,8 +108,11 @@ impl SparseGraph {
             edge_vec.push(dst as f32);
         }
 
-        from_vec(edge_vec, &[2, self.edge_list.len()], DeviceType::Cpu)
-            .expect("edge buffer length matches [2, num_edges]")
+        Ok(from_vec(
+            edge_vec,
+            &[2, self.edge_list.len()],
+            DeviceType::Cpu,
+        )?)
     }
 
     /// Total memory occupied by this representation, in bytes.
@@ -155,87 +157,81 @@ impl SparseGraph {
 /// `L = D - A`; with `normalized == true` it returns the symmetric normalized
 /// Laplacian `L = I - D^{-1/2} A D^{-1/2}`.
 ///
-/// Node degrees are accumulated treating each column of `edge_index` as an
-/// undirected edge (both endpoints gain one degree), and each undirected edge
-/// contributes the matching symmetric off-diagonal entries. The result matches
-/// the dense [`graph_laplacian`](super::graph_laplacian) for self-loop-free
-/// graphs while only storing the non-zero entries.
-pub fn sparse_laplacian(edge_index: &Tensor, num_nodes: usize, normalized: bool) -> SparseGraph {
-    let edge_data =
-        tensor_to_vec2::<f32>(edge_index).expect("edge_index must be a 2 x num_edges tensor");
+/// The adjacency is symmetrized and de-duplicated first, and node degrees are
+/// the row sums of that adjacency, so an undirected edge listed once and the
+/// same edge listed in both directions produce the same operator. The result
+/// matches the dense [`graph_laplacian`](super::graph_laplacian) entry for
+/// entry while only storing the non-zero entries.
+///
+/// # Errors
+/// Returns an error when `edge_index` is not a `[2, num_edges]` tensor.
+pub fn sparse_laplacian(
+    edge_index: &Tensor,
+    num_nodes: usize,
+    normalized: bool,
+) -> Result<SparseGraph> {
+    let (src_row, dst_row) = super::edge_rows(edge_index)?;
 
-    let src_row: &[f32] = edge_data.first().map(|r| r.as_slice()).unwrap_or(&[]);
-    let dst_row: &[f32] = edge_data.get(1).map(|r| r.as_slice()).unwrap_or(&[]);
-
-    // Undirected degree accumulation (matches the dense reference).
-    let mut degrees = vec![0usize; num_nodes];
+    // De-duplicated, symmetric adjacency; degrees are the resulting row sums so
+    // listing an undirected edge once or in both directions gives the same
+    // operator (matching the dense `graph_laplacian`).
+    let mut neighbors: Vec<HashSet<usize>> = vec![HashSet::new(); num_nodes];
     for (&src, &dst) in src_row.iter().zip(dst_row.iter()) {
+        if src < 0.0 || dst < 0.0 {
+            continue;
+        }
         let s = src as usize;
         let d = dst as usize;
         if s < num_nodes && d < num_nodes {
-            degrees[s] += 1;
-            degrees[d] += 1;
+            neighbors[s].insert(d);
+            neighbors[d].insert(s);
         }
     }
+
+    let degrees: Vec<f32> = neighbors.iter().map(|row| row.len() as f32).collect();
 
     let mut edges: Vec<(usize, usize)> = Vec::new();
     let mut values: Vec<f32> = Vec::new();
 
-    if normalized {
-        // Diagonal: identity.
-        for i in 0..num_nodes {
-            edges.push((i, i));
-            values.push(1.0);
-        }
-        // Off-diagonal: -1 / sqrt(deg_i * deg_j).
-        for (&src, &dst) in src_row.iter().zip(dst_row.iter()) {
-            let s = src as usize;
-            let d = dst as usize;
-            if s >= num_nodes || d >= num_nodes {
-                continue;
-            }
-            let weight = if degrees[s] > 0 && degrees[d] > 0 {
-                -1.0 / ((degrees[s] as f32).sqrt() * (degrees[d] as f32).sqrt())
+    for i in 0..num_nodes {
+        let self_loop = if neighbors[i].contains(&i) { 1.0 } else { 0.0 };
+        let diagonal = if normalized {
+            if degrees[i] > 0.0 {
+                1.0 - self_loop / degrees[i]
             } else {
-                0.0
+                1.0
+            }
+        } else {
+            degrees[i] - self_loop
+        };
+        edges.push((i, i));
+        values.push(diagonal);
+
+        let mut row: Vec<usize> = neighbors[i].iter().copied().filter(|&j| j != i).collect();
+        row.sort_unstable();
+        for j in row {
+            let weight = if normalized {
+                if degrees[i] > 0.0 && degrees[j] > 0.0 {
+                    -1.0 / (degrees[i].sqrt() * degrees[j].sqrt())
+                } else {
+                    0.0
+                }
+            } else {
+                -1.0
             };
-            edges.push((s, d));
+            edges.push((i, j));
             values.push(weight);
-            if s != d {
-                edges.push((d, s));
-                values.push(weight);
-            }
-        }
-    } else {
-        // Diagonal: node degree.
-        for (i, &deg) in degrees.iter().enumerate() {
-            edges.push((i, i));
-            values.push(deg as f32);
-        }
-        // Off-diagonal: -1 for each adjacency entry.
-        for (&src, &dst) in src_row.iter().zip(dst_row.iter()) {
-            let s = src as usize;
-            let d = dst as usize;
-            if s >= num_nodes || d >= num_nodes {
-                continue;
-            }
-            edges.push((s, d));
-            values.push(-1.0);
-            if s != d {
-                edges.push((d, s));
-                values.push(-1.0);
-            }
         }
     }
 
     let num_edges = edges.len();
-    SparseGraph {
+    Ok(SparseGraph {
         edge_list: edges,
         node_features: None,
         edge_weights: Some(values),
         num_nodes,
         num_edges,
-    }
+    })
 }
 
 /// Find the representative of `x` with path compression.
@@ -280,19 +276,19 @@ fn uf_union(parent: &mut [usize], rank: &mut [u8], a: usize, b: usize) {
 ///
 /// If `graph.num_nodes <= target_nodes` the graph is returned unchanged. A
 /// `target_nodes` of `0` is treated as `1` so the result is never empty.
-pub fn adaptive_coarsening(graph: &GraphData, target_nodes: usize) -> GraphData {
+pub fn adaptive_coarsening(graph: &GraphData, target_nodes: usize) -> Result<GraphData> {
     let n = graph.num_nodes;
     // Never collapse to an empty graph.
     let target = target_nodes.max(1);
 
     if n <= target {
-        return graph.clone();
+        return Ok(graph.clone());
     }
 
     let num_features = graph.x.shape().dims()[1];
 
     // --- Greedy edge-contraction via union-find -------------------------------
-    let adjacency = super::connectivity::build_adjacency_list(&graph.edge_index, n);
+    let adjacency = super::connectivity::build_adjacency_list(&graph.edge_index, n)?;
     let mut parent: Vec<usize> = (0..n).collect();
     let mut rank: Vec<u8> = vec![0; n];
     let mut num_components = n;
@@ -335,7 +331,7 @@ pub fn adaptive_coarsening(graph: &GraphData, target_nodes: usize) -> GraphData 
                 representatives.push(root);
             }
         }
-        let anchor = representatives[0];
+        let anchor = representatives.first().copied().unwrap_or(0);
         let mut idx = representatives.len();
         while num_components > target && idx > 1 {
             idx -= 1;
@@ -360,10 +356,7 @@ pub fn adaptive_coarsening(graph: &GraphData, target_nodes: usize) -> GraphData 
     let num_coarse = root_to_cluster.len();
 
     // --- Mean-aggregate features within each cluster --------------------------
-    let x_flat = graph
-        .x
-        .to_vec()
-        .expect("node feature tensor must be convertible to a vector");
+    let x_flat = graph.x.to_vec()?;
     let mut coarse_features = vec![0.0f32; num_coarse * num_features];
     let mut cluster_sizes = vec![0usize; num_coarse];
     for (node, &cluster_id) in node_to_cluster.iter().enumerate() {
@@ -385,8 +378,7 @@ pub fn adaptive_coarsening(graph: &GraphData, target_nodes: usize) -> GraphData 
     }
 
     // --- Build coarsened edges (undirected, de-duplicated, no self-loops) -----
-    let edge_data = tensor_to_vec2::<f32>(&graph.edge_index)
-        .expect("edge_index must be a 2 x num_edges tensor");
+    let edge_data = tensor_to_vec2::<f32>(&graph.edge_index)?;
     let mut edge_set: HashSet<(usize, usize)> = HashSet::new();
     if edge_data.len() >= 2 {
         for (&src, &dst) in edge_data[0].iter().zip(edge_data[1].iter()) {
@@ -409,8 +401,7 @@ pub fn adaptive_coarsening(graph: &GraphData, target_nodes: usize) -> GraphData 
         coarse_features,
         &[num_coarse, num_features],
         DeviceType::Cpu,
-    )
-    .expect("coarse feature buffer matches [num_coarse, num_features]");
+    )?;
 
     let coarse_edge_index = if num_coarse_edges > 0 {
         let mut edge_vec = Vec::with_capacity(2 * num_coarse_edges);
@@ -420,13 +411,12 @@ pub fn adaptive_coarsening(graph: &GraphData, target_nodes: usize) -> GraphData 
         for &(_, dst) in &coarse_edges {
             edge_vec.push(dst as f32);
         }
-        from_vec(edge_vec, &[2, num_coarse_edges], DeviceType::Cpu)
-            .expect("coarse edge buffer matches [2, num_coarse_edges]")
+        from_vec(edge_vec, &[2, num_coarse_edges], DeviceType::Cpu)?
     } else {
-        zeros(&[2, 0]).expect("zeros([2, 0]) is a valid empty edge index")
+        zeros(&[2, 0])?
     };
 
-    GraphData::new(coarse_x, coarse_edge_index)
+    Ok(GraphData::new(coarse_x, coarse_edge_index))
 }
 
 /// Mean-aggregate each node's neighbor features.
@@ -438,15 +428,12 @@ pub fn adaptive_coarsening(graph: &GraphData, target_nodes: usize) -> GraphData 
 /// the output is always well defined and finite for finite inputs.
 ///
 /// The returned tensor has shape `[num_nodes, num_features]`.
-pub fn chunked_neighbor_aggregation(graph: &GraphData, chunk_size: usize) -> Tensor {
+pub fn chunked_neighbor_aggregation(graph: &GraphData, chunk_size: usize) -> Result<Tensor> {
     let n = graph.num_nodes;
     let num_features = if n == 0 { 0 } else { graph.x.shape().dims()[1] };
 
-    let x_flat = graph
-        .x
-        .to_vec()
-        .expect("node feature tensor must be convertible to a vector");
-    let adjacency = super::connectivity::build_adjacency_list(&graph.edge_index, n);
+    let x_flat = graph.x.to_vec()?;
+    let adjacency = super::connectivity::build_adjacency_list(&graph.edge_index, n)?;
     let chunk = chunk_size.max(1);
     let mut out = vec![0.0f32; n * num_features];
 
@@ -476,8 +463,7 @@ pub fn chunked_neighbor_aggregation(graph: &GraphData, chunk_size: usize) -> Ten
         start = end;
     }
 
-    from_vec(out, &[n, num_features], DeviceType::Cpu)
-        .expect("aggregated feature buffer matches [num_nodes, num_features]")
+    Ok(from_vec(out, &[n, num_features], DeviceType::Cpu)?)
 }
 
 #[cfg(test)]
@@ -512,7 +498,7 @@ mod tests {
         )
         .unwrap();
 
-        let sparse = SparseGraph::from_dense(&dense, 0.1);
+        let sparse = SparseGraph::from_dense(&dense, 0.1).expect("operation should succeed");
         assert_eq!(sparse.num_nodes, 3);
         assert_eq!(sparse.num_edges, 2);
         assert_eq!(sparse.edge_list, vec![(0, 1), (2, 0)]);
@@ -528,7 +514,7 @@ mod tests {
         // An all-zero adjacency produces no stored edges, but the structure
         // itself still occupies memory.
         let dense = zeros(&[4, 4]).unwrap();
-        let sparse = SparseGraph::from_dense(&dense, 0.1);
+        let sparse = SparseGraph::from_dense(&dense, 0.1).expect("operation should succeed");
         assert_eq!(sparse.num_edges, 0);
         assert!(sparse.memory_footprint() > 0);
         assert_eq!(sparse.density(), 0.0);
@@ -548,9 +534,11 @@ mod tests {
             DeviceType::Cpu,
         )
         .unwrap();
-        let full = SparseGraph::from_dense(&dense, 0.1);
+        let full = SparseGraph::from_dense(&dense, 0.1).expect("operation should succeed");
         assert_eq!(full.num_edges, 12);
-        assert!(full.memory_footprint() > empty.memory_footprint());
+        assert!(
+            full.memory_footprint() > empty.expect("operation should succeed").memory_footprint()
+        );
         assert!((full.density() - 12.0 / 16.0).abs() < 1e-6);
     }
 
@@ -566,8 +554,8 @@ mod tests {
             DeviceType::Cpu,
         )
         .unwrap();
-        let sparse = SparseGraph::from_dense(&dense, 0.5);
-        let edge_index = sparse.to_edge_index();
+        let sparse = SparseGraph::from_dense(&dense, 0.5).unwrap();
+        let edge_index = sparse.to_edge_index().unwrap();
         assert_eq!(edge_index.shape().dims(), &[2, 3]);
         let rows = tensor_to_vec2::<f32>(&edge_index).unwrap();
         assert_eq!(rows[0], vec![0.0, 1.0, 2.0]);
@@ -576,15 +564,52 @@ mod tests {
 
     #[test]
     fn to_edge_index_empty_is_two_by_zero() {
-        let sparse = SparseGraph::from_dense(&zeros(&[3, 3]).unwrap(), 0.5);
-        let edge_index = sparse.to_edge_index();
+        let sparse = SparseGraph::from_dense(&zeros(&[3, 3]).unwrap(), 0.5).unwrap();
+        let edge_index = sparse.to_edge_index().unwrap();
         assert_eq!(edge_index.shape().dims(), &[2, 0]);
+    }
+
+    fn self_loop_edge_index() -> Tensor {
+        // Triangle 0-1-2 listed in both directions plus a self-loop on node 0.
+        from_vec(
+            vec![
+                0.0, 1.0, 1.0, 2.0, 2.0, 0.0, 0.0, 1.0, 0.0, 2.0, 1.0, 0.0, 2.0, 0.0,
+            ],
+            &[2, 7],
+            DeviceType::Cpu,
+        )
+        .unwrap()
+    }
+
+    fn assert_sparse_matches_dense(edge_index: &Tensor, num_nodes: usize, normalized: bool) {
+        let sparse = sparse_laplacian(edge_index, num_nodes, normalized).unwrap();
+        let weights = sparse.edge_weights.as_ref().unwrap();
+        assert!(weights.iter().all(|w| w.is_finite()));
+
+        let mut reconstructed = vec![0.0f32; num_nodes * num_nodes];
+        for (&(row, col), &value) in sparse.edge_list.iter().zip(weights.iter()) {
+            reconstructed[row * num_nodes + col] += value;
+        }
+        let reference = graph_laplacian(edge_index, num_nodes, normalized)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        for (got, want) in reconstructed.iter().zip(reference.iter()) {
+            assert!((got - want).abs() < 1e-6, "sparse {got} vs dense {want}");
+        }
+    }
+
+    #[test]
+    fn sparse_laplacian_matches_dense_with_self_loops() {
+        let edge_index = self_loop_edge_index();
+        assert_sparse_matches_dense(&edge_index, 3, false);
+        assert_sparse_matches_dense(&edge_index, 3, true);
     }
 
     #[test]
     fn sparse_unnormalized_laplacian_matches_dense_reference() {
         let edge_index = cycle4_edge_index();
-        let sparse = sparse_laplacian(&edge_index, 4, false);
+        let sparse = sparse_laplacian(&edge_index, 4, false).unwrap();
         let weights = sparse.edge_weights.as_ref().unwrap();
         assert!(weights.iter().all(|w| w.is_finite()));
 
@@ -594,7 +619,10 @@ mod tests {
         for (&(row, col), &value) in sparse.edge_list.iter().zip(weights.iter()) {
             reconstructed[row * 4 + col] += value;
         }
-        let reference = graph_laplacian(&edge_index, 4, false).to_vec().unwrap();
+        let reference = graph_laplacian(&edge_index, 4, false)
+            .unwrap()
+            .to_vec()
+            .unwrap();
         for (got, want) in reconstructed.iter().zip(reference.iter()) {
             assert!((got - want).abs() < 1e-6, "sparse {got} vs dense {want}");
         }
@@ -603,7 +631,7 @@ mod tests {
     #[test]
     fn sparse_normalized_laplacian_matches_dense_reference() {
         let edge_index = cycle4_edge_index();
-        let sparse = sparse_laplacian(&edge_index, 4, true);
+        let sparse = sparse_laplacian(&edge_index, 4, true).unwrap();
         let weights = sparse.edge_weights.as_ref().unwrap();
         assert!(weights.iter().all(|w| w.is_finite()));
 
@@ -611,7 +639,10 @@ mod tests {
         for (&(row, col), &value) in sparse.edge_list.iter().zip(weights.iter()) {
             reconstructed[row * 4 + col] += value;
         }
-        let reference = graph_laplacian(&edge_index, 4, true).to_vec().unwrap();
+        let reference = graph_laplacian(&edge_index, 4, true)
+            .unwrap()
+            .to_vec()
+            .unwrap();
         for (got, want) in reconstructed.iter().zip(reference.iter()) {
             assert!((got - want).abs() < 1e-6, "sparse {got} vs dense {want}");
         }
@@ -622,7 +653,7 @@ mod tests {
         let x = from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2], DeviceType::Cpu).unwrap();
         let edge_index = from_vec(vec![0.0, 1.0], &[2, 1], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(x, edge_index);
-        let coarsened = adaptive_coarsening(&graph, 5);
+        let coarsened = adaptive_coarsening(&graph, 5).unwrap();
         assert_eq!(coarsened.num_nodes, 2);
     }
 
@@ -641,7 +672,7 @@ mod tests {
         )
         .unwrap();
         let graph = GraphData::new(x, cycle4_edge_index());
-        let coarsened = adaptive_coarsening(&graph, 2);
+        let coarsened = adaptive_coarsening(&graph, 2).unwrap();
 
         assert_eq!(coarsened.num_nodes, 2);
         let vals = coarsened.x.to_vec().unwrap();
@@ -660,7 +691,7 @@ mod tests {
     fn coarsening_to_one_node_averages_everything() {
         let x = from_vec(vec![1.0, 3.0, 5.0, 7.0], &[4, 1], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(x, cycle4_edge_index());
-        let coarsened = adaptive_coarsening(&graph, 1);
+        let coarsened = adaptive_coarsening(&graph, 1).unwrap();
         assert_eq!(coarsened.num_nodes, 1);
         let vals = coarsened.x.to_vec().unwrap();
         assert!((vals[0] - 4.0).abs() < 1e-6);
@@ -673,7 +704,7 @@ mod tests {
         let x = from_vec(vec![1.0, 2.0, 3.0, 4.0], &[4, 1], DeviceType::Cpu).unwrap();
         let edge_index = zeros(&[2, 0]).unwrap();
         let graph = GraphData::new(x, edge_index);
-        let coarsened = adaptive_coarsening(&graph, 2);
+        let coarsened = adaptive_coarsening(&graph, 2).unwrap();
         assert_eq!(coarsened.num_nodes, 2);
         let vals = coarsened.x.to_vec().unwrap();
         assert!(vals.iter().all(|v| v.is_finite()));
@@ -704,6 +735,7 @@ mod tests {
 
         for chunk in [1usize, 2, 3, 100] {
             let out = chunked_neighbor_aggregation(&graph, chunk)
+                .unwrap()
                 .to_vec()
                 .unwrap();
             assert_eq!(out.len(), naive.len());
@@ -718,7 +750,10 @@ mod tests {
         let x = from_vec(vec![5.0, 9.0], &[2, 1], DeviceType::Cpu).unwrap();
         let edge_index = zeros(&[2, 0]).unwrap();
         let graph = GraphData::new(x, edge_index);
-        let out = chunked_neighbor_aggregation(&graph, 1).to_vec().unwrap();
+        let out = chunked_neighbor_aggregation(&graph, 1)
+            .unwrap()
+            .to_vec()
+            .unwrap();
         assert_eq!(out, vec![5.0, 9.0]);
     }
 }

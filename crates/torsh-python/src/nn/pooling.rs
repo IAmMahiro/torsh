@@ -20,6 +20,7 @@ pub struct PyMaxPool2d {
 #[pymethods]
 impl PyMaxPool2d {
     #[new]
+    #[pyo3(signature = (kernel_size, stride=None, padding=None, dilation=None, ceil_mode=None, return_indices=None))]
     fn new(
         kernel_size: Py<PyAny>,
         stride: Option<Py<PyAny>>,
@@ -216,6 +217,7 @@ pub struct PyAvgPool2d {
 #[pymethods]
 impl PyAvgPool2d {
     #[new]
+    #[pyo3(signature = (kernel_size, stride=None, padding=None, ceil_mode=None, count_include_pad=None, divisor_override=None))]
     fn new(
         kernel_size: Py<PyAny>,
         stride: Option<Py<PyAny>>,
@@ -410,6 +412,7 @@ pub struct PyAdaptiveAvgPool2d {
 #[pymethods]
 impl PyAdaptiveAvgPool2d {
     #[new]
+    #[pyo3(signature = (output_size))]
     fn new(output_size: Py<PyAny>) -> PyResult<PyClassInitializer<Self>> {
         // Parse output size
         let output_size = Python::attach(|py| -> PyResult<(usize, usize)> {
@@ -512,6 +515,7 @@ pub struct PyAdaptiveMaxPool2d {
 #[pymethods]
 impl PyAdaptiveMaxPool2d {
     #[new]
+    #[pyo3(signature = (output_size, return_indices=None))]
     fn new(
         output_size: Py<PyAny>,
         return_indices: Option<bool>,
