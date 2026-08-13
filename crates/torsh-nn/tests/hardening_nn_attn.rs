@@ -372,32 +372,38 @@ fn f133_lstm_stacking_preserves_timestep_values() {
 }
 
 #[test]
-fn f133_rnn_gradient_gap_is_upstream_of_stacking() {
-    // Characterisation test for the remaining RNN autograd gap.
-    //
-    // The recurrent graph is severed *inside* the cell, where `narrow` splits
-    // the gate pre-activations: torsh-tensor rebuilds a slice through
-    // `from_data`, producing a fresh leaf. Replacing the output stacking with a
-    // graph-preserving `Tensor::stack` therefore changes nothing observable
-    // until a differentiable narrow/slice exists.
-    //
-    // When torsh-tensor gains that primitive this assertion must be flipped to
-    // require a real gradient.
+fn f133_rnn_gradients_reach_the_weights_through_stacking() {
+    // This used to be a characterisation test asserting the opposite, on the
+    // theory that "the recurrent graph is severed inside the cell, where
+    // `narrow` splits the gate pre-activations". That diagnosis was wrong:
+    // `narrow` records a `Gather` and matches finite differences. The actual
+    // cut was the output stacking, which rebuilt its result through
+    // `Tensor::from_vec`. `stack_time_major` now goes through `Tensor::stack`,
+    // so backpropagation-through-time reaches every weight; the numeric
+    // gradcheck lives in `hardening_nn_recurrent.rs`.
     let lstm = LSTM::new(2, 2, 1).expect("lstm");
     let input = Tensor::from_vec(vec![1.0f32, 1.0, 2.0, 2.0], &[2, 1, 2])
         .expect("input")
         .requires_grad_(true);
 
     let output = lstm.forward(&input).expect("forward");
-    let backward = output.sum().expect("sum").backward();
+    assert!(
+        output.requires_grad(),
+        "the stacked LSTM output must stay on the autograd graph"
+    );
+    output.sum().expect("sum").backward().expect("backward");
 
     let params = lstm.named_parameters();
-    let weight = params.get("weight_ih_l0").expect("weight");
-    let has_grad = weight.tensor().read().grad().is_some();
+    for name in ["weight_ih_l0", "weight_hh_l0", "bias_ih_l0", "bias_hh_l0"] {
+        let param = params.get(name).expect("parameter");
+        assert!(
+            param.tensor().read().grad().is_some(),
+            "{name} must receive a gradient"
+        );
+    }
     assert!(
-        backward.is_err() || !has_grad,
-        "RNN weight gradients now flow: flip this characterisation test and drop the \
-         to_vec/from_vec stacking in favour of a graph-preserving Tensor::stack"
+        input.grad().is_some(),
+        "the input sequence must receive a gradient"
     );
 }
 

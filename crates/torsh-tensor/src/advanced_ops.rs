@@ -19,7 +19,10 @@ use torsh_core::{
     error::{Result, TorshError},
 };
 
-use crate::{core_ops::Tensor, storage::TensorStorage};
+use crate::{
+    core_ops::{Tensor, UnaryKind},
+    storage::TensorStorage,
+};
 
 /// Element count above which a full-tensor sum is folded in parallel chunks.
 const PARALLEL_SUM_THRESHOLD: usize = 65_536;
@@ -259,8 +262,24 @@ impl<T: TensorElement + Copy> Tensor<T> {
 
     /// Transpose operation (2D tensor)
     ///
-    /// Uses a cache-blocked copy so that both the read and the write stream stay
-    /// inside one cache tile, which matters for the matmul operands this feeds.
+    /// Produces exactly what [`Tensor::transpose(0, 1)`](Tensor::transpose)
+    /// produces, including its autograd node: a transpose is the permutation
+    /// that swaps the two axes, recorded as
+    /// [`ViewKind::Permute`](crate::core_ops::ViewKind::Permute) so the backward
+    /// pass permutes the gradient straight back. Building the result with a
+    /// private `from_data` copy instead — which is what this used to do — made
+    /// `t()` an honestly-detached leaf: `x.t()` came back with
+    /// `requires_grad == false` even from a `requires_grad` input, so any loss
+    /// routed through a transpose silently lost its gradient path.
+    ///
+    /// The rank check is kept: unlike `transpose`, `t()` is defined only for
+    /// matrices and still rejects any other rank.
+    ///
+    /// # Layout
+    /// The result is a *strided view* of `self`, exactly like `transpose`'s (no
+    /// data is copied). Callers that need a packed buffer call `.contiguous()`;
+    /// callers that read it through [`Tensor::to_vec`] or
+    /// `with_contiguous_data` see the transposed order either way.
     pub fn t(&self) -> Result<Self>
     where
         T: Copy + num_traits::Zero,
@@ -274,26 +293,7 @@ impl<T: TensorElement + Copy> Tensor<T> {
             ));
         }
 
-        let (rows, cols) = (dims[0], dims[1]);
-        const TILE: usize = 32;
-
-        let transposed_data = self.with_contiguous_data(|data| {
-            let mut out = vec![num_traits::Zero::zero(); data.len()];
-            for row_block in (0..rows).step_by(TILE) {
-                let row_end = (row_block + TILE).min(rows);
-                for col_block in (0..cols).step_by(TILE) {
-                    let col_end = (col_block + TILE).min(cols);
-                    for i in row_block..row_end {
-                        for j in col_block..col_end {
-                            out[j * rows + i] = data[i * cols + j];
-                        }
-                    }
-                }
-            }
-            Ok(out)
-        })?;
-
-        Self::from_data(transposed_data, vec![cols, rows], self.device)
+        self.transpose(0, 1)
     }
 
     /// Check if two tensors share the same underlying storage
@@ -302,6 +302,13 @@ impl<T: TensorElement + Copy> Tensor<T> {
         match (&self.storage, &other.storage) {
             (TensorStorage::InMemory(a), TensorStorage::InMemory(b)) => Arc::ptr_eq(a, b),
             (TensorStorage::MemoryMapped(a), TensorStorage::MemoryMapped(b)) => Arc::ptr_eq(a, b),
+            // Without this arm the catch-all below would report two aliases of
+            // one device allocation as unshared, and `make_unique` would skip a
+            // copy it needs.
+            #[cfg(feature = "gpu")]
+            (TensorStorage::Device { buffer: a, .. }, TensorStorage::Device { buffer: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
             _ => false,
         }
     }
@@ -466,6 +473,15 @@ impl<T: TensorElement + Copy> Tensor<T> {
                 let promoted = storage.with_slice(TensorStorage::aligned_from_slice)?;
                 self.storage = promoted;
             }
+            #[cfg(feature = "gpu")]
+            TensorStorage::Device { .. } => {
+                // A device buffer is immutable and has no offset-capable write
+                // primitive, so making a tensor writable *always* means moving
+                // it back to the host. The download is the storage's cached one,
+                // so this costs at most a single transfer.
+                let data_vec = self.to_vec()?;
+                self.storage = Self::mutable_storage(data_vec)?;
+            }
         }
         Ok(())
     }
@@ -511,6 +527,17 @@ impl<T: TensorElement + Copy> Tensor<T> {
     ///
     /// Allocates exactly one output buffer and fills it from a borrowed view of
     /// the input.
+    ///
+    /// **Forward-only: the result is a detached leaf.** A closure carries no
+    /// derivative, so propagating `requires_grad` here would manufacture a
+    /// `requires_grad` node whose operation is still
+    /// [`Operation::Leaf`](crate::core_ops::Operation::Leaf) — and the backward
+    /// pass stops at every leaf and accumulates into that leaf's own
+    /// (unreachable) gradient slot, which makes `backward()` succeed with
+    /// silently wrong numbers. Callers that *are* differentiable must therefore
+    /// record their own [`Operation`](crate::core_ops::Operation) on the result
+    /// (see `Tensor::record_unary` and the `MulScalar`/`AddScalar` idiom in
+    /// `math_ops.rs`).
     pub fn map<F>(&self, func: F) -> Result<Self>
     where
         F: Fn(T) -> T,
@@ -521,12 +548,7 @@ impl<T: TensorElement + Copy> Tensor<T> {
             out.extend(data.iter().map(|&x| func(x)));
             Ok(out)
         })?;
-        let mut result = Self::from_data(new_data, self.shape().dims().to_vec(), self.device)?;
-
-        // Preserve gradient tracking flag from original tensor
-        result.requires_grad = crate::should_record_grad(self.requires_grad);
-
-        Ok(result)
+        Self::from_data(new_data, self.shape().dims().to_vec(), self.device)
     }
 
     /// Extract a scalar value from a single-element tensor
@@ -898,34 +920,48 @@ impl<T: TensorElement + Copy> Tensor<T> {
     }
 
     /// Use SciRS2 backend for optimized ReLU activation
+    ///
+    /// Records the same [`UnaryKind::Relu`] as [`Tensor::relu`]: the forward
+    /// predicate (`x > 0`) is identical, just computed through a bare `map`
+    /// instead of `relu`'s SIMD/parallel dispatch, so the two must share one
+    /// recorded derivative rather than one silently detaching.
     pub fn relu_scirs2(&self) -> Result<Self>
     where
         T: PartialOrd + num_traits::Zero,
     {
         // TODO: Integrate with actual SciRS2 backend
         let zero = <T as num_traits::Zero>::zero();
-        self.map(|x| if x > zero { x } else { zero })
+        let result = self.map(|x| if x > zero { x } else { zero })?;
+        Ok(self.record_unary(result, UnaryKind::Relu))
     }
 
     /// Use SciRS2 backend for optimized sigmoid activation
+    ///
+    /// Records the same [`UnaryKind::Sigmoid`] as [`Tensor::sigmoid`]: this is
+    /// the exact closed form (not an approximation), so it is numerically
+    /// consistent with `Sigmoid`'s recorded derivative on every input.
     pub fn sigmoid_scirs2(&self) -> Result<Self>
     where
         T: num_traits::Float,
     {
         // TODO: Integrate with actual SciRS2 backend
-        self.map(|x| {
+        let result = self.map(|x| {
             let one = <T as num_traits::One>::one();
             one / (one + (-x).exp())
-        })
+        })?;
+        Ok(self.record_unary(result, UnaryKind::Sigmoid))
     }
 
     /// Use SciRS2 backend for optimized tanh activation
+    ///
+    /// Records the same [`UnaryKind::Tanh`] as [`Tensor::tanh`].
     pub fn tanh_scirs2(&self) -> Result<Self>
     where
         T: num_traits::Float,
     {
         // TODO: Integrate with actual SciRS2 backend
-        self.map(|x| x.tanh())
+        let result = self.map(|x| x.tanh())?;
+        Ok(self.record_unary(result, UnaryKind::Tanh))
     }
 
     /// Softmax activation along specified dimension

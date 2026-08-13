@@ -3,7 +3,7 @@
 //! This module provides specialized loss functions for specific domains
 //! such as sequence-to-sequence learning, time series, and other advanced applications.
 
-use crate::loss::common::ReductionType;
+use crate::loss::common::{ReductionType, DISTANCE_FLOOR};
 use crate::utils::{function_context, validate_positive};
 use torsh_core::{Result as TorshResult, TorshError};
 use torsh_tensor::Tensor;
@@ -28,6 +28,21 @@ use torsh_tensor::Tensor;
 ///
 /// # Returns
 /// CTC loss tensor
+///
+/// # Limitations
+///
+/// This is a **placeholder**: it sums the negative log-probabilities of the
+/// target labels read straight off the time axis, with no blank handling and no
+/// forward–backward marginalisation over alignments, so it does not compute the
+/// CTC objective. It also builds its result from scalar reads
+/// ([`torsh_tensor::Tensor::get`]) and therefore returns a tensor that is
+/// **detached from the autograd graph** — `backward()` will not reach
+/// `log_probs`.
+///
+/// Both facts are deliberate and recorded rather than papered over: reconnecting
+/// autograd to a quantity that is not the CTC loss would make a wrong gradient
+/// flow while looking fixed. A real implementation needs the alpha/beta dynamic
+/// program over the blank-expanded label sequence.
 pub fn ctc_loss(
     log_probs: &Tensor,
     targets: &Tensor,
@@ -172,14 +187,19 @@ pub fn temporal_consistency_loss(
         ));
     }
 
-    // Compute differences between consecutive time steps
-    let pred_t = predictions.slice(1, 0, seq_len - 1)?; // t=0 to T-2
-    let pred_t_plus_1 = predictions.slice(1, 1, seq_len)?; // t=1 to T-1
+    // Compute differences between consecutive time steps.
+    //
+    // `slice(..)?.to_tensor()?` used to be how the two windows were taken; that
+    // pair rebuilds a fresh tensor from raw data and records nothing, which left
+    // this loss detached from `predictions`. `Tensor::narrow` selects exactly the
+    // same elements (verified element-for-element) and records, so the graph
+    // survives. `narrow` is (dim, start, length) where `slice` was (dim, start,
+    // end), hence the second argument of the second call.
+    let pred_t = predictions.narrow(1, 0, seq_len - 1)?; // t=0 to T-2
+    let pred_t_plus_1 = predictions.narrow(1, 1, seq_len - 1)?; // t=1 to T-1
 
     // L2 difference between consecutive predictions
-    let pred_t_tensor = pred_t.to_tensor()?;
-    let pred_t_plus_1_tensor = pred_t_plus_1.to_tensor()?;
-    let diff = pred_t_tensor.sub(&pred_t_plus_1_tensor)?;
+    let diff = pred_t.sub(&pred_t_plus_1)?;
     let smoothness_loss = diff.pow_scalar(2.0)?.mean(None, false)?;
 
     let total_loss = smoothness_loss.mul_scalar(smoothness_weight)?;
@@ -226,8 +246,20 @@ pub fn gradient_penalty_loss(
 ) -> TorshResult<Tensor> {
     validate_positive(penalty_weight, "penalty_weight", "gradient_penalty_loss")?;
 
-    // Compute L2 norm of gradients
-    let grad_norm = gradients.norm()?;
+    // Compute L2 norm of gradients.
+    //
+    // `Tensor::norm` folds the sum of squares in plain Rust and returns a fresh
+    // scalar (advanced_ops.rs), so it records nothing and this penalty used to be
+    // a detached leaf — a WGAN-GP term that never actually penalised anything.
+    // Spelling the same Frobenius norm out of recording ops reproduces the value
+    // exactly (measured: 2.0808651 either way) and keeps the graph. The radicand
+    // is floored so that an all-zero gradient tensor yields a finite derivative
+    // instead of `sqrt'(0) = inf`.
+    let grad_norm = gradients
+        .pow_scalar(2.0)?
+        .sum()?
+        .clamp_min(DISTANCE_FLOOR)?
+        .sqrt()?;
 
     // Gradient penalty: (||grad|| - 1)^2
     let penalty = grad_norm.sub_scalar(1.0)?.pow_scalar(2.0)?;
@@ -238,28 +270,96 @@ pub fn gradient_penalty_loss(
 
 // Helper functions
 
+/// Token-averaged negative log-likelihood of `targets` under `predictions`.
+///
+/// The predecessor accumulated `total_loss` in an `f32` by reading individual
+/// entries with [`torsh_tensor::Tensor::get`] and then wrapped the number in a
+/// brand-new tensor — an honestly detached leaf, so `seq2seq_loss_with_attention`
+/// never propagated a gradient into its logits.
+///
+/// The gather is now a single differentiable expression: a constant selector
+/// holding `-1 / (N * T)` at each `(n, t, target[n, t])` entry turns the whole
+/// average into `sum(selector * log_probs)`. This is the same technique
+/// `loss/classification.rs`'s [`crate::loss::nll_loss`] uses, and it produces
+/// the same number (measured: 2.3025854 and 0.74311393 on the two pinned
+/// fixtures) while keeping `predictions` on the graph.
+///
+/// The `[1]` output shape is the predecessor's and is preserved: under
+/// `ReductionType::None` this loss reports `[1]`, not `[]`.
 fn compute_sequence_cross_entropy(predictions: &Tensor, targets: &Tensor) -> TorshResult<Tensor> {
-    // Apply log_softmax to predictions
-    let dim = (predictions.shape().ndim() - 1) as i32;
-    let log_probs = predictions.log_softmax(dim)?;
+    let context = function_context("seq2seq_loss_with_attention");
 
-    // Compute negative log likelihood
-    let shape = targets.shape();
-    let dims = shape.dims();
-    let batch_size = dims[0];
-    let seq_len = dims[1];
-
-    let mut total_loss = 0.0;
-    for i in 0..batch_size {
-        for j in 0..seq_len {
-            let target_class = targets.get(&[i, j])? as usize;
-            let log_prob = log_probs.get(&[i, j, target_class])?;
-            total_loss -= log_prob;
-        }
+    if predictions.ndim() != 3 {
+        return Err(TorshError::config_error_with_context(
+            "predictions must be 3D tensor with shape (N, T_out, V)",
+            &context,
+        ));
+    }
+    if targets.ndim() != 2 {
+        return Err(TorshError::config_error_with_context(
+            "targets must be 2D tensor with shape (N, T_out)",
+            &context,
+        ));
     }
 
-    let loss_value = total_loss / (batch_size * seq_len) as f32;
-    Tensor::from_vec(vec![loss_value], &[1])
+    let prediction_shape = predictions.shape();
+    let prediction_dims = prediction_shape.dims();
+    let (batch_size, seq_len, vocab_size) =
+        (prediction_dims[0], prediction_dims[1], prediction_dims[2]);
+
+    let target_shape = targets.shape();
+    let target_dims = target_shape.dims();
+    if target_dims[0] != batch_size || target_dims[1] != seq_len {
+        return Err(TorshError::ShapeMismatch {
+            expected: vec![batch_size, seq_len],
+            got: target_dims.to_vec(),
+        });
+    }
+    if batch_size == 0 || seq_len == 0 {
+        return Err(TorshError::config_error_with_context(
+            "seq2seq loss needs at least one batch element and one time step",
+            &context,
+        ));
+    }
+
+    // Apply log_softmax to predictions
+    let dim = (prediction_dims.len() - 1) as i32;
+    let log_probs = predictions.log_softmax(dim)?;
+
+    // Constant selector: -1/(N*T) at the target vocabulary entry of every token,
+    // zero everywhere else. Folding the 1/(N*T) average into the selector keeps
+    // the whole loss a single tensor expression.
+    let scale = -1.0 / (batch_size * seq_len) as f32;
+    let mut selector = vec![0.0f32; batch_size * seq_len * vocab_size];
+    for i in 0..batch_size {
+        for j in 0..seq_len {
+            let raw = targets.get(&[i, j])?;
+            if !raw.is_finite() || raw.fract() != 0.0 {
+                return Err(TorshError::config_error_with_context(
+                    &format!("targets[{i}, {j}] = {raw} is not an integral token index"),
+                    &context,
+                ));
+            }
+            let token = raw as i64;
+            if token < 0 || token as usize >= vocab_size {
+                return Err(TorshError::config_error_with_context(
+                    &format!(
+                        "targets[{i}, {j}] = {token} is out of range for a vocabulary of \
+                         {vocab_size} tokens"
+                    ),
+                    &context,
+                ));
+            }
+            selector[(i * seq_len + j) * vocab_size + token as usize] = scale;
+        }
+    }
+    let selector_tensor = Tensor::from_data(
+        selector,
+        vec![batch_size, seq_len, vocab_size],
+        predictions.device(),
+    )?;
+
+    log_probs.mul(&selector_tensor)?.sum()?.view(&[1])
 }
 
 fn attention_regularization_loss(attention_weights: &Tensor) -> TorshResult<Tensor> {

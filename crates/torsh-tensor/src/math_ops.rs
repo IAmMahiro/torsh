@@ -80,6 +80,65 @@ impl<T: TensorElement> Tensor<T> {
         }
         result
     }
+
+    /// Record `result` as `leaky_relu(self, negative_slope)`.
+    ///
+    /// Parameterized twin of [`Tensor::record_unary`]: the slope cannot live
+    /// in [`UnaryKind`], so it goes in its own `Operation` variant (the
+    /// `MulScalar`/`DivScalar` idiom). A no-op when gradients are not tracked.
+    pub(crate) fn record_leaky_relu(&self, mut result: Self, negative_slope: T) -> Self {
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = Operation::LeakyRelu {
+                input: Arc::new(self.clone()),
+                negative_slope,
+            };
+        }
+        result
+    }
+
+    /// Record `result` as `maximum(self, other)` (`is_maximum`) or
+    /// `minimum(self, other)`.
+    ///
+    /// The operands are stored *un-broadcast*, like [`Operation::Add`]'s, so
+    /// backward folds each gradient back to its own operand's shape.
+    pub(crate) fn record_extremum(&self, other: &Self, mut result: Self, is_maximum: bool) -> Self {
+        if crate::should_record_grad(self.requires_grad || other.requires_grad) {
+            result.requires_grad = true;
+            let lhs = Arc::new(self.clone());
+            let rhs = Arc::new(other.clone());
+            result.operation = if is_maximum {
+                Operation::Maximum { lhs, rhs }
+            } else {
+                Operation::Minimum { lhs, rhs }
+            };
+        }
+        result
+    }
+
+    /// Record `result` as `abs(self)` — but only when `self` and `result` have
+    /// the *same* element type.
+    ///
+    /// `Tensor::abs` lives on the [`torsh_core::dtype::ComplexElement`] impl
+    /// block (`complex_ops.rs`) and has signature
+    /// `Tensor<T> -> Tensor<T::Real>`. Real element types implement
+    /// `ComplexElement` with `Real = Self`, so for them the two types coincide
+    /// and `|x|` is the ordinary real absolute value with sub-gradient
+    /// `sign(x)`. For a genuinely complex `T` the output type differs, the
+    /// derivative is the Wirtinger `z / |z|` rather than `sign(x)`, and
+    /// [`Operation::Unary`] could not hold the operand anyway (it wants an
+    /// `Arc<Tensor<R>>`, not an `Arc<Tensor<T>>`).
+    ///
+    /// The `Any` downcast is what separates the two cases: it succeeds exactly
+    /// when `T == R`, so complex `abs` keeps its historical detached behaviour
+    /// and real `abs` records. It is a safe downcast — `TensorElement: 'static`
+    /// supplies the `Any` bound — not a transmute.
+    pub(crate) fn record_abs_if_real<R: TensorElement>(&self, result: Tensor<R>) -> Tensor<R> {
+        match (self as &dyn std::any::Any).downcast_ref::<Tensor<R>>() {
+            Some(real_self) => real_self.record_unary(result, UnaryKind::Abs),
+            None => result,
+        }
+    }
 }
 
 /// Element count from which a same-shape binary op dispatches to the hardware
@@ -132,11 +191,17 @@ pub(crate) mod adaptive_simd {
         scirs2_core::simd::transcendental::simd_sigmoid_f32(input)
     }
 
-    /// SIMD-accelerated GELU activation function
-    /// Uses scirs2_core SIMD implementation for optimal performance
-    pub fn adaptive_simd_gelu_f32(input: &ArrayView1<f32>) -> Array1<f32> {
-        scirs2_core::simd::transcendental::simd_gelu_f32(input)
-    }
+    // NOTE: there is deliberately no `adaptive_simd_gelu_f32` shim.
+    // `scirs2_core::simd::transcendental::simd_gelu_f32` computes a
+    // clamped-Pade approximation of `tanh`, i.e. a materially different
+    // function from the exact-tanh GELU the crate documents and
+    // differentiates (measured: up to 0.0211 absolute, 515% relative at
+    // x = -2.40). Routing large f32 tensors through it made `Tensor::gelu`
+    // discontinuous across its own `numel = 1000` dispatch threshold and
+    // inconsistent with its recorded backward, so the shim and its dispatch
+    // were removed rather than documented around. See
+    // `Tensor::gelu_forward` in math_ops_trig.rs. `relu` and `sigmoid` are
+    // unaffected: their SIMD kernels match their formulas exactly.
 }
 
 #[cfg(feature = "simd")]
@@ -363,6 +428,10 @@ impl<T: TensorElement + Copy> Tensor<T> {
             (TensorStorage::Aligned(a), TensorStorage::Aligned(b)) => Arc::ptr_eq(a, b),
             #[cfg(feature = "simd")]
             (TensorStorage::SimdOptimized(a), TensorStorage::SimdOptimized(b)) => Arc::ptr_eq(a, b),
+            #[cfg(feature = "gpu")]
+            (TensorStorage::Device { buffer: a, .. }, TensorStorage::Device { buffer: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
             _ => false,
         }
     }
@@ -379,6 +448,8 @@ impl<T: TensorElement + Copy> Tensor<T> {
             TensorStorage::Aligned(data) => Arc::as_ptr(data) as usize,
             #[cfg(feature = "simd")]
             TensorStorage::SimdOptimized(storage) => Arc::as_ptr(storage) as usize,
+            #[cfg(feature = "gpu")]
+            TensorStorage::Device { buffer, .. } => Arc::as_ptr(buffer) as usize,
         }
     }
 
@@ -490,11 +561,23 @@ impl<T: TensorElement + Copy> Tensor<T> {
     }
 
     /// Add scalar to all elements (returns new tensor)
+    ///
+    /// Records [`Operation::AddScalar`]: `map` is forward-only, so without this
+    /// the shifted tensor would be a `requires_grad` leaf that swallows the
+    /// gradient of everything upstream of it.
     pub fn add_scalar(&self, scalar: T) -> Result<Self>
     where
         T: Copy + std::ops::Add<Output = T>,
     {
-        self.map(|x| x + scalar)
+        let mut result = self.map(|x| x + scalar)?;
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = Operation::AddScalar {
+                input: Arc::new(self.clone()),
+                scalar,
+            };
+        }
+        Ok(result)
     }
 
     /// Subtract scalar from all elements in-place
@@ -507,11 +590,23 @@ impl<T: TensorElement + Copy> Tensor<T> {
     }
 
     /// Subtract scalar from all elements (returns new tensor)
+    ///
+    /// Records [`Operation::AddScalar`] with the negated constant — the
+    /// backward rule is the same identity — so the public bound stays
+    /// `Sub<Output = T>` and no `Neg`/`Add` bound leaks into the API.
     pub fn sub_scalar(&self, scalar: T) -> Result<Self>
     where
         T: Copy + std::ops::Sub<Output = T>,
     {
-        self.map(|x| x - scalar)
+        let mut result = self.map(|x| x - scalar)?;
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = Operation::AddScalar {
+                input: Arc::new(self.clone()),
+                scalar: <T as TensorElement>::zero() - scalar,
+            };
+        }
+        Ok(result)
     }
 
     /// Multiply all elements by scalar in-place
@@ -1305,46 +1400,102 @@ impl<T: TensorElement + Copy> Tensor<T> {
         Self::from_data(result_data, self.shape().dims().to_vec(), self.device)
     }
 
-    /// Element-wise minimum with another tensor
+    /// Element-wise minimum with another tensor (supports broadcasting).
+    ///
+    /// Records [`Operation::Minimum`] with the *un-broadcast* operands, so
+    /// backward sends each element's gradient to whichever operand was smaller
+    /// (splitting `0.5 / 0.5` on an exact tie) and folds it back to that
+    /// operand's own shape.
     pub fn minimum(&self, other: &Self) -> Result<Self>
     where
         T: std::cmp::PartialOrd,
     {
-        self.elementwise_operation(other, |a, b| if a < b { a } else { b })
+        let result = self.elementwise_operation(other, |a, b| if a < b { a } else { b })?;
+        Ok(self.record_extremum(other, result, false))
     }
 
-    /// Element-wise maximum with another tensor
+    /// Element-wise maximum with another tensor (supports broadcasting).
+    ///
+    /// Records [`Operation::Maximum`] with the *un-broadcast* operands. This is
+    /// what makes `relu(x) == x.maximum(&zeros)` differentiable, which is the
+    /// form `torsh_nn::functional::relu` uses.
     pub fn maximum(&self, other: &Self) -> Result<Self>
     where
         T: std::cmp::PartialOrd,
     {
-        self.elementwise_operation(other, |a, b| if a > b { a } else { b })
+        let result = self.elementwise_operation(other, |a, b| if a > b { a } else { b })?;
+        Ok(self.record_extremum(other, result, true))
     }
 
-    /// Clamp tensor values between min and max bounds
+    /// Clamp tensor values between `min` and `max` bounds.
+    ///
+    /// Records [`Operation::ClampBounds`]: the gradient passes wherever the
+    /// element was left alone (`min <= x <= max`, inclusive at both bounds, as
+    /// in ATen's `clamp_backward`) and is zero wherever the clamp moved it.
     pub fn clamp(&self, min: T, max: T) -> Result<Self>
     where
         T: std::cmp::PartialOrd + Copy,
     {
+        self.clamp_bounds(Some(min), Some(max))
+    }
+
+    /// Clamp tensor values from below only — PyTorch's `tensor.clamp_min(min)`.
+    ///
+    /// Gradient passes wherever `x >= min` (inclusive) and is zero below it.
+    pub fn clamp_min(&self, min: T) -> Result<Self>
+    where
+        T: std::cmp::PartialOrd + Copy,
+    {
+        self.clamp_bounds(Some(min), None)
+    }
+
+    /// Clamp tensor values from above only — PyTorch's `tensor.clamp_max(max)`.
+    ///
+    /// Gradient passes wherever `x <= max` (inclusive) and is zero above it.
+    pub fn clamp_max(&self, max: T) -> Result<Self>
+    where
+        T: std::cmp::PartialOrd + Copy,
+    {
+        self.clamp_bounds(None, Some(max))
+    }
+
+    /// Shared implementation of [`Tensor::clamp`], [`Tensor::clamp_min`] and
+    /// [`Tensor::clamp_max`]: apply whichever bounds were supplied, then record
+    /// them so backward can reproduce the same predicate.
+    fn clamp_bounds(&self, min: Option<T>, max: Option<T>) -> Result<Self>
+    where
+        T: std::cmp::PartialOrd + Copy,
+    {
         let data = self.to_vec()?;
+        // Exactly the original `if x < min { min } else if x > max { max }
+        // else { x }` ladder, with an absent bound skipping its arm. Order
+        // matters and is preserved: for the degenerate `min > max` the lower
+        // bound still wins, as it did before.
         let clamped_data: Vec<T> = data
             .iter()
-            .map(|&x| {
-                if x < min {
-                    min
-                } else if x > max {
-                    max
-                } else {
-                    x
-                }
+            .map(|&x| match (min, max) {
+                (Some(lower), _) if x < lower => lower,
+                (_, Some(upper)) if x > upper => upper,
+                _ => x,
             })
             .collect();
 
-        Self::from_data(
+        let mut result = Self::from_data(
             clamped_data,
             self.shape().dims().to_vec(),
             self.device.clone(),
-        )
+        )?;
+
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = Operation::ClampBounds {
+                input: Arc::new(self.clone()),
+                min,
+                max,
+            };
+        }
+
+        Ok(result)
     }
 
     // ✅ clamp_ moved to in-place operations section below for PyTorch compatibility
@@ -1456,7 +1607,17 @@ where
     type Output = Tensor<T>;
 
     fn neg(self) -> Self::Output {
-        self.map(|x| -x).expect("negation map should succeed")
+        let mut result = self.map(|x| -x).expect("negation map should succeed");
+        // `map` is forward-only, so the operator has to record its own node;
+        // negation is `MulScalar(-1)`, whose backward arm already exists.
+        if crate::should_record_grad(self.requires_grad()) {
+            result.requires_grad = true;
+            result.operation = Operation::MulScalar {
+                input: Arc::new(self.clone()),
+                scalar: -<T as TensorElement>::one(),
+            };
+        }
+        result
     }
 }
 

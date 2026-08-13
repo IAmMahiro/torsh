@@ -169,6 +169,8 @@ pub use custom_ops::{
 };
 
 // Re-export storage types for advanced usage
+#[cfg(feature = "gpu")]
+pub use storage::DeviceBuffer;
 pub use storage::{MemoryMappedStorage, TensorStorage};
 
 // Re-export zero-copy view types (CRITICAL #1)
@@ -235,6 +237,8 @@ impl<T: TensorElement> Tensor<T> {
             TensorStorage::Aligned(data) => Arc::strong_count(data),
             #[cfg(feature = "simd")]
             TensorStorage::SimdOptimized(storage) => Arc::strong_count(storage),
+            #[cfg(feature = "gpu")]
+            TensorStorage::Device { buffer, .. } => Arc::strong_count(buffer),
         }
     }
 

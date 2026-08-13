@@ -94,13 +94,22 @@ fn sine_series(len: usize) -> TimeSeries {
     TimeSeries::new(Tensor::from_vec(data, &[len]).expect("tensor creation should succeed"))
 }
 
-/// Documents *why* [`LSTMForecaster::fit`] implements backpropagation through
-/// time by hand instead of relying on `Tensor::backward`:
-/// `torsh_nn::layers::recurrent::LSTM::forward` rebuilds its stacked output
-/// with `Tensor::from_vec`, which severs the autograd graph, so no gradient can
-/// ever reach the recurrent weights.
+/// The precondition [`LSTMForecaster::fit`] is built on.
+///
+/// `torsh_nn::layers::recurrent::LSTM::forward` used to rebuild its stacked
+/// output with `Tensor::from_vec`, which severed the autograd graph, so no
+/// gradient could reach the recurrent weights — which is why `fit` once carried
+/// a hand-written backpropagation-through-time recurrence in
+/// `forecast/lstm_bptt.rs`. The module now stacks with `Tensor::stack` and keeps
+/// the graph alive, the hand-written recurrence has been retired, and this test
+/// is the blocking guard that stops the sever from coming back: if it fails,
+/// `fit` is no longer training the recurrent weights at all.
+///
+/// (Renamed from `f047_torsh_nn_lstm_forward_severs_the_autograd_graph`, which
+/// was a deliberately non-blocking canary printing a NOTE when the graph
+/// survived.)
 #[test]
-fn f047_torsh_nn_lstm_forward_severs_the_autograd_graph() {
+fn f047_torsh_nn_lstm_forward_keeps_the_autograd_graph() {
     use torsh_nn::layers::recurrent::LSTM;
     use torsh_nn::Module;
 
@@ -116,13 +125,28 @@ fn f047_torsh_nn_lstm_forward_severs_the_autograd_graph() {
     let x = Tensor::from_vec(vec![0.1f32, 0.2, 0.3, 0.4], &[1, 4, 1]).expect("tensor creation");
     let out = lstm.forward(&x).expect("forward should succeed");
 
-    // Deliberately non-blocking: a torsh-nn fix must not fail a torsh-series
-    // test, it should just tell us the hand-written BPTT can be retired.
-    if out.requires_grad() {
-        eprintln!(
-            "NOTE: torsh-nn's LSTM now keeps the autograd graph alive; \
-             LSTMForecaster::fit can switch from the hand-written BPTT in \
-             forecast/lstm_bptt.rs to Tensor::backward"
+    assert!(
+        out.requires_grad(),
+        "LSTM::forward severed the autograd graph again; LSTMForecaster::fit \
+         cannot train the recurrent weights through Tensor::backward"
+    );
+
+    out.sum()
+        .expect("sum should succeed")
+        .backward()
+        .expect("backward through the stacked LSTM output should succeed");
+
+    for name in ["weight_ih_l0", "weight_hh_l0", "bias_ih_l0", "bias_hh_l0"] {
+        let param = lstm
+            .parameters()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| panic!("parameter `{name}` must exist"));
+        let handle = param.tensor();
+        let guard = handle.read();
+        assert!(
+            guard.grad().is_some(),
+            "no gradient reached `{name}`: the recurrent graph is severed"
         );
     }
 }
@@ -170,10 +194,10 @@ fn f047_fit_reduces_training_loss() {
         .sum();
     assert!(delta > 1e-6, "training must change the model's forecasts");
 
-    // The hand-written BPTT forward pass must agree with the module forward
-    // pass it trains: measure the MSE of `LSTMForecaster::forward` now, then
-    // run one more epoch, whose first reported loss is measured on exactly
-    // these weights (before that epoch's update).
+    // The loss `fit` reports must be the loss of the module forward pass it
+    // trains: measure the MSE of `LSTMForecaster::forward` now, then run one
+    // more epoch, whose first reported loss is measured on exactly these
+    // weights (before that epoch's update).
     let (inputs, targets) = model
         .create_sequences(&series)
         .expect("sequence creation should succeed");
@@ -192,6 +216,6 @@ fn f047_fit_reduces_training_loss() {
     let reported = model.fit(&series, 1, 0.05).expect("fit should succeed")[0];
     assert!(
         (reported - mse).abs() <= 1e-3 * mse.abs().max(1e-3),
-        "hand-written BPTT forward ({reported}) disagrees with LSTM::forward ({mse})"
+        "the loss fit reports ({reported}) disagrees with LSTMForecaster::forward ({mse})"
     );
 }

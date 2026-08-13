@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+#[cfg(feature = "gpu")]
+use torsh_core::sync::RwLockExt;
 use torsh_core::{
     dtype::TensorElement,
     error::{Result, TorshError},
@@ -225,6 +227,106 @@ impl<T> std::fmt::Debug for SimdStorage<T> {
     }
 }
 
+// ============================================================================
+// DEVICE-RESIDENT STORAGE
+// ============================================================================
+// A tensor whose data lives in device memory keeps only a pointer here; the
+// host copy is materialised lazily and at most once. That is what turns a chain
+// of GPU ops into "one upload, one download" instead of a host round trip per
+// operation.
+// ============================================================================
+
+/// An owned device allocation.
+///
+/// **A device buffer is immutable for its whole life.** ToRSh writes it exactly
+/// once, as the output of a backend op, and every mutation path on a
+/// device-resident tensor demotes the tensor to host storage first (see
+/// [`crate::Tensor::make_unique`]). Two properties follow, and the rest of the
+/// design rests on them:
+///
+/// - the lazily downloaded host copy in [`TensorStorage::Device`] never needs
+///   invalidating, and
+/// - no device-to-device copy is required — which matters, because
+///   [`oxicuda_backend::ComputeBackend`] does not provide one.
+///
+/// The buffer owns its pointer: `adopt` is the only constructor,
+/// and `Drop` releases the allocation. It also owns a handle on the backend that
+/// allocated it, so freeing consults no registry, takes no ToRSh lock, and stays
+/// correct even after a different backend has been installed.
+#[cfg(feature = "gpu")]
+pub struct DeviceBuffer {
+    /// Device pointer owned by this buffer.
+    ptr: u64,
+    /// Size of the allocation in bytes.
+    bytes: usize,
+    /// Element type the bytes encode.
+    dtype: torsh_core::dtype::DType,
+    /// The backend that allocated `ptr`, and the only one that may free it.
+    backend: Arc<dyn oxicuda_backend::ComputeBackend>,
+}
+
+#[cfg(feature = "gpu")]
+impl DeviceBuffer {
+    /// Take ownership of `ptr`, which `backend` allocated with `bytes` bytes.
+    ///
+    /// The caller must not free `ptr` afterwards and must never hand the same
+    /// pointer to a second `DeviceBuffer`: `Drop` frees it exactly once.
+    pub(crate) fn adopt(
+        ptr: u64,
+        bytes: usize,
+        dtype: torsh_core::dtype::DType,
+        backend: Arc<dyn oxicuda_backend::ComputeBackend>,
+    ) -> Self {
+        Self {
+            ptr,
+            bytes,
+            dtype,
+            backend,
+        }
+    }
+
+    /// The device pointer this buffer owns.
+    pub fn ptr(&self) -> u64 {
+        self.ptr
+    }
+
+    /// Size of the allocation in bytes.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Element type the buffer's bytes encode.
+    pub fn dtype(&self) -> torsh_core::dtype::DType {
+        self.dtype
+    }
+
+    /// The backend that owns this allocation.
+    pub fn backend(&self) -> &Arc<dyn oxicuda_backend::ComputeBackend> {
+        &self.backend
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Drop for DeviceBuffer {
+    fn drop(&mut self) {
+        // Deliberately infallible: `drop` may run while unwinding, so a failed
+        // free must never panic, and no ToRSh lock is taken here.
+        let _ = self.backend.free(self.ptr);
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl std::fmt::Debug for DeviceBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceBuffer")
+            .field("ptr", &format_args!("{:#x}", self.ptr))
+            .field("bytes", &self.bytes)
+            .field("dtype", &self.dtype)
+            .field("backend", &self.backend.name())
+            .finish()
+    }
+}
+
 /// Storage abstraction for tensor data
 pub enum TensorStorage<T: TensorElement> {
     /// In-memory storage for smaller tensors
@@ -242,6 +344,21 @@ pub enum TensorStorage<T: TensorElement> {
     /// - Thread-safe through atomic COW
     #[cfg(feature = "simd")]
     SimdOptimized(Arc<SimdStorage<T>>),
+    /// Device-resident storage: the data lives in GPU memory.
+    ///
+    /// Produced by the residency path in [`crate::gpu_dispatch`], so a chain of
+    /// device ops never returns to the host between operations.
+    #[cfg(feature = "gpu")]
+    Device {
+        /// The device allocation holding this tensor's data.
+        buffer: Arc<DeviceBuffer>,
+        /// Host copy, downloaded on the first host-side read and kept
+        /// afterwards.
+        ///
+        /// It never needs invalidating: the device buffer is immutable, because
+        /// every mutation path demotes the tensor to host storage first.
+        host_cache: Arc<RwLock<Option<Vec<T>>>>,
+    },
 }
 
 impl<T: TensorElement> std::fmt::Debug for TensorStorage<T> {
@@ -253,6 +370,8 @@ impl<T: TensorElement> std::fmt::Debug for TensorStorage<T> {
             Self::Aligned(_) => f.debug_tuple("Aligned").field(&"<AlignedVec>").finish(),
             #[cfg(feature = "simd")]
             Self::SimdOptimized(storage) => f.debug_tuple("SimdOptimized").field(storage).finish(),
+            #[cfg(feature = "gpu")]
+            Self::Device { buffer, .. } => f.debug_tuple("Device").field(buffer).finish(),
         }
     }
 }
@@ -409,6 +528,137 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
         }
     }
 
+    /// Wrap an owned device allocation as device-resident storage.
+    ///
+    /// The host cache starts empty and is filled by the first host-side read.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn device(buffer: Arc<DeviceBuffer>) -> Self {
+        Self::Device {
+            buffer,
+            host_cache: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Whether this storage's data lives in device memory.
+    ///
+    /// Always `false` without the `gpu` feature, so callers that must demote
+    /// before a write can test it unconditionally.
+    pub fn is_device(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            matches!(self, Self::Device { .. })
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            false
+        }
+    }
+
+    /// The device allocation backing this storage, if it is device-resident.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn device_buffer(&self) -> Option<&Arc<DeviceBuffer>> {
+        match self {
+            Self::Device { buffer, .. } => Some(buffer),
+            _ => None,
+        }
+    }
+
+    /// Run `f` against the host copy of a device buffer, downloading it first if
+    /// this is the first host-side read.
+    ///
+    /// This is the **single** download point for device-resident storage: every
+    /// later read is served from the cache, which is what keeps a materialised
+    /// view or a per-element `get` loop from re-transferring the whole tensor.
+    #[cfg(feature = "gpu")]
+    fn with_host_cache<R, F>(
+        buffer: &Arc<DeviceBuffer>,
+        host_cache: &RwLock<Option<Vec<T>>>,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&[T]) -> Result<R>,
+        T: Copy,
+    {
+        // Fast path: serve from the cache under a read guard, exactly like the
+        // `InMemory` arm does.
+        {
+            let guard = host_cache.read_or_recover();
+            if let Some(cached) = guard.as_ref() {
+                return f(cached);
+            }
+        }
+
+        // Cold path: download while holding no guard at all, then publish. The
+        // write guard is never held across user code, so a closure that reads
+        // this storage again cannot dead-lock against the download.
+        let downloaded = Self::download(buffer)?;
+        {
+            let mut guard = host_cache.write_or_recover();
+            if guard.is_none() {
+                *guard = Some(downloaded);
+            }
+        }
+
+        let guard = host_cache.read_or_recover();
+        match guard.as_ref() {
+            Some(cached) => f(cached),
+            None => Err(TorshError::SynchronizationError(
+                "device host cache disappeared".to_string(),
+            )),
+        }
+    }
+
+    /// Copy a device buffer's contents into a freshly allocated host `Vec<T>`.
+    #[cfg(feature = "gpu")]
+    fn download(buffer: &Arc<DeviceBuffer>) -> Result<Vec<T>>
+    where
+        T: Copy,
+    {
+        let element_size = std::mem::size_of::<T>();
+        if element_size == 0 || buffer.bytes() % element_size != 0 {
+            return Err(TorshError::InvalidOperation(format!(
+                "device buffer of {} bytes does not hold whole {}-byte elements",
+                buffer.bytes(),
+                element_size
+            )));
+        }
+        // Checked rather than assumed: this is what makes the reinterpret below
+        // sound without relying on a guard in another module.
+        if buffer.dtype() != T::dtype() {
+            return Err(TorshError::InvalidOperation(format!(
+                "device buffer holds {} but the tensor element type is {}",
+                buffer.dtype(),
+                T::dtype()
+            )));
+        }
+
+        let count = buffer.bytes() / element_size;
+        let mut raw = vec![0u8; buffer.bytes()];
+        buffer
+            .backend()
+            .copy_dtoh(&mut raw, buffer.ptr())
+            .map_err(|e| TorshError::InvalidOperation(format!("device download failed: {e}")))?;
+
+        let mut out: Vec<T> = Vec::with_capacity(count);
+        if count > 0 {
+            // SAFETY: `out` was allocated by `Vec<T>` with capacity for `count`
+            // elements, so it is `T`-aligned and spans exactly `buffer.bytes()`
+            // bytes; `raw` was just allocated, so the regions cannot overlap.
+            // The dtype check above establishes that the downloaded bytes are a
+            // valid representation of `T`, and `T: Copy` makes a bitwise copy a
+            // valid initialization.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    raw.as_ptr(),
+                    out.as_mut_ptr().cast::<u8>(),
+                    buffer.bytes(),
+                );
+                out.set_len(count);
+            }
+        }
+        Ok(out)
+    }
+
     /// Get the number of elements
     pub fn len(&self) -> usize {
         match self {
@@ -424,6 +674,16 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
             }
             #[cfg(feature = "simd")]
             Self::SimdOptimized(storage) => storage.len(), // Lock-free!
+            #[cfg(feature = "gpu")]
+            Self::Device { buffer, .. } => {
+                // Derived from the allocation size: no download, no lock.
+                let element_size = std::mem::size_of::<T>();
+                if element_size == 0 {
+                    0
+                } else {
+                    buffer.bytes() / element_size
+                }
+            }
         }
     }
 
@@ -474,6 +734,18 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
             Self::SimdOptimized(storage) => {
                 // Lock-free while the storage has never been written to.
                 storage.with_slice(|slice| {
+                    slice
+                        .get(index)
+                        .copied()
+                        .ok_or_else(|| TorshError::IndexOutOfBounds {
+                            index,
+                            size: slice.len(),
+                        })
+                })
+            }
+            #[cfg(feature = "gpu")]
+            Self::Device { buffer, host_cache } => {
+                Self::with_host_cache(buffer, host_cache, |slice| {
                     slice
                         .get(index)
                         .copied()
@@ -541,7 +813,21 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
                     }
                 })?
             }
+            #[cfg(feature = "gpu")]
+            Self::Device { .. } => Err(Self::device_is_immutable()),
         }
+    }
+
+    /// The error every in-place write on device-resident storage returns.
+    ///
+    /// Device buffers are immutable by construction (see [`DeviceBuffer`]), so
+    /// the tensor must be demoted to host storage before it can be written.
+    #[cfg(feature = "gpu")]
+    fn device_is_immutable() -> TorshError {
+        TorshError::InvalidOperation(
+            "device-resident storage is immutable; call make_unique() or to_device(DeviceType::Cpu) first"
+                .to_string(),
+        )
     }
 
     /// Get multiple elements
@@ -592,6 +878,18 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
                 }
                 Ok(slice[start..start + len].to_vec())
             }),
+            #[cfg(feature = "gpu")]
+            Self::Device { buffer, host_cache } => {
+                Self::with_host_cache(buffer, host_cache, |slice| {
+                    if start + len > slice.len() {
+                        return Err(TorshError::IndexOutOfBounds {
+                            index: start + len - 1,
+                            size: slice.len(),
+                        });
+                    }
+                    Ok(slice[start..start + len].to_vec())
+                })
+            }
         }
     }
 
@@ -648,6 +946,8 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
                 slice[start..start + values.len()].copy_from_slice(values);
                 Ok(())
             })?,
+            #[cfg(feature = "gpu")]
+            Self::Device { .. } => Err(Self::device_is_immutable()),
         }
     }
 
@@ -678,6 +978,10 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
             }
             #[cfg(feature = "simd")]
             Self::SimdOptimized(storage) => Ok(storage.to_vec()),
+            #[cfg(feature = "gpu")]
+            Self::Device { buffer, host_cache } => {
+                Self::with_host_cache(buffer, host_cache, |slice| Ok(slice.to_vec()))
+            }
         }
     }
 
@@ -690,6 +994,8 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
             Self::Aligned(_) => "aligned_simd",
             #[cfg(feature = "simd")]
             Self::SimdOptimized(_) => "simd_optimized",
+            #[cfg(feature = "gpu")]
+            Self::Device { .. } => "device",
         }
     }
 
@@ -726,6 +1032,15 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
                 // alongside the (retained) original one.
                 let buffers = if storage.is_mutated() { 2 } else { 1 };
                 storage.capacity() * std::mem::size_of::<T>() * buffers
+            }
+            #[cfg(feature = "gpu")]
+            Self::Device { buffer, host_cache } => {
+                // The device allocation, plus the host copy once one exists.
+                let cached = host_cache
+                    .read_or_recover()
+                    .as_ref()
+                    .map_or(0, |cache| cache.len() * std::mem::size_of::<T>());
+                buffer.bytes() + cached
             }
         }
     }
@@ -786,6 +1101,8 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
                 // 🚀 Lock-free access while the storage has never been written to.
                 storage.with_slice(f)
             }
+            #[cfg(feature = "gpu")]
+            Self::Device { buffer, host_cache } => Self::with_host_cache(buffer, host_cache, f),
         }
     }
 
@@ -861,6 +1178,8 @@ impl<T: TensorElement + Copy> TensorStorage<T> {
                 // Copy-on-write promotion, then a direct mutable slice.
                 storage.with_slice_mut(f)?
             }
+            #[cfg(feature = "gpu")]
+            Self::Device { .. } => Err(Self::device_is_immutable()),
         }
     }
 }
@@ -1288,6 +1607,13 @@ impl<T: TensorElement> Clone for TensorStorage<T> {
                 storage.mark_shared();
                 Self::SimdOptimized(Arc::clone(storage))
             }
+            #[cfg(feature = "gpu")]
+            Self::Device { buffer, host_cache } => Self::Device {
+                // Both handles are shared: the device allocation is immutable,
+                // and sharing the cache means a clone never re-downloads.
+                buffer: Arc::clone(buffer),
+                host_cache: Arc::clone(host_cache),
+            },
         }
     }
 }

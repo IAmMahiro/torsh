@@ -9,9 +9,15 @@ use torsh_nn::{
         recurrent::{GRU, LSTM},
         regularization::Dropout,
     },
-    Module,
+    Module, Parameter,
 };
 use torsh_tensor::Tensor;
+
+/// Maximum L2 norm of a single [`LSTMForecaster::fit`] update.
+///
+/// The bound is on the *step* (`learning_rate * gradient`), not on the raw
+/// gradient, so the same limit holds however the loss is scaled.
+pub const LSTM_GRAD_CLIP_NORM: f32 = 5.0;
 
 /// LSTM-based time series forecaster
 pub struct LSTMForecaster {
@@ -79,12 +85,48 @@ impl LSTMForecaster {
         )
     }
 
+    /// Every trainable parameter of the forecaster, in a deterministic order.
+    ///
+    /// Names are namespaced (`lstm.weight_ih_l0`, `readout.weight`, …) because
+    /// the recurrent layer and the linear read-out both use unqualified
+    /// parameter names. The order is lexicographic, so an update that folds all
+    /// parameters together (gradient clipping, norm reporting) is reproducible.
+    pub fn trainable_parameters(&self) -> Vec<(String, Parameter)> {
+        let mut named: Vec<(String, Parameter)> = self
+            .lstm
+            .parameters()
+            .into_iter()
+            .map(|(name, parameter)| (format!("lstm.{name}"), parameter))
+            .chain(
+                self.output_layer
+                    .parameters()
+                    .into_iter()
+                    .map(|(name, parameter)| (format!("readout.{name}"), parameter)),
+            )
+            .collect();
+        named.sort_by(|left, right| left.0.cmp(&right.0));
+        named
+    }
+
     /// Forward pass
     ///
     /// Routes the input through the real LSTM layer, extracts the hidden state
     /// at the final time step, optionally applies dropout, and projects it
     /// through the linear output layer to produce one prediction per sequence.
+    ///
+    /// The result stays connected to the autograd graph, so
+    /// `prediction.backward()` reaches every parameter reported by
+    /// [`trainable_parameters`](Self::trainable_parameters).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_core(x, self.dropout.as_ref())
+    }
+
+    /// Shared forward body.
+    ///
+    /// `dropout` is `None` during training, which is what makes the loss
+    /// [`fit`](Self::fit) reports comparable across epochs (a resampled mask
+    /// would add noise to the reported convergence curve).
+    fn forward_core(&self, x: &Tensor, dropout: Option<&Dropout>) -> Result<Tensor> {
         // Input shape: [batch_size, seq_len, input_size] (LSTM is batch_first)
         let dims_binding = x.shape();
         let dims = dims_binding.dims();
@@ -104,10 +146,9 @@ impl LSTMForecaster {
         let lstm_out = self.lstm.forward(x)?;
 
         // Apply dropout if specified.
-        let lstm_out = if let Some(ref dropout) = self.dropout {
-            dropout.forward(&lstm_out)?
-        } else {
-            lstm_out
+        let lstm_out = match dropout {
+            Some(dropout) => dropout.forward(&lstm_out)?,
+            None => lstm_out,
         };
 
         // Take the hidden state at the last time step:
@@ -123,15 +164,16 @@ impl LSTMForecaster {
     ///
     /// The series is windowed into `(input, target)` pairs of length
     /// [`sequence_length`](Self::with_sequence_length); every epoch runs a full
-    /// forward pass through the LSTM recurrence and the linear read-out,
-    /// backpropagates the error through time and updates all recurrent and
-    /// read-out weights in place, so subsequent [`forward`](Self::forward) and
-    /// [`forecast`](Self::forecast) calls use the trained parameters.
+    /// forward pass through the LSTM recurrence and the linear read-out, calls
+    /// [`Tensor::backward`] to backpropagate the error through time, and updates
+    /// every parameter reported by [`trainable_parameters`](Self::trainable_parameters) in place, so
+    /// subsequent [`forward`](Self::forward) and [`forecast`](Self::forecast)
+    /// calls use the trained weights.
     ///
-    /// Training is performed without dropout, and — like
-    /// `torsh_nn::layers::recurrent::LSTM::forward`, which evaluates only the
-    /// first layer — it updates the first LSTM layer plus the read-out, i.e.
-    /// exactly the parameters the forward pass depends on.
+    /// Training runs without dropout so that the reported loss curve measures
+    /// the model rather than the mask. Every layer is trained, including the
+    /// deeper layers of a multi-layer forecaster, and the update is rescaled
+    /// whenever its L2 norm would exceed [`LSTM_GRAD_CLIP_NORM`].
     ///
     /// # Arguments
     ///
@@ -147,8 +189,8 @@ impl LSTMForecaster {
     /// # Errors
     ///
     /// Returns an error if the series is too short for a single window, if the
-    /// hyper-parameters are invalid, or if training diverges to a non-finite
-    /// loss.
+    /// hyper-parameters are invalid, if a parameter turns out to be unreachable
+    /// from the loss, or if training diverges to a non-finite loss.
     pub fn fit(
         &mut self,
         series: &TimeSeries,
@@ -167,14 +209,126 @@ impl LSTMForecaster {
         }
 
         let (inputs, targets) = self.create_sequences(series)?;
-        crate::forecast::lstm_bptt::train_lstm_readout(
-            &self.lstm,
-            &self.output_layer,
-            &inputs,
-            &targets,
-            epochs,
-            learning_rate,
-        )
+        let sample_count = targets.numel();
+        if sample_count == 0 {
+            return Err(torsh_core::error::TorshError::InvalidArgument(
+                "LSTMForecaster::fit requires at least one training window".to_string(),
+            ));
+        }
+
+        let trainable = self.trainable_parameters();
+        // Every parameter must be a grad-tracking leaf *before* the first
+        // forward pass, and must carry no gradient left over from an earlier
+        // call: `backward` accumulates into the slot rather than replacing it.
+        for (_, parameter) in &trainable {
+            let handle = parameter.tensor();
+            let mut guard = handle.write();
+            guard.zero_grad();
+            if !guard.requires_grad() {
+                let tracked = guard.clone().requires_grad_(true);
+                *guard = tracked;
+            }
+        }
+
+        let mut history = Vec::with_capacity(epochs);
+        for _ in 0..epochs {
+            let predictions = self.forward_core(&inputs, None)?;
+            let residual = predictions.sub(&targets)?;
+            let loss = residual
+                .mul(&residual)?
+                .sum()?
+                .div_scalar(sample_count as f32)?;
+
+            let loss_value = loss.get_item_flat(0)?;
+            if !loss_value.is_finite() {
+                return Err(torsh_core::error::TorshError::ComputeError(format!(
+                    "LSTM training diverged: loss is {loss_value}"
+                )));
+            }
+            history.push(loss_value);
+
+            loss.backward()?;
+
+            // Snapshot every gradient *before* any write-back: an update
+            // replaces the parameter tensor, and with it the gradient slot the
+            // remaining reads would otherwise observe.
+            let gradients = Self::snapshot_gradients(&trainable)?;
+            let step = learning_rate * Self::clip_scale(&gradients, learning_rate)?;
+            Self::apply_update(&trainable, &gradients, step)?;
+        }
+
+        Ok(history)
+    }
+
+    /// Read the gradient of every trainable parameter into a flat buffer.
+    fn snapshot_gradients(trainable: &[(String, Parameter)]) -> Result<Vec<Vec<f32>>> {
+        let mut gradients = Vec::with_capacity(trainable.len());
+        for (name, parameter) in trainable {
+            let handle = parameter.tensor();
+            let guard = handle.read();
+            let gradient = guard.grad().ok_or_else(|| {
+                torsh_core::error::TorshError::ComputeError(format!(
+                    "LSTM training: parameter `{name}` is not reachable from the loss, \
+                     so backpropagation produced no gradient for it"
+                ))
+            })?;
+            let values = gradient.to_vec()?;
+            if values.len() != guard.numel() {
+                return Err(torsh_core::error::TorshError::ShapeMismatch {
+                    expected: guard.shape().dims().to_vec(),
+                    got: gradient.shape().dims().to_vec(),
+                });
+            }
+            gradients.push(values);
+        }
+        Ok(gradients)
+    }
+
+    /// Rescaling factor that keeps the L2 norm of one update at or below
+    /// [`LSTM_GRAD_CLIP_NORM`].
+    fn clip_scale(gradients: &[Vec<f32>], learning_rate: f32) -> Result<f32> {
+        let mut norm_squared = 0.0f64;
+        for gradient in gradients {
+            for value in gradient {
+                norm_squared += f64::from(*value) * f64::from(*value);
+            }
+        }
+        let norm = (norm_squared.sqrt() as f32) * learning_rate;
+        if !norm.is_finite() {
+            return Err(torsh_core::error::TorshError::ComputeError(format!(
+                "LSTM training diverged: the gradient norm is {norm}"
+            )));
+        }
+        if norm > LSTM_GRAD_CLIP_NORM {
+            Ok(LSTM_GRAD_CLIP_NORM / norm)
+        } else {
+            Ok(1.0)
+        }
+    }
+
+    /// Apply one gradient-descent step to every trainable parameter.
+    ///
+    /// `Tensor::from_vec` yields a detached tensor, so `requires_grad` is
+    /// re-applied on every write-back; without it the next epoch's forward pass
+    /// would silently stop recording and no gradient would reach the weights.
+    fn apply_update(
+        trainable: &[(String, Parameter)],
+        gradients: &[Vec<f32>],
+        step: f32,
+    ) -> Result<()> {
+        for ((_, parameter), gradient) in trainable.iter().zip(gradients.iter()) {
+            let handle = parameter.tensor();
+            let mut guard = handle.write();
+            let shape = guard.shape().dims().to_vec();
+            let updated: Vec<f32> = guard
+                .to_vec()?
+                .iter()
+                .zip(gradient.iter())
+                .map(|(value, grad)| value - step * grad)
+                .collect();
+            *guard = Tensor::from_vec(updated, &shape)?.requires_grad_(true);
+        }
+        Ok(())
     }
 
     /// Forecast future values

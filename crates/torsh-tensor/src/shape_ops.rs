@@ -79,7 +79,7 @@ impl<T: TensorElement + Copy> Tensor<T> {
     ///
     /// Nothing is recorded when the source does not require gradients, so
     /// inference pipelines keep building plain leaves.
-    fn record_view(&self, result: &mut Self, kind: ViewKind) {
+    pub(crate) fn record_view(&self, result: &mut Self, kind: ViewKind) {
         if crate::should_record_grad(self.requires_grad) {
             result.requires_grad = true;
             result.operation = Operation::View {
@@ -268,9 +268,15 @@ impl<T: TensorElement + Copy> Tensor<T> {
 
     /// Create a view of a slice along a dimension (shares data, no copying).
     ///
-    /// Under `requires_grad` the slice is recorded as a gather so gradients
-    /// scatter back into the source, which means the source is retained for the
-    /// graph's lifetime; inference (no grad) keeps the plain zero-copy view.
+    /// Under `requires_grad` the slice records its geometry
+    /// ([`ViewKind::Narrow`]) so gradients scatter back into the source as one
+    /// zero-padded slab, which means the source is retained for the graph's
+    /// lifetime; inference (no grad) keeps the plain zero-copy view.
+    ///
+    /// [`Tensor::narrow`] is the same view under PyTorch's argument
+    /// convention (signed `dim`/`start`, a `length` instead of an `end`, and an
+    /// empty range allowed); the two share one view constructor, so a range
+    /// spelled either way yields the same layout and the same gradient.
     pub fn slice_tensor(&self, dim: usize, start: usize, end: usize) -> Result<Self> {
         if dim >= self.ndim() {
             return Err(TorshError::InvalidArgument(format!(
@@ -288,9 +294,25 @@ impl<T: TensorElement + Copy> Tensor<T> {
             )));
         }
 
-        // Calculate new shape
-        let mut new_shape = shape.to_vec();
-        new_shape[dim] = end - start;
+        Ok(self.narrow_view(dim, start, end - start))
+    }
+
+    /// Build the aliasing view of a contiguous `length`-long range on `dim`.
+    ///
+    /// The single construction site for a narrowed view: the storage handle is
+    /// shared, the source's strides are kept, and only the storage offset moves
+    /// to the start of the window — so the result addresses the *same* buffer
+    /// and writes through it (PyTorch's `narrow`/basic-slicing semantics).
+    ///
+    /// Callers validate `dim`, `start` and `length` under their own error
+    /// contract ([`Self::slice_tensor`] and [`Tensor::narrow`] word their
+    /// messages differently), so nothing is re-checked here; `start` must be a
+    /// valid index on `dim` and `start + length` must not exceed its extent.
+    /// A `length` of 0 is a well-formed empty window — it keeps the offset of
+    /// its (still in-range) start and simply has no elements to read.
+    pub(crate) fn narrow_view(&self, dim: usize, start: usize, length: usize) -> Self {
+        let mut new_shape = self.shape.dims().to_vec();
+        new_shape[dim] = length;
 
         // Calculate new strides and offset
         let current_strides = self.strides();
@@ -298,7 +320,7 @@ impl<T: TensorElement + Copy> Tensor<T> {
 
         let mut result = Self {
             storage: self.storage.clone(),
-            shape: Shape::new(new_shape.clone()),
+            shape: Shape::new(new_shape),
             device: self.device,
             requires_grad: crate::should_record_grad(self.requires_grad),
             grad: Arc::new(RwLock::new(None)),
@@ -308,35 +330,13 @@ impl<T: TensorElement + Copy> Tensor<T> {
             base_tensor: Some(self.view_base()),
         };
 
-        // Record the slice as a gather so gradients scatter back into `self`.
-        // The map uses `self`'s *logical* (default row-major) strides — not the
-        // view's physical strides — because the backward scatter target is a
-        // zeros tensor in `self`'s logical order.
-        if crate::should_record_grad(self.requires_grad) {
-            let input_strides = self.compute_default_strides();
-            let out_numel: usize = new_shape.iter().product();
-            let mut index_map = Vec::with_capacity(out_numel);
-            let mut coords = vec![0usize; new_shape.len()];
-            for _ in 0..out_numel {
-                let mut input_flat = 0usize;
-                for (axis, &coord) in coords.iter().enumerate() {
-                    let input_coord = if axis == dim { coord + start } else { coord };
-                    input_flat += input_coord * input_strides[axis];
-                }
-                index_map.push(input_flat);
-                // Advance the row-major odometer over `new_shape`.
-                for axis in (0..new_shape.len()).rev() {
-                    coords[axis] += 1;
-                    if coords[axis] < new_shape[axis] {
-                        break;
-                    }
-                    coords[axis] = 0;
-                }
-            }
-            self.record_gather(&mut result, index_map);
-        }
+        // Record the slice's geometry so gradients scatter back into `self` as
+        // one zero-padded slab. The backward pass works in `self`'s *logical*
+        // (default row-major) order — not the view's physical strides — because
+        // the scatter target is a zeros tensor in `self`'s logical order.
+        self.record_view(&mut result, ViewKind::Narrow { dim, start });
 
-        Ok(result)
+        result
     }
 
     /// Create a transposed view (shares data, no copying)

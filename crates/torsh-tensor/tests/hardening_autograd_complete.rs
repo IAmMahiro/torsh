@@ -9,6 +9,23 @@
 use torsh_core::device::DeviceType;
 use torsh_tensor::Tensor;
 
+/// Serializes every test in this file against
+/// `gelu_leaky_relu_do_not_record_under_no_grad`'s `with_grad_mode(false, ..)`
+/// window. Grad mode is a process-global `AtomicBool`
+/// (`torsh-core/src/grad_mode.rs`), so under `cargo test` -- which runs a whole
+/// binary's tests in one process across a thread pool, unlike `cargo nextest`'s
+/// process-per-test -- a no_grad scope on one thread transiently suppresses
+/// recording for every other test's tensor ops too. Measured before this guard
+/// existed: `cargo test -p torsh-tensor --test hardening_autograd_complete`
+/// failed 5 of 5 default-parallel runs (4-9 of the 19 tests, a different set
+/// each time), while `--test-threads=1` and `--skip
+/// gelu_leaky_relu_do_not_record_under_no_grad` both passed. Confining the
+/// grad-mode manipulation to one test is therefore NOT sufficient on its own;
+/// every test that records or checks recording has to take this lock for its
+/// full body. It costs nothing measurable (the whole file runs in ~10 ms).
+/// Mirrors the identical guard in `hardening_autograd_unary.rs`.
+static GRAD_MODE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn t32(data: Vec<f32>, shape: Vec<usize>) -> Tensor<f32> {
     Tensor::from_data(data, shape, DeviceType::Cpu).expect("f32 tensor creation should succeed")
 }
@@ -59,6 +76,7 @@ fn assert_close(a: &[f32], b: &[f32], tol: f32, ctx: &str) {
 /// (single-block) backward would scatter the wrong slabs.
 #[test]
 fn cat_backward_splits_grad_along_dim1() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let a = ramp(&[2, 3, 4]).requires_grad_(true);
     let b = ramp(&[2, 3, 4]).requires_grad_(true);
     let out = Tensor::cat(&[&a, &b], 1).expect("cat");
@@ -100,6 +118,7 @@ fn cat_backward_splits_grad_along_dim1() {
 /// stack inserts a new dim=1; each input's grad is that slab of the seed.
 #[test]
 fn stack_backward_selects_grad_along_new_dim1() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let a = ramp(&[2, 4]).requires_grad_(true);
     let b = ramp(&[2, 4]).requires_grad_(true);
     let c = ramp(&[2, 4]).requires_grad_(true);
@@ -135,6 +154,7 @@ fn stack_backward_selects_grad_along_new_dim1() {
 
 #[test]
 fn narrow_backward_scatters_into_zeros_f133() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let x = ramp(&[4, 5]).requires_grad_(true);
     let y = x.narrow(0, 1, 2).expect("narrow"); // rows 1,2 -> [2,5]
     assert_eq!(y.shape().dims(), &[2, 5]);
@@ -157,6 +177,7 @@ fn narrow_backward_scatters_into_zeros_f133() {
 
 #[test]
 fn select_backward_scatters_row() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let x = ramp(&[4, 3]).requires_grad_(true);
     let y = x.select(0, 2).expect("select"); // row 2 -> [3]
     assert_eq!(y.shape().dims(), &[3]);
@@ -172,6 +193,7 @@ fn select_backward_scatters_row() {
 
 #[test]
 fn slice_tensor_backward_scatters_view() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let x = ramp(&[3, 4]).requires_grad_(true);
     let y = x.slice_tensor(1, 1, 3).expect("slice_tensor"); // cols 1,2 -> [3,2]
     assert_eq!(y.shape().dims(), &[3, 2]);
@@ -197,6 +219,7 @@ fn slice_tensor_backward_scatters_view() {
 
 #[test]
 fn log_softmax_backward_matches_finite_difference_f112() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let shape = [2usize, 3];
     let base = ramp(&shape).to_vec().unwrap();
     let weight = t32(vec![0.3, -1.2, 0.7, 2.0, -0.5, 1.1], shape.to_vec());
@@ -239,6 +262,7 @@ fn log_softmax_backward_matches_finite_difference_f112() {
 
 #[test]
 fn exp_log_tanh_sigmoid_backward_are_recorded() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     // exp: d/dx = exp(x)
     let xv = vec![-1.0f32, 0.0, 0.5, 1.5];
     let x = t32(xv.clone(), vec![4]).requires_grad_(true);
@@ -280,6 +304,7 @@ fn exp_log_tanh_sigmoid_backward_are_recorded() {
 /// sigmoid/relu must record gradients too, not only the sequential fallback.
 #[test]
 fn sigmoid_relu_backward_on_simd_and_parallel_paths() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     for &n in &[1024usize, 256usize] {
         // sigmoid over a large tensor
         let xv: Vec<f32> = (0..n).map(|i| ((i % 7) as f32) - 3.0).collect();
@@ -321,6 +346,7 @@ fn sigmoid_relu_backward_on_simd_and_parallel_paths() {
 
 #[test]
 fn contiguous_backward_flows_through_copy() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let x = ramp(&[2, 3]).requires_grad_(true);
     let xt = x.transpose_view(0, 1).expect("transpose_view"); // [3,2], non-contiguous
     assert!(!xt.is_contiguous());
@@ -350,6 +376,7 @@ fn contiguous_backward_flows_through_copy() {
 
 #[test]
 fn from_vec_rejects_length_mismatch() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     // 8 values into [4,1,2,2] (numel 16) must be an Err, not silent acceptance.
     assert!(
         Tensor::<f32>::from_vec(vec![0.0; 8], &[4, 1, 2, 2]).is_err(),
@@ -369,6 +396,7 @@ fn from_vec_rejects_length_mismatch() {
 
 #[test]
 fn copy_is_cow_safe_shared_clone_survives() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let mut a = t32(vec![1.0, 2.0, 3.0], vec![3]);
     let snap = a.clone(); // shallow clone shares storage
     a.copy_(&t32(vec![9.0, 9.0, 9.0], vec![3])).expect("copy_");
@@ -382,6 +410,7 @@ fn copy_is_cow_safe_shared_clone_survives() {
 
 #[test]
 fn copy_from_and_set_data_are_cow_safe() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let mut a = t32(vec![1.0, 2.0, 3.0], vec![3]);
     let snap = a.clone();
     a.copy_from(&t32(vec![7.0, 8.0, 9.0], vec![3]))
@@ -413,6 +442,7 @@ fn copy_from_and_set_data_are_cow_safe() {
 /// style aggregation relies on — not silently detach the view and drop the write.
 #[test]
 fn copy_from_and_set_data_write_through_views() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     // base = [[0,1,2,3],[4,5,6,7],[8,9,10,11]]; view = columns 1..3 (a [3,2] strided view).
     let base = ramp(&[3, 4]);
     let mut view = base.slice_tensor(1, 1, 3).expect("slice_tensor");
@@ -449,6 +479,7 @@ fn copy_from_and_set_data_write_through_views() {
 /// the sum of both slabs, not just one.
 #[test]
 fn cat_backward_accumulates_duplicate_input() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let a = ramp(&[2, 3]).requires_grad_(true);
     let out = Tensor::cat(&[&a, &a], 0).expect("cat"); // [4,3]
     let seed = ramp(&[4, 3]);
@@ -463,4 +494,188 @@ fn cat_backward_accumulates_duplicate_input() {
     }
     let g = a.grad().expect("duplicate-input grad").to_vec().unwrap();
     assert_close(&g, &exp, 1e-5, "cat duplicate-input grad accumulation");
+}
+
+// ---------------------------------------------------------------------------
+// Item 6: gelu / leaky_relu record a real backward (TODO.md:118).
+// ---------------------------------------------------------------------------
+
+/// Sequential (numel<=100) and parallel (101..=1000) GELU dispatch both run
+/// the exact-tanh forward (`compute_gelu_scalar`), so finite differences are
+/// valid on both. Sizes above 1000 are covered by
+/// `hardening_autograd_primitives.rs`, which since Wave 4 can FD-gradcheck
+/// them too -- they no longer take a separate kernel.
+#[test]
+fn gelu_backward_matches_finite_difference_sequential_and_parallel() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    for &n in &[8usize, 256usize] {
+        let xv: Vec<f32> = (0..n).map(|i| ((i % 9) as f32) * 0.5 - 2.0).collect();
+        let x = t32(xv.clone(), vec![n]).requires_grad_(true);
+        x.gelu()
+            .expect("gelu")
+            .sum()
+            .expect("sum")
+            .backward()
+            .expect("gelu backward must be recorded");
+        let analytic = x
+            .grad()
+            .unwrap_or_else(|| panic!("gelu grad missing at n={n}"))
+            .to_vec()
+            .unwrap();
+        let numeric = fd_grad(&xv, &[n], |t| {
+            t.gelu().unwrap().sum().unwrap().item().unwrap()
+        });
+        assert_close(
+            &analytic,
+            &numeric,
+            2e-2,
+            &format!("gelu grad vs FD (n={n})"),
+        );
+    }
+}
+
+/// n=2048 is the size band that used to take a separate f32 SIMD kernel
+/// (numel>1000, default features): scirs2-core's `simd_gelu_f32` replaced
+/// `tanh` with a clamped Pade rational, so the forward there was a DIFFERENT
+/// function from the recorded (exact-tanh) derivative and finite differences
+/// could not check it. Wave 4 deleted that dispatch -- `Tensor::gelu` now
+/// evaluates one closed form at every size -- and
+/// `hardening_autograd_primitives.rs` adds the FD gradcheck and the
+/// cross-threshold continuity check that became possible as a result.
+///
+/// This test survives the change unweakened and is still worth keeping: it
+/// pins the analytic closed form directly at a large size, independent of any
+/// FD step size, which is exactly the regression guard that would catch a
+/// future re-introduction of an approximate large-tensor kernel.
+#[test]
+fn gelu_backward_matches_closed_form_at_the_former_simd_size() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    let n = 2048usize;
+    let xv: Vec<f32> = (0..n).map(|i| ((i % 13) as f32) * 0.25 - 1.5).collect();
+    let x = t32(xv.clone(), vec![n]).requires_grad_(true);
+    x.gelu()
+        .expect("gelu")
+        .sum()
+        .expect("sum")
+        .backward()
+        .expect("gelu backward must be recorded at n=2048");
+    let g = x
+        .grad()
+        .expect("gelu grad missing at n=2048")
+        .to_vec()
+        .unwrap();
+    let k = (2.0f32 / std::f32::consts::PI).sqrt();
+    let c = 0.044_715f32;
+    for (i, &v) in xv.iter().enumerate() {
+        let t = (k * (v + c * v * v * v)).tanh();
+        let want = 0.5 * (1.0 + t) + 0.5 * v * (1.0 - t * t) * k * (1.0 + 3.0 * c * v * v);
+        assert!(
+            (g[i] - want).abs() < 1e-4,
+            "gelu n=2048 grad i={i}: {} vs {want}",
+            g[i]
+        );
+    }
+}
+
+/// Slope != the crate's implicit default, and no sample sits at the kink
+/// (|x| >= 0.05, well outside the FD step of 1e-3), so the discontinuous
+/// derivative at x==0 cannot corrupt the central-difference estimate.
+#[test]
+fn leaky_relu_backward_matches_finite_difference() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    let slope = 0.2f32;
+    let xv = vec![-2.0f32, -0.75, -0.05, 0.05, 0.75, 2.0, -1.25, 1.25];
+    let x = t32(xv.clone(), vec![8]).requires_grad_(true);
+    x.leaky_relu(slope)
+        .expect("leaky_relu")
+        .sum()
+        .expect("sum")
+        .backward()
+        .expect("leaky_relu backward must be recorded");
+    let analytic = x.grad().expect("leaky_relu grad").to_vec().unwrap();
+    let numeric = fd_grad(&xv, &[8], move |t| {
+        t.leaky_relu(slope).unwrap().sum().unwrap().item().unwrap()
+    });
+    assert_close(&analytic, &numeric, 1e-3, "leaky_relu grad vs FD");
+}
+
+/// Cross-product over slope and size. `leaky_relu` has a single dispatch path
+/// today, but pinning several sizes guards a future SIMD/parallel split the
+/// same way `sigmoid_relu_backward_on_simd_and_parallel_paths` does above.
+///
+/// Each `(slope, n)` pair gets its OWN tensor: `backward()` accumulates into
+/// the grad slot, so reusing one `x` across iterations would silently sum
+/// multiple backward passes into a single grad and could mask a wrong
+/// derivative as an exact small-integer multiple of the right one.
+#[test]
+fn leaky_relu_backward_analytic_across_slopes_and_sizes() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    let slopes = [0.0f32, 0.01, 0.2, 1.0];
+    let sizes = [8usize, 256usize, 2048usize];
+    for &slope in &slopes {
+        for &n in &sizes {
+            let xv: Vec<f32> = (0..n).map(|i| ((i % 11) as f32) - 5.0).collect();
+            let x = t32(xv.clone(), vec![n]).requires_grad_(true);
+            let y = x.leaky_relu(slope).expect("leaky_relu");
+            assert!(
+                y.requires_grad(),
+                "leaky_relu(slope={slope}) output must require grad (n={n})"
+            );
+            y.sum()
+                .expect("sum")
+                .backward()
+                .expect("leaky_relu backward must be recorded");
+            let g = x
+                .grad()
+                .unwrap_or_else(|| panic!("leaky_relu grad missing (slope={slope}, n={n})"))
+                .to_vec()
+                .unwrap();
+            // v == 0.0 takes the slope branch, matching the forward's `x > 0`
+            // predicate (the `i % 11 == 5` sample hits it for every n here).
+            for (i, &v) in xv.iter().enumerate() {
+                let expected = if v > 0.0 { 1.0 } else { slope };
+                assert!(
+                    (g[i] - expected).abs() < 1e-6,
+                    "leaky_relu grad slope={slope} n={n} i={i}: {} vs {expected}",
+                    g[i]
+                );
+            }
+        }
+    }
+}
+
+/// Regression guard for the record-gating in `record_unary` /
+/// `record_leaky_relu`: passes today (the parallel/SIMD branches return
+/// `from_data`, whose `requires_grad` is unconditionally `false`) and must
+/// keep passing after the fix, once the sequential branch's
+/// `requires_grad = should_record_grad(...)` and the explicit
+/// `Operation::Unary`/`Operation::LeakyRelu` records are both gated on the
+/// same no_grad check.
+///
+/// Grad mode is a process-global `AtomicBool`
+/// (`torsh-core/src/grad_mode.rs`), not thread-local. Confining the
+/// manipulation to this one test is NOT enough to protect siblings under a
+/// plain `cargo test` binary, which runs the whole file in one process across
+/// a thread pool -- see [`GRAD_MODE_GUARD`], which every test in this file
+/// takes for exactly that reason.
+#[test]
+fn gelu_leaky_relu_do_not_record_under_no_grad() {
+    let _serial = GRAD_MODE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    use torsh_core::grad_mode::with_grad_mode;
+
+    for &n in &[8usize, 256usize, 2048usize] {
+        let xv: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1 - 1.0).collect();
+        let x = t32(xv, vec![n]).requires_grad_(true);
+        let (g_out, l_out) =
+            with_grad_mode(false, || (x.gelu().unwrap(), x.leaky_relu(0.2).unwrap()));
+        assert!(
+            !g_out.requires_grad(),
+            "gelu must not record under no_grad (n={n})"
+        );
+        assert!(
+            !l_out.requires_grad(),
+            "leaky_relu must not record under no_grad (n={n})"
+        );
+        assert!(g_out.sum().unwrap().backward().is_err());
+    }
 }

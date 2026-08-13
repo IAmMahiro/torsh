@@ -329,7 +329,7 @@ impl HardwareLinear {
     ///
     /// # Dispatch
     ///
-    /// The CPU path goes straight to [`Self::forward_generic`], which routes to
+    /// The CPU path goes straight to `Self::forward_generic`, which routes to
     /// `Tensor::matmul` — a blocked, SIMD GEMM (`scirs2_core::ndarray`'s
     /// `general_mat_mul` for `f32`/`f64`, a cache-blocked `i-k-j` kernel
     /// otherwise). There are deliberately no separate AVX-512/AVX2/NEON

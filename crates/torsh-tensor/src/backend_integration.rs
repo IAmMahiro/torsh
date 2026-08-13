@@ -321,7 +321,19 @@ impl<T: TensorElement + Copy> Tensor<T> {
     }
 
     /// Optimized CPU to GPU transfer
+    ///
+    /// With the `gpu` feature and an active backend this genuinely uploads: the
+    /// result holds device-resident storage, so the ops that follow run without
+    /// any further transfer. Otherwise the tensor is re-tagged with the target
+    /// device and its data stays on the host.
     fn cpu_to_gpu_transfer(&self, _gpu_id: u32, optimization: DeviceOptimization) -> Result<Self> {
+        #[cfg(feature = "gpu")]
+        if let Some(uploaded) =
+            crate::gpu_dispatch::try_upload_f32(self, DeviceType::Cuda(_gpu_id as usize))
+        {
+            return Ok(uploaded);
+        }
+
         let data = self.to_vec()?;
 
         // Apply GPU-specific optimizations

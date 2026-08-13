@@ -23,18 +23,37 @@ where
     }
 
     /// Square of all elements
+    ///
+    /// Records [`Operation::Power`] with exponent `2.0`: `map` is
+    /// forward-only (see [`Tensor::neg`]'s doc for why), so without this
+    /// `square()` would return a `requires_grad` leaf that swallows the
+    /// gradient of everything upstream of it. The `Power` backward arm
+    /// already exists and needs no extra trait bound here -- `2.0` is a
+    /// literal `f32`, not a value converted from `T` (that conversion is
+    /// what [`Tensor::pow`]'s `Into<f32>` bound is for).
     pub fn square(&self) -> Result<Self> {
-        self.map(|x| x * x)
+        let mut result = self.map(|x| x * x)?;
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = Operation::Power {
+                input: Arc::new(self.clone()),
+                exponent: 2.0,
+            };
+        }
+        Ok(result)
     }
 
     /// Reciprocal square root of all elements (1/sqrt(x))
     pub fn rsqrt(&self) -> Result<Self> {
-        self.map(|x| T::from(1.0).expect("numeric conversion should succeed") / x.sqrt())
+        let result =
+            self.map(|x| T::from(1.0).expect("numeric conversion should succeed") / x.sqrt())?;
+        Ok(self.record_unary(result, UnaryKind::Rsqrt))
     }
 
     /// Reciprocal of all elements (1/x)
     pub fn reciprocal(&self) -> Result<Self> {
-        self.map(|x| T::from(1.0).expect("numeric conversion should succeed") / x)
+        let result = self.map(|x| T::from(1.0).expect("numeric conversion should succeed") / x)?;
+        Ok(self.record_unary(result, UnaryKind::Reciprocal))
     }
 
     /// Exponential of all elements
@@ -51,12 +70,14 @@ where
 
     /// Logarithm base 10 of all elements
     pub fn log10(&self) -> Result<Self> {
-        self.map(|x| x.log10())
+        let result = self.map(|x| x.log10())?;
+        Ok(self.record_unary(result, UnaryKind::Log10))
     }
 
     /// Logarithm base 2 of all elements
     pub fn log2(&self) -> Result<Self> {
-        self.map(|x| x.log2())
+        let result = self.map(|x| x.log2())?;
+        Ok(self.record_unary(result, UnaryKind::Log2))
     }
 
     /// Natural logarithm of all elements
@@ -79,26 +100,47 @@ where
 
     /// Tangent of all elements
     pub fn tan(&self) -> Result<Self> {
-        self.map(|x| x.tan())
+        let result = self.map(|x| x.tan())?;
+        Ok(self.record_unary(result, UnaryKind::Tan))
     }
 
-    /// GELU (Gaussian Error Linear Unit) activation function with GPU and SIMD optimization
+    /// GELU (Gaussian Error Linear Unit) activation, in the tanh
+    /// approximation `0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))`.
+    ///
+    /// One closed form at every tensor size — see the private `gelu_forward`
+    /// below for why the f32 SIMD kernel is deliberately not used — and one recorded
+    /// derivative ([`crate::core_ops::UnaryKind::Gelu`]) that matches it exactly.
     pub fn gelu(&self) -> Result<Self> {
+        let result = self.gelu_forward()?;
+        Ok(self.record_unary(result, UnaryKind::Gelu))
+    }
+
+    /// Forward-only GELU (parallel or scalar path); autograd is recorded by
+    /// the public [`Tensor::gelu`] wrapper, so every dispatch path shares one
+    /// recorded derivative.
+    ///
+    /// **There is deliberately no f32 SIMD path.** Until Wave 4, tensors with
+    /// `numel > 1000` were routed to scirs2-core's `adaptive_simd_gelu_f32`,
+    /// which substitutes a clamped Pade rational for `tanh`. That is a
+    /// *different function*, not a faster evaluation of the same one: the
+    /// forward jumped by up to 0.0211 absolute (515% relative at `x = -2.40`)
+    /// the moment a tensor crossed 1000 elements, and the recorded backward —
+    /// which differentiates the exact-tanh closed form — no longer matched the
+    /// forward that had run. Both defects are pinned by
+    /// `tests/hardening_autograd_primitives.rs`
+    /// (`gelu_forward_is_continuous_across_the_dispatch_threshold` and
+    /// `gelu_backward_matches_finite_difference_above_the_simd_threshold`).
+    /// The parallel path below still fans large tensors out across worker
+    /// threads; it just evaluates the same `compute_gelu_scalar` everywhere.
+    fn gelu_forward(&self) -> Result<Self> {
         // GPU fast path (deferred): GELU is not yet a variant of oxicuda's
         // `ComputeBackend` `UnaryOp`.  oxicuda-blas already ships
         // `elementwise::unary::gelu`, so once `UnaryOp::Gelu` is added upstream
         // (TODO(oxicuda-unaryop-gelu)) dispatch here via
         // `crate::gpu_dispatch::try_unary_f32(self, UnaryOp::Gelu)`.
 
-        // ✅ SciRS2 SIMD Optimization - Vectorized GELU for f32 tensors
-        #[cfg(feature = "simd")]
-        {
-            if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() && self.numel() > 1000 {
-                return self.simd_gelu_f32();
-            }
-        }
-
-        // ✅ SciRS2 Parallel Processing - Use parallel computation for medium tensors
+        // ✅ SciRS2 Parallel Processing - Use parallel computation for medium
+        // and large tensors (there is no separate SIMD band; see above).
         #[cfg(feature = "parallel")]
         {
             if self.numel() > 100 {
@@ -125,39 +167,15 @@ where
         half * x * (one + tanh_input.tanh())
     }
 
-    /// SIMD-optimized GELU activation function for f32 tensors
-    #[cfg(feature = "simd")]
-    fn simd_gelu_f32(&self) -> Result<Self> {
-        use scirs2_core::ndarray::ArrayView1;
-
-        let data = self.data()?;
-
-        // Cast to f32 for SIMD operations
-        let data_f32: &[f32] =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len()) };
-
-        // Create ArrayView1 for SIMD function
-        let data_view = ArrayView1::from(data_f32);
-
-        // Use scirs2_core SIMD-accelerated GELU
-        let result_array = adaptive_simd::adaptive_simd_gelu_f32(&data_view);
-
-        // Convert result back to T type
-        let result_vec: Vec<T> = result_array
-            .to_vec()
-            .into_iter()
-            .map(|f| unsafe { std::mem::transmute_copy::<f32, T>(&f) })
-            .collect();
-
-        Self::from_data(
-            result_vec,
-            self.shape().dims().to_vec(),
-            self.device.clone(),
-        )
-    }
-
     /// Leaky ReLU activation function with negative slope
     pub fn leaky_relu(&self, negative_slope: T) -> Result<Self> {
+        let result = self.leaky_relu_forward(negative_slope)?;
+        Ok(self.record_leaky_relu(result, negative_slope))
+    }
+
+    /// Forward-only leaky ReLU; autograd is recorded by the public
+    /// [`Tensor::leaky_relu`] wrapper.
+    fn leaky_relu_forward(&self, negative_slope: T) -> Result<Self> {
         // GPU fast path (deferred): parameterized LeakyReLU has no oxicuda
         // `ComputeBackend` `UnaryOp` variant (the flat `unary` op takes no
         // scalar parameter).  TODO(oxicuda-unaryop-leakyrelu): add a
@@ -173,27 +191,32 @@ where
 
     /// Arcsine of all elements
     pub fn asin(&self) -> Result<Self> {
-        self.map(|x| x.asin())
+        let result = self.map(|x| x.asin())?;
+        Ok(self.record_unary(result, UnaryKind::Asin))
     }
 
     /// Arccosine of all elements
     pub fn acos(&self) -> Result<Self> {
-        self.map(|x| x.acos())
+        let result = self.map(|x| x.acos())?;
+        Ok(self.record_unary(result, UnaryKind::Acos))
     }
 
     /// Arctangent of all elements
     pub fn atan(&self) -> Result<Self> {
-        self.map(|x| x.atan())
+        let result = self.map(|x| x.atan())?;
+        Ok(self.record_unary(result, UnaryKind::Atan))
     }
 
     /// Hyperbolic sine of all elements
     pub fn sinh(&self) -> Result<Self> {
-        self.map(|x| x.sinh())
+        let result = self.map(|x| x.sinh())?;
+        Ok(self.record_unary(result, UnaryKind::Sinh))
     }
 
     /// Hyperbolic cosine of all elements
     pub fn cosh(&self) -> Result<Self> {
-        self.map(|x| x.cosh())
+        let result = self.map(|x| x.cosh())?;
+        Ok(self.record_unary(result, UnaryKind::Cosh))
     }
 
     /// Hyperbolic tangent of all elements
@@ -253,39 +276,64 @@ where
     }
 
     /// Floor of all elements
+    ///
+    /// a.e. zero derivative: the result is detached.
     pub fn floor(&self) -> Result<Self> {
         self.map(|x| x.floor())
     }
 
     /// Ceiling of all elements
+    ///
+    /// a.e. zero derivative: the result is detached.
     pub fn ceil(&self) -> Result<Self> {
         self.map(|x| x.ceil())
     }
 
     /// Round to nearest integer
+    ///
+    /// a.e. zero derivative: the result is detached.
     pub fn round(&self) -> Result<Self> {
         self.map(|x| x.round())
     }
 
     /// Truncate to integer part
+    ///
+    /// a.e. zero derivative: the result is detached.
     pub fn trunc(&self) -> Result<Self> {
         self.map(|x| x.trunc())
     }
 
     /// Fractional part
+    ///
+    /// a.e. zero derivative (`fract` is `x - trunc(x)`, and the recorded
+    /// pass-through would be wrong at every integer): the result is detached.
     pub fn fract(&self) -> Result<Self> {
         self.map(|x| x.fract())
     }
 
     /// Negation of all elements
+    ///
+    /// Records [`Operation::MulScalar`] with `-1`: `map` is forward-only, so
+    /// without this the negated tensor would be a `requires_grad` leaf that
+    /// swallows the gradient of everything upstream of it.
     pub fn neg(&self) -> Result<Self>
     where
         T: std::ops::Neg<Output = T>,
     {
-        self.map(|x| -x)
+        let mut result = self.map(|x| -x)?;
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = Operation::MulScalar {
+                input: Arc::new(self.clone()),
+                scalar: -<T as TensorElement>::one(),
+            };
+        }
+        Ok(result)
     }
 
     /// Sign of all elements (-1, 0, or 1)
+    ///
+    /// a.e. zero derivative: the result is detached.
     pub fn sign(&self) -> Result<Self> {
         self.map(|x| {
             if x > <T as scirs2_core::numeric::Zero>::zero() {

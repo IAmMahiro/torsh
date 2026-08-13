@@ -154,6 +154,15 @@ impl<T: TensorElement + Copy> Tensor<T> {
                 let vec_data = storage.to_vec();
                 Arc::new(RwLock::new(vec_data))
             }
+            #[cfg(feature = "gpu")]
+            TensorStorage::Device { .. } => {
+                // A strided view can never address device memory: the backend's
+                // copy primitives have no offset parameter, so the buffer is
+                // materialised on the host once (through the storage's cache)
+                // and the view reads that.
+                let data = self.to_vec()?;
+                Arc::new(RwLock::new(data))
+            }
         };
 
         // Create view storage
@@ -388,6 +397,8 @@ impl<T: TensorElement + Copy> TensorAlias<T> {
             TensorStorage::Aligned(data) => Arc::strong_count(data),
             #[cfg(feature = "simd")]
             TensorStorage::SimdOptimized(storage) => Arc::strong_count(storage),
+            #[cfg(feature = "gpu")]
+            TensorStorage::Device { buffer, .. } => Arc::strong_count(buffer),
         }
     }
 

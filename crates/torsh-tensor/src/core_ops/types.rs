@@ -70,6 +70,31 @@ impl<T: TensorElement + Copy> Tensor<T> {
             base_tensor: None,
         })
     }
+    /// Wrap already-built storage as a detached leaf tensor.
+    ///
+    /// This is how [`crate::gpu_dispatch`] publishes a device-resident result:
+    /// going through [`Tensor::from_data`] would allocate *host* storage and
+    /// undo the residency the dispatch just achieved. The tensor is contiguous,
+    /// unviewed and gradient-free; callers that need autograd record their own
+    /// [`Operation`] on it afterwards, exactly as the host paths do.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn from_device_storage(
+        storage: TensorStorage<T>,
+        shape: Vec<usize>,
+        device: DeviceType,
+    ) -> Self {
+        Self {
+            storage,
+            shape: Shape::new(shape),
+            device,
+            requires_grad: false,
+            grad: Arc::new(RwLock::new(None)),
+            operation: Operation::Leaf,
+            strides: None,
+            storage_offset: 0,
+            base_tensor: None,
+        }
+    }
     /// 🚀 **Phase 7**: Create tensor with fast result storage (skips alignment copy)
     ///
     /// For SIMD operation results, uses simple InMemory storage to avoid
@@ -200,6 +225,30 @@ impl<T: TensorElement + Copy> Tensor<T> {
         self.storage.get(self.logical_to_physical(index)?)
     }
     /// Set element at index (requires multi-dimensional indices for views)
+    ///
+    /// # Aliasing: no copy-on-write
+    /// Unlike the `&mut self` writers ([`Tensor::set_item`],
+    /// [`Tensor::set_item_flat`], [`Tensor::fill_`], the in-place arithmetic
+    /// ops), this one takes `&self` and therefore *cannot* call
+    /// [`Tensor::make_unique`]. It always writes straight into the shared
+    /// storage, so the write is visible through every handle that aliases it —
+    /// including a `Tensor::clone()`, which shares storage rather than
+    /// deep-copying. Callers that need value semantics must either take the
+    /// tensor by `&mut` and use [`Tensor::set_item`], or isolate the storage
+    /// themselves with `make_unique()` first.
+    ///
+    /// The receiver is `&self` for backwards compatibility: the signature is
+    /// load-bearing for several hundred call sites that build a tensor and fill
+    /// it element by element through a shared binding. Changing it to
+    /// `&mut self` is a breaking API change and is deliberately not done here.
+    ///
+    /// # Device-resident tensors
+    /// This writer takes `&self` and therefore cannot demote the tensor to host
+    /// storage, so on a device-resident tensor (`gpu` feature) it returns
+    /// [`TorshError::InvalidOperation`]. Call
+    /// [`Tensor::make_unique`](crate::Tensor::make_unique) or
+    /// `to_device(DeviceType::Cpu)` first, or use one of the `&mut self`
+    /// writers such as [`Tensor::fill_`], which demote automatically.
     pub fn set(&self, indices: &[usize], value: T) -> Result<()>
     where
         T: Copy,
@@ -232,6 +281,17 @@ impl<T: TensorElement + Copy> Tensor<T> {
     ///
     /// The range is expressed in this tensor's own row-major order, so writing
     /// through a view updates the elements the view actually addresses.
+    ///
+    /// # Aliasing: no copy-on-write
+    /// Like [`Tensor::set`], this takes `&self` and cannot call
+    /// [`Tensor::make_unique`], so it always writes into the shared storage and
+    /// the write is visible through every aliasing handle. The `&mut self` bulk
+    /// writers [`Tensor::copy_from`] and [`Tensor::set_data`] wrap this one with
+    /// the copy-on-write step and are what callers should normally use.
+    ///
+    /// # Device-resident tensors
+    /// Like [`Tensor::set`], this takes `&self` and cannot demote, so it returns
+    /// [`TorshError::InvalidOperation`] on device-resident storage.
     pub fn set_slice(&self, start: usize, values: &[T]) -> Result<()>
     where
         T: Copy,
@@ -486,6 +546,11 @@ impl<T: TensorElement + Copy> Tensor<T> {
     /// # Performance
     /// - Zero memory copies for InMemory storage
     /// - Not supported for MemoryMapped or Aligned storage (returns error)
+    ///
+    /// # Device-resident tensors
+    /// Device buffers are immutable and this writer takes `&self`, so it cannot
+    /// demote them; it returns [`TorshError::InvalidOperation`] instead. Demote
+    /// with [`Tensor::make_unique`](crate::Tensor::make_unique) first.
     ///
     /// # Examples
     /// ```ignore

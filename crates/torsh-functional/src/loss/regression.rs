@@ -3,7 +3,7 @@
 //! This module provides loss functions commonly used for regression tasks,
 //! including mean squared error, L1 loss, and other regression-specific losses.
 
-use crate::loss::common::ReductionType;
+use crate::loss::common::{blend, branch_masks, ReductionType};
 use crate::utils::{
     function_context, validate_elementwise_shapes, validate_non_empty, validate_positive,
 };
@@ -106,6 +106,19 @@ pub fn l1_loss(input: &Tensor, target: &Tensor, reduction: ReductionType) -> Tor
 ///
 /// # Returns
 /// Loss tensor with reduction applied
+///
+/// # Autograd
+///
+/// The quadratic/linear branch used to be selected with
+/// `Tensor::where_tensor`, which rebuilds its result from raw data and records
+/// nothing — so this loss returned a detached leaf and `backward()` never
+/// reached `input`. It now uses the constant-mask composition (`branch_masks` /
+/// `blend` in `loss::common`), which selects the same element from the same arm
+/// while leaving both arms on the graph. Forward values are unchanged; the mask
+/// predicate is still exactly `|diff| < beta`.
+///
+/// Note that Smooth L1 is `C¹` at `|diff| == beta` (both arms agree in value
+/// *and* slope there), so the branch boundary is not a subgradient hazard.
 pub fn smooth_l1_loss(
     input: &Tensor,
     target: &Tensor,
@@ -118,14 +131,14 @@ pub fn smooth_l1_loss(
     let diff = input.sub(target)?;
     let abs_diff = diff.abs()?;
 
-    // Create mask for |diff| < beta
-    let mask = abs_diff.lt_scalar(beta)?;
+    // Constant 0/1 indicator of |diff| < beta, replacing `abs_diff.lt_scalar(beta)`.
+    let (inside_mask, outside_mask) = branch_masks(&abs_diff, |value| value < beta)?;
 
     // Smooth L1: 0.5 * diff^2 / beta for |diff| < beta, |diff| - 0.5 * beta otherwise
     let l2_component = diff.pow_scalar(2.0)?.div_scalar(2.0 * beta)?;
     let l1_component = abs_diff.sub_scalar(0.5 * beta)?;
 
-    let smooth_l1 = l2_component.where_tensor(&mask, &l1_component)?;
+    let smooth_l1 = blend(&l2_component, &l1_component, &inside_mask, &outside_mask)?;
     reduction.apply(smooth_l1)
 }
 

@@ -1,6 +1,8 @@
 //! Basic container modules for organizing layers
 
 use crate::{Module, ModuleBase, Parameter};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use torsh_core::device::DeviceType;
 use torsh_core::error::{Result, TorshError};
 use torsh_tensor::Tensor;
@@ -97,6 +99,36 @@ impl Module for Sequential {
         params
     }
 
+    /// Every child's buffers, in child order.
+    ///
+    /// Without this override the container answered the *trait default*
+    /// (`Vec::new()`), so a `Sequential` holding a `BatchNorm` reported zero
+    /// buffers and its `state_dict()` silently dropped every running statistic
+    /// — a saved model reloaded with freshly initialized statistics and
+    /// evaluated differently, with no error anywhere. See
+    /// `tests/hardening_nn_state_dict.rs`.
+    fn buffers(&self) -> Vec<Arc<RwLock<Tensor>>> {
+        self.modules
+            .iter()
+            .flat_map(|module| module.buffers())
+            .collect()
+    }
+
+    /// The same buffers as [`Self::buffers`], keyed `"{index}.{name}"` — the
+    /// key scheme [`Self::named_parameters`] already uses, so the parameter and
+    /// buffer halves of a checkpoint agree on how to address a child.
+    fn named_buffers(&self) -> HashMap<String, Arc<RwLock<Tensor>>> {
+        let mut buffers = HashMap::new();
+
+        for (i, module) in self.modules.iter().enumerate() {
+            for (name, buffer) in module.named_buffers() {
+                buffers.insert(format!("{}.{}", i, name), buffer);
+            }
+        }
+
+        buffers
+    }
+
     fn train(&mut self) {
         self.base.set_training(true);
         for module in &mut self.modules {
@@ -132,6 +164,20 @@ impl Module for Sequential {
 
     fn children(&self) -> Vec<&dyn Module> {
         self.modules.iter().map(|m| m.as_ref()).collect()
+    }
+
+    /// The same children as [`Self::children`], addressed by their index.
+    ///
+    /// Every name-carrying recursion in the trait
+    /// (`all_named_parameters`, `all_named_buffers`, `named_modules`) walks
+    /// `named_children()`, not `children()`. Overriding only the latter left
+    /// the container invisible to all three.
+    fn named_children(&self) -> Vec<(String, &dyn Module)> {
+        self.modules
+            .iter()
+            .enumerate()
+            .map(|(i, module)| (i.to_string(), module.as_ref()))
+            .collect()
     }
 }
 
@@ -228,6 +274,28 @@ impl Module for ModuleList {
         params
     }
 
+    /// Every child's buffers, in child order. See [`Sequential::buffers`].
+    fn buffers(&self) -> Vec<Arc<RwLock<Tensor>>> {
+        self.modules
+            .iter()
+            .flat_map(|module| module.buffers())
+            .collect()
+    }
+
+    /// The same buffers as [`Self::buffers`], keyed `"{index}.{name}"`,
+    /// mirroring [`Self::named_parameters`].
+    fn named_buffers(&self) -> HashMap<String, Arc<RwLock<Tensor>>> {
+        let mut buffers = HashMap::new();
+
+        for (i, module) in self.modules.iter().enumerate() {
+            for (name, buffer) in module.named_buffers() {
+                buffers.insert(format!("{}.{}", i, name), buffer);
+            }
+        }
+
+        buffers
+    }
+
     fn train(&mut self) {
         self.base.set_training(true);
         for module in &mut self.modules {
@@ -263,6 +331,16 @@ impl Module for ModuleList {
 
     fn children(&self) -> Vec<&dyn Module> {
         self.modules.iter().map(|m| m.as_ref()).collect()
+    }
+
+    /// The same children as [`Self::children`], addressed by their index. See
+    /// [`Sequential::named_children`] for why the trait needs both.
+    fn named_children(&self) -> Vec<(String, &dyn Module)> {
+        self.modules
+            .iter()
+            .enumerate()
+            .map(|(i, module)| (i.to_string(), module.as_ref()))
+            .collect()
     }
 }
 
@@ -356,6 +434,28 @@ impl Module for ModuleDict {
         params
     }
 
+    /// Every child's buffers. See [`Sequential::buffers`].
+    fn buffers(&self) -> Vec<Arc<RwLock<Tensor>>> {
+        self.modules
+            .values()
+            .flat_map(|module| module.buffers())
+            .collect()
+    }
+
+    /// The same buffers as [`Self::buffers`], keyed `"{key}.{name}"`,
+    /// mirroring [`Self::named_parameters`].
+    fn named_buffers(&self) -> HashMap<String, Arc<RwLock<Tensor>>> {
+        let mut buffers = HashMap::new();
+
+        for (module_name, module) in &self.modules {
+            for (buffer_name, buffer) in module.named_buffers() {
+                buffers.insert(format!("{}.{}", module_name, buffer_name), buffer);
+            }
+        }
+
+        buffers
+    }
+
     fn train(&mut self) {
         self.base.set_training(true);
         for module in self.modules.values_mut() {
@@ -391,6 +491,15 @@ impl Module for ModuleDict {
 
     fn children(&self) -> Vec<&dyn Module> {
         self.modules.values().map(|m| m.as_ref()).collect()
+    }
+
+    /// The same children as [`Self::children`], addressed by their dictionary
+    /// key. See [`Sequential::named_children`] for why the trait needs both.
+    fn named_children(&self) -> Vec<(String, &dyn Module)> {
+        self.modules
+            .iter()
+            .map(|(name, module)| (name.clone(), module.as_ref()))
+            .collect()
     }
 }
 

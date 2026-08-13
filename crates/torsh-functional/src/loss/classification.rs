@@ -10,9 +10,10 @@ use torsh_tensor::Tensor;
 
 /// Sum a `[N, C]` tensor along its class axis while keeping the autograd graph.
 ///
-/// The reduction is expressed as a matrix product with a constant column of ones
-/// because `Tensor::sum_dim` rebuilds its result from raw data and therefore
-/// detaches the graph, which would make every loss built on it non-differentiable.
+/// `Tensor::sum_dim` records `Operation::SumDim`, so the reduction stays
+/// differentiable. (This helper used to route through a matmul against a
+/// constant column of ones because `sum_dim` once rebuilt its result from raw
+/// data and severed the graph; that workaround is no longer needed.)
 fn row_sum(input: &Tensor) -> TorshResult<Tensor> {
     let dims_binding = input.shape();
     let dims = dims_binding.dims();
@@ -22,9 +23,7 @@ fn row_sum(input: &Tensor) -> TorshResult<Tensor> {
             dims.len()
         )));
     }
-    let (rows, cols) = (dims[0], dims[1]);
-    let ones = Tensor::from_data(vec![1.0f32; cols], vec![cols, 1], input.device())?;
-    input.matmul(&ones)?.view(&[rows as i32])
+    input.sum_dim(&[1], false)
 }
 
 /// Read the target class index of sample `index`, validating it against `num_classes`.

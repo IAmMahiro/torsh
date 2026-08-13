@@ -115,9 +115,78 @@ rustfft, onig-sys, openblas, cust}` all **absent** ✓ · 0 files ≥ 2000 lines
 - Lock-poison remaining crates (~700 sites: distributed 317, fx 62, jit 59, vision 46, …) — helper exists, mechanical.
 - Example relocation blocked on an example-rewrite pass (root examples/ have 0.1.x-era API drift); webgpu feature-name fixed, honest status banner added.
 - torsh-core cudnn-sys optional C-FFI leak (F203); blake3 asm transitive via scirs2-datasets; hdf5 → oxih5 when ready.
-- Deeper perf: Storage::Device residency (kills per-op H2D/D2H), sum_dim non-keepdim autograd, gelu/leaky_relu backward records, RNN cell narrow-gradient (needs Slice/Cat records — partially landed).
+- ~~Deeper perf: Storage::Device residency, sum_dim non-keepdim autograd, gelu/leaky_relu backward records, RNN cell narrow-gradient~~ **ALL DONE — see the 2026-08-13 follow-up campaign below.**
 
 Full finding digest: session scratchpad `discovery.json` / `digest.md` (318 items, F000–F317).
+
+---
+
+## ✅ Perf/Autograd Follow-up Campaign (2026-08-13, COMPLETE — 6 waves, all green)
+
+The four "Deeper perf" follow-ups turned out (4-agent investigation, runtime-probed) to be mostly
+SILENT-CORRECTNESS bugs; fixing them cascaded into a full autograd-completeness campaign.
+
+### Landed (uncommitted on branch 0.2.0)
+- **Operation::SumDim** + deleted the silently-TRANSPOSING `Operation::Mean` producer (softmax grad
+  was 0.54 max-abs wrong; nll backward hard-errored; ~106 call sites affected). mean/var/std/
+  softmax/nll/cross_entropy now differentiate correctly by composition (FD-verified).
+- **UnaryKind::Gelu + Operation::LeakyRelu{slope: T}** + 14 more unary records (tan/asin/acos/atan/
+  sinh/cosh/log10/log2/rsqrt/reciprocal/square→Power, abs) + **AddScalar** + recording
+  **maximum/minimum/clamp** (PyTorch tie rules: ties 0.5/0.5, |x|′(0)=0, clamp inclusive-bound).
+- **Tensor::map made forward-only** — it was a silent gradient sink (requires_grad=true Leaf) that
+  produced measurably wrong GRU/GRUCell gradients. **Exact GELU on all paths** (removed scirs2
+  clamped-Pade SIMD kernel: forward was discontinuous at numel=1000, 515% rel err at x=−2.4).
+- **TensorStorage::Device residency** (gpu feature): injectable backend + CountingBackend proof —
+  chained 3 ops went 3×H2D/3×D2H → **1 upload + 1 download**; immutable device buffers, mutation
+  demotes, leak-checked error paths, default build stays oxicuda-free. GPU suite 872 tests.
+- **RNN/LSTM/GRU end-to-end BPTT**: stack/cat/dropout severs fixed; `RNN::forward` real
+  implementation (was a zeros stub; bidirectional params now registered); `slab_along_dim` hoist
+  (LSTM backward O(T²)→O(T)); **ViewKind::Narrow** geometric record (no index_map allocation);
+  **narrow() is now an aliasing view** (PyTorch parity + no slab copy per RNN gate split).
+- **torsh-series**: hand-written BPTT deleted; `LSTMForecaster::fit` trains via real backward
+  (head-to-head vs old BPTT from identical weights before switching; old BPTT mismodeled
+  num_layers≥2).
+- **torsh-nn functional**: softmax/log_softmax delegate (recording); swish (21.6% wrong grad) and
+  mish (SIGN-FLIPPED grad) fixed; relu/sigmoid/tanh/gelu/leaky_relu/elu/selu reconnected
+  (compile_time MLP now trainable); **14 losses reconnected** (l1/huber/smooth_l1/focal/dice/
+  tversky/wing/center/infonce/bce/triplet_margin/contrastive/multi_margin/cosine_embedding — the
+  last had a total batched-call failure, fixed to the PyTorch shape contract).
+- **Module norm layers** (LayerNorm/GroupNorm/BatchNorm/InstanceNorm): statistics now on the graph
+  (were frozen constants → incomplete gradients); running stats stay detached buffers.
+- **Buffer-aware state_dict** (PyTorch parity): running stats survive save/load (were silently
+  dropped — reloaded models evaluated differently); Sequential/ModuleList/ModuleDict
+  named_buffers/named_children; Box<dyn Module> forwards every trait method (macro).
+- **CoW value semantics**: clone-then-set_item no longer writes through (TODO item from
+  2026-06-21 closed); views keep PyTorch write-through; `fill_` stride/offset-blindness fixed
+  (view fill was clobbering the base prefix). t()/gather/index_select now record (duplicate-index
+  gradient accumulation verified).
+- **torsh-functional**: similarity losses (cosine_embedding/contrastive/triplet_margin/
+  hinge_embedding/margin_ranking) reconnected; stale `row_sum` matmul workaround → `sum_dim`.
+- **torsh-text**: padding embedding row is now actually zeroed (fill_ wrote to a dropped local).
+- Test hygiene: grad-mode process-global race serialized (GRAD_MODE_GUARD pattern); memory_pool
+  and torsh-graph flakes fixed/seeded; wave-introduced convergence test seeded (30/30 gates).
+
+### Final verification (2026-08-13)
+`cargo nextest run --workspace` **10,964 passed / 0 failed / 95 skipped** (campaign start: 10,638) ·
+gpu suite 872 ✓ · doctests 614 ✓ · check/clippy `-D warnings` default+all-features+gpu all clean ✓ ·
+fmt clean ✓ · `cargo deny check bans` ok ✓ · default graph free of oxicuda-backend/aws-lc-sys/
+rustfft/onig-sys ✓ · 0 files ≥ 2000 lines ✓ · flake gates 90/90 ✓ · HEAD still `7ec403eb MOS`,
+nothing committed.
+
+### Follow-ups from this campaign (not blockers)
+- extremum (max_dim/min_dim/amin/amax), cumsum/cumprod, sort backward records (need argmax-scatter /
+  reverse-scan / permutation-inverse designs — genuinely different backward rules).
+- grad-mode is a process-global AtomicBool (PyTorch's is thread-local); production use in
+  torsh-autograd checkpoint.rs. Design decision needed before changing.
+- GPU phase 2 on the A4000 Linux box: real-CUDA validation of Device residency (synchronize-before-
+  copy semantics), gemm/conv/attention residency (column-major f64 marshalling), device-side
+  backward, device memory pool.
+- SIMD gelu could be re-added with an exact-tanh vector kernel (upstream scirs2 issue: its
+  simd_gelu_f32 is a clamped-Pade approximation; relu/sigmoid SIMD verified exact and kept).
+- torsh-nn `Tensor::where_tensor`/`eq` still don't record (worked around via constant-mask
+  composition); recording variants would simplify future loss implementations.
+- nll_loss masked-sum formulation: a −inf anywhere in a row poisons that row (documented contract;
+  intrinsic to every differentiable masked-gather formulation).
 
 ---
 

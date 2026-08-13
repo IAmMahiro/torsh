@@ -136,7 +136,7 @@ impl MultiheadAttention {
     /// input projection, so cross-attention really attends to the supplied
     /// memory instead of silently re-running self-attention on `query`.
     ///
-    /// The layout of all three inputs follows [`Self::batch_first`]:
+    /// The layout of all three inputs follows `Self::batch_first`:
     /// `[batch, seq, embed]` when it is `true`, `[seq, batch, embed]` (the
     /// PyTorch default) otherwise.
     pub fn forward_with_kv(

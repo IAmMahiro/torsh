@@ -89,6 +89,16 @@ fn register_affine(base: &mut ModuleBase, num_features: usize) -> Result<()> {
 /// In training mode the batch statistics are used *and* folded into the running
 /// statistics (with the unbiased batch variance, matching PyTorch). In
 /// evaluation mode the tracked running statistics are used instead.
+///
+/// # Autograd
+///
+/// The training-mode statistics are recording tensor compositions, so
+/// `backward()` propagates through the batch mean and variance exactly as
+/// PyTorch does. What is folded into the running buffers is a *detached* copy:
+/// those buffers are state, not graph nodes, and splicing them into the graph
+/// would both mark them as requiring gradients and pin every past batch's graph
+/// in memory. Evaluation mode likewise consumes the buffers detached, so the
+/// tracked statistics are constants there.
 fn batch_norm_forward(
     input: &Tensor,
     base: &ModuleBase,
@@ -97,7 +107,10 @@ fn batch_norm_forward(
     training: bool,
 ) -> Result<Tensor> {
     let (mean, var) = match (training, stats) {
-        (false, Some(tracked)) => (tracked.running_mean(), tracked.running_var()),
+        (false, Some(tracked)) => (
+            tracked.running_mean().detach(),
+            tracked.running_var().detach(),
+        ),
         (_, tracked) => {
             let batch_mean = utils::compute_channel_mean(input)?;
             let batch_var = utils::compute_channel_variance(input, &batch_mean)?;
@@ -106,8 +119,10 @@ fn batch_norm_forward(
                 if let Some(tracked) = tracked {
                     let shape = input.shape();
                     let count = samples_per_channel(shape.dims());
-                    let unbiased = unbiased_variance(&batch_var, count)?;
-                    tracked.update(&batch_mean, &unbiased, config.momentum)?;
+                    let buffered_mean = utils::detached_statistic(&batch_mean)?;
+                    let buffered_var = utils::detached_statistic(&batch_var)?;
+                    let unbiased = unbiased_variance(&buffered_var, count)?;
+                    tracked.update(&buffered_mean, &unbiased, config.momentum)?;
                 }
             }
 
@@ -529,7 +544,15 @@ impl Module for VirtualBatchNorm2d {
             )
         })?;
 
-        let (batch_mean, batch_mean_square, batch_count) = channel_moments(input)?;
+        let shape = input.shape();
+        let dims = shape.dims();
+        let batch_count = dims[0] * dims[2] * dims[3];
+
+        // The *reference* moments are frozen constants; the current batch's
+        // moments are recording tensor compositions, so `backward()` reaches the
+        // input through the pooled statistics as well as through `x` itself.
+        let batch_mean = utils::compute_channel_mean(input)?;
+        let batch_mean_square = utils::compute_channel_mean(&input.pow_scalar(2.0)?)?;
 
         // Pool the reference batch with the current batch, weighted by size.
         let total = (reference.count + batch_count) as f32;
@@ -537,24 +560,41 @@ impl Module for VirtualBatchNorm2d {
         let batch_weight = batch_count as f32 / total;
 
         let channels = self.num_features;
-        let mut mean = Vec::with_capacity(channels);
-        let mut variance = Vec::with_capacity(channels);
-        for c in 0..channels {
-            let pooled_mean = reference_weight * reference.mean[c] + batch_weight * batch_mean[c];
-            let pooled_mean_square =
-                reference_weight * reference.mean_square[c] + batch_weight * batch_mean_square[c];
-            mean.push(pooled_mean);
-            variance.push((pooled_mean_square - pooled_mean * pooled_mean).max(0.0));
-        }
+        let reference_mean = Tensor::from_data(
+            reference
+                .mean
+                .iter()
+                .map(|m| m * reference_weight)
+                .collect::<Vec<f32>>(),
+            vec![channels],
+            input.device(),
+        )?;
+        let reference_mean_square = Tensor::from_data(
+            reference
+                .mean_square
+                .iter()
+                .map(|m| m * reference_weight)
+                .collect::<Vec<f32>>(),
+            vec![channels],
+            input.device(),
+        )?;
 
-        let mean_tensor = Tensor::from_data(mean, vec![channels], input.device())?;
-        let var_tensor = Tensor::from_data(variance, vec![channels], input.device())?;
+        let pooled_mean = reference_mean.add(&batch_mean.mul_scalar(batch_weight)?)?;
+        let pooled_mean_square =
+            reference_mean_square.add(&batch_mean_square.mul_scalar(batch_weight)?)?;
+        // `relu` is the differentiable spelling of the `max(0.0)` clamp the
+        // scalar implementation used: identical values, zero gradient where the
+        // clamp bites.
+        let pooled_variance = pooled_mean_square
+            .sub(&pooled_mean.pow_scalar(2.0)?)?
+            .relu()?;
+
         let (weight, bias) = affine_tensors(&self.base, self.config.affine);
 
         utils::apply_channel_normalization(
             input,
-            &mean_tensor,
-            &var_tensor,
+            &pooled_mean,
+            &pooled_variance,
             weight.as_ref(),
             bias.as_ref(),
             self.config.eps,
@@ -732,16 +772,20 @@ impl Module for BatchRenorm2d {
         let (weight, bias) = affine_tensors(&self.base, self.config.affine);
 
         if !self.training() {
+            // The running statistics are buffers, not graph nodes.
             return utils::apply_channel_normalization(
                 input,
-                &self.stats.running_mean(),
-                &self.stats.running_var(),
+                &self.stats.running_mean().detach(),
+                &self.stats.running_var().detach(),
                 weight.as_ref(),
                 bias.as_ref(),
                 self.config.eps,
             );
         }
 
+        // Batch statistics stay on the autograd graph: Ioffe's backward pass
+        // propagates through `mu_B` and `sigma_B` and only stops the gradient at
+        // the correction terms `r` and `d`.
         let batch_mean = utils::compute_channel_mean(input)?;
         let batch_var = utils::compute_channel_variance(input, &batch_mean)?;
 
@@ -753,41 +797,51 @@ impl Module for BatchRenorm2d {
         let (r_max, d_max) = self.schedule.limits_at(self.step());
         let eps = self.config.eps;
 
-        // Fold `(x - mu)/sigma * r + d` into a single per-channel scale/shift,
-        // then apply the affine parameters on top of it.
-        let weight_values = match weight.as_ref() {
-            Some(w) => w.to_vec()?,
-            None => vec![1.0; self.num_features],
-        };
-        let bias_values = match bias.as_ref() {
-            Some(b) => b.to_vec()?,
-            None => vec![0.0; self.num_features],
-        };
-
-        let mut scale = Vec::with_capacity(self.num_features);
-        let mut shift = Vec::with_capacity(self.num_features);
+        // `r` and `d` are constants (stop-gradient), so they are built from the
+        // raw values as detached per-channel tensors.
+        let mut r_values = Vec::with_capacity(self.num_features);
+        let mut d_values = Vec::with_capacity(self.num_features);
         for c in 0..self.num_features {
             let sigma_batch = (var_values[c] + eps).sqrt();
             let sigma_running = (running_var_values[c] + eps).sqrt();
 
-            let r = (sigma_batch / sigma_running).clamp(1.0 / r_max, r_max);
-            let d =
-                ((mean_values[c] - running_mean_values[c]) / sigma_running).clamp(-d_max, d_max);
-
-            let channel_scale = weight_values[c] * r / sigma_batch;
-            let channel_shift =
-                weight_values[c] * (d - mean_values[c] * r / sigma_batch) + bias_values[c];
-            scale.push(channel_scale);
-            shift.push(channel_shift);
+            r_values.push((sigma_batch / sigma_running).clamp(1.0 / r_max, r_max));
+            d_values.push(
+                ((mean_values[c] - running_mean_values[c]) / sigma_running).clamp(-d_max, d_max),
+            );
         }
 
-        let output = utils::apply_channel_affine(input, &scale, &shift)?;
-
         let shape = input.shape();
-        let count = samples_per_channel(shape.dims());
-        let unbiased = unbiased_variance(&batch_var, count)?;
+        let dims = shape.dims();
+        let broadcast_usize: Vec<usize> = utils::channel_broadcast_shape(dims.len(), dims[1])
+            .into_iter()
+            .map(|d| d as usize)
+            .collect();
+        let broadcast = utils::channel_broadcast_shape(dims.len(), dims[1]);
+        let r_tensor = Tensor::from_data(r_values, broadcast_usize.clone(), input.device())?;
+        let d_tensor = Tensor::from_data(d_values, broadcast_usize, input.device())?;
+
+        // x_hat = (x - mu_B) / sigma_B * r + d, then the affine parameters.
+        let sigma = batch_var.add_scalar(eps)?.sqrt()?;
+        let centered = input.sub(&batch_mean.reshape(&broadcast)?)?;
+        let mut output = centered
+            .div(&sigma.reshape(&broadcast)?)?
+            .mul(&r_tensor)?
+            .add(&d_tensor)?;
+
+        if let Some(w) = weight.as_ref() {
+            output = output.mul(&w.reshape(&broadcast)?)?;
+        }
+        if let Some(b) = bias.as_ref() {
+            output = output.add(&b.reshape(&broadcast)?)?;
+        }
+
+        let count = samples_per_channel(dims);
+        let buffered_mean = utils::detached_statistic(&batch_mean)?;
+        let buffered_var = utils::detached_statistic(&batch_var)?;
+        let unbiased = unbiased_variance(&buffered_var, count)?;
         self.stats
-            .update(&batch_mean, &unbiased, self.config.momentum)?;
+            .update(&buffered_mean, &unbiased, self.config.momentum)?;
         *self.step.write() += 1;
 
         Ok(output)

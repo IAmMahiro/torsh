@@ -202,6 +202,18 @@ impl<T: FloatElement + Copy> Tensor<T> {
         }
 
         let output_shape = reduced_shape(input_shape, axis, keepdim);
+
+        // GPU fast path first: it keeps the result device-resident, whereas
+        // `with_contiguous_data` below would download the operand.
+        let kind = if want_max {
+            ReduceKind::Max
+        } else {
+            ReduceKind::Min
+        };
+        if let Some(result) = self.try_device_reduce(kind, axis, &output_shape) {
+            return Ok(result);
+        }
+
         let result_data = self.with_contiguous_data(|data| {
             Ok(if want_max {
                 extremum_values(data, outer, dim_size, inner, |new, best| new > best)
@@ -227,7 +239,73 @@ fn global_extremum<T: Copy>(data: &[T], prefer_new: impl Fn(T, T) -> bool, op: &
 // Generic dimension-aware operations
 // ---------------------------------------------------------------------------
 
+/// Which single-axis reduction a dimension-wise op wants from the GPU dispatch
+/// layer.
+///
+/// Keeping the `oxicuda` op vocabulary behind this enum is what lets the call
+/// sites stay free of `#[cfg(feature = "gpu")]`.
+#[derive(Clone, Copy)]
+enum ReduceKind {
+    Sum,
+    Max,
+    Min,
+}
+
 impl<T: TensorElement + Copy> Tensor<T> {
+    /// Try the device-resident single-axis reduction.
+    ///
+    /// Returns `None` — meaning "run the host path" — without the `gpu` feature,
+    /// when no backend is active, or whenever the dispatch declines. `output_shape`
+    /// is the caller's already-resolved reduced shape, so `keepdim` never has to
+    /// be re-derived (the element count is the same either way).
+    ///
+    /// # NaN handling
+    /// For [`ReduceKind::Max`] / [`ReduceKind::Min`] the backend kernels use
+    /// `f32::max` / `f32::min` from an infinite seed, which *ignore* NaN, while
+    /// the host path seeds from the first element and therefore propagates it.
+    /// An axis that is entirely NaN consequently reduces to ±inf on the device
+    /// and to NaN on the host. Reconciling that belongs with the phase-2
+    /// real-device numeric validation, not here.
+    fn try_device_reduce(
+        &self,
+        kind: ReduceKind,
+        axis: usize,
+        output_shape: &[usize],
+    ) -> Option<Self> {
+        #[cfg(feature = "gpu")]
+        {
+            let op = match kind {
+                ReduceKind::Sum => crate::gpu_dispatch::ReduceOp::Sum,
+                ReduceKind::Max => crate::gpu_dispatch::ReduceOp::Max,
+                ReduceKind::Min => crate::gpu_dispatch::ReduceOp::Min,
+            };
+            crate::gpu_dispatch::try_reduce_axis_f32(self, op, axis, output_shape)
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (kind, axis, output_shape);
+            None
+        }
+    }
+
+    /// Record `result` as a dimension-wise sum of `self` in the autograd graph.
+    ///
+    /// `reduce_dims` must be the **normalised** (resolved / sorted / deduplicated)
+    /// axis list the forward pass actually reduced — the backward rule rebuilds
+    /// the keepdim layout from it, so the caller's raw `&[i32]` would be wrong for
+    /// negative or repeated indices. A no-op when gradients are not being tracked,
+    /// so inference keeps building plain leaves.
+    fn record_sum_dim(&self, result: &mut Self, reduce_dims: &[usize], keepdim: bool) {
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = crate::core_ops::Operation::SumDim {
+                input: std::sync::Arc::new(self.clone()),
+                dims: reduce_dims.to_vec(),
+                keepdim,
+            };
+        }
+    }
+
     /// Compute the sum along the specified dimensions.
     ///
     /// Every listed dimension is reduced (duplicates and negative indices are
@@ -258,22 +336,34 @@ impl<T: TensorElement + Copy> Tensor<T> {
             let (outer, dim_size, inner) = split_extents(&input_shape, axis);
             let output_shape = reduced_shape(&input_shape, axis, keepdim);
 
-            let result_data = self.with_contiguous_data(|data| {
-                let mut result = vec![<T as num_traits::Zero>::zero(); outer * inner];
-                for o in 0..outer {
-                    for n in 0..inner {
-                        let base = o * dim_size * inner + n;
-                        let mut acc = <T as num_traits::Zero>::zero();
-                        for d in 0..dim_size {
-                            acc = acc + data[base + d * inner];
-                        }
-                        result[o * inner + n] = acc;
-                    }
-                }
-                Ok(result)
-            })?;
+            // GPU fast path first: it keeps the result device-resident, whereas
+            // `with_contiguous_data` below would download the operand.
+            let device_result = self.try_device_reduce(ReduceKind::Sum, axis, &output_shape);
 
-            return Self::from_data(result_data, output_shape, self.device());
+            let mut result = match device_result {
+                Some(result) => result,
+                None => {
+                    let result_data = self.with_contiguous_data(|data| {
+                        let mut result = vec![<T as num_traits::Zero>::zero(); outer * inner];
+                        for o in 0..outer {
+                            for n in 0..inner {
+                                let base = o * dim_size * inner + n;
+                                let mut acc = <T as num_traits::Zero>::zero();
+                                for d in 0..dim_size {
+                                    acc = acc + data[base + d * inner];
+                                }
+                                result[o * inner + n] = acc;
+                            }
+                        }
+                        Ok(result)
+                    })?;
+                    Self::from_data(result_data, output_shape, self.device())?
+                }
+            };
+            // Recorded on whichever tensor the dispatch produced, so the device
+            // path joins the autograd graph exactly like the host path.
+            self.record_sum_dim(&mut result, &reduce_dims, keepdim);
+            return Ok(result);
         }
 
         // General multi-axis reduction: map every input element onto the flat
@@ -319,7 +409,9 @@ impl<T: TensorElement + Copy> Tensor<T> {
                 .collect::<Vec<_>>()
         };
 
-        Self::from_data(result_data, final_shape, self.device())
+        let mut result = Self::from_data(result_data, final_shape, self.device())?;
+        self.record_sum_dim(&mut result, &reduce_dims, keepdim);
+        Ok(result)
     }
 
     /// Compute the mean along the specified dimensions.
@@ -380,19 +472,10 @@ impl<T: TensorElement + Copy> Tensor<T> {
             None => self.numel() as f64,
         };
 
-        let mut result = sum.div_scalar(
+        let result = sum.div_scalar(
             <T as num_traits::FromPrimitive>::from_f64(count)
                 .unwrap_or_else(|| <T as num_traits::One>::one()),
         )?;
-
-        // Propagate requires_grad and record operation for autograd
-        if crate::should_record_grad(self.requires_grad) {
-            result.requires_grad = true;
-            result.operation = crate::core_ops::Operation::Mean {
-                input: std::sync::Arc::new(self.clone()),
-                count,
-            };
-        }
 
         Ok(result)
     }

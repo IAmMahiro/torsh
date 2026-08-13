@@ -64,14 +64,24 @@ impl<T: ComplexElement + Copy> Tensor<T> {
         Tensor::from_data(imag_data, self.shape().dims().to_vec(), self.device)
     }
 
-    /// Get magnitude (absolute value) of complex tensor
+    /// Get magnitude (absolute value) of complex tensor.
+    ///
+    /// This is also the `abs` that *real* tensors resolve to: `f32` and `f64`
+    /// implement [`ComplexElement`] with `Real = Self`, so `Tensor<f32>::abs`
+    /// is the ordinary `|x|`. Only that real case is differentiable —
+    /// `Tensor::record_abs_if_real` records [`crate::core_ops::UnaryKind::Abs`]
+    /// (sub-gradient `sign(x)`, `0` at the kink) when the input and output
+    /// element types coincide and declines otherwise, leaving genuinely
+    /// complex `abs` detached as before (its derivative is the Wirtinger
+    /// `z/|z|`, which needs a different `Operation`).
     pub fn abs(&self) -> Result<Tensor<T::Real>>
     where
         T::Real: TensorElement + Copy + num_traits::Float,
     {
         let data = self.to_vec()?;
         let abs_data: Vec<T::Real> = data.iter().map(|x| x.abs()).collect();
-        Tensor::from_data(abs_data, self.shape().dims().to_vec(), self.device)
+        let result = Tensor::from_data(abs_data, self.shape().dims().to_vec(), self.device)?;
+        Ok(self.record_abs_if_real(result))
     }
 
     /// Get phase (argument) of complex tensor

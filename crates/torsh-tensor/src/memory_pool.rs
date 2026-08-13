@@ -1153,11 +1153,39 @@ pub fn cleanup_memory_pool() {
 mod tests {
     use super::*;
 
-    // Serialise the pool-identity tests that rely on global singleton state.
+    /// Serialises **every** test in this module.
+    ///
+    /// They all read or mutate one process-global singleton — the pool itself
+    /// plus its allocation/hit counters — and `cargo test` runs a binary's
+    /// tests in one process across a thread pool (unlike `cargo nextest`'s
+    /// process-per-test). `clear_memory_pool()` resets those counters to zero,
+    /// so a test calling it concurrently with another test's measurement makes
+    /// that measurement read a wiped pool. Measured on the pre-fix tree, with
+    /// only the buffer-identity tests holding this lock:
+    ///
+    /// ```text
+    /// thread 'memory_pool::tests::test_pool_statistics' panicked at
+    ///   crates/torsh-tensor/src/memory_pool.rs:1189:9:
+    /// assertion failed: stats.total_allocations >= 2
+    /// ```
+    ///
+    /// — 2 of 20 `cargo test -p torsh-tensor --lib memory_pool::` runs (and 4
+    /// of 10 in a hotter round), because `test_memory_pool_basic`,
+    /// `test_pool_statistics` and `test_pool_cleanup` called
+    /// `clear_memory_pool()` without holding it. The lock is held for each
+    /// test's full body, which costs nothing measurable: the whole module runs
+    /// in well under a millisecond.
+    ///
+    /// The three memory-mapped tests below are deliberately *not* serialised:
+    /// they drive file I/O and a locally constructed `GlobalMemoryPool`, and
+    /// never touch the singleton.
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_memory_pool_basic() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_memory_pool();
 
         // Create pooled tensor
@@ -1178,6 +1206,9 @@ mod tests {
 
     #[test]
     fn test_pool_statistics() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_memory_pool();
 
         let _pooled1 = PooledTensor::<f32>::zeros(&[50, 50], DeviceType::Cpu)
@@ -1192,6 +1223,9 @@ mod tests {
 
     #[test]
     fn test_pool_cleanup() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clear_memory_pool();
 
         // Create many temporary tensors
@@ -1207,6 +1241,11 @@ mod tests {
 
     #[test]
     fn test_pooled_tensor_conversion() {
+        // Allocates from (and releases into) the singleton, so it has to be
+        // serialised too even though it never asserts on the counters.
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let pooled = PooledTensor::<f32>::ones(&[10, 10], DeviceType::Cpu)
             .expect("ones creation should succeed");
         let tensor = pooled.into_tensor();

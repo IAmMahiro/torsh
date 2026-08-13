@@ -8,7 +8,6 @@
 
 pub mod arima;
 pub mod deep;
-mod lstm_bptt;
 pub mod smoothing;
 pub mod var;
 

@@ -10,7 +10,7 @@ use super::*;
 // ============================================================================
 
 /// PyTorch parameter-name suffix for a direction (`""` forward, `"_reverse"`).
-fn direction_suffix(direction: usize) -> &'static str {
+pub(super) fn direction_suffix(direction: usize) -> &'static str {
     if direction == 0 {
         ""
     } else {
@@ -22,13 +22,13 @@ fn direction_suffix(direction: usize) -> &'static str {
 ///
 /// # Autograd
 ///
-/// The step tensors are copied element-wise, so the result is a fresh leaf: the
-/// stacked sequence is *not* connected to the cells that produced it. A
-/// graph-preserving version needs a differentiable `Tensor::stack` in
-/// torsh-tensor (`cat`/`stack` currently rebuild through `from_data`), which is
-/// tracked as follow-up work; the recurrent graph is severed earlier anyway,
-/// where `narrow` splits the gate pre-activations.
-fn stack_time_major(steps: &[Tensor]) -> Result<Tensor> {
+/// The steps are joined with [`Tensor::stack`], which records
+/// `Operation::Stack`, so the stacked sequence stays connected to the cells
+/// that produced it and backpropagation-through-time reaches `weight_ih`,
+/// `weight_hh` and both biases. Stacking along dimension 0 emits each step's
+/// buffer once, in order, so the layout is exactly the row-major
+/// `[steps, batch, features]` a hand-rolled copy would produce.
+pub(super) fn stack_time_major(steps: &[Tensor]) -> Result<Tensor> {
     if steps.is_empty() {
         return Err(torsh_core::TorshError::InvalidArgument(
             "No outputs to stack".to_string(),
@@ -43,25 +43,19 @@ fn stack_time_major(steps: &[Tensor]) -> Result<Tensor> {
             first.len()
         )));
     }
-    let batch_size = first[0];
-    let features = first[1];
 
-    let mut stacked_data = Vec::with_capacity(steps.len() * batch_size * features);
-    for step in steps {
-        if step.shape().dims() != [batch_size, features] {
-            return Err(torsh_core::TorshError::ShapeMismatch {
-                expected: vec![batch_size, features],
-                got: step.shape().dims().to_vec(),
-            });
-        }
-        stacked_data.extend(step.to_vec()?);
-    }
-
-    Tensor::from_vec(stacked_data, &[steps.len(), batch_size, features])
+    // `Tensor::stack` validates that every step carries the identical shape and
+    // raises the same `ShapeMismatch` variant on a mismatch.
+    Tensor::stack(steps, 0)
 }
 
 /// Concatenate two `[batch, features]` tensors along the feature axis.
-fn concat_features(left: &Tensor, right: &Tensor) -> Result<Tensor> {
+///
+/// # Autograd
+///
+/// [`Tensor::cat`] records `Operation::Concat`, so a bidirectional layer keeps
+/// both directions on the graph.
+pub(super) fn concat_features(left: &Tensor, right: &Tensor) -> Result<Tensor> {
     let left_binding = left.shape();
     let left_shape = left_binding.dims();
     let right_binding = right.shape();
@@ -74,20 +68,7 @@ fn concat_features(left: &Tensor, right: &Tensor) -> Result<Tensor> {
         });
     }
 
-    let batch_size = left_shape[0];
-    let left_features = left_shape[1];
-    let right_features = right_shape[1];
-    let left_data = left.to_vec()?;
-    let right_data = right.to_vec()?;
-
-    let mut combined = Vec::with_capacity(batch_size * (left_features + right_features));
-    for batch in 0..batch_size {
-        combined.extend_from_slice(&left_data[batch * left_features..(batch + 1) * left_features]);
-        combined
-            .extend_from_slice(&right_data[batch * right_features..(batch + 1) * right_features]);
-    }
-
-    Tensor::from_vec(combined, &[batch_size, left_features + right_features])
+    Tensor::cat(&[left, right], 1)
 }
 
 // ============================================================================
@@ -391,7 +372,7 @@ impl LSTM {
     /// `state` is `(h_0, c_0)`, each shaped
     /// `[num_layers * num_directions, batch, hidden_size]`; `None` starts from
     /// zeros. Returns `(output, (h_n, c_n))` with the same layout conventions as
-    /// `torch.nn.LSTM`, honouring [`Self::batch_first`] for `output`.
+    /// `torch.nn.LSTM`, honouring `Self::batch_first` for `output`.
     pub fn forward_with_state(
         &self,
         input: &Tensor,
@@ -745,7 +726,7 @@ impl GRU {
     ///
     /// `state` is `h_0` shaped `[num_layers * num_directions, batch, hidden_size]`
     /// (`None` starts from zeros). Returns `(output, h_n)` following
-    /// `torch.nn.GRU`, honouring [`Self::batch_first`] for `output`.
+    /// `torch.nn.GRU`, honouring `Self::batch_first` for `output`.
     pub fn forward_with_state(
         &self,
         input: &Tensor,

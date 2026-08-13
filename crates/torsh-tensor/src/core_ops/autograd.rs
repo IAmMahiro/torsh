@@ -44,6 +44,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use torsh_core::{
+    device::DeviceType,
     dtype::{FloatElement, TensorElement},
     error::{Result, TorshError},
 };
@@ -242,9 +243,13 @@ fn operation_name<T: TensorElement>(operation: &Operation<T>) -> String {
         Operation::Mul { .. } => "mul".to_string(),
         Operation::Div { .. } => "div".to_string(),
         Operation::MulScalar { .. } => "mul_scalar".to_string(),
+        Operation::AddScalar { .. } => "add_scalar".to_string(),
         Operation::DivScalar { .. } => "div_scalar".to_string(),
         Operation::Mean { .. } => "mean".to_string(),
         Operation::Sum { .. } => "sum".to_string(),
+        Operation::SumDim { dims, keepdim, .. } => {
+            format!("sum_dim(dims={dims:?}, keepdim={keepdim})")
+        }
         Operation::MatMul { .. } => "matmul".to_string(),
         Operation::Custom(name, _) => format!("custom({name})"),
         Operation::View { kind, .. } => format!("view({kind:?})"),
@@ -254,6 +259,14 @@ fn operation_name<T: TensorElement>(operation: &Operation<T>) -> String {
         Operation::Gather { .. } => "gather".to_string(),
         Operation::LogSoftmax { dim, .. } => format!("log_softmax(dim={dim})"),
         Operation::Unary { kind, .. } => format!("unary({kind:?})"),
+        Operation::LeakyRelu { negative_slope, .. } => {
+            format!("leaky_relu(slope={negative_slope:?})")
+        }
+        Operation::Maximum { .. } => "maximum".to_string(),
+        Operation::Minimum { .. } => "minimum".to_string(),
+        Operation::ClampBounds { min, max, .. } => {
+            format!("clamp(min={min:?}, max={max:?})")
+        }
     }
 }
 
@@ -264,17 +277,23 @@ fn graph_parents<T: TensorElement>(operation: &Operation<T>) -> Vec<Arc<Tensor<T
         Operation::Power { input, .. }
         | Operation::Mean { input, .. }
         | Operation::Sum { input }
+        | Operation::SumDim { input, .. }
         | Operation::MulScalar { input, .. }
+        | Operation::AddScalar { input, .. }
         | Operation::DivScalar { input, .. }
         | Operation::View { input, .. }
         | Operation::Im2Col { input, .. }
         | Operation::Gather { input, .. }
         | Operation::LogSoftmax { input, .. }
-        | Operation::Unary { input, .. } => vec![Arc::clone(input)],
+        | Operation::Unary { input, .. }
+        | Operation::LeakyRelu { input, .. }
+        | Operation::ClampBounds { input, .. } => vec![Arc::clone(input)],
         Operation::Add { lhs, rhs }
         | Operation::Sub { lhs, rhs }
         | Operation::Mul { lhs, rhs }
         | Operation::Div { lhs, rhs }
+        | Operation::Maximum { lhs, rhs }
+        | Operation::Minimum { lhs, rhs }
         | Operation::MatMul { lhs, rhs } => vec![Arc::clone(lhs), Arc::clone(rhs)],
         // Multi-input ops list every operand once per occurrence, so a tensor
         // concatenated with itself is counted twice and its gradient accumulates.
@@ -522,6 +541,19 @@ where
                     ));
                 }
             }
+            Operation::AddScalar { input, .. } => {
+                // d/dinput (input + c) = 1: the gradient passes through
+                // unchanged. `reduce_grad_to_shape` is a detach when the shapes
+                // already match — which they always do here — and keeps this arm
+                // uniform with the rest of the file.
+                if input.requires_grad {
+                    let shape = input.shape();
+                    contributions.push((
+                        Arc::clone(input),
+                        reduce_grad_to_shape(&grad_output.detach(), shape.dims())?,
+                    ));
+                }
+            }
             Operation::DivScalar { input, scalar } => {
                 // d/dinput (input / s) = 1 / s.
                 if input.requires_grad {
@@ -572,6 +604,71 @@ where
                     contributions.push((Arc::clone(input), expanded));
                 }
             }
+            Operation::SumDim {
+                input,
+                dims,
+                keepdim,
+            } => {
+                if input.requires_grad {
+                    let input_shape_binding = input.shape();
+                    let input_dims = input_shape_binding.dims();
+
+                    // Mirror the forward pass's reduced-axis mask (dim_ops.rs:281-284).
+                    let mut is_reduced = vec![false; input_dims.len()];
+                    for &axis in dims {
+                        let slot = is_reduced.get_mut(axis).ok_or_else(|| {
+                            TorshError::AutogradError(format!(
+                                "sum_dim backward: axis {axis} is out of range for a \
+                                 {input_dims:?} input"
+                            ))
+                        })?;
+                        *slot = true;
+                    }
+
+                    // Shape with the reduced axes kept at extent 1 — the layout the
+                    // forward pass actually wrote (identical buffer for both keepdim
+                    // values; only the Shape differs, see dim_ops.rs:270 / :291-311).
+                    let keepdim_shape: Vec<usize> = input_dims
+                        .iter()
+                        .zip(is_reduced.iter())
+                        .map(|(&extent, &reduced)| if reduced { 1 } else { extent })
+                        .collect();
+
+                    // Shape the forward pass returned to the consumer.
+                    let output_shape: Vec<usize> = if *keepdim {
+                        keepdim_shape.clone()
+                    } else {
+                        input_dims
+                            .iter()
+                            .zip(is_reduced.iter())
+                            .filter(|(_, &reduced)| !reduced)
+                            .map(|(&extent, _)| extent)
+                            .collect()
+                    };
+
+                    // 1. Fold away any residual broadcast a consumer introduced.
+                    //    A no-op fast path when the shapes already match
+                    //    (autograd.rs:79-81).
+                    let folded = reduce_grad_to_shape(grad_output, &output_shape)?;
+
+                    // 2. Re-insert the reduced axes. This is a pure re-label of the
+                    //    same buffer, never a permutation.
+                    let as_keepdim =
+                        Self::from_data(folded.to_vec()?, keepdim_shape.clone(), input.device)?;
+
+                    // 3. Replicate over the reduced axes (now extent 1, so
+                    //    expand_grad_to_shape gives them stride 0).
+                    let expanded = expand_grad_to_shape(&as_keepdim, input_dims).map_err(|_| {
+                        TorshError::AutogradError(format!(
+                            "sum_dim backward cannot map a {:?} gradient onto a \
+                                 {input_dims:?} input (dims={dims:?}, keepdim={keepdim})",
+                            grad_output.shape().dims()
+                        ))
+                    })?;
+
+                    contributions.push((Arc::clone(input), expanded));
+                }
+            }
             Operation::MatMul { lhs, rhs } => {
                 contributions.extend(Self::matmul_gradients(lhs, rhs, grad_output)?);
             }
@@ -604,6 +701,54 @@ where
                         }
                         // Broadcast axes accumulate every copy of the value.
                         ViewKind::Expand => reduce_grad_to_shape(&grad, dims)?,
+                        // A contiguous slice: scatter the gradient back as one
+                        // zero-padded slab, the exact inverse of the forward
+                        // extraction (and of `slab_along_dim_from`).
+                        ViewKind::Narrow { dim, start } => {
+                            let extent = *dims.get(*dim).ok_or_else(|| {
+                                TorshError::AutogradError(format!(
+                                    "narrow backward: axis {dim} is out of range for a {dims:?} \
+                                     input"
+                                ))
+                            })?;
+                            let grad_shape = grad.shape();
+                            let grad_dims = grad_shape.dims();
+                            let length = *grad_dims.get(*dim).ok_or_else(|| {
+                                TorshError::AutogradError(format!(
+                                    "narrow backward: axis {dim} is out of range for a \
+                                     {grad_dims:?} gradient"
+                                ))
+                            })?;
+                            if start + length > extent {
+                                return Err(TorshError::AutogradError(format!(
+                                    "narrow backward: slice [{start}, {}) exceeds axis {dim} of \
+                                     size {extent}",
+                                    start + length
+                                )));
+                            }
+                            let outer: usize = dims[..*dim].iter().product();
+                            let inner: usize = dims[*dim + 1..].iter().product();
+                            let values = grad.to_vec()?;
+                            if values.len() != outer * length * inner {
+                                return Err(TorshError::AutogradError(format!(
+                                    "narrow backward: gradient has {} elements but its \
+                                     {grad_dims:?} shape needs {}",
+                                    values.len(),
+                                    outer * length * inner
+                                )));
+                            }
+                            let zero = <T as TensorElement>::zero();
+                            let mut padded = vec![zero; outer * extent * inner];
+                            for o in 0..outer {
+                                for d in 0..length {
+                                    let target = (o * extent + start + d) * inner;
+                                    let source = (o * length + d) * inner;
+                                    padded[target..target + inner]
+                                        .copy_from_slice(&values[source..source + inner]);
+                                }
+                            }
+                            Self::from_data(padded, dims.to_vec(), input.device)?
+                        }
                     };
                     contributions.push((Arc::clone(input), contribution));
                 }
@@ -619,6 +764,13 @@ where
                 // its gradient is that slab of the upstream gradient. The offset
                 // advances for every input so positions stay correct even when
                 // some inputs do not require a gradient.
+                //
+                // The gradient is materialised once for the whole node, not once
+                // per input: an N-way concatenation would otherwise copy the
+                // full seed N times.
+                let grad_shape = grad_output.shape();
+                let grad_dims = grad_shape.dims();
+                let grad_data = grad_output.to_vec()?;
                 let mut offset = 0usize;
                 for input in inputs {
                     let len = input.shape().dims().get(*dim).copied().ok_or_else(|| {
@@ -628,7 +780,15 @@ where
                         ))
                     })?;
                     if input.requires_grad {
-                        let slab = Self::slab_along_dim(grad_output, *dim, offset, len, true)?;
+                        let slab = Self::slab_along_dim_from(
+                            &grad_data,
+                            grad_dims,
+                            grad_output.device,
+                            *dim,
+                            offset,
+                            len,
+                            true,
+                        )?;
                         contributions.push((Arc::clone(input), slab));
                     }
                     offset += len;
@@ -637,9 +797,24 @@ where
             Operation::Stack { inputs, dim } => {
                 // stack inserts a fresh axis; input `i` receives the slice of the
                 // gradient at index `i` along that axis, with the axis removed.
+                //
+                // One materialisation for the whole node: an unrolled RNN stacks
+                // `T` step outputs, so a per-input `to_vec()` of the `[T, B, F]`
+                // gradient would make backward quadratic in `T`.
+                let grad_shape = grad_output.shape();
+                let grad_dims = grad_shape.dims();
+                let grad_data = grad_output.to_vec()?;
                 for (index, input) in inputs.iter().enumerate() {
                     if input.requires_grad {
-                        let slab = Self::slab_along_dim(grad_output, *dim, index, 1, false)?;
+                        let slab = Self::slab_along_dim_from(
+                            &grad_data,
+                            grad_dims,
+                            grad_output.device,
+                            *dim,
+                            index,
+                            1,
+                            false,
+                        )?;
                         contributions.push((Arc::clone(input), slab));
                     }
                 }
@@ -681,6 +856,27 @@ where
             Operation::Unary { input, kind } => {
                 if input.requires_grad {
                     let local = Self::unary_local_gradient(input, *kind)?;
+                    contributions.push((Arc::clone(input), local.mul(&grad_output.detach())?));
+                }
+            }
+            Operation::LeakyRelu {
+                input,
+                negative_slope,
+            } => {
+                if input.requires_grad {
+                    let local = Self::leaky_relu_local_gradient(input, *negative_slope)?;
+                    contributions.push((Arc::clone(input), local.mul(&grad_output.detach())?));
+                }
+            }
+            Operation::Maximum { lhs, rhs } => {
+                Self::push_extremum_gradients(lhs, rhs, grad_output, true, &mut contributions)?;
+            }
+            Operation::Minimum { lhs, rhs } => {
+                Self::push_extremum_gradients(lhs, rhs, grad_output, false, &mut contributions)?;
+            }
+            Operation::ClampBounds { input, min, max } => {
+                if input.requires_grad {
+                    let local = Self::clamp_local_gradient(input, *min, *max)?;
                     contributions.push((Arc::clone(input), local.mul(&grad_output.detach())?));
                 }
             }
@@ -922,26 +1118,31 @@ where
     }
 
     /// Gather one contiguous slab `[start, start + length)` along `dim` out of
-    /// `grad`, returning a fresh contiguous tensor.
+    /// an **already materialised**, row-major gradient buffer.
     ///
     /// With `keep_dim` the sliced axis is retained (used by `cat`, whose inputs
     /// keep their extent along `dim`); without it the axis is dropped, which is
     /// the per-index slice `stack` needs (it always slices `length == 1`).
-    fn slab_along_dim(
-        grad: &Self,
+    ///
+    /// The buffer is a parameter rather than a `&Self` so the caller can
+    /// materialise the upstream gradient **once per node** instead of once per
+    /// input: `stack` backward runs this `T` times over a `[T, B, F]` gradient,
+    /// so a per-call `to_vec()` would make an unrolled RNN's backward pass
+    /// `O(T^2 * B * F)`.
+    fn slab_along_dim_from(
+        data: &[T],
+        dims: &[usize],
+        device: DeviceType,
         dim: usize,
         start: usize,
         length: usize,
         keep_dim: bool,
     ) -> Result<Self> {
-        let shape = grad.shape();
-        let dims = shape.dims();
-        if dim >= dims.len() {
-            return Err(TorshError::AutogradError(format!(
+        let dim_size = *dims.get(dim).ok_or_else(|| {
+            TorshError::AutogradError(format!(
                 "cat/stack backward: dim {dim} is out of range for a {dims:?} gradient"
-            )));
-        }
-        let dim_size = dims[dim];
+            ))
+        })?;
         if start + length > dim_size {
             return Err(TorshError::AutogradError(format!(
                 "cat/stack backward: slice [{start}, {}) exceeds axis {dim} of size {dim_size}",
@@ -950,7 +1151,14 @@ where
         }
         let outer: usize = dims[..dim].iter().product();
         let inner: usize = dims[dim + 1..].iter().product();
-        let data = grad.to_vec()?;
+        if data.len() != outer * dim_size * inner {
+            return Err(TorshError::AutogradError(format!(
+                "cat/stack backward: gradient buffer has {} elements but its {dims:?} shape \
+                 needs {}",
+                data.len(),
+                outer * dim_size * inner
+            )));
+        }
         let mut out = Vec::with_capacity(outer * length * inner);
         for o in 0..outer {
             for d in start..start + length {
@@ -964,7 +1172,7 @@ where
         } else {
             new_dims.remove(dim);
         }
-        Self::from_data(out, new_dims, grad.device)
+        Self::from_data(out, new_dims, device)
     }
 
     /// Backward rule of [`Tensor::log_softmax`] along `dim`.
@@ -1029,6 +1237,16 @@ where
         let zero = <T as TensorElement>::zero();
         let one = Self::scalar_from_f64(1.0)?;
         let two = Self::scalar_from_f64(2.0)?;
+        // tanh-GELU constants, shared by the `Gelu` arm below; `half` is also
+        // reused by `Rsqrt`. Hoisted out of the per-element closure so they
+        // are computed once per call, not once per element.
+        let half = Self::scalar_from_f64(0.5)?;
+        let gelu_k = Self::scalar_from_f64((2.0 / std::f64::consts::PI).sqrt())?;
+        let gelu_c = Self::scalar_from_f64(0.044_715)?;
+        let gelu_3c = Self::scalar_from_f64(3.0 * 0.044_715)?;
+        // ln(10) / ln(2), needed by the `Log10` / `Log2` derivatives.
+        let ln10 = Self::scalar_from_f64(std::f64::consts::LN_10)?;
+        let ln2 = Self::scalar_from_f64(std::f64::consts::LN_2)?;
         let local: Vec<T> = x
             .iter()
             .map(|&v| match kind {
@@ -1052,7 +1270,187 @@ where
                         zero
                     }
                 }
+                UnaryKind::Gelu => {
+                    // f(x)  = 0.5*x*(1 + tanh(u)),  u = k*(x + c*x^3)
+                    // f'(x) = 0.5*(1 + t) + 0.5*x*(1 - t^2)*k*(1 + 3*c*x^2)
+                    let u = gelu_k * (v + gelu_c * v * v * v);
+                    let t = u.tanh();
+                    let sech2 = one - t * t;
+                    let saturated = half * (one + t);
+                    if sech2 == zero {
+                        // Saturated tail: the second term is mathematically
+                        // zero, and evaluating it would be 0 * inf = NaN once
+                        // x^3 (hence 1 + 3*c*x^2) overflows (|x| >~ 7e12 in
+                        // f32). REQUIRED, not an optimisation.
+                        saturated
+                    } else {
+                        saturated + half * v * sech2 * gelu_k * (one + gelu_3c * v * v)
+                    }
+                }
+                // -0.5 * x^(-3/2), written as a division so it reuses `sqrt`
+                // instead of `powf`. At x == 0, `v * v.sqrt()` is `+0.0`, so
+                // this divides by zero and yields `-inf` (not a 0*inf NaN):
+                // there is no separate factor that vanishes here while
+                // another diverges, just one honest division.
+                UnaryKind::Rsqrt => zero - half / (v * v.sqrt()),
+                // -1/x^2; at x == 0 this is `-1/0 == -inf`, matching the
+                // domain-edge contract (no clamping).
+                UnaryKind::Reciprocal => zero - one / (v * v),
+                UnaryKind::Log10 => one / (v * ln10),
+                UnaryKind::Log2 => one / (v * ln2),
+                UnaryKind::Tan => {
+                    let t = v.tan();
+                    one + t * t
+                }
+                // 1/sqrt(1-x^2); at x == +-1 the argument of `sqrt` is +0.0,
+                // giving +inf (never a spurious 0*inf: it is a single
+                // division, like `Rsqrt` above). Outside [-1,1] the argument
+                // is negative, `sqrt` is NaN by IEEE 754, and NaN propagates
+                // honestly through the division.
+                UnaryKind::Asin => one / (one - v * v).sqrt(),
+                // The exact negation of `Asin`'s local gradient.
+                UnaryKind::Acos => zero - one / (one - v * v).sqrt(),
+                // 1/(1+x^2); 1+x^2 is never zero, so this never diverges.
+                UnaryKind::Atan => one / (one + v * v),
+                UnaryKind::Sinh => v.cosh(),
+                UnaryKind::Cosh => v.sinh(),
+                // sign(x), with the kink at x == 0 resolved to 0.0 —
+                // PyTorch's pick out of the sub-differential [-1, 1] there.
+                // NaN takes neither branch and lands on 0 as well, which is
+                // the same convention `sign` itself uses.
+                UnaryKind::Abs => {
+                    if v > zero {
+                        one
+                    } else if v < zero {
+                        zero - one
+                    } else {
+                        zero
+                    }
+                }
             })
+            .collect();
+        Self::from_data(local, shape.dims().to_vec(), input.device)
+    }
+
+    /// Backward rule shared by [`Operation::Maximum`] and
+    /// [`Operation::Minimum`]: route each element's gradient to the operand
+    /// that won the element-wise comparison.
+    ///
+    /// `is_maximum` selects the forward's own predicate — `lhs > rhs` for
+    /// `maximum`, `lhs < rhs` for `minimum` — so backward and forward always
+    /// agree about who won, including for `NaN` (neither predicate holds, and
+    /// both forwards return `rhs`). An **exact tie** splits the gradient
+    /// `0.5 / 0.5`, which is what PyTorch does for `torch.maximum` /
+    /// `torch.minimum`.
+    ///
+    /// The forward broadcasts, so both operands are first expanded to the
+    /// output shape to be compared element-for-element, and each operand's
+    /// finished gradient is then folded back to its own shape — the same
+    /// un-broadcast discipline as the `Add`/`Mul` arms.
+    fn push_extremum_gradients(
+        lhs: &Arc<Self>,
+        rhs: &Arc<Self>,
+        grad_output: &Self,
+        is_maximum: bool,
+        contributions: &mut Vec<(Arc<Self>, Self)>,
+    ) -> Result<()> {
+        if !lhs.requires_grad && !rhs.requires_grad {
+            return Ok(());
+        }
+        let grad = grad_output.detach();
+        let grad_shape = grad.shape();
+        let out_dims = grad_shape.dims().to_vec();
+
+        // Compare the operands at the output geometry: a `[3]` operand against
+        // a `[2, 3]` one has to be replicated before the winner is decided.
+        let lhs_values = expand_grad_to_shape(&lhs.detach(), &out_dims)?.to_vec()?;
+        let rhs_values = expand_grad_to_shape(&rhs.detach(), &out_dims)?.to_vec()?;
+        let grad_values = grad.to_vec()?;
+        if lhs_values.len() != grad_values.len() || rhs_values.len() != grad_values.len() {
+            return Err(TorshError::AutogradError(format!(
+                "maximum/minimum backward: operands expand to {} and {} elements but the \
+                 gradient has {}",
+                lhs_values.len(),
+                rhs_values.len(),
+                grad_values.len()
+            )));
+        }
+
+        let zero = <T as TensorElement>::zero();
+        let half = Self::scalar_from_f64(0.5)?;
+        let mut lhs_grad = Vec::with_capacity(grad_values.len());
+        let mut rhs_grad = Vec::with_capacity(grad_values.len());
+        for ((&a, &b), &g) in lhs_values
+            .iter()
+            .zip(rhs_values.iter())
+            .zip(grad_values.iter())
+        {
+            let lhs_wins = if is_maximum { a > b } else { a < b };
+            if lhs_wins {
+                lhs_grad.push(g);
+                rhs_grad.push(zero);
+            } else if a == b {
+                lhs_grad.push(half * g);
+                rhs_grad.push(half * g);
+            } else {
+                lhs_grad.push(zero);
+                rhs_grad.push(g);
+            }
+        }
+
+        if lhs.requires_grad {
+            let full = Self::from_data(lhs_grad, out_dims.clone(), grad.device)?;
+            let shape = lhs.shape();
+            contributions.push((Arc::clone(lhs), reduce_grad_to_shape(&full, shape.dims())?));
+        }
+        if rhs.requires_grad {
+            let full = Self::from_data(rhs_grad, out_dims, grad.device)?;
+            let shape = rhs.shape();
+            contributions.push((Arc::clone(rhs), reduce_grad_to_shape(&full, shape.dims())?));
+        }
+        Ok(())
+    }
+
+    /// Local derivative `df/dx` of `clamp(x, min, max)`.
+    ///
+    /// ATen's `clamp_backward`: `1` where `(x >= min) && (x <= max)`, else `0`,
+    /// with an absent bound treated as always satisfied. Both comparisons are
+    /// **inclusive**, so an element sitting exactly on a bound keeps its
+    /// gradient. `NaN` fails both comparisons and therefore gets `0`, even
+    /// though the forward passes it through — that is PyTorch's behaviour too.
+    fn clamp_local_gradient(input: &Arc<Self>, min: Option<T>, max: Option<T>) -> Result<Self> {
+        let shape = input.shape();
+        let x = input.to_vec()?;
+        let zero = <T as TensorElement>::zero();
+        let one = Self::scalar_from_f64(1.0)?;
+        let local: Vec<T> = x
+            .iter()
+            .map(|&v| {
+                let at_or_above_min = min.is_none_or(|bound| v >= bound);
+                let at_or_below_max = max.is_none_or(|bound| v <= bound);
+                if at_or_above_min && at_or_below_max {
+                    one
+                } else {
+                    zero
+                }
+            })
+            .collect();
+        Self::from_data(local, shape.dims().to_vec(), input.device)
+    }
+
+    /// Local derivative `df/dx` of `leaky_relu(x, negative_slope)`.
+    ///
+    /// Uses the same `> 0` predicate as the forward pass, so `x == 0` takes
+    /// the slope branch, and NaN inputs take it too (both mirror the
+    /// forward).
+    fn leaky_relu_local_gradient(input: &Arc<Self>, negative_slope: T) -> Result<Self> {
+        let shape = input.shape();
+        let x = input.to_vec()?;
+        let zero = <T as TensorElement>::zero();
+        let one = Self::scalar_from_f64(1.0)?;
+        let local: Vec<T> = x
+            .iter()
+            .map(|&v| if v > zero { one } else { negative_slope })
             .collect();
         Self::from_data(local, shape.dims().to_vec(), input.device)
     }

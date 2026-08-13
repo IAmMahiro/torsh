@@ -1,6 +1,50 @@
 //! Gradient checking and validation tests
 //!
-//! Tests that verify gradients are computed correctly for various operations
+//! Tests that verify gradients are computed correctly for various operations.
+//!
+//! # Why some of these are still `#[ignore]`d
+//!
+//! The whole file used to be ignored behind "requires full autograd integration
+//! - currently in development". That blanket reason is no longer true: the
+//! activation family is differentiable end to end (see
+//! `tests/hardening_nn_activations.rs`), and the cases below that exercise it
+//! now run. Four concrete, *measured* limitations keep the rest ignored, and
+//! each surviving `#[ignore]` names the one that blocks it:
+//!
+//! * **`gradcheck_function` only supports rank-1 inputs.**
+//!   `GradChecker::compute_numerical_gradient_function` perturbs element `idx`
+//!   with `input.get_item(&[idx])`, i.e. a single *flat* index, while
+//!   `get_item` requires one index per dimension. Any 2-D input therefore fails
+//!   with `InvalidArgument("Expected 2 indices, got 1")` before autograd is
+//!   even consulted. Every test kept below therefore uses `tensor_1d`.
+//! * **`gradcheck_function` requires a scalar-valued function.** It calls
+//!   `output.backward()`, which rejects non-scalar outputs with
+//!   `AutogradError("Gradient can only be computed for scalar outputs")`.
+//!   Tensor-valued activations must be composed with a reduction first; the
+//!   running tests do that with `.sum()`.
+//! * **Module-based `gradcheck`/`fast_gradcheck` are deliberately
+//!   unimplemented.** `GradChecker::compute_analytical_gradient` returns
+//!   `TorshError::NotImplemented` on purpose (a checker that always passes is
+//!   worse than none), because the `Module` trait exposes no autograd-tracked
+//!   parameter access. Those cases cannot pass until that lands.
+//! * **Module gradcheck over a parameter-less module checks nothing at all.**
+//!   `GradChecker::check_module` initialises `all_passed = true` and then loops
+//!   over `module.named_parameters()`. Hand it a module with no parameters and
+//!   the loop body never runs: it returns `Ok(GradCheckResult { passed: true,
+//!   parameter_results: [], .. })` without ever calling
+//!   `compute_analytical_gradient`. That is why the two cases below stay
+//!   ignored — not because they fail, but because they *pass* while measuring
+//!   nothing. (Measured: `cargo test --test gradient_tests -- --ignored
+//!   test_loss_gradients test_reduction_gradients` reports `2 passed`.)
+//!
+//! # Finite-difference policy
+//!
+//! The original configs used `eps: 1e-6`. In `f32` that is *below* the noise
+//! floor of a central difference — the subtraction of two nearly-equal values
+//! loses ~7 significant digits — so those checks measured rounding, not
+//! gradients. The running tests use the campaign policy instead: step `1e-2`,
+//! tolerance `2e-2` (relative, with an absolute floor), and probe points kept
+//! clear of any kink so the difference straddles a single branch.
 
 use std::collections::HashMap;
 use torsh_core::error::Result;
@@ -12,9 +56,59 @@ use torsh_tensor::creation::ones;
 use torsh_tensor::creation::{tensor_1d, tensor_2d};
 use torsh_tensor::Tensor;
 
+/// Central-difference settings mandated for this campaign: step `1e-2`, `2e-2`
+/// relative tolerance, every element checked.
+fn fd_config() -> GradCheckConfig {
+    GradCheckConfig {
+        eps: 1e-2,
+        atol: 2e-2,
+        rtol: 2e-2,
+        double_precision: false,
+        max_elements: None,
+        seed: Some(42),
+    }
+}
+
+/// Gradient-check a tensor-valued activation by contracting it to a scalar.
+///
+/// Summing is the right objective for an element-wise activation:
+/// `d(sum f(x))/dx_i` is exactly `f'(x_i)`, so the check measures the
+/// activation's own derivative.
+///
+/// The input is rebuilt from `data` on every call rather than shared between
+/// checks. `GradChecker::check_function` runs `backward()` on
+/// `input.clone().requires_grad_(true)`, and a cloned tensor shares its
+/// gradient accumulator with the original — so re-using one tensor for two
+/// checks silently adds the first activation's derivative to the second's.
+/// Measured: checking `sigmoid` and then `tanh` on one shared tensor reported a
+/// 0.23501348 discrepancy for `tanh`, which is exactly `sigmoid'(0.5)`.
+fn check_activation<F>(label: &str, data: &[f32], f: F)
+where
+    F: Fn(&Tensor) -> Result<Tensor>,
+{
+    let input = tensor_1d(data).unwrap();
+    let result = gradcheck_function(|x| f(x)?.sum(), &input, &fd_config())
+        .unwrap_or_else(|e| panic!("{label}: gradient check could not run: {e:?}"));
+    assert!(
+        result.passed,
+        "{label}: gradient check failed - {} (max abs diff {}, max rel diff {})",
+        result.summary,
+        result
+            .worst_parameter()
+            .map(|p| p.max_abs_diff)
+            .unwrap_or(f64::NAN),
+        result
+            .worst_parameter()
+            .map(|p| p.max_rel_diff)
+            .unwrap_or(f64::NAN),
+    );
+}
+
 /// Test gradient computation for simple operations
 #[test]
-#[ignore = "Gradient checking requires full autograd integration - currently in development"]
+#[ignore = "gradcheck_function rejects the 2-D input (`Expected 2 indices, got 1`, \
+            see the module docs), and mse_loss lives in functional/loss.rs which \
+            another agent is editing in this same wave"]
 fn test_basic_gradient_check() {
     // Test MSE loss gradient
     let input = tensor_2d(&[&[1.0, 2.0]]).unwrap();
@@ -34,48 +128,39 @@ fn test_basic_gradient_check() {
     assert!(grad_result.passed, "MSE gradient check should pass");
 }
 
-/// Test gradient computation for activation functions
+/// Test gradient computation for activation functions.
+///
+/// Un-ignored: every one of these was previously either detached
+/// (`sigmoid`, `tanh`, `gelu`, `elu`, `selu`) or attached-but-wrong
+/// (`swish` 21.9%, `mish` sign-flipped) — see
+/// `tests/hardening_nn_activations.rs` for the measurements. The rank-1 input
+/// and the `.sum()` contraction work around the two `gradcheck_function`
+/// limitations documented at the top of this file.
 #[test]
-#[ignore = "Gradient checking requires full autograd integration - currently in development"]
 fn test_activation_gradients() {
-    let input = tensor_2d(&[&[0.5, -0.5, 1.0, -1.0]]).unwrap();
+    // Smooth activations: any probe points are fine.
+    const SMOOTH: [f32; 4] = [0.5, -0.5, 1.0, -1.0];
+    check_activation("sigmoid", &SMOOTH, sigmoid);
+    check_activation("tanh", &SMOOTH, tanh);
+    check_activation("gelu", &SMOOTH, gelu);
+    check_activation("swish", &SMOOTH, swish);
+    check_activation("mish", &SMOOTH, mish);
 
-    // Test sigmoid gradient
-    let sigmoid_fn = |x: &torsh_tensor::Tensor| -> torsh_core::error::Result<torsh_tensor::Tensor> {
-        sigmoid(x)
-    };
-
-    let config = GradCheckConfig {
-        eps: 1e-6,
-        atol: 1e-5,
-        rtol: 1e-3,
-        double_precision: false,
-        max_elements: None,
-        seed: Some(42),
-    };
-
-    let result = gradcheck_function(sigmoid_fn, &input, &config);
-    assert!(result.is_ok(), "Gradient check failed for sigmoid");
-
-    // Test tanh gradient
-    let tanh_fn =
-        |x: &torsh_tensor::Tensor| -> torsh_core::error::Result<torsh_tensor::Tensor> { tanh(x) };
-
-    let result = gradcheck_function(tanh_fn, &input, &config);
-    assert!(result.is_ok(), "Gradient check failed for tanh");
-
-    // Test ReLU gradient (note: ReLU has discontinuous gradient at 0)
-    let relu_input = tensor_2d(&[&[0.5, 1.0, 2.0]]).unwrap(); // Avoid 0 for stability
-    let relu_fn =
-        |x: &torsh_tensor::Tensor| -> torsh_core::error::Result<torsh_tensor::Tensor> { relu(x) };
-
-    let result = gradcheck_function(relu_fn, &relu_input, &config);
-    assert!(result.is_ok(), "Gradient check failed for ReLU");
+    // Kinked activations: the central difference must not straddle x = 0, so
+    // every probe point sits several finite-difference steps away from it.
+    const KINKED: [f32; 5] = [0.5, 1.0, 2.0, -0.5, -1.5];
+    check_activation("relu", &KINKED, relu);
+    check_activation("leaky_relu", &KINKED, |x| leaky_relu(x, 0.01));
+    check_activation("elu", &KINKED, |x| elu(x, 1.0));
+    check_activation("selu", &KINKED, selu);
 }
 
 /// Test linear layer gradients
 #[test]
-#[ignore = "Gradient checking requires full autograd integration - currently in development"]
+#[ignore = "Linear::forward is tensor-valued, so gradcheck_function rejects it with \
+            `Gradient can only be computed for scalar outputs`, and the 2-D input hits \
+            the flat-index defect (see the module docs). Needs gradcheck.rs, which is \
+            outside this wave's ownership"]
 fn test_linear_layer_gradients() {
     let layer = Linear::new(3, 2, true);
     let input = tensor_2d(&[&[1.0, 2.0, 3.0]]).unwrap();
@@ -99,8 +184,14 @@ fn test_linear_layer_gradients() {
 }
 
 /// Test chain rule with composed functions
+///
+/// The activation half of this (a `relu -> sigmoid` chain) is covered by
+/// `hardening_nn_activations::w4_relu_keeps_a_two_layer_chain_trainable`, which
+/// finite-differences it directly instead of going through `gradcheck_function`.
 #[test]
-#[ignore = "Gradient checking requires full autograd integration - currently in development"]
+#[ignore = "2-D input hits gradcheck_function's flat-index defect (see the module docs), \
+            and the sigmoid+MSE half depends on functional/loss.rs, which another agent \
+            is editing in this same wave"]
 fn test_chain_rule_gradients() {
     let input = tensor_2d(&[&[0.5, -0.2, 1.0]]).unwrap();
     let target = tensor_2d(&[&[0.8, 0.1, 0.9]]).unwrap();
@@ -141,77 +232,80 @@ fn test_chain_rule_gradients() {
     );
 }
 
-/// Test gradients with different tensor shapes
+/// Test gradients across tensor lengths and through a reduction.
+///
+/// The 2-D case the original test carried cannot run — `gradcheck_function`
+/// perturbs with a flat index (see the module docs) — so the shape coverage is
+/// expressed as a length sweep that also crosses `Tensor`'s `numel > 100`
+/// parallel dispatch band, which is the boundary that actually changes which
+/// kernel evaluates the activation.
 #[test]
-#[ignore = "Gradient checking requires full autograd integration - currently in development"]
 fn test_gradient_shapes() {
-    // Test 1D tensor
-    let input_1d = tensor_1d(&[1.0, 2.0, 3.0]).unwrap();
-    let sigmoid_fn = |x: &torsh_tensor::Tensor| -> torsh_core::error::Result<torsh_tensor::Tensor> {
-        sigmoid(x)
-    };
+    for len in [1usize, 3, 8, 128] {
+        let data: Vec<f32> = (0..len).map(|i| 0.25 + 0.05 * (i as f32)).collect();
+        check_activation(&format!("sigmoid @ len {len}"), &data, sigmoid);
+    }
 
-    let config = GradCheckConfig::default();
-    let result = gradcheck_function(sigmoid_fn, &input_1d, &config);
-    assert!(result.is_ok(), "Gradient check failed for 1D tensor");
-
-    // Test 2D tensor (batch)
-    let input_2d = tensor_2d(&[&[1.0, 2.0], &[3.0, 4.0]]).unwrap();
-    let result = gradcheck_function(sigmoid_fn, &input_2d, &config);
-    assert!(result.is_ok(), "Gradient check failed for 2D tensor");
-
-    // Test with mean reduction maintaining shape consistency
-    let mean_fn = |x: &torsh_tensor::Tensor| -> torsh_core::error::Result<torsh_tensor::Tensor> {
-        x.mean(None, false)
-    };
-
-    let result = gradcheck_function(mean_fn, &input_2d, &config);
-    assert!(result.is_ok(), "Gradient check failed for mean reduction");
+    // A reduction is already scalar-valued, so it needs no `.sum()` wrapper.
+    let input = tensor_1d(&[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let result = gradcheck_function(|x| x.mean(None, false), &input, &fd_config())
+        .expect("mean reduction gradient check should run");
+    assert!(
+        result.passed,
+        "Gradient check failed for mean reduction - {}",
+        result.summary
+    );
 }
 
-/// Test numerical stability of gradient computation
+/// Test numerical stability of gradient computation.
+///
+/// The original probe points (`1e-6`..`1e-4`, and `+/-1e-3` around ELU's kink)
+/// were an order of magnitude *inside* the `1e-2` finite-difference step, so a
+/// central difference there straddles both branches of ELU and measures neither
+/// derivative. The stability property being checked — `log(1 + x)` for small
+/// `x`, and ELU on each side of the origin — is preserved by moving the points
+/// out to where the difference is meaningful.
 #[test]
-#[ignore = "Gradient checking requires full autograd integration - currently in development"]
 fn test_gradient_numerical_stability() {
-    // Test with small values
-    let small_input = tensor_2d(&[&[1e-6, 1e-5, 1e-4]]).unwrap();
-
-    let stable_fn = |x: &torsh_tensor::Tensor| -> torsh_core::error::Result<torsh_tensor::Tensor> {
-        // Use log(1 + x) which is more stable for small x
-        let ones = ones(x.shape().dims())?;
-        let one_plus_x = x.add(&ones)?;
-        one_plus_x.log()
-    };
-
-    let config = GradCheckConfig {
-        eps: 1e-8,
-        atol: 1e-6,
-        rtol: 1e-4,
-        double_precision: false,
-        max_elements: None,
-        seed: Some(42),
-    };
-
-    let result = gradcheck_function(stable_fn, &small_input, &config);
+    let small_input = tensor_1d(&[0.05, 0.1, 0.25]).unwrap();
+    let result = gradcheck_function(
+        |x| {
+            // log(1 + x), which stays well-conditioned for small x.
+            let ones = ones(x.shape().dims())?;
+            x.add(&ones)?.log()?.sum()
+        },
+        &small_input,
+        &fd_config(),
+    )
+    .expect("log(1 + x) gradient check should run");
     assert!(
-        result.is_ok(),
-        "Gradient check failed for numerically stable function"
+        result.passed,
+        "Gradient check failed for numerically stable function - {}",
+        result.summary
     );
 
-    // Test with values near zero (but not exactly zero to avoid ReLU discontinuity)
-    let near_zero = tensor_2d(&[&[1e-3, -1e-3, 2e-3]]).unwrap();
-
-    let elu_fn = |x: &torsh_tensor::Tensor| -> torsh_core::error::Result<torsh_tensor::Tensor> {
-        elu(x, 1.0)
-    };
-
-    let result = gradcheck_function(elu_fn, &near_zero, &config);
-    assert!(result.is_ok(), "Gradient check failed for ELU near zero");
+    // ELU on each side of its kink, clear of the finite-difference step.
+    check_activation("elu near zero", &[0.2, -0.2, 0.6, -0.6], |x| elu(x, 1.0));
 }
 
 /// Test gradient computation for loss functions
+///
+/// NOTE: this asserts only `result.is_ok()`, and the checker it calls never
+/// looks at a gradient: `IdentityModule` declares no parameters, so
+/// `GradChecker::check_module` loops over an empty `named_parameters()` map,
+/// leaves `all_passed` at its `true` initial value, and returns
+/// `Ok(GradCheckResult { passed: true, parameter_results: [], summary: "All 0
+/// parameters passed gradient check" })`. Un-ignoring it would therefore be a
+/// *vacuous* green — and tightening the assertion to `result.passed` would not
+/// help, because that is `true` too. The test only becomes meaningful once the
+/// module under check owns parameters, at which point it runs into the
+/// third module-doc limitation (`compute_analytical_gradient` is deliberately
+/// `NotImplemented`).
 #[test]
-#[ignore = "Gradient checking requires full autograd integration - currently in development"]
+#[ignore = "vacuous: IdentityModule declares no parameters, so \
+            GradChecker::check_module iterates an empty named_parameters() map and returns \
+            passed: true with an empty parameter_results — compute_analytical_gradient is \
+            never reached, so nothing about mse_loss/binary_cross_entropy is actually checked"]
 fn test_loss_gradients() {
     let predictions = tensor_2d(&[&[0.7, 0.2, 0.1], &[0.1, 0.8, 0.1]]).unwrap();
     let targets = tensor_2d(&[&[0.8, 0.1, 0.1], &[0.2, 0.7, 0.1]]).unwrap();
@@ -248,8 +342,16 @@ fn test_loss_gradients() {
 }
 
 /// Test gradient computation with different reduction modes
+///
+/// Same vacuous-green hazard as [`test_loss_gradients`], and for the same
+/// reason: the assertions are `is_ok()` against a checker that was handed a
+/// parameter-less `IdentityModule`, so it checks zero parameters and reports
+/// success without ever computing a gradient.
 #[test]
-#[ignore = "Gradient checking requires full autograd integration - currently in development"]
+#[ignore = "vacuous: IdentityModule declares no parameters, so \
+            GradChecker::check_module iterates an empty named_parameters() map and returns \
+            passed: true with an empty parameter_results — compute_analytical_gradient is \
+            never reached, so none of the three mse_loss reductions is actually checked"]
 fn test_reduction_gradients() {
     let input = tensor_2d(&[&[1.0, 2.0], &[3.0, 4.0]]).unwrap();
     let target = tensor_2d(&[&[1.5, 1.5], &[2.5, 3.5]]).unwrap();
@@ -292,7 +394,10 @@ fn test_reduction_gradients() {
 
 /// Test fast gradient checking for efficiency
 #[test]
-#[ignore = "Gradient checking requires full autograd integration - currently in development"]
+#[ignore = "module gradcheck is deliberately unimplemented (GradChecker::\
+            compute_analytical_gradient returns NotImplemented because the Module trait \
+            exposes no autograd-tracked parameter access), so `grad_result.passed` is \
+            false by construction for every parameter of the Linear layer"]
 fn test_fast_gradcheck() {
     let input = tensor_2d(&[&[1.0, 2.0, 3.0, 4.0, 5.0]]).unwrap();
 

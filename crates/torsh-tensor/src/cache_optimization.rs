@@ -300,6 +300,12 @@ impl<T: TensorElement + Copy> Tensor<T> {
                 // Arc + SimdStorage overhead (no RwLock, so less overhead)
                 std::mem::size_of::<std::sync::Arc<SimdStorage<T>>>()
             }
+            #[cfg(feature = "gpu")]
+            TensorStorage::Device { .. } => {
+                // Two Arc handles: the device allocation and the host cache.
+                std::mem::size_of::<std::sync::Arc<crate::storage::DeviceBuffer>>()
+                    + std::mem::size_of::<std::sync::Arc<std::sync::RwLock<Option<Vec<T>>>>>()
+            }
         };
 
         MemoryStats {
