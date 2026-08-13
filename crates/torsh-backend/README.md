@@ -31,7 +31,7 @@ let backend = Backend::new(BackendType::Metal)?; // Explicit Metal
 
 ```toml
 [dependencies]
-torsh-backend = { version = "0.2.0", features = ["cuda", "metal"] }
+torsh-backend = { version = "0.2.1", features = ["cuda", "metal"] }
 
 # Available features:
 # - "cpu" (default): CPU backend with SIMD optimizations (scirs2-core parallel/simd, oxiblas-backed)
@@ -219,7 +219,7 @@ The previous separate backend crates (`torsh-backend-cpu`, `torsh-backend-cuda`,
 torsh-backend-cuda = "0.1.3"
 
 # New (unified)
-torsh-backend = { version = "0.2.0", features = ["cuda"] }
+torsh-backend = { version = "0.2.1", features = ["cuda"] }
 ```
 
 ## Dependencies

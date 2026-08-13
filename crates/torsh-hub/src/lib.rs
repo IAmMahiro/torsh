@@ -265,7 +265,7 @@ impl Default for HubConfig {
             max_retries: 3,
             user_agent: format!(
                 "torsh-hub/{}",
-                option_env!("CARGO_PKG_VERSION").unwrap_or("0.2.0")
+                option_env!("CARGO_PKG_VERSION").unwrap_or("0.2.1")
             ),
         }
     }
@@ -1644,8 +1644,8 @@ mod tests {
 // Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const VERSION_MAJOR: u32 = 0;
-pub const VERSION_MINOR: u32 = 1;
-pub const VERSION_PATCH: u32 = 0;
+pub const VERSION_MINOR: u32 = 2;
+pub const VERSION_PATCH: u32 = 1;
 
 /// Prelude module for convenient imports
 #[allow(ambiguous_glob_reexports)]

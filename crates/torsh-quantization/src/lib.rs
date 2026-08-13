@@ -254,8 +254,8 @@ pub use torsh_tensor::Tensor;
 // Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const VERSION_MAJOR: u32 = 0;
-pub const VERSION_MINOR: u32 = 1;
-pub const VERSION_PATCH: u32 = 0;
+pub const VERSION_MINOR: u32 = 2;
+pub const VERSION_PATCH: u32 = 1;
 
 /// Prelude module for convenient imports
 pub mod prelude {

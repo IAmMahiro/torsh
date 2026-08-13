@@ -14,8 +14,8 @@ pub use config::Config;
 /// CLI version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const VERSION_MAJOR: u32 = 0;
-pub const VERSION_MINOR: u32 = 1;
-pub const VERSION_PATCH: u32 = 0;
+pub const VERSION_MINOR: u32 = 2;
+pub const VERSION_PATCH: u32 = 1;
 
 /// Error returned when the running CLI is older than a required version.
 #[derive(Debug, thiserror::Error)]

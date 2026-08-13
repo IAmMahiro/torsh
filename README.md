@@ -99,12 +99,12 @@ Add ToRSh to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-torsh = "0.2.0"
-torsh-nn = "0.2.0"      # Neural networks
-torsh-graph = "0.2.0"   # Graph neural networks
-torsh-series = "0.2.0"  # Time series analysis
-torsh-vision = "0.2.0"  # Computer vision
-torsh-metrics = "0.2.0" # Evaluation metrics
+torsh = "0.2.1"
+torsh-nn = "0.2.1"      # Neural networks
+torsh-graph = "0.2.1"   # Graph neural networks
+torsh-series = "0.2.1"  # Time series analysis
+torsh-vision = "0.2.1"  # Computer vision
+torsh-metrics = "0.2.1" # Evaluation metrics
 ```
 
 ## 🚀 Quick Start

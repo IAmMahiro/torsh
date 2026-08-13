@@ -185,8 +185,8 @@ pub type OptimizerResult<T> = std::result::Result<T, OptimizerError>;
 // Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const VERSION_MAJOR: u32 = 0;
-pub const VERSION_MINOR: u32 = 1;
-pub const VERSION_PATCH: u32 = 0;
+pub const VERSION_MINOR: u32 = 2;
+pub const VERSION_PATCH: u32 = 1;
 
 // Re-export scirs2 optimizer functionality
 // use scirs2::optim as sci_optim;

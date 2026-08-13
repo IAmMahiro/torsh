@@ -1,6 +1,6 @@
 # ToRSh Development Roadmap
 
-**Status**: v0.2.0 (In Development)
+**Status**: v0.2.1 (In Development)
 
 ---
 

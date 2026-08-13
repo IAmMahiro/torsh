@@ -112,8 +112,8 @@ use hashbrown::HashMap;
 // Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const VERSION_MAJOR: u32 = 0;
-pub const VERSION_MINOR: u32 = 1;
-pub const VERSION_PATCH: u32 = 0;
+pub const VERSION_MINOR: u32 = 2;
+pub const VERSION_PATCH: u32 = 1;
 
 // Note: impl_module_constructor macro is already available via #[macro_export]
 
