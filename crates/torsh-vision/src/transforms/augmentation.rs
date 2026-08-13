@@ -47,10 +47,22 @@ impl ColorJitter {
     /// # Arguments
     ///
     /// * `brightness` - Maximum absolute change in brightness (0.0 to 1.0)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `brightness` is negative. Use [`Self::try_brightness`] to get an
+    /// error instead.
     pub fn brightness(mut self, brightness: f32) -> Self {
         assert!(brightness >= 0.0, "Brightness must be non-negative");
         self.brightness = Some(brightness);
         self
+    }
+
+    /// Fallible variant of [`Self::brightness`]
+    pub fn try_brightness(mut self, brightness: f32) -> Result<Self> {
+        validate_non_negative(brightness, "brightness")?;
+        self.brightness = Some(brightness);
+        Ok(self)
     }
 
     /// Set contrast jitter amount
@@ -58,10 +70,22 @@ impl ColorJitter {
     /// # Arguments
     ///
     /// * `contrast` - Maximum absolute change in contrast (0.0 to 1.0)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `contrast` is negative. Use [`Self::try_contrast`] to get an
+    /// error instead.
     pub fn contrast(mut self, contrast: f32) -> Self {
         assert!(contrast >= 0.0, "Contrast must be non-negative");
         self.contrast = Some(contrast);
         self
+    }
+
+    /// Fallible variant of [`Self::contrast`]
+    pub fn try_contrast(mut self, contrast: f32) -> Result<Self> {
+        validate_non_negative(contrast, "contrast")?;
+        self.contrast = Some(contrast);
+        Ok(self)
     }
 
     /// Set saturation jitter amount
@@ -69,10 +93,22 @@ impl ColorJitter {
     /// # Arguments
     ///
     /// * `saturation` - Maximum absolute change in saturation (0.0 to 1.0)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `saturation` is negative. Use [`Self::try_saturation`] to get an
+    /// error instead.
     pub fn saturation(mut self, saturation: f32) -> Self {
         assert!(saturation >= 0.0, "Saturation must be non-negative");
         self.saturation = Some(saturation);
         self
+    }
+
+    /// Fallible variant of [`Self::saturation`]
+    pub fn try_saturation(mut self, saturation: f32) -> Result<Self> {
+        validate_non_negative(saturation, "saturation")?;
+        self.saturation = Some(saturation);
+        Ok(self)
     }
 
     /// Set hue jitter amount
@@ -80,10 +116,22 @@ impl ColorJitter {
     /// # Arguments
     ///
     /// * `hue` - Maximum absolute change in hue (0.0 to 0.5)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hue` is outside `[0.0, 0.5]`. Use [`Self::try_hue`] to get an
+    /// error instead.
     pub fn hue(mut self, hue: f32) -> Self {
         assert!(hue >= 0.0 && hue <= 0.5, "Hue must be between 0.0 and 0.5");
         self.hue = Some(hue);
         self
+    }
+
+    /// Fallible variant of [`Self::hue`]
+    pub fn try_hue(mut self, hue: f32) -> Result<Self> {
+        validate_in_range(hue, 0.0, 0.5, "hue")?;
+        self.hue = Some(hue);
+        Ok(self)
     }
 
     /// Get the brightness setting
@@ -205,10 +253,32 @@ impl GaussianBlur {
     ///
     /// * `kernel_size` - Size of the Gaussian kernel (should be odd)
     /// * `sigma` - Standard deviation of the Gaussian distribution
+    ///
+    /// # Panics
+    ///
+    /// Panics if `kernel_size` is even or `sigma` is not positive. Use
+    /// [`Self::try_new`] to get an error instead.
     pub fn new(kernel_size: usize, sigma: f32) -> Self {
         assert!(kernel_size % 2 == 1, "Kernel size must be odd");
         assert!(sigma > 0.0, "Sigma must be positive");
         Self { kernel_size, sigma }
+    }
+
+    /// Fallible variant of [`Self::new`]
+    pub fn try_new(kernel_size: usize, sigma: f32) -> Result<Self> {
+        if kernel_size % 2 != 1 {
+            return Err(VisionError::InvalidArgument(format!(
+                "GaussianBlur: kernel_size must be odd, got {}",
+                kernel_size
+            )));
+        }
+        if !(sigma > 0.0) {
+            return Err(VisionError::InvalidArgument(format!(
+                "GaussianBlur: sigma must be positive, got {}",
+                sigma
+            )));
+        }
+        Ok(Self { kernel_size, sigma })
     }
 
     /// Get the kernel size
@@ -277,6 +347,10 @@ impl RandomErasing {
     /// # Arguments
     ///
     /// * `p` - Probability of applying random erasing
+    ///
+    /// # Panics
+    ///
+    /// Panics if `p` is outside `[0.0, 1.0]`. Use [`Self::try_new`] instead.
     pub fn new(p: f32) -> Self {
         assert!(
             (0.0..=1.0).contains(&p),
@@ -290,11 +364,26 @@ impl RandomErasing {
         }
     }
 
+    /// Fallible variant of [`Self::new`]
+    pub fn try_new(p: f32) -> Result<Self> {
+        validate_probability(p, "p")?;
+        Ok(Self {
+            p,
+            scale: (0.02, 0.33),
+            ratio: (0.3, 3.3),
+            value: 0.0,
+        })
+    }
+
     /// Set the scale range for erased area
     ///
     /// # Arguments
     ///
     /// * `scale` - Range of erased area as proportion of total area (min, max)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is invalid. Use [`Self::try_with_scale`] instead.
     pub fn with_scale(mut self, scale: (f32, f32)) -> Self {
         assert!(scale.0 <= scale.1, "Scale min must be <= scale max");
         assert!(scale.0 >= 0.0, "Scale min must be >= 0.0");
@@ -303,16 +392,34 @@ impl RandomErasing {
         self
     }
 
+    /// Fallible variant of [`Self::with_scale`]
+    pub fn try_with_scale(mut self, scale: (f32, f32)) -> Result<Self> {
+        validate_range(scale, 0.0, 1.0, "scale")?;
+        self.scale = scale;
+        Ok(self)
+    }
+
     /// Set the aspect ratio range for erased rectangle
     ///
     /// # Arguments
     ///
     /// * `ratio` - Range of aspect ratios (width/height) for erased rectangle (min, max)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is invalid. Use [`Self::try_with_ratio`] instead.
     pub fn with_ratio(mut self, ratio: (f32, f32)) -> Self {
         assert!(ratio.0 <= ratio.1, "Ratio min must be <= ratio max");
         assert!(ratio.0 > 0.0, "Ratio min must be > 0.0");
         self.ratio = ratio;
         self
+    }
+
+    /// Fallible variant of [`Self::with_ratio`]
+    pub fn try_with_ratio(mut self, ratio: (f32, f32)) -> Result<Self> {
+        validate_range(ratio, f32::MIN_POSITIVE, f32::MAX, "ratio")?;
+        self.ratio = ratio;
+        Ok(self)
     }
 
     /// Set the fill value for erased pixels
@@ -454,10 +561,29 @@ impl Cutout {
     ///
     /// * `length` - Side length of the square cutout regions
     /// * `n_holes` - Number of cutout holes to create
+    ///
+    /// # Panics
+    ///
+    /// Panics if `length` or `n_holes` is zero. Use [`Self::try_new`] instead.
     pub fn new(length: usize, n_holes: usize) -> Self {
         assert!(length > 0, "Length must be positive");
         assert!(n_holes > 0, "Number of holes must be positive");
         Self { length, n_holes }
+    }
+
+    /// Fallible variant of [`Self::new`]
+    pub fn try_new(length: usize, n_holes: usize) -> Result<Self> {
+        if length == 0 {
+            return Err(VisionError::InvalidArgument(
+                "Cutout: length must be positive, got 0".to_string(),
+            ));
+        }
+        if n_holes == 0 {
+            return Err(VisionError::InvalidArgument(
+                "Cutout: n_holes must be positive, got 0".to_string(),
+            ));
+        }
+        Ok(Self { length, n_holes })
     }
 
     /// Get the cutout length
@@ -738,4 +864,58 @@ mod tests {
         assert_eq!(blur.kernel_size(), 1);
         assert_eq!(blur.sigma(), 0.1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared parameter validation helpers for the fallible (`try_*`) constructors.
+// ---------------------------------------------------------------------------
+
+/// Validate that a parameter is non-negative
+pub(crate) fn validate_non_negative(value: f32, name: &str) -> Result<()> {
+    if !(value >= 0.0) {
+        return Err(VisionError::InvalidArgument(format!(
+            "{} must be non-negative, got {}",
+            name, value
+        )));
+    }
+    Ok(())
+}
+
+/// Validate that a parameter lies within an inclusive range
+pub(crate) fn validate_in_range(value: f32, min: f32, max: f32, name: &str) -> Result<()> {
+    if !(value >= min && value <= max) {
+        return Err(VisionError::InvalidArgument(format!(
+            "{} must be between {} and {}, got {}",
+            name, min, max, value
+        )));
+    }
+    Ok(())
+}
+
+/// Validate that a parameter is a probability in `[0.0, 1.0]`
+pub(crate) fn validate_probability(value: f32, name: &str) -> Result<()> {
+    validate_in_range(value, 0.0, 1.0, name)
+}
+
+/// Validate an ordered `(min, max)` range constrained to `[lower, upper]`
+pub(crate) fn validate_range(range: (f32, f32), lower: f32, upper: f32, name: &str) -> Result<()> {
+    if !(range.0 <= range.1) {
+        return Err(VisionError::InvalidArgument(format!(
+            "{} min must be <= max, got ({}, {})",
+            name, range.0, range.1
+        )));
+    }
+    if !(range.0 >= lower) {
+        return Err(VisionError::InvalidArgument(format!(
+            "{} min must be >= {}, got {}",
+            name, lower, range.0
+        )));
+    }
+    if !(range.1 <= upper) {
+        return Err(VisionError::InvalidArgument(format!(
+            "{} max must be <= {}, got {}",
+            name, upper, range.1
+        )));
+    }
+    Ok(())
 }

@@ -6,7 +6,6 @@
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
 use crate::CacheManager;
-use reqwest::blocking::Client as BlockingClient;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
@@ -113,7 +112,7 @@ impl HuggingFaceHub {
             format!("{}/api/models?{}", self.api_url, query_string)
         };
 
-        let mut client_builder = BlockingClient::builder()
+        let mut client_builder = crate::tls::blocking_client_builder()?
             .user_agent(&self.user_agent)
             .timeout(std::time::Duration::from_secs(self.timeout));
 
@@ -157,7 +156,7 @@ impl HuggingFaceHub {
     pub fn model_info(&self, model_id: &str) -> Result<HfModelInfo> {
         let url = format!("{}/api/models/{}", self.api_url, model_id);
 
-        let mut client_builder = BlockingClient::builder()
+        let mut client_builder = crate::tls::blocking_client_builder()?
             .user_agent(&self.user_agent)
             .timeout(std::time::Duration::from_secs(self.timeout));
 
@@ -269,7 +268,7 @@ impl HuggingFaceHub {
         );
 
         // Build the HTTP client
-        let mut client_builder = BlockingClient::builder()
+        let mut client_builder = crate::tls::blocking_client_builder()?
             .user_agent(&self.user_agent)
             .timeout(std::time::Duration::from_secs(self.timeout));
 

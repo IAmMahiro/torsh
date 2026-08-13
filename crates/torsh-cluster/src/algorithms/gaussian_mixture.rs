@@ -179,9 +179,20 @@ pub struct GMResult {
     pub bic: f64,
 }
 
-impl ClusteringResult for GMResult {
-    fn labels(&self) -> &Tensor {
+impl GMResult {
+    /// Get cluster labels for each data point (hard assignment).
+    ///
+    /// Gaussian Mixture fitting always produces labels, so this concrete
+    /// accessor is infallible; see [`ClusteringResult::labels`] for the
+    /// fallible, trait-object-safe equivalent.
+    pub fn labels(&self) -> &Tensor {
         &self.labels
+    }
+}
+
+impl ClusteringResult for GMResult {
+    fn labels(&self) -> Option<&Tensor> {
+        Some(&self.labels)
     }
 
     fn n_clusters(&self) -> usize {

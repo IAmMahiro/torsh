@@ -292,7 +292,7 @@ impl Optimizer for STDPOptimizer {
                     // Clamp weights to valid range
                     let clamped =
                         new_param.clamp(self.config.w_min as f32, self.config.w_max as f32)?;
-                    *param_write = clamped;
+                    crate::param_update::assign(&mut param_write, &clamped)?;
                 }
             }
         }
@@ -538,7 +538,7 @@ impl Optimizer for EventDrivenOptimizer {
                     let update = buffer.mul_scalar(self.lr)?;
                     let param = &self.param_groups[i];
                     let mut param_write = param.write();
-                    *param_write = param_write.sub(&update)?;
+                    crate::param_update::sub_assign(&mut param_write, &update)?;
                 }
             }
         }
@@ -758,7 +758,7 @@ impl TemporalCreditOptimizer {
 
             let update = trace.mul_scalar(self.lr * modulation)?;
             let mut param_write = param.write();
-            *param_write = param_write.sub(&update)?;
+            crate::param_update::sub_assign(&mut param_write, &update)?;
         }
 
         Ok(())

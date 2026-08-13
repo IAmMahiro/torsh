@@ -43,6 +43,11 @@ impl<T: 'static + Send + Sync> AugmentationPipeline<T> {
     }
 
     /// Set the probability of applying the entire pipeline
+    ///
+    /// # Panics
+    ///
+    /// Panics if `prob` is outside `[0.0, 1.0]`. See [`Self::try_with_probability`]
+    /// for a non-panicking variant.
     pub fn with_probability(mut self, prob: f32) -> Self {
         assert!(
             (0.0..=1.0).contains(&prob),
@@ -50,6 +55,14 @@ impl<T: 'static + Send + Sync> AugmentationPipeline<T> {
         );
         self.probability = prob;
         self
+    }
+
+    /// Fallible variant of [`Self::with_probability`] that returns an error
+    /// instead of panicking when `prob` is outside `[0.0, 1.0]`.
+    pub fn try_with_probability(mut self, prob: f32) -> Result<Self> {
+        crate::utils::validate_probability(prob, "prob")?;
+        self.probability = prob;
+        Ok(self)
     }
 
     /// Add a transform to the pipeline
@@ -104,6 +117,10 @@ pub struct ConditionalTransform<T, F> {
 }
 
 impl<T, F> ConditionalTransform<T, F> {
+    /// # Panics
+    ///
+    /// Panics if `probability` is outside `[0.0, 1.0]`. See
+    /// [`Self::try_new`] for a non-panicking variant.
     pub fn new(transform: F, probability: f32) -> Self {
         assert!(
             (0.0..=1.0).contains(&probability),
@@ -114,6 +131,17 @@ impl<T, F> ConditionalTransform<T, F> {
             probability,
             _phantom: core::marker::PhantomData,
         }
+    }
+
+    /// Fallible variant of [`Self::new`] that returns an error instead of
+    /// panicking when `probability` is outside `[0.0, 1.0]`.
+    pub fn try_new(transform: F, probability: f32) -> Result<Self> {
+        crate::utils::validate_probability(probability, "probability")?;
+        Ok(Self {
+            transform,
+            probability,
+            _phantom: core::marker::PhantomData,
+        })
     }
 }
 
@@ -141,9 +169,20 @@ pub struct RandomBrightness {
 }
 
 impl RandomBrightness {
+    /// # Panics
+    ///
+    /// Panics if `factor_range.0 > factor_range.1`. See [`Self::try_new`] for
+    /// a non-panicking variant.
     pub fn new(factor_range: (f32, f32)) -> Self {
         assert!(factor_range.0 <= factor_range.1, "Invalid factor range");
         Self { factor_range }
+    }
+
+    /// Fallible variant of [`Self::new`] that returns an error instead of
+    /// panicking when `factor_range.0 > factor_range.1`.
+    pub fn try_new(factor_range: (f32, f32)) -> Result<Self> {
+        crate::utils::validate_range(factor_range, "factor_range")?;
+        Ok(Self { factor_range })
     }
 
     /// Create with symmetric range around 1.0
@@ -182,9 +221,20 @@ pub struct RandomContrast {
 }
 
 impl RandomContrast {
+    /// # Panics
+    ///
+    /// Panics if `factor_range.0 > factor_range.1`. See [`Self::try_new`] for
+    /// a non-panicking variant.
     pub fn new(factor_range: (f32, f32)) -> Self {
         assert!(factor_range.0 <= factor_range.1, "Invalid factor range");
         Self { factor_range }
+    }
+
+    /// Fallible variant of [`Self::new`] that returns an error instead of
+    /// panicking when `factor_range.0 > factor_range.1`.
+    pub fn try_new(factor_range: (f32, f32)) -> Result<Self> {
+        crate::utils::validate_range(factor_range, "factor_range")?;
+        Ok(Self { factor_range })
     }
 
     /// Create with symmetric range around 1.0
@@ -230,9 +280,20 @@ pub struct RandomSaturation {
 }
 
 impl RandomSaturation {
+    /// # Panics
+    ///
+    /// Panics if `factor_range.0 > factor_range.1`. See [`Self::try_new`] for
+    /// a non-panicking variant.
     pub fn new(factor_range: (f32, f32)) -> Self {
         assert!(factor_range.0 <= factor_range.1, "Invalid factor range");
         Self { factor_range }
+    }
+
+    /// Fallible variant of [`Self::new`] that returns an error instead of
+    /// panicking when `factor_range.0 > factor_range.1`.
+    pub fn try_new(factor_range: (f32, f32)) -> Result<Self> {
+        crate::utils::validate_range(factor_range, "factor_range")?;
+        Ok(Self { factor_range })
     }
 
     /// Create with symmetric range around 1.0
@@ -288,6 +349,11 @@ pub struct RandomHue {
 }
 
 impl RandomHue {
+    /// # Panics
+    ///
+    /// Panics if `delta_range.0 > delta_range.1`, or if either bound falls
+    /// outside `[-1.0, 1.0]`. See [`Self::try_new`] for a non-panicking
+    /// variant.
     pub fn new(delta_range: (f32, f32)) -> Self {
         assert!(delta_range.0 <= delta_range.1, "Invalid delta range");
         assert!(
@@ -295,6 +361,18 @@ impl RandomHue {
             "Hue delta must be in [-1, 1]"
         );
         Self { delta_range }
+    }
+
+    /// Fallible variant of [`Self::new`] that returns an error instead of
+    /// panicking on an invalid `delta_range`.
+    pub fn try_new(delta_range: (f32, f32)) -> Result<Self> {
+        crate::utils::validate_range(delta_range, "delta_range")?;
+        if !(delta_range.0 >= -1.0 && delta_range.1 <= 1.0) {
+            return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                "Hue delta must be in [-1, 1], got {delta_range:?}"
+            )));
+        }
+        Ok(Self { delta_range })
     }
 
     /// Create with symmetric range
@@ -354,12 +432,23 @@ pub struct RandomVerticalFlip {
 }
 
 impl RandomVerticalFlip {
+    /// # Panics
+    ///
+    /// Panics if `prob` is outside `[0.0, 1.0]`. See [`Self::try_new`] for a
+    /// non-panicking variant.
     pub fn new(prob: f32) -> Self {
         assert!(
             (0.0..=1.0).contains(&prob),
             "Probability must be between 0 and 1"
         );
         Self { prob }
+    }
+
+    /// Fallible variant of [`Self::new`] that returns an error instead of
+    /// panicking when `prob` is outside `[0.0, 1.0]`.
+    pub fn try_new(prob: f32) -> Result<Self> {
+        crate::utils::validate_probability(prob, "prob")?;
+        Ok(Self { prob })
     }
 }
 
@@ -414,9 +503,24 @@ pub struct GaussianNoise {
 }
 
 impl GaussianNoise {
+    /// # Panics
+    ///
+    /// Panics if `std` is negative. See [`Self::try_new`] for a non-panicking
+    /// variant.
     pub fn new(mean: f32, std: f32) -> Self {
         assert!(std >= 0.0, "Standard deviation must be non-negative");
         Self { mean, std }
+    }
+
+    /// Fallible variant of [`Self::new`] that returns an error instead of
+    /// panicking when `std` is negative.
+    pub fn try_new(mean: f32, std: f32) -> Result<Self> {
+        if std < 0.0 {
+            return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                "Standard deviation must be non-negative, got {std}"
+            )));
+        }
+        Ok(Self { mean, std })
     }
 
     /// Create with zero mean
@@ -466,6 +570,10 @@ pub struct RandomErasing {
 }
 
 impl RandomErasing {
+    /// # Panics
+    ///
+    /// Panics if `prob` is outside `[0.0, 1.0]`, or if either range is
+    /// inverted. See [`Self::try_new`] for a non-panicking variant.
     pub fn new(prob: f32, scale_range: (f32, f32), ratio_range: (f32, f32)) -> Self {
         assert!(
             (0.0..=1.0).contains(&prob),
@@ -480,6 +588,21 @@ impl RandomErasing {
             ratio_range,
             fill_value: 0.0,
         }
+    }
+
+    /// Fallible variant of [`Self::new`] that returns an error instead of
+    /// panicking on an invalid `prob`, `scale_range`, or `ratio_range`.
+    pub fn try_new(prob: f32, scale_range: (f32, f32), ratio_range: (f32, f32)) -> Result<Self> {
+        crate::utils::validate_probability(prob, "prob")?;
+        crate::utils::validate_range(scale_range, "scale_range")?;
+        crate::utils::validate_range(ratio_range, "ratio_range")?;
+
+        Ok(Self {
+            prob,
+            scale_range,
+            ratio_range,
+            fill_value: 0.0,
+        })
     }
 
     pub fn with_fill_value(mut self, fill_value: f32) -> Self {

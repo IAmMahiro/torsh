@@ -52,11 +52,12 @@ impl<O: Optimizer> Lookahead<O> {
     /// Get parameter key for slow weight storage.
     ///
     /// Keyed by the `Arc<RwLock<Tensor>>` handle identity, NOT the tensor's data
-    /// buffer pointer. Base optimizers update parameters by *replacing* the inner
-    /// tensor (`*param = param.sub(..)`), which allocates a new data buffer each
-    /// step; a data-pointer key would therefore change between initialization and
-    /// the slow-weight update, silently losing the mapping. The `Arc` handle, by
-    /// contrast, is stable for the lifetime of the parameter.
+    /// buffer pointer. Optimizer updates go through `crate::param_update`, whose
+    /// in-place writes are copy-on-write: a parameter whose storage is shared
+    /// with a snapshot gets a fresh buffer on the next update, so a data-pointer
+    /// key could change between initialization and the slow-weight update and
+    /// silently lose the mapping. The `Arc` handle, by contrast, is stable for
+    /// the lifetime of the parameter.
     fn get_param_key(param_ref: &Arc<RwLock<Tensor>>) -> String {
         format!("param_{:p}", Arc::as_ptr(param_ref))
     }
@@ -91,7 +92,7 @@ impl<O: Optimizer> Lookahead<O> {
                 // Update fast weights to slow weights
                 drop(param); // Release read lock
                 let mut param_mut = param_ref.write();
-                *param_mut = slow_weight.clone();
+                crate::param_update::assign(&mut param_mut, slow_weight)?;
             }
         }
         Ok(())

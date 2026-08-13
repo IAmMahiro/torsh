@@ -5,6 +5,7 @@
 //! bottleneck identification.
 
 use crate::error::{Result, TorshError};
+use crate::sync::MutexExt;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -651,14 +652,14 @@ macro_rules! profile_operation {
     ($op_type:expr, $context:expr, $body:expr) => {{
         let profiler = $crate::profiling::get_profiler();
         let handle = {
-            let mut p = profiler.lock().expect("lock should not be poisoned");
+            let mut p = profiler.lock_or_recover();
             p.start_operation($op_type)
         };
 
         let result = $body;
 
         {
-            let mut p = profiler.lock().expect("lock should not be poisoned");
+            let mut p = profiler.lock_or_recover();
             p.finish_operation(handle, $context);
         }
 
@@ -673,14 +674,14 @@ where
 {
     let profiler = get_profiler();
     let handle = {
-        let mut p = profiler.lock().expect("lock should not be poisoned");
+        let mut p = profiler.lock_or_recover();
         p.start_operation(op_type)
     };
 
     let result = closure();
 
     {
-        let mut p = profiler.lock().expect("lock should not be poisoned");
+        let mut p = profiler.lock_or_recover();
         p.finish_operation(handle, context);
     }
 
@@ -1185,7 +1186,7 @@ mod tests {
         // Check that the operation was recorded
         let profiler = get_profiler();
         let records = {
-            let p = profiler.lock().expect("lock should not be poisoned");
+            let p = profiler.lock_or_recover();
             p.get_records()
         };
 

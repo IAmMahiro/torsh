@@ -53,8 +53,8 @@ pub struct HierarchicalResult {
 }
 
 impl ClusteringResult for HierarchicalResult {
-    fn labels(&self) -> &Tensor {
-        &self.labels
+    fn labels(&self) -> Option<&Tensor> {
+        Some(&self.labels)
     }
 
     fn n_clusters(&self) -> usize {
@@ -63,6 +63,15 @@ impl ClusteringResult for HierarchicalResult {
 }
 
 impl HierarchicalResult {
+    /// Get cluster labels for each data point.
+    ///
+    /// Hierarchical clustering always produces labels, so this concrete
+    /// accessor is infallible; see [`ClusteringResult::labels`] for the
+    /// fallible, trait-object-safe equivalent.
+    pub fn labels(&self) -> &Tensor {
+        &self.labels
+    }
+
     /// Extract flat cluster labels for a target number of clusters.
     ///
     /// Replays the merge history in reverse to cut the dendrogram at the

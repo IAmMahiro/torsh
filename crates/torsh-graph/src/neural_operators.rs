@@ -11,9 +11,12 @@
 //! - Multi-scale graph operators
 //! - Spectral graph convolutions with learnable kernels
 //! - Graph wavelet neural operators
-
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
+
 use crate::parameter::Parameter;
 use crate::{GraphData, GraphLayer};
 use torsh_tensor::{
@@ -52,40 +55,30 @@ impl GraphFNO {
         num_modes: usize,
         num_layers: usize,
         bias: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut fourier_weights = Vec::new();
         let mut conv_weights = Vec::new();
 
         // Initialize Fourier weights for each layer
         for _ in 0..num_layers {
-            fourier_weights.push(Parameter::new(
-                randn(&[hidden_features, hidden_features, num_modes])
-                    .expect("failed to create fourier_weights tensor"),
-            ));
-            conv_weights.push(Parameter::new(
-                randn(&[hidden_features, hidden_features])
-                    .expect("failed to create conv_weights tensor"),
-            ));
+            fourier_weights.push(Parameter::new(randn(&[
+                hidden_features,
+                hidden_features,
+                num_modes,
+            ])?));
+            conv_weights.push(Parameter::new(randn(&[hidden_features, hidden_features])?));
         }
 
-        let input_projection = Parameter::new(
-            randn(&[in_features, hidden_features])
-                .expect("failed to create input_projection tensor"),
-        );
-        let output_projection = Parameter::new(
-            randn(&[hidden_features, out_features])
-                .expect("failed to create output_projection tensor"),
-        );
+        let input_projection = Parameter::new(randn(&[in_features, hidden_features])?);
+        let output_projection = Parameter::new(randn(&[hidden_features, out_features])?);
 
         let bias = if bias {
-            Some(Parameter::new(
-                zeros::<f32>(&[out_features]).expect("failed to create bias tensor"),
-            ))
+            Some(Parameter::new(zeros::<f32>(&[out_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             hidden_features,
@@ -96,69 +89,60 @@ impl GraphFNO {
             input_projection,
             output_projection,
             bias,
-        }
+        })
     }
 
     /// Forward pass through GraphFNO
-    pub fn forward(&self, graph: &GraphData) -> GraphData {
+    pub fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         let _num_nodes = graph.num_nodes;
 
         // Input projection
-        let mut x = graph
-            .x
-            .matmul(&self.input_projection.clone_data())
-            .expect("operation should succeed");
+        let mut x = graph.x.matmul(&self.input_projection.clone_data())?;
 
         // Apply Fourier layers
         for layer in 0..self.num_layers {
-            x = self.fourier_layer(&x, layer, graph);
+            x = self.fourier_layer(&x, layer, graph)?;
         }
 
         // Output projection
-        let mut output = x
-            .matmul(&self.output_projection.clone_data())
-            .expect("operation should succeed");
+        let mut output = x.matmul(&self.output_projection.clone_data())?;
 
         // Add bias if present
         if let Some(ref bias) = self.bias {
-            output = output
-                .add(&bias.clone_data())
-                .expect("operation should succeed");
+            output = output.add(&bias.clone_data())?;
         }
 
         // Create output graph
         let mut output_graph = graph.clone();
         output_graph.x = output;
-        output_graph
+        Ok(output_graph)
     }
 
     /// Apply a single Fourier layer
-    fn fourier_layer(&self, x: &Tensor, layer: usize, graph: &GraphData) -> Tensor {
+    fn fourier_layer(&self, x: &Tensor, layer: usize, graph: &GraphData) -> Result<Tensor> {
         // Step 1: Apply graph Fourier transform (simplified)
-        let fourier_x = self.graph_fourier_transform(x, graph);
+        let fourier_x = self.graph_fourier_transform(x, graph)?;
 
         // Step 2: Apply learnable Fourier weights
         let fourier_weights = &self.fourier_weights[layer];
-        let spectral_conv = self.spectral_convolution(&fourier_x, fourier_weights);
+        let spectral_conv = self.spectral_convolution(&fourier_x, fourier_weights)?;
 
         // Step 3: Inverse Fourier transform
-        let spatial_features = self.inverse_graph_fourier_transform(&spectral_conv, graph);
+        let spatial_features = self.inverse_graph_fourier_transform(&spectral_conv, graph)?;
 
         // Step 4: Apply spatial convolution
         let conv_weights = &self.conv_weights[layer];
-        let conv_output = spatial_features
-            .matmul(&conv_weights.clone_data())
-            .expect("operation should succeed");
+        let conv_output = spatial_features.matmul(&conv_weights.clone_data())?;
 
         // Step 5: Residual connection and activation
-        let residual = x.add(&conv_output).expect("operation should succeed");
+        let residual = x.add(&conv_output)?;
 
         // Apply ReLU activation (simplified)
         self.relu(&residual)
     }
 
     /// Graph Fourier Transform (simplified eigendecomposition)
-    fn graph_fourier_transform(&self, x: &Tensor, graph: &GraphData) -> Tensor {
+    fn graph_fourier_transform(&self, x: &Tensor, graph: &GraphData) -> Result<Tensor> {
         // For simplicity, we'll use a learned transformation matrix
         // In practice, this would use graph Laplacian eigendecomposition
         let num_nodes = graph.num_nodes;
@@ -177,19 +161,18 @@ impl GraphFNO {
             transform_data,
             &[num_nodes, self.num_modes],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("GFT transform matrix creation should succeed");
+        )?;
 
         // Project to spectral domain
-        transform_matrix
-            .t()
-            .expect("operation should succeed")
-            .matmul(x)
-            .expect("operation should succeed")
+        Ok(transform_matrix.t()?.matmul(x)?)
     }
 
     /// Inverse Graph Fourier Transform
-    fn inverse_graph_fourier_transform(&self, fourier_x: &Tensor, graph: &GraphData) -> Tensor {
+    fn inverse_graph_fourier_transform(
+        &self,
+        fourier_x: &Tensor,
+        graph: &GraphData,
+    ) -> Result<Tensor> {
         let num_nodes = graph.num_nodes;
 
         // Create inverse transformation matrix
@@ -206,50 +189,40 @@ impl GraphFNO {
             inv_transform_data,
             &[num_nodes, self.num_modes],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("inverse GFT transform matrix creation should succeed");
+        )?;
 
         // Project back to spatial domain
-        inv_transform_matrix
-            .matmul(fourier_x)
-            .expect("operation should succeed")
+        Ok(inv_transform_matrix.matmul(fourier_x)?)
     }
 
     /// Spectral convolution in Fourier domain
-    fn spectral_convolution(&self, fourier_x: &Tensor, weights: &Parameter) -> Tensor {
+    fn spectral_convolution(&self, fourier_x: &Tensor, weights: &Parameter) -> Result<Tensor> {
         // Apply Fourier weights (simplified)
         let weight_data = weights.clone_data();
 
         // For simplicity, use only the first mode slice
         // In practice, this would involve complex multiplication across all modes
-        let weight_2d = weight_data
-            .slice_tensor(2, 0, 1)
-            .expect("spectral weight slice should succeed")
-            .squeeze_tensor(2)
-            .expect("spectral weight squeeze should succeed");
+        let weight_2d = weight_data.slice_tensor(2, 0, 1)?.squeeze_tensor(2)?;
 
-        fourier_x
-            .matmul(&weight_2d)
-            .expect("operation should succeed")
+        Ok(fourier_x.matmul(&weight_2d)?)
     }
 
     /// ReLU activation function
-    fn relu(&self, x: &Tensor) -> Tensor {
+    fn relu(&self, x: &Tensor) -> Result<Tensor> {
         // Simplified ReLU - clamp negative values to 0
-        let data = x.to_vec().expect("conversion should succeed");
+        let data = x.to_vec()?;
         let activated_data: Vec<f32> = data.iter().map(|&val| val.max(0.0)).collect();
 
-        from_vec(
+        Ok(from_vec(
             activated_data,
             x.shape().dims(),
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("GraphFNO relu tensor creation should succeed")
+        )?)
     }
 }
 
 impl GraphLayer for GraphFNO {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         self.forward(graph)
     }
 
@@ -304,7 +277,7 @@ impl GraphDeepONet {
         num_sensors: usize,
         num_layers: usize,
         bias: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut branch_layers = Vec::new();
         let mut trunk_layers = Vec::new();
 
@@ -316,9 +289,7 @@ impl GraphDeepONet {
             } else {
                 hidden_features
             };
-            branch_layers.push(Parameter::new(
-                randn(&[in_dim, out_dim]).expect("failed to create branch layer tensor"),
-            ));
+            branch_layers.push(Parameter::new(randn(&[in_dim, out_dim])?));
         }
 
         // Initialize trunk network layers
@@ -333,20 +304,16 @@ impl GraphDeepONet {
             } else {
                 hidden_features
             };
-            trunk_layers.push(Parameter::new(
-                randn(&[in_dim, out_dim]).expect("failed to create trunk layer tensor"),
-            ));
+            trunk_layers.push(Parameter::new(randn(&[in_dim, out_dim])?));
         }
 
         let bias = if bias {
-            Some(Parameter::new(
-                zeros::<f32>(&[output_features]).expect("failed to create DeepONet bias tensor"),
-            ))
+            Some(Parameter::new(zeros::<f32>(&[output_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             trunk_net_features,
             branch_net_features,
             hidden_features,
@@ -355,7 +322,7 @@ impl GraphDeepONet {
             branch_layers,
             trunk_layers,
             bias,
-        }
+        })
     }
 
     /// Forward pass through Graph DeepONet
@@ -364,95 +331,86 @@ impl GraphDeepONet {
         graph: &GraphData,
         sensor_data: &Tensor,
         locations: &Tensor,
-    ) -> GraphData {
+    ) -> Result<GraphData> {
         // Process sensor data through branch network
-        let branch_output = self.forward_branch_net(sensor_data);
+        let branch_output = self.forward_branch_net(sensor_data)?;
 
         // Process locations through trunk network
-        let trunk_output = self.forward_trunk_net(locations);
+        let trunk_output = self.forward_trunk_net(locations)?;
 
         // Combine branch and trunk outputs (dot product)
-        let combined = self.combine_outputs(&branch_output, &trunk_output);
+        let combined = self.combine_outputs(&branch_output, &trunk_output)?;
 
         // Add bias if present
         let mut output = combined;
         if let Some(ref bias) = self.bias {
-            output = output
-                .add(&bias.clone_data())
-                .expect("operation should succeed");
+            output = output.add(&bias.clone_data())?;
         }
 
         // Create output graph
         let mut output_graph = graph.clone();
         output_graph.x = output;
-        output_graph
+        Ok(output_graph)
     }
 
     /// Forward pass through branch network
-    fn forward_branch_net(&self, sensor_data: &Tensor) -> Tensor {
+    fn forward_branch_net(&self, sensor_data: &Tensor) -> Result<Tensor> {
         let mut x = sensor_data.clone();
 
         for (i, layer) in self.branch_layers.iter().enumerate() {
-            x = x
-                .matmul(&layer.clone_data())
-                .expect("operation should succeed");
+            x = x.matmul(&layer.clone_data())?;
 
             // Apply activation function except for last layer
             if i < self.branch_layers.len() - 1 {
-                x = self.tanh(&x);
+                x = self.tanh(&x)?;
             }
         }
 
-        x
+        Ok(x)
     }
 
     /// Forward pass through trunk network
-    fn forward_trunk_net(&self, locations: &Tensor) -> Tensor {
+    fn forward_trunk_net(&self, locations: &Tensor) -> Result<Tensor> {
         let mut x = locations.clone();
 
         for (i, layer) in self.trunk_layers.iter().enumerate() {
-            x = x
-                .matmul(&layer.clone_data())
-                .expect("operation should succeed");
+            x = x.matmul(&layer.clone_data())?;
 
             // Apply activation function except for last layer
             if i < self.trunk_layers.len() - 1 {
-                x = self.tanh(&x);
+                x = self.tanh(&x)?;
             }
         }
 
-        x
+        Ok(x)
     }
 
     /// Combine branch and trunk network outputs
-    fn combine_outputs(&self, branch_output: &Tensor, trunk_output: &Tensor) -> Tensor {
+    fn combine_outputs(&self, branch_output: &Tensor, trunk_output: &Tensor) -> Result<Tensor> {
         // Element-wise multiplication and sum
-        branch_output
-            .mul(trunk_output)
-            .expect("operation should succeed")
+        Ok(branch_output.mul(trunk_output)?)
     }
 
     /// Tanh activation function
-    fn tanh(&self, x: &Tensor) -> Tensor {
-        let data = x.to_vec().expect("conversion should succeed");
+    fn tanh(&self, x: &Tensor) -> Result<Tensor> {
+        let data = x.to_vec()?;
         let activated_data: Vec<f32> = data.iter().map(|&val| val.tanh()).collect();
 
-        from_vec(
+        Ok(from_vec(
             activated_data,
             x.shape().dims(),
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("DeepONet tanh tensor creation should succeed")
+        )?)
     }
 }
 
 impl GraphLayer for GraphDeepONet {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         // Default forward using graph features as both sensor data and locations
-        let sensor_data = graph
-            .x
-            .slice_tensor(1, 0, self.num_sensors.min(graph.x.shape().dims()[1]))
-            .expect("sensor data slice should succeed");
+        let sensor_data =
+            graph
+                .x
+                .slice_tensor(1, 0, self.num_sensors.min(graph.x.shape().dims()[1]))?;
         let locations = graph.x.clone();
 
         self.forward(graph, &sensor_data, &locations)
@@ -505,7 +463,7 @@ impl PhysicsInformedGNN {
         diffusion_coefficient: f32,
         reaction_rate: f32,
         bias: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut layers = Vec::new();
 
         for i in 0..num_layers {
@@ -515,20 +473,16 @@ impl PhysicsInformedGNN {
             } else {
                 hidden_features
             };
-            layers.push(Parameter::new(
-                randn(&[in_dim, out_dim]).expect("failed to create PIGNN layer tensor"),
-            ));
+            layers.push(Parameter::new(randn(&[in_dim, out_dim])?));
         }
 
         let bias = if bias {
-            Some(Parameter::new(
-                zeros::<f32>(&[out_features]).expect("failed to create PIGNN bias tensor"),
-            ))
+            Some(Parameter::new(zeros::<f32>(&[out_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             hidden_features,
@@ -536,22 +490,20 @@ impl PhysicsInformedGNN {
             diffusion_coefficient,
             reaction_rate,
             bias,
-        }
+        })
     }
 
     /// Forward pass with physics constraints
-    pub fn forward(&self, graph: &GraphData) -> GraphData {
+    pub fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         // Neural network forward pass
         let mut x = graph.x.clone();
 
         for (i, layer) in self.layers.iter().enumerate() {
-            x = x
-                .matmul(&layer.clone_data())
-                .expect("operation should succeed");
+            x = x.matmul(&layer.clone_data())?;
 
             // Apply activation except for last layer
             if i < self.layers.len() - 1 {
-                x = self.swish(&x);
+                x = self.swish(&x)?;
             }
         }
 
@@ -561,44 +513,34 @@ impl PhysicsInformedGNN {
         // Add bias if present
         let mut output = physics_constrained;
         if let Some(ref bias) = self.bias {
-            output = output
-                .add(&bias.clone_data())
-                .expect("operation should succeed");
+            output = Ok(output?.add(&bias.clone_data())?);
         }
 
         // Create output graph
         let mut output_graph = graph.clone();
-        output_graph.x = output;
-        output_graph
+        output_graph.x = output?;
+        Ok(output_graph)
     }
 
     /// Apply physics constraints (diffusion-reaction equation)
-    fn apply_physics_constraints(&self, prediction: &Tensor, graph: &GraphData) -> Tensor {
+    fn apply_physics_constraints(&self, prediction: &Tensor, graph: &GraphData) -> Result<Tensor> {
         // Compute graph Laplacian for diffusion term
         let laplacian = self.compute_graph_laplacian(graph);
 
         // Diffusion term: D * L * u
-        let diffusion_term = laplacian
-            .matmul(prediction)
-            .expect("operation should succeed")
-            .mul_scalar(self.diffusion_coefficient)
-            .expect("operation should succeed");
+        let diffusion_term = laplacian?
+            .matmul(prediction)?
+            .mul_scalar(self.diffusion_coefficient)?;
 
         // Reaction term: r * u
-        let reaction_term = prediction
-            .mul_scalar(self.reaction_rate)
-            .expect("operation should succeed");
+        let reaction_term = prediction.mul_scalar(self.reaction_rate)?;
 
         // Combine terms (simplified physics equation)
-        prediction
-            .add(&diffusion_term)
-            .expect("operation should succeed")
-            .add(&reaction_term)
-            .expect("operation should succeed")
+        Ok(prediction.add(&diffusion_term)?.add(&reaction_term)?)
     }
 
     /// Compute graph Laplacian matrix
-    fn compute_graph_laplacian(&self, graph: &GraphData) -> Tensor {
+    fn compute_graph_laplacian(&self, graph: &GraphData) -> Result<Tensor> {
         let num_nodes = graph.num_nodes;
         let _num_edges = graph.num_edges;
 
@@ -606,10 +548,7 @@ impl PhysicsInformedGNN {
         let mut adj_data = vec![0.0f32; num_nodes * num_nodes];
 
         // Fill adjacency matrix from edge_index
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
         for i in (0..edge_data.len()).step_by(2) {
             if i + 1 < edge_data.len() {
                 let src = edge_data[i] as usize;
@@ -638,33 +577,31 @@ impl PhysicsInformedGNN {
             laplacian_data.push(degree_data[i] - adj_data[i]);
         }
 
-        from_vec(
+        Ok(from_vec(
             laplacian_data,
             &[num_nodes, num_nodes],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("graph Laplacian tensor creation should succeed")
+        )?)
     }
 
     /// Swish activation function (x * sigmoid(x))
-    fn swish(&self, x: &Tensor) -> Tensor {
-        let data = x.to_vec().expect("conversion should succeed");
+    fn swish(&self, x: &Tensor) -> Result<Tensor> {
+        let data = x.to_vec()?;
         let activated_data: Vec<f32> = data
             .iter()
             .map(|&val| val * (1.0 / (1.0 + (-val).exp())))
             .collect();
 
-        from_vec(
+        Ok(from_vec(
             activated_data,
             x.shape().dims(),
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("PIGNN swish tensor creation should succeed")
+        )?)
     }
 }
 
 impl GraphLayer for PhysicsInformedGNN {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         self.forward(graph)
     }
 
@@ -711,36 +648,26 @@ impl MultiScaleGNO {
         num_scales: usize,
         hidden_features: usize,
         bias: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut scale_operators = Vec::new();
 
         // Initialize scale-specific operators
         for _ in 0..num_scales {
-            scale_operators.push(Parameter::new(
-                randn(&[in_features, hidden_features])
-                    .expect("failed to create scale operator tensor"),
-            ));
+            scale_operators.push(Parameter::new(randn(&[in_features, hidden_features])?));
         }
 
-        let fusion_weights = Parameter::new(
-            randn(&[num_scales * hidden_features, hidden_features])
-                .expect("failed to create fusion_weights tensor"),
-        );
+        let fusion_weights =
+            Parameter::new(randn(&[num_scales * hidden_features, hidden_features])?);
 
-        let output_projection = Parameter::new(
-            randn(&[hidden_features, out_features])
-                .expect("failed to create MultiScaleGNO output_projection tensor"),
-        );
+        let output_projection = Parameter::new(randn(&[hidden_features, out_features])?);
 
         let bias = if bias {
-            Some(Parameter::new(
-                zeros::<f32>(&[out_features]).expect("failed to create MultiScaleGNO bias tensor"),
-            ))
+            Some(Parameter::new(zeros::<f32>(&[out_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             num_scales,
@@ -749,44 +676,40 @@ impl MultiScaleGNO {
             fusion_weights,
             output_projection,
             bias,
-        }
+        })
     }
 
     /// Forward pass through multi-scale operator
-    pub fn forward(&self, graph: &GraphData) -> GraphData {
+    pub fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         let mut scale_features = Vec::new();
 
         // Process each scale
         for scale in 0..self.num_scales {
-            let scale_graph = self.coarsen_graph(graph, scale);
-            let features = self.process_scale(&scale_graph, scale);
-            let upsampled = self.upsample_features(&features, graph.num_nodes);
+            let scale_graph = self.coarsen_graph(graph, scale)?;
+            let features = self.process_scale(&scale_graph, scale)?;
+            let upsampled = self.upsample_features(&features, graph.num_nodes)?;
             scale_features.push(upsampled);
         }
 
         // Fuse multi-scale features
-        let fused_features = self.fuse_scales(&scale_features);
+        let fused_features = self.fuse_scales(&scale_features)?;
 
         // Output projection
-        let mut output = fused_features
-            .matmul(&self.output_projection.clone_data())
-            .expect("operation should succeed");
+        let mut output = fused_features.matmul(&self.output_projection.clone_data())?;
 
         // Add bias if present
         if let Some(ref bias) = self.bias {
-            output = output
-                .add(&bias.clone_data())
-                .expect("operation should succeed");
+            output = output.add(&bias.clone_data())?;
         }
 
         // Create output graph
         let mut output_graph = graph.clone();
         output_graph.x = output;
-        output_graph
+        Ok(output_graph)
     }
 
     /// Coarsen graph for multi-scale processing
-    fn coarsen_graph(&self, graph: &GraphData, scale: usize) -> GraphData {
+    fn coarsen_graph(&self, graph: &GraphData, scale: usize) -> Result<GraphData> {
         let coarsening_factor = 2_usize.pow(scale as u32);
         let coarse_nodes = (graph.num_nodes + coarsening_factor - 1) / coarsening_factor;
 
@@ -802,11 +725,8 @@ impl MultiScaleGNO {
             let mut count = 0;
 
             for node_id in start_node..end_node {
-                let features = graph
-                    .x
-                    .slice_tensor(0, node_id, node_id + 1)
-                    .expect("node feature slice should succeed");
-                let feature_data = features.to_vec().expect("conversion should succeed");
+                let features = graph.x.slice_tensor(0, node_id, node_id + 1)?;
+                let feature_data = features.to_vec()?;
 
                 for (i, &val) in feature_data.iter().enumerate() {
                     if i < sum_features.len() {
@@ -830,8 +750,7 @@ impl MultiScaleGNO {
             coarse_features,
             &[coarse_nodes, graph.x.shape().dims()[1]],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("coarse node features tensor creation should succeed");
+        )?;
 
         // Simplified edge index (connect sequential nodes)
         let mut coarse_edges = Vec::new();
@@ -844,35 +763,29 @@ impl MultiScaleGNO {
             coarse_edges,
             &[2, coarse_nodes.saturating_sub(1)],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("coarse edge index tensor creation should succeed");
+        )?;
 
-        GraphData::new(coarse_x, coarse_edge_index)
+        Ok(GraphData::new(coarse_x, coarse_edge_index))
     }
 
     /// Process features at a specific scale
-    fn process_scale(&self, graph: &GraphData, scale: usize) -> Tensor {
+    fn process_scale(&self, graph: &GraphData, scale: usize) -> Result<Tensor> {
         let operator = &self.scale_operators[scale];
-        graph
-            .x
-            .matmul(&operator.clone_data())
-            .expect("operation should succeed")
+        Ok(graph.x.matmul(&operator.clone_data())?)
     }
 
     /// Upsample features to original graph size
-    fn upsample_features(&self, features: &Tensor, target_nodes: usize) -> Tensor {
+    fn upsample_features(&self, features: &Tensor, target_nodes: usize) -> Result<Tensor> {
         let current_nodes = features.shape().dims()[0];
         let feature_dim = features.shape().dims()[1];
 
         if current_nodes >= target_nodes {
             // Truncate if necessary
-            return features
-                .slice_tensor(0, 0, target_nodes)
-                .expect("feature truncation should succeed");
+            return Ok(features.slice_tensor(0, 0, target_nodes)?);
         }
 
         // Simple upsampling by repetition
-        let feature_data = features.to_vec().expect("conversion should succeed");
+        let feature_data = features.to_vec()?;
         let mut upsampled_data = Vec::new();
 
         for target_id in 0..target_nodes {
@@ -888,26 +801,23 @@ impl MultiScaleGNO {
             }
         }
 
-        from_vec(
+        Ok(from_vec(
             upsampled_data,
             &[target_nodes, feature_dim],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("upsampled features tensor creation should succeed")
+        )?)
     }
 
     /// Fuse multi-scale features
-    fn fuse_scales(&self, scale_features: &[Tensor]) -> Tensor {
+    fn fuse_scales(&self, scale_features: &[Tensor]) -> Result<Tensor> {
         // Concatenate features from all scales
         let mut concatenated_data = Vec::new();
         let num_nodes = scale_features[0].shape().dims()[0];
 
         for node_id in 0..num_nodes {
             for scale_feature in scale_features {
-                let node_features = scale_feature
-                    .slice_tensor(0, node_id, node_id + 1)
-                    .expect("scale feature slice should succeed");
-                let feature_data = node_features.to_vec().expect("conversion should succeed");
+                let node_features = scale_feature.slice_tensor(0, node_id, node_id + 1)?;
+                let feature_data = node_features.to_vec()?;
                 concatenated_data.extend(feature_data);
             }
         }
@@ -916,18 +826,15 @@ impl MultiScaleGNO {
             concatenated_data,
             &[num_nodes, self.num_scales * self.hidden_features],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("concatenated scale features tensor creation should succeed");
+        )?;
 
         // Apply fusion weights
-        concatenated
-            .matmul(&self.fusion_weights.clone_data())
-            .expect("operation should succeed")
+        Ok(concatenated.matmul(&self.fusion_weights.clone_data())?)
     }
 }
 
 impl GraphLayer for MultiScaleGNO {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         self.forward(graph)
     }
 
@@ -954,7 +861,7 @@ pub mod utils {
     use super::*;
 
     /// Compute spectral features of a graph
-    pub fn compute_spectral_features(graph: &GraphData, num_eigenvalues: usize) -> Tensor {
+    pub fn compute_spectral_features(graph: &GraphData, num_eigenvalues: usize) -> Result<Tensor> {
         // Simplified spectral computation
         let num_nodes = graph.num_nodes;
         let mut spectral_data = Vec::new();
@@ -969,12 +876,11 @@ pub mod utils {
             }
         }
 
-        from_vec(
+        Ok(from_vec(
             spectral_data,
             &[num_nodes, num_eigenvalues],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("spectral features tensor creation should succeed")
+        )?)
     }
 
     /// Generate synthetic operator learning data
@@ -982,14 +888,13 @@ pub mod utils {
         num_graphs: usize,
         num_nodes: usize,
         feature_dim: usize,
-    ) -> Vec<(GraphData, GraphData)> {
+    ) -> Result<Vec<(GraphData, GraphData)>> {
         let mut rng = scirs2_core::random::thread_rng();
         let mut data_pairs = Vec::new();
 
         for _ in 0..num_graphs {
             // Generate input graph
-            let input_features = randn(&[num_nodes, feature_dim])
-                .expect("input features tensor creation should succeed");
+            let input_features = randn(&[num_nodes, feature_dim])?;
             let mut edge_data = Vec::new();
 
             // Create random edges
@@ -1004,28 +909,24 @@ pub mod utils {
                 edge_data,
                 &[2, num_nodes * 2],
                 torsh_core::device::DeviceType::Cpu,
-            )
-            .expect("edge index tensor creation should succeed");
+            )?;
 
             let input_graph = GraphData::new(input_features, edge_index);
 
             // Generate corresponding output (apply some transformation)
-            let output_features = input_graph
-                .x
-                .mul_scalar(2.0)
-                .expect("output transformation should succeed");
+            let output_features = input_graph.x.mul_scalar(2.0)?;
             let output_graph = GraphData::new(output_features, input_graph.edge_index.clone());
 
             data_pairs.push((input_graph, output_graph));
         }
 
-        data_pairs
+        Ok(data_pairs)
     }
 
     /// Evaluate operator approximation error
-    pub fn compute_operator_error(predicted: &GraphData, target: &GraphData) -> f32 {
-        let pred_data = predicted.x.to_vec().expect("conversion should succeed");
-        let target_data = target.x.to_vec().expect("conversion should succeed");
+    pub fn compute_operator_error(predicted: &GraphData, target: &GraphData) -> Result<f32> {
+        let pred_data = predicted.x.to_vec()?;
+        let target_data = target.x.to_vec()?;
 
         let mut mse = 0.0;
         let mut count = 0;
@@ -1036,9 +937,9 @@ pub mod utils {
         }
 
         if count > 0 {
-            mse / count as f32
+            Ok(mse / count as f32)
         } else {
-            0.0
+            Ok(0.0)
         }
     }
 }
@@ -1050,7 +951,7 @@ mod tests {
 
     #[test]
     fn test_graph_fno_creation() {
-        let fno = GraphFNO::new(4, 8, 16, 10, 3, true);
+        let fno = GraphFNO::new(4, 8, 16, 10, 3, true).expect("operation should succeed");
         assert_eq!(fno.in_features, 4);
         assert_eq!(fno.out_features, 8);
         assert_eq!(fno.hidden_features, 16);
@@ -1065,15 +966,16 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 4], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let fno = GraphFNO::new(4, 8, 16, 10, 3, true);
-        let output = fno.forward(&graph);
+        let fno = GraphFNO::new(4, 8, 16, 10, 3, true).expect("operation should succeed");
+        let output = fno.forward(&graph).expect("operation should succeed");
 
         assert_eq!(output.x.shape().dims(), &[5, 8]);
     }
 
     #[test]
     fn test_graph_deeponet_creation() {
-        let deeponet = GraphDeepONet::new(3, 4, 16, 8, 10, 3, true);
+        let deeponet =
+            GraphDeepONet::new(3, 4, 16, 8, 10, 3, true).expect("operation should succeed");
         assert_eq!(deeponet.trunk_net_features, 3);
         assert_eq!(deeponet.branch_net_features, 4);
         assert_eq!(deeponet.output_features, 8);
@@ -1087,8 +989,9 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 3], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let pignn = PhysicsInformedGNN::new(3, 6, 12, 2, 0.1, 0.05, true);
-        let output = pignn.forward(&graph);
+        let pignn = PhysicsInformedGNN::new(3, 6, 12, 2, 0.1, 0.05, true)
+            .expect("operation should succeed");
+        let output = pignn.forward(&graph).expect("operation should succeed");
 
         assert_eq!(output.x.shape().dims(), &[4, 6]);
     }
@@ -1102,8 +1005,8 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 7], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let ms_gno = MultiScaleGNO::new(4, 6, 3, 8, true);
-        let output = ms_gno.forward(&graph);
+        let ms_gno = MultiScaleGNO::new(4, 6, 3, 8, true).expect("operation should succeed");
+        let output = ms_gno.forward(&graph).expect("operation should succeed");
 
         assert_eq!(output.x.shape().dims(), &[8, 6]);
     }
@@ -1115,13 +1018,14 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 5], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let spectral_features = utils::compute_spectral_features(&graph, 4);
+        let spectral_features =
+            utils::compute_spectral_features(&graph, 4).expect("operation should succeed");
         assert_eq!(spectral_features.shape().dims(), &[6, 4]);
     }
 
     #[test]
     fn test_operator_data_generation() {
-        let data_pairs = utils::generate_operator_data(3, 5, 4);
+        let data_pairs = utils::generate_operator_data(3, 5, 4).expect("operation should succeed");
         assert_eq!(data_pairs.len(), 3);
 
         for (input, output) in &data_pairs {
@@ -1142,7 +1046,8 @@ mod tests {
         let graph1 = GraphData::new(features1, edge_index.clone());
         let graph2 = GraphData::new(features2, edge_index);
 
-        let error = utils::compute_operator_error(&graph1, &graph2);
+        let error =
+            utils::compute_operator_error(&graph1, &graph2).expect("operation should succeed");
         assert!(error > 0.0);
         assert!(error < 1.0); // Should be small for similar graphs
     }

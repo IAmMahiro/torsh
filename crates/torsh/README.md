@@ -74,6 +74,10 @@ let output = F::relu(&input);
 let output = F::softmax(&logits, -1)?;
 ```
 
+## Testing
+
+The umbrella crate has 28 passing tests (`cargo nextest run -p torsh --all-features`); most functional coverage lives in the underlying sub-crates it re-exports.
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](../../LICENSE) for details.

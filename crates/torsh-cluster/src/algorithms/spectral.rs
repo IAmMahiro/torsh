@@ -149,9 +149,20 @@ pub struct SpectralResult {
     pub kmeans_iterations: usize,
 }
 
-impl ClusteringResult for SpectralResult {
-    fn labels(&self) -> &Tensor {
+impl SpectralResult {
+    /// Get cluster labels for each data point.
+    ///
+    /// Spectral clustering always produces labels, so this concrete
+    /// accessor is infallible; see [`ClusteringResult::labels`] for the
+    /// fallible, trait-object-safe equivalent.
+    pub fn labels(&self) -> &Tensor {
         &self.labels
+    }
+}
+
+impl ClusteringResult for SpectralResult {
+    fn labels(&self) -> Option<&Tensor> {
+        Some(&self.labels)
     }
 
     fn n_clusters(&self) -> usize {

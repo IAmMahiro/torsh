@@ -38,6 +38,7 @@ pub struct DistributedWrapper<S: Sampler> {
     rank: usize,
     shuffle: bool,
     generator: Option<u64>,
+    epoch: usize,
 }
 
 impl<S: Sampler> DistributedWrapper<S> {
@@ -62,6 +63,7 @@ impl<S: Sampler> DistributedWrapper<S> {
             rank,
             shuffle: true,
             generator: None,
+            epoch: 0,
         }
     }
 
@@ -104,6 +106,25 @@ impl<S: Sampler> DistributedWrapper<S> {
         self.generator
     }
 
+    /// Set the current epoch, so the next shuffle draws a fresh permutation
+    /// derived from `(seed, epoch)` instead of repeating the same order every
+    /// epoch (mirrors `torch.utils.data.distributed.DistributedSampler.set_epoch`).
+    pub fn set_epoch(&mut self, epoch: usize) {
+        self.epoch = epoch;
+    }
+
+    /// Get the current epoch
+    pub fn epoch(&self) -> usize {
+        self.epoch
+    }
+
+    /// Effective seed for the current epoch. At epoch 0 this reproduces the
+    /// exact seed used before per-epoch reseeding existed, so existing callers
+    /// that never call `set_epoch` see no behavior change.
+    fn seed_for_epoch(&self) -> u64 {
+        self.generator.unwrap_or(42).wrapping_add(self.epoch as u64)
+    }
+
     /// Get a reference to the underlying sampler
     pub fn sampler(&self) -> &S {
         &self.sampler
@@ -140,10 +161,7 @@ impl<S: Sampler> Sampler for DistributedWrapper<S> {
         // Shuffle if enabled
         if self.shuffle {
             // ✅ SciRS2 Policy Compliant - Using scirs2_core for random operations
-            let mut rng = match self.generator {
-                Some(seed) => Random::seed(seed),
-                None => Random::seed(42),
-            };
+            let mut rng = Random::seed(self.seed_for_epoch());
 
             // Fisher-Yates shuffle
             for i in (1..all_indices.len()).rev() {
@@ -198,6 +216,7 @@ pub struct DistributedSampler {
     shuffle: bool,
     generator: Option<u64>,
     drop_last: bool,
+    epoch: usize,
 }
 
 impl DistributedSampler {
@@ -225,6 +244,7 @@ impl DistributedSampler {
             shuffle,
             generator: None,
             drop_last: false,
+            epoch: 0,
         }
     }
 
@@ -270,6 +290,26 @@ impl DistributedSampler {
         self.generator
     }
 
+    /// Set the current epoch, so the next shuffle draws a fresh permutation
+    /// derived from `(seed, epoch)` instead of repeating the same order (and
+    /// dropping/padding the same samples) every epoch (mirrors
+    /// `torch.utils.data.distributed.DistributedSampler.set_epoch`).
+    pub fn set_epoch(&mut self, epoch: usize) {
+        self.epoch = epoch;
+    }
+
+    /// Get the current epoch
+    pub fn epoch(&self) -> usize {
+        self.epoch
+    }
+
+    /// Effective seed for the current epoch. At epoch 0 this reproduces the
+    /// exact seed used before per-epoch reseeding existed, so existing callers
+    /// that never call `set_epoch` see no behavior change.
+    fn seed_for_epoch(&self) -> u64 {
+        self.generator.unwrap_or(42).wrapping_add(self.epoch as u64)
+    }
+
     /// Calculate the effective dataset size after potential padding
     fn effective_dataset_size(&self) -> usize {
         if self.drop_last {
@@ -300,30 +340,39 @@ impl Sampler for DistributedSampler {
         let effective_size = self.effective_dataset_size();
         let samples_per_replica = self.calculate_num_samples();
 
-        // Create base indices
-        let mut indices: Vec<usize> = if self.drop_last {
-            (0..effective_size).collect()
-        } else {
-            // Pad with duplicates if needed
-            (0..effective_size).map(|i| i % self.dataset_size).collect()
-        };
+        // Build the FULL index list first and shuffle it (if enabled) BEFORE
+        // truncating/padding to effective_size. Shuffling after truncation would
+        // permanently exclude the same `dataset_size % num_replicas` tail
+        // indices from every rank on every epoch, since those indices would
+        // never even enter the pool that gets shuffled. Building the full list
+        // first (matching torch.utils.data.distributed.DistributedSampler)
+        // means every index has a chance to survive truncation, and which
+        // indices get dropped/padded rotates with the epoch-derived seed.
+        let mut base: Vec<usize> = (0..self.dataset_size).collect();
 
-        // Shuffle if enabled
         if self.shuffle {
             // ✅ SciRS2 Policy Compliant - Using scirs2_core for random operations
-            let mut rng = match self.generator {
-                Some(seed) => Random::seed(seed),
-                None => Random::seed(42),
-            };
+            let mut rng = Random::seed(self.seed_for_epoch());
 
             // Fisher-Yates shuffle
-            for i in (1..indices.len()).rev() {
+            for i in (1..base.len()).rev() {
                 let j = rng.gen_range(0..=i);
-                indices.swap(i, j);
+                base.swap(i, j);
             }
         }
 
-        // Extract this replica's portion
+        let indices: Vec<usize> = if self.drop_last {
+            base.truncate(effective_size);
+            base
+        } else {
+            // Pad by wrapping around the (possibly shuffled) base list, so with
+            // shuffle=false this is exactly `i % dataset_size` as before.
+            (0..effective_size)
+                .map(|i| base[i % self.dataset_size])
+                .collect()
+        };
+
+        // Extract this replica's portion (contiguous block per rank).
         let start_idx = self.rank * samples_per_replica;
         let end_idx = start_idx + samples_per_replica;
         let replica_indices = indices[start_idx..end_idx.min(indices.len())].to_vec();

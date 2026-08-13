@@ -1,10 +1,16 @@
 //! Post-training quantization
 
 use crate::{Observer, QScheme, QuantBackend, QuantConfig, TorshResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use torsh_core::{DType, TorshError};
 // use torsh_nn::Module; // Temporarily disabled due to autograd compilation issues
 use torsh_tensor::Tensor;
+
+/// Sink invoked once per quantizable layer during a calibration forward pass.
+///
+/// The first argument is the layer name (matching the observer keys produced by
+/// [`extract_layer_name`]), the second is that layer's own output activation.
+pub type ActivationSink<'a> = dyn FnMut(&str, &Tensor) -> TorshResult<()> + 'a;
 
 // Temporary placeholder trait for Module (to allow compilation)
 #[allow(dead_code)]
@@ -16,6 +22,26 @@ pub trait Module {
     fn train(&mut self, mode: bool);
     fn eval(&mut self) {
         self.train(false);
+    }
+
+    /// Forward pass that reports every quantizable layer's output activation.
+    ///
+    /// This is the calibration hook used by [`calibrate_model`]: an
+    /// implementation must call `sink(layer_name, &activation)` for each layer
+    /// it wants calibrated, passing **that layer's own output**, and return the
+    /// model output.
+    ///
+    /// The default implementation reports no activations at all. Calibration
+    /// then fails with an explicit error instead of silently filling every
+    /// observer with the model input, which would produce quantization
+    /// parameters derived from the wrong distribution.
+    fn forward_with_activations(
+        &self,
+        input: &Tensor,
+        sink: &mut ActivationSink<'_>,
+    ) -> TorshResult<Tensor> {
+        let _ = sink;
+        self.forward(input)
     }
 }
 
@@ -159,6 +185,12 @@ pub fn quantize_post_training(module: &mut dyn Module) -> TorshResult<()> {
 }
 
 /// Calibrate the model with representative data
+///
+/// Each observer is updated with the activations reported by
+/// [`Module::forward_with_activations`] for the layer it is attached to. A
+/// model that does not implement that hook cannot be calibrated and this
+/// function returns [`TorshError::NotImplemented`] rather than filling the
+/// observers with the model input.
 pub fn calibrate_model(
     module: &mut dyn Module,
     dataset: &CalibrationDataset,
@@ -167,22 +199,36 @@ pub fn calibrate_model(
     // Validate configuration
     ptq_state.config.validate()?;
 
+    if ptq_state.observers.is_empty() {
+        return Err(TorshError::InvalidArgument(
+            "No observers attached: nothing to calibrate".to_string(),
+        ));
+    }
+
     // Put model in evaluation mode
     module.eval();
 
     let mut processed_samples = 0;
+    let mut observed_layers: HashSet<String> = HashSet::new();
 
     // Process each calibration batch
     for batch in dataset.iter() {
         for sample in batch {
-            // Forward pass through the model
-            // This would trigger observers to collect statistics
-            let _ = module.forward(sample)?;
-
-            // In a real implementation, we would use hooks to capture
-            // intermediate activations and update observers
-            // For now, we simulate observer updates
-            simulate_observer_updates(ptq_state, sample)?;
+            // Forward pass through the model. Every quantizable layer reports
+            // its own output activation through the sink, so each observer sees
+            // the distribution it is actually responsible for.
+            {
+                let observers = &mut ptq_state.observers;
+                let seen = &mut observed_layers;
+                let mut sink = |layer_name: &str, activation: &Tensor| -> TorshResult<()> {
+                    if let Some(observer) = observers.get_mut(layer_name) {
+                        observer.update(activation)?;
+                        seen.insert(layer_name.to_string());
+                    }
+                    Ok(())
+                };
+                module.forward_with_activations(sample, &mut sink)?;
+            }
 
             processed_samples += 1;
         }
@@ -195,30 +241,25 @@ pub fn calibrate_model(
         }
     }
 
+    // Every attached observer must have received real activations, otherwise
+    // its quantization parameters would be fabricated.
+    let missing: Vec<&str> = ptq_state
+        .observers
+        .keys()
+        .filter(|name| !observed_layers.contains(*name))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(TorshError::NotImplemented(format!(
+            "Module::forward_with_activations reported no activations for layer(s): {}. \
+             Implement the calibration hook so each observer receives its own layer's output.",
+            missing.join(", ")
+        )));
+    }
+
     // Calculate quantization parameters from collected statistics
     ptq_state.calculate_all_qparams()?;
     ptq_state.num_calibration_samples = processed_samples;
-
-    Ok(())
-}
-
-/// Simulate observer updates (placeholder for real hook-based collection)
-fn simulate_observer_updates(ptq_state: &mut PTQState, sample: &Tensor) -> TorshResult<()> {
-    // In a real implementation, this would be replaced by forward hooks
-    // that capture intermediate activations from specific layers
-
-    for (layer_name, observer) in ptq_state.observers.iter_mut() {
-        // For demonstration, update with the input sample
-        // In practice, each observer would get the actual layer's output
-        observer.update(sample)?;
-
-        // Add some noise to simulate different layer outputs
-        if layer_name.contains("conv") || layer_name.contains("linear") {
-            // Simulate different activation ranges for different layer types
-            let simulated_output = sample.clone(); // Would be actual layer output
-            observer.update(&simulated_output)?;
-        }
-    }
 
     Ok(())
 }
@@ -323,6 +364,22 @@ mod tests {
     impl Module for MockModule {
         fn forward(&self, input: &Tensor) -> TorshResult<Tensor> {
             Ok(input.clone())
+        }
+
+        fn forward_with_activations(
+            &self,
+            input: &Tensor,
+            sink: &mut ActivationSink<'_>,
+        ) -> TorshResult<Tensor> {
+            // linear1 sees the input; linear2 sees linear1's (scaled) output.
+            let first = input.clone();
+            sink("linear1", &first)?;
+
+            let scaled: Vec<f32> = first.data()?.iter().map(|&x| x * 2.0).collect();
+            let second = Tensor::from_data(scaled, first.shape().dims().to_vec(), first.device())?;
+            sink("linear2", &second)?;
+
+            Ok(second)
         }
 
         fn parameters(&self) -> Vec<&Tensor> {

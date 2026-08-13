@@ -492,6 +492,7 @@ impl PerformanceTestSuite {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_all_reduce_performance() -> Result<()> {
     let config = PerformanceTestConfig {
         tensor_sizes: vec![vec![1000], vec![10000]],
@@ -537,6 +538,7 @@ async fn test_all_reduce_performance() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_collective_scaling_performance() -> Result<()> {
     let config = PerformanceTestConfig {
         world_sizes: vec![2, 4, 8],
@@ -555,6 +557,7 @@ async fn test_collective_scaling_performance() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_compression_performance() -> Result<()> {
     let config = PerformanceTestConfig {
         tensor_sizes: vec![vec![1000], vec![10000]],
@@ -584,6 +587,7 @@ async fn test_compression_performance() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_memory_usage_scaling() -> Result<()> {
     // Test that memory usage scales reasonably with tensor size
     let tensor_sizes = vec![
@@ -622,6 +626,7 @@ async fn test_memory_usage_scaling() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_concurrent_operations_performance() -> Result<()> {
     let pg = init_process_group(BackendType::Gloo, 0, 4, "127.0.0.1", 30004).await?;
     let pg_arc = Arc::new(pg);
@@ -666,6 +671,7 @@ async fn test_concurrent_operations_performance() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_profiling_overhead() -> Result<()> {
     let pg = init_process_group(BackendType::Gloo, 0, 2, "127.0.0.1", 30005).await?;
 

@@ -216,9 +216,13 @@ pub fn default_distributed_sampler(
     dataset_size: usize,
     num_replicas: usize,
     rank: usize,
-    _seed: Option<u64>,
+    seed: Option<u64>,
 ) -> DistributedSampler {
-    distributed_sampler(dataset_size, num_replicas, rank, true)
+    let mut sampler = distributed_sampler(dataset_size, num_replicas, rank, true);
+    if let Some(seed) = seed {
+        sampler = sampler.with_generator(seed);
+    }
+    sampler
 }
 
 /// Factory function for creating samplers based on configuration
@@ -369,13 +373,32 @@ impl Sampler for SamplerWrapper {
     }
 }
 
+/// Resolve an optional seed to a concrete one.
+///
+/// `Some(seed)` is passed through unchanged (reproducible). `None` means
+/// "random", not "no shuffle": a fresh seed is drawn from a real entropy
+/// source (`scirs2_core::random`'s thread RNG) so callers who don't ask for
+/// reproducibility still get a genuinely random split/shuffle on every call.
+fn resolve_seed(seed: Option<u64>) -> u64 {
+    match seed {
+        Some(s) => s,
+        None => {
+            use scirs2_core::random::Random;
+            let mut entropy_rng = Random::default();
+            entropy_rng.gen_range(0..=u64::MAX)
+        }
+    }
+}
+
 /// Utility function to split dataset into train and validation sets
 ///
 /// # Arguments
 ///
 /// * `dataset_size` - Total number of samples
 /// * `val_ratio` - Fraction of data to use for validation (0.0 to 1.0)
-/// * `seed` - Optional seed for reproducible splits
+/// * `seed` - Optional seed for reproducible splits. `None` means the split is
+///   still shuffled, just with a fresh, non-reproducible seed drawn from
+///   entropy on every call.
 ///
 /// # Returns
 ///
@@ -395,10 +418,10 @@ pub fn train_val_split(
 
     let mut indices: Vec<usize> = (0..dataset_size).collect();
 
-    if let Some(seed_val) = seed {
+    {
         use scirs2_core::random::Random;
-        let mut rng = Random::seed(seed_val);
-        // Simple Fisher-Yates shuffle
+        let mut rng = Random::seed(resolve_seed(seed));
+        // Simple Fisher-Yates shuffle - always runs, regardless of seed.
         for i in (1..indices.len()).rev() {
             let j = rng.gen_range(0..=i);
             indices.swap(i, j);
@@ -448,10 +471,10 @@ pub fn train_val_test_split(
 
     let mut indices: Vec<usize> = (0..dataset_size).collect();
 
-    if let Some(seed_val) = seed {
+    {
         use scirs2_core::random::Random;
-        let mut rng = Random::seed(seed_val);
-        // Simple Fisher-Yates shuffle
+        let mut rng = Random::seed(resolve_seed(seed));
+        // Simple Fisher-Yates shuffle - always runs, regardless of seed.
         for i in (1..indices.len()).rev() {
             let j = rng.gen_range(0..=i);
             indices.swap(i, j);
@@ -489,10 +512,10 @@ pub fn kfold_splits(
 
     let mut indices: Vec<usize> = (0..dataset_size).collect();
 
-    if let Some(seed_val) = seed {
+    {
         use scirs2_core::random::Random;
-        let mut rng = Random::seed(seed_val);
-        // Simple Fisher-Yates shuffle
+        let mut rng = Random::seed(resolve_seed(seed));
+        // Simple Fisher-Yates shuffle - always runs, regardless of seed.
         for i in (1..indices.len()).rev() {
             let j = rng.gen_range(0..=i);
             indices.swap(i, j);

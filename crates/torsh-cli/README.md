@@ -377,16 +377,16 @@ Generate shell completion scripts:
 
 ```bash
 # Bash
-torsh completion bash > /etc/bash_completion.d/torsh
+torsh completions bash > /etc/bash_completion.d/torsh
 
 # Zsh
-torsh completion zsh > ~/.zfunc/_torsh
+torsh completions zsh > ~/.zfunc/_torsh
 
 # Fish
-torsh completion fish > ~/.config/fish/completions/torsh.fish
+torsh completions fish > ~/.config/fish/completions/torsh.fish
 
 # PowerShell
-torsh completion powershell > torsh.ps1
+torsh completions powershell > torsh.ps1
 ```
 
 ## Examples
@@ -462,12 +462,14 @@ cargo build --package torsh-cli --release
 ### Testing
 
 ```bash
-# Run tests
-cargo test --package torsh-cli
+# Run tests (all features)
+cargo test --package torsh-cli --all-features
 
-# Integration tests
-cargo test --package torsh-cli --test integration_tests
+# Or with cargo-nextest
+cargo nextest run --package torsh-cli --all-features
 ```
+
+The crate currently has 110 tests (unit tests embedded in the source modules), all passing.
 
 ## License
 

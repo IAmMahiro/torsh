@@ -23,7 +23,7 @@ from ._C import (
     device,
     TorshError,
     
-    # Creation functions
+    # Creation functions (all provided by the Rust extension)
     tensor,
     zeros,
     ones,
@@ -31,11 +31,23 @@ from ._C import (
     rand,
     arange,
     linspace,
-    
+    eye,
+    empty,
+    full,
+    zeros_like,
+    ones_like,
+    empty_like,
+    full_like,
+    randn_like,
+    rand_like,
+
     # Device and dtype constants
+    # NOTE: uint16 is intentionally absent — torsh_core::DType has no U16
+    # variant, so the extension does not register it (see FOLLOW-UP: add
+    # DType::U16 to torsh-core to restore uint16 support).
     float32, float64,
     int8, int16, int32, int64,
-    uint8, uint16, uint32, uint64,
+    uint8, uint32, uint64,
     bool as bool_dtype,
     cpu,
     
@@ -82,84 +94,28 @@ def get_default_device() -> 'device':
     """Get the default device for new tensors."""
     return _default_device
 
-# Tensor creation with default dtype and device
-def zeros_like(input: Tensor, *, dtype: Optional['dtype'] = None, 
-               device: Optional['device'] = None, requires_grad: bool = False) -> Tensor:
-    """Create a tensor of zeros with the same shape as input."""
-    dtype = dtype or input.dtype
-    device = device or input.device
-    return zeros(input.shape, dtype=dtype, device=device, requires_grad=requires_grad)
-
-def ones_like(input: Tensor, *, dtype: Optional['dtype'] = None,
-              device: Optional['device'] = None, requires_grad: bool = False) -> Tensor:
-    """Create a tensor of ones with the same shape as input."""
-    dtype = dtype or input.dtype
-    device = device or input.device
-    return ones(input.shape, dtype=dtype, device=device, requires_grad=requires_grad)
-
-def randn_like(input: Tensor, *, dtype: Optional['dtype'] = None,
-               device: Optional['device'] = None, requires_grad: bool = False) -> Tensor:
-    """Create a tensor of random normal values with the same shape as input."""
-    dtype = dtype or input.dtype
-    device = device or input.device
-    return randn(input.shape, dtype=dtype, device=device, requires_grad=requires_grad)
-
-def rand_like(input: Tensor, *, dtype: Optional['dtype'] = None,
-              device: Optional['device'] = None, requires_grad: bool = False) -> Tensor:
-    """Create a tensor of random uniform values with the same shape as input."""
-    dtype = dtype or input.dtype
-    device = device or input.device
-    return rand(input.shape, dtype=dtype, device=device, requires_grad=requires_grad)
-
-def empty(size: List[int], *, dtype: Optional['dtype'] = None,
-          device: Optional['device'] = None, requires_grad: bool = False) -> Tensor:
-    """Create an uninitialized tensor."""
-    # For now, use zeros as empty (would need proper uninitialized tensor support)
-    return zeros(size, dtype=dtype, device=device, requires_grad=requires_grad)
-
-def empty_like(input: Tensor, *, dtype: Optional['dtype'] = None,
-               device: Optional['device'] = None, requires_grad: bool = False) -> Tensor:
-    """Create an uninitialized tensor with the same shape as input."""
-    dtype = dtype or input.dtype
-    device = device or input.device
-    return empty(input.shape, dtype=dtype, device=device, requires_grad=requires_grad)
-
-def full(size: List[int], fill_value: float, *, dtype: Optional['dtype'] = None,
-         device: Optional['device'] = None, requires_grad: bool = False) -> Tensor:
-    """Create a tensor filled with a specific value."""
-    t = zeros(size, dtype=dtype, device=device, requires_grad=requires_grad)
-    # Would need to implement fill operation
-    return t
-
-def full_like(input: Tensor, fill_value: float, *, dtype: Optional['dtype'] = None,
-              device: Optional['device'] = None, requires_grad: bool = False) -> Tensor:
-    """Create a tensor filled with a specific value, same shape as input."""
-    dtype = dtype or input.dtype
-    device = device or input.device
-    return full(input.shape, fill_value, dtype=dtype, device=device, requires_grad=requires_grad)
+# NOTE: The tensor-creation helpers (zeros_like, ones_like, empty, empty_like,
+# full, full_like, randn_like, rand_like) are imported directly from the Rust
+# extension above. The previous pure-Python shims defined here silently returned
+# wrong results (e.g. `full` ignored `fill_value` and returned zeros), so they
+# were removed in favour of the real `_C` implementations.
 
 # Math operations
 def add(input: Tensor, other: Union[Tensor, float], *, alpha: float = 1.0) -> Tensor:
-    """Add tensors element-wise."""
+    """Add tensors element-wise: ``input + alpha * other``."""
     if isinstance(other, (int, float)):
-        return input + tensor(other, dtype=input.dtype, device=input.device)
+        return input + tensor(other * alpha, dtype=input.dtype, device=input.device)
     else:
-        result = input + other
-        if alpha != 1.0:
-            # Would need scalar multiplication
-            pass
-        return result
+        scaled = other if alpha == 1.0 else mul(other, alpha)
+        return input + scaled
 
 def sub(input: Tensor, other: Union[Tensor, float], *, alpha: float = 1.0) -> Tensor:
-    """Subtract tensors element-wise."""
+    """Subtract tensors element-wise: ``input - alpha * other``."""
     if isinstance(other, (int, float)):
-        return input - tensor(other, dtype=input.dtype, device=input.device)
+        return input - tensor(other * alpha, dtype=input.dtype, device=input.device)
     else:
-        result = input - other
-        if alpha != 1.0:
-            # Would need scalar multiplication
-            pass
-        return result
+        scaled = other if alpha == 1.0 else mul(other, alpha)
+        return input - scaled
 
 def mul(input: Tensor, other: Union[Tensor, float]) -> Tensor:
     """Multiply tensors element-wise."""
@@ -232,7 +188,7 @@ __all__ = [
     'nn', 'optim', 'autograd', 'distributed', 'F',
     
     # Creation functions
-    'tensor', 'zeros', 'ones', 'randn', 'rand', 'arange', 'linspace',
+    'tensor', 'zeros', 'ones', 'randn', 'rand', 'arange', 'linspace', 'eye',
     'zeros_like', 'ones_like', 'randn_like', 'rand_like',
     'empty', 'empty_like', 'full', 'full_like',
     
@@ -244,7 +200,7 @@ __all__ = [
     
     # Device and dtype constants
     'float32', 'float64', 'int8', 'int16', 'int32', 'int64',
-    'uint8', 'uint16', 'uint32', 'uint64', 'bool_dtype', 'cpu',
+    'uint8', 'uint32', 'uint64', 'bool_dtype', 'cpu',
     
     # Utility functions
     'device_count', 'is_available', 'cuda_is_available', 'mps_is_available',

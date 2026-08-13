@@ -235,6 +235,15 @@ use hashbrown::HashMap;
 /// - [`all_parameters()`](Module::all_parameters) - Get parameters recursively
 /// - [`zero_grad()`](Module::zero_grad) - Clear all gradients
 ///
+/// ## Buffer Management
+/// Buffers are persistent, *untrained* tensors (a `BatchNorm`'s `running_mean`,
+/// `running_var`, `num_batches_tracked`). They are not returned by
+/// `parameters()` and no optimizer touches them, but they are model state and
+/// travel in the checkpoint.
+/// - [`buffers()`](Module::buffers) - Get all buffers
+/// - [`named_buffers()`](Module::named_buffers) - Get buffers with names
+/// - [`all_named_buffers()`](Module::all_named_buffers) - Get buffers recursively
+///
 /// ## Training Mode Control
 /// - [`training()`](Module::training) - Check if in training mode
 /// - [`train()`](Module::train) - Set to training mode
@@ -247,8 +256,8 @@ use hashbrown::HashMap;
 /// - [`modules()`](Module::modules) - Get all modules recursively
 ///
 /// ## State Management
-/// - [`state_dict()`](Module::state_dict) - Save module state
-/// - [`load_state_dict()`](Module::load_state_dict) - Load module state
+/// - [`state_dict()`](Module::state_dict) - Save module state (parameters *and* buffers)
+/// - [`load_state_dict()`](Module::load_state_dict) - Load module state (parameters *and* buffers)
 /// - [`to_device()`](Module::to_device) - Move module to device
 ///
 /// ## Utilities
@@ -265,12 +274,18 @@ use hashbrown::HashMap;
 /// |---------|-------|-------|
 /// | `forward(x)` | `forward(&x)` | Returns `Result<Tensor>` |
 /// | `parameters()` | `parameters()` | Returns `HashMap<String, Parameter>` |
+/// | `named_buffers()` | `named_buffers()` | Returns `HashMap<String, Arc<RwLock<Tensor>>>` — live handles, not copies |
 /// | `train()` | `train()` | Sets training mode |
 /// | `eval()` | `eval()` | Sets evaluation mode |
-/// | `state_dict()` | `state_dict()` | Returns parameter tensors |
-/// | `load_state_dict()` | `load_state_dict()` | Loads from HashMap |
+/// | `state_dict()` | `state_dict()` | Returns parameter **and buffer** tensors |
+/// | `load_state_dict()` | `load_state_dict()` | Loads parameters **and buffers** from a HashMap |
 /// | `to(device)` | `to_device(device)` | Moves to device |
 /// | `zero_grad()` | `zero_grad()` | Clears gradients |
+///
+/// One deliberate divergence: PyTorch exempts `num_batches_tracked` from
+/// strict-mode key checking for backwards compatibility with pre-0.4.1
+/// checkpoints. ToRSh grants no per-key exemptions — every buffer is required
+/// under `strict = true`.
 ///
 /// # Best Practices
 ///
@@ -366,6 +381,35 @@ pub trait Module: Send + Sync {
         all_params
     }
 
+    /// Get all named buffers recursively with module prefixes
+    ///
+    /// The buffer-side twin of [`all_named_parameters()`](Module::all_named_parameters),
+    /// and the recursion [`state_dict()`](Module::state_dict) uses to reach a
+    /// child's non-trainable state. Buffers are a module's *persistent, untrained*
+    /// tensors — a `BatchNorm`'s `running_mean` / `running_var` /
+    /// `num_batches_tracked` — which evaluation mode consumes in place of the
+    /// batch statistics, so losing them turns a trained normalization layer back
+    /// into a freshly constructed one.
+    ///
+    /// Child names come from [`named_children()`](Module::named_children); a
+    /// module that overrides only `children()` contributes no buffer names here,
+    /// exactly as it contributes no parameter names to `all_named_parameters()`.
+    ///
+    /// # Returns
+    /// * `HashMap<String, Arc<RwLock<Tensor>>>` - Hierarchical buffer names,
+    ///   holding the module's *live* handles rather than copies
+    fn all_named_buffers(&self) -> HashMap<String, std::sync::Arc<parking_lot::RwLock<Tensor>>> {
+        let mut all_buffers = self.named_buffers();
+
+        for (child_name, child) in self.named_children() {
+            for (buffer_name, buffer) in child.all_named_buffers() {
+                all_buffers.insert(format!("{}.{}", child_name, buffer_name), buffer);
+            }
+        }
+
+        all_buffers
+    }
+
     /// Check if in training mode
     ///
     /// Default implementation returns true. Override if your module tracks training state.
@@ -405,46 +449,69 @@ pub trait Module: Send + Sync {
 
     /// Load state dictionary into the module
     ///
+    /// Restores **parameters and buffers**, matching PyTorch's
+    /// `nn.Module.load_state_dict`. Buffers are written through the live
+    /// handles published by [`all_named_buffers()`](Module::all_named_buffers),
+    /// so a `BatchNorm`'s running statistics come back into the layer itself
+    /// rather than into a detached copy.
+    ///
     /// # Arguments
-    /// * `state_dict` - Map of parameter names to tensors
-    /// * `strict` - Whether to require exact parameter name matches
+    /// * `state_dict` - Map of parameter *and buffer* names to tensors
+    /// * `strict` - Whether to require exact name matches. Strict mode counts
+    ///   buffers: a checkpoint missing `running_mean` is rejected, with no
+    ///   per-key exemptions (PyTorch's legacy leniency for
+    ///   `num_batches_tracked` is deliberately not reproduced — silently
+    ///   accepting a partial checkpoint is the defect this method exists to
+    ///   prevent).
     ///
     /// # Returns
     /// * `Result<()>` - Success or error with details about missing/unexpected keys
+    ///
+    /// # Errors
+    ///
+    /// Shapes are validated for every matching entry *before* anything is
+    /// written, so a corrupt checkpoint leaves the module exactly as it was
+    /// instead of half-loaded. A shape mismatch is an error in both strict and
+    /// non-strict mode; `strict` governs which *names* must be present, not
+    /// whether the values that are present have to fit.
     fn load_state_dict(
         &mut self,
         state_dict: &HashMap<String, Tensor>,
         strict: bool,
     ) -> Result<()> {
         let current_params = self.all_named_parameters();
+        let current_buffers = self.all_named_buffers();
         let mut missing_keys = Vec::new();
         let mut unexpected_keys = Vec::new();
 
-        // Check for missing parameters
-        for name in current_params.keys() {
+        // Check for missing parameters and buffers
+        for name in current_params.keys().chain(current_buffers.keys()) {
             if !state_dict.contains_key(name) {
                 missing_keys.push(name.clone());
             }
         }
 
-        // Check for unexpected parameters
+        // Check for entries the module cannot consume
         for name in state_dict.keys() {
-            if !current_params.contains_key(name) {
+            if !current_params.contains_key(name) && !current_buffers.contains_key(name) {
                 unexpected_keys.push(name.clone());
             }
         }
 
         if strict && (!missing_keys.is_empty() || !unexpected_keys.is_empty()) {
+            // Sorted so the report is reproducible; both maps iterate in
+            // unspecified order.
+            missing_keys.sort();
+            unexpected_keys.sort();
             return Err(torsh_core::error::TorshError::Other(format!(
                 "State dict loading failed. Missing keys: {:?}, Unexpected keys: {:?}",
                 missing_keys, unexpected_keys
             )));
         }
 
-        // Load matching parameters
-        for (name, param) in current_params {
-            if let Some(new_tensor) = state_dict.get(&name) {
-                // Validate tensor shapes match
+        // Validate every shape before mutating anything.
+        for (name, param) in &current_params {
+            if let Some(new_tensor) = state_dict.get(name) {
                 let current_shape = param.shape()?;
                 let new_shape = new_tensor.shape().dims().to_vec();
                 if current_shape != new_shape {
@@ -453,9 +520,35 @@ pub trait Module: Send + Sync {
                         name, current_shape, new_shape
                     )));
                 }
+            }
+        }
+        for (name, buffer) in &current_buffers {
+            if let Some(new_tensor) = state_dict.get(name) {
+                // The read guard is a statement-scoped temporary: it must be
+                // released before the write pass below takes the same lock,
+                // because `parking_lot::RwLock` is not reentrant.
+                let current_shape = buffer.read().shape().dims().to_vec();
+                let new_shape = new_tensor.shape().dims().to_vec();
+                if current_shape != new_shape {
+                    return Err(torsh_core::error::TorshError::Other(format!(
+                        "Shape mismatch for buffer '{}': expected {:?}, got {:?}",
+                        name, current_shape, new_shape
+                    )));
+                }
+            }
+        }
 
-                // Copy tensor data
+        // Load matching parameters
+        for (name, param) in current_params {
+            if let Some(new_tensor) = state_dict.get(&name) {
                 *param.tensor().write() = new_tensor.clone();
+            }
+        }
+
+        // Load matching buffers
+        for (name, buffer) in current_buffers {
+            if let Some(new_tensor) = state_dict.get(&name) {
+                *buffer.write() = new_tensor.clone();
             }
         }
 
@@ -468,10 +561,29 @@ pub trait Module: Send + Sync {
     }
 
     /// Save state dictionary from the module
+    ///
+    /// Carries **parameters and buffers**, matching PyTorch's
+    /// `nn.Module.state_dict`. Buffers are a module's persistent untrained
+    /// state — `running_mean`, `running_var`, `num_batches_tracked` — and
+    /// evaluation mode consumes them in place of the batch statistics, so a
+    /// checkpoint that omitted them reloaded as a *different* model with no
+    /// error reported anywhere.
+    ///
+    /// Values are snapshots taken at call time, keyed by
+    /// [`all_named_parameters()`](Module::all_named_parameters) and
+    /// [`all_named_buffers()`](Module::all_named_buffers), which is exactly the
+    /// key set [`load_state_dict()`](Module::load_state_dict) expects back.
     fn state_dict(&self) -> HashMap<String, Tensor> {
         let mut state = HashMap::new();
         for (name, param) in self.all_named_parameters() {
             state.insert(name, param.clone_data());
+        }
+        for (name, buffer) in self.all_named_buffers() {
+            // PyTorch rejects registering a buffer under a name already taken
+            // by a parameter; nothing enforces that here, so the impossible
+            // case is resolved deterministically in the parameter's favour
+            // rather than by silently overwriting trainable state.
+            state.entry(name).or_insert_with(|| buffer.read().clone());
         }
         state
     }
@@ -899,80 +1011,308 @@ pub trait Module: Send + Sync {
     }
 }
 
+/// Forwards **every** `Module` method to `(**self)`.
+///
+/// `Module` has one required method and ~50 defaulted ones, and those defaults
+/// split into two families. *Composed* defaults (`all_named_parameters`,
+/// `state_dict`, `num_parameters`, `residual_forward`, …) are written in terms
+/// of other trait methods, so an impl that forwards the primitives inherits
+/// them correctly. *Leaf* defaults (`buffers`, `named_buffers`, `name`,
+/// `zero_grad`, `freeze`, `unfreeze`, `extra_repr`, and the whole hook
+/// protocol) return emptiness — `Vec::new()`, `HashMap::new()`, `None`,
+/// `false`, `Ok(())`, an empty body. A smart-pointer impl that *omits* one of
+/// those does not fall through to the pointee: it answers "nothing" on the
+/// pointee's behalf, with no error anywhere.
+///
+/// That distinction is why this macro exists rather than a hand-written list.
+/// The predecessor forwarded nine methods and omitted every leaf default, so a
+/// boxed `BatchNorm1d` reported zero buffers while the bare layer reported
+/// three — and `Sequential`/`ModuleList` store their children as
+/// `Vec<Box<dyn Module>>`, where *every* trait call on a child resolves through
+/// this impl. A checkpoint or device migration taken through the box therefore
+/// dropped `running_mean` / `running_var` / `num_batches_tracked` silently,
+/// reverting a trained normalization layer to its initialization on reload.
+/// `tests/hardening_nn_module_box.rs` pins the whole surface.
+///
+/// The body is spelled `(**self)` for both implementors on purpose:
+/// - for `Box<dyn Module>` that is the `dyn Module` pointee, i.e. a vtable call;
+/// - for `&mut Box<dyn Module>` that is the `Box<dyn Module>` itself, i.e. a
+///   call into the impl directly above, which then performs the vtable call.
+///
+/// `modules`/`named_modules` are excluded: they carry a `where Self: Sized`
+/// bound, so they cannot be invoked on an unsized `dyn Module` and are supplied
+/// per-implementor below. `sequential_forward` is excluded too — it is an
+/// associated function with no receiver, so there is nothing to forward to.
+macro_rules! forward_all_module_methods {
+    () => {
+        fn forward(&self, input: &Tensor) -> Result<Tensor> {
+            (**self).forward(input)
+        }
+
+        fn parameters(&self) -> HashMap<String, crate::Parameter> {
+            (**self).parameters()
+        }
+
+        fn named_parameters(&self) -> HashMap<String, crate::Parameter> {
+            (**self).named_parameters()
+        }
+
+        fn all_parameters(&self) -> HashMap<String, crate::Parameter> {
+            (**self).all_parameters()
+        }
+
+        fn all_named_parameters(&self) -> HashMap<String, crate::Parameter> {
+            (**self).all_named_parameters()
+        }
+
+        fn all_named_buffers(
+            &self,
+        ) -> HashMap<String, std::sync::Arc<parking_lot::RwLock<Tensor>>> {
+            (**self).all_named_buffers()
+        }
+
+        fn training(&self) -> bool {
+            (**self).training()
+        }
+
+        fn train(&mut self) {
+            (**self).train()
+        }
+
+        fn eval(&mut self) {
+            (**self).eval()
+        }
+
+        fn set_training(&mut self, training: bool) {
+            (**self).set_training(training)
+        }
+
+        fn to_device(&mut self, device: DeviceType) -> Result<()> {
+            (**self).to_device(device)
+        }
+
+        fn load_state_dict(
+            &mut self,
+            state_dict: &HashMap<String, Tensor>,
+            strict: bool,
+        ) -> Result<()> {
+            (**self).load_state_dict(state_dict, strict)
+        }
+
+        fn load_state_dict_strict(&mut self, state_dict: &HashMap<String, Tensor>) -> Result<()> {
+            (**self).load_state_dict_strict(state_dict)
+        }
+
+        fn state_dict(&self) -> HashMap<String, Tensor> {
+            (**self).state_dict()
+        }
+
+        fn name(&self) -> Option<&str> {
+            (**self).name()
+        }
+
+        fn buffers(&self) -> Vec<std::sync::Arc<parking_lot::RwLock<Tensor>>> {
+            (**self).buffers()
+        }
+
+        fn named_buffers(&self) -> HashMap<String, std::sync::Arc<parking_lot::RwLock<Tensor>>> {
+            (**self).named_buffers()
+        }
+
+        fn children(&self) -> Vec<&dyn Module> {
+            (**self).children()
+        }
+
+        fn named_children(&self) -> Vec<(String, &dyn Module)> {
+            (**self).named_children()
+        }
+
+        fn zero_grad(&mut self) {
+            (**self).zero_grad()
+        }
+
+        fn num_parameters(&self) -> usize {
+            (**self).num_parameters()
+        }
+
+        fn num_trainable_parameters(&self) -> usize {
+            (**self).num_trainable_parameters()
+        }
+
+        fn memory_usage(&self) -> usize {
+            (**self).memory_usage()
+        }
+
+        fn freeze(&mut self) {
+            (**self).freeze()
+        }
+
+        fn unfreeze(&mut self) {
+            (**self).unfreeze()
+        }
+
+        fn extra_repr(&self) -> String {
+            (**self).extra_repr()
+        }
+
+        fn register_hook(
+            &mut self,
+            hook_type: crate::HookType,
+            callback: crate::HookCallback,
+        ) -> Option<crate::HookHandle> {
+            (**self).register_hook(hook_type, callback)
+        }
+
+        fn remove_hook(&mut self, hook_type: crate::HookType, handle: crate::HookHandle) -> bool {
+            (**self).remove_hook(hook_type, handle)
+        }
+
+        fn execute_hooks(
+            &self,
+            hook_type: crate::HookType,
+            input: &Tensor,
+            output: Option<&Tensor>,
+        ) -> Result<()> {
+            (**self).execute_hooks(hook_type, input, output)
+        }
+
+        fn forward_with_hooks(&self, input: &Tensor) -> Result<Tensor> {
+            (**self).forward_with_hooks(input)
+        }
+
+        fn has_hooks(&self, hook_type: crate::HookType) -> bool {
+            (**self).has_hooks(hook_type)
+        }
+
+        fn call(&self, input: &Tensor) -> Result<Tensor> {
+            (**self).call(input)
+        }
+
+        fn apply(&self, input: &Tensor) -> Result<Tensor> {
+            (**self).apply(input)
+        }
+
+        fn has_parameters(&self) -> bool {
+            (**self).has_parameters()
+        }
+
+        fn has_children(&self) -> bool {
+            (**self).has_children()
+        }
+
+        fn parameter_count(&self) -> usize {
+            (**self).parameter_count()
+        }
+
+        fn trainable_parameter_count(&self) -> usize {
+            (**self).trainable_parameter_count()
+        }
+
+        fn memory_usage_mb(&self) -> f64 {
+            (**self).memory_usage_mb()
+        }
+
+        fn toggle_training(&mut self) {
+            (**self).toggle_training()
+        }
+
+        fn eval_mode(&self) -> bool {
+            (**self).eval_mode()
+        }
+
+        fn batch_forward(&self, inputs: &[Tensor]) -> Result<Vec<Tensor>> {
+            (**self).batch_forward(inputs)
+        }
+
+        fn conditional_forward(&self, input: &Tensor, condition: bool) -> Result<Tensor> {
+            (**self).conditional_forward(input, condition)
+        }
+
+        fn residual_forward(&self, input: &Tensor) -> Result<Tensor> {
+            (**self).residual_forward(input)
+        }
+
+        fn module_info(&self) -> crate::ModuleInfo {
+            (**self).module_info()
+        }
+
+        fn check_training_readiness(&self) -> Result<()> {
+            (**self).check_training_readiness()
+        }
+
+        fn parameter_names_matching(&self, pattern: &str) -> Vec<String> {
+            (**self).parameter_names_matching(pattern)
+        }
+
+        // Spelled as a fully-qualified call because `ModuleExt` (blanket-impl'd
+        // for every `Module`) also has a `parameters_by_type`, with a different
+        // signature; plain method syntax is ambiguous between the two.
+        fn parameters_by_type(&self, param_type: &str) -> HashMap<String, crate::Parameter> {
+            Module::parameters_by_type(&**self, param_type)
+        }
+
+        fn clone_parameters(&self) -> HashMap<String, Tensor> {
+            (**self).clone_parameters()
+        }
+
+        fn diagnose(&self) -> crate::ModuleDiagnostics {
+            (**self).diagnose()
+        }
+    };
+}
+
 /// Implementation for boxed trait objects
 impl Module for Box<dyn Module> {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        (**self).forward(x)
+    forward_all_module_methods!();
+
+    /// Rooted at the *inner* module rather than at the box.
+    ///
+    /// The trait default pushes `self`, which here is the `Box` — a legal
+    /// `&dyn Module`, but one extra indirection deep, so a caller walking the
+    /// tree sees a wrapper that has no counterpart in the module hierarchy it
+    /// is describing. `(**self).modules()` cannot be used to delegate because
+    /// the method carries `where Self: Sized` and `dyn Module` is unsized, so
+    /// the walk is rebuilt here from the same two pieces the default uses.
+    fn modules(&self) -> Vec<&dyn Module>
+    where
+        Self: Sized,
+    {
+        let inner: &dyn Module = &**self;
+        let mut modules: Vec<&dyn Module> = vec![inner];
+        modules.extend(inner.children());
+        modules
     }
 
-    fn parameters(&self) -> HashMap<String, crate::Parameter> {
-        (**self).parameters()
-    }
-
-    fn train(&mut self) {
-        (**self).train()
-    }
-
-    fn eval(&mut self) {
-        (**self).eval()
-    }
-
-    fn training(&self) -> bool {
-        (**self).training()
-    }
-
-    fn children(&self) -> Vec<&dyn Module> {
-        (**self).children()
-    }
-
-    fn named_children(&self) -> Vec<(String, &dyn Module)> {
-        (**self).named_children()
-    }
-
-    fn set_training(&mut self, training: bool) {
-        (**self).set_training(training)
-    }
-
-    fn to_device(&mut self, device: DeviceType) -> Result<()> {
-        (**self).to_device(device)
+    /// Rooted at the inner module, for the same reason as [`Module::modules`].
+    fn named_modules(&self) -> Vec<(String, &dyn Module)>
+    where
+        Self: Sized,
+    {
+        let inner: &dyn Module = &**self;
+        let mut modules: Vec<(String, &dyn Module)> = vec![(String::new(), inner)];
+        modules.extend(inner.named_children());
+        modules
     }
 }
 
 /// Implementation for mutable references to boxed trait objects
 impl Module for &mut Box<dyn Module> {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        (***self).forward(x)
+    forward_all_module_methods!();
+
+    /// Delegates to the `Box<dyn Module>` impl: `**self` *is* a `Box`, which is
+    /// `Sized`, so unlike the boxed case this one can simply forward.
+    fn modules(&self) -> Vec<&dyn Module>
+    where
+        Self: Sized,
+    {
+        (**self).modules()
     }
 
-    fn parameters(&self) -> HashMap<String, crate::Parameter> {
-        (***self).parameters()
-    }
-
-    fn train(&mut self) {
-        (***self).train()
-    }
-
-    fn eval(&mut self) {
-        (***self).eval()
-    }
-
-    fn training(&self) -> bool {
-        (***self).training()
-    }
-
-    fn children(&self) -> Vec<&dyn Module> {
-        (***self).children()
-    }
-
-    fn named_children(&self) -> Vec<(String, &dyn Module)> {
-        (***self).named_children()
-    }
-
-    fn set_training(&mut self, training: bool) {
-        (***self).set_training(training)
-    }
-
-    fn to_device(&mut self, device: DeviceType) -> Result<()> {
-        (***self).to_device(device)
+    /// Delegates to the `Box<dyn Module>` impl, as [`Module::modules`] does.
+    fn named_modules(&self) -> Vec<(String, &dyn Module)>
+    where
+        Self: Sized,
+    {
+        (**self).named_modules()
     }
 }

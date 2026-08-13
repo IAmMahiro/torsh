@@ -216,38 +216,57 @@ impl KalmanFilter {
         let h_p_ht = h_p.matmul(&self.observation.transpose(0, 1)?)?;
         let innovation_cov = h_p_ht.add(&self.measurement_noise)?;
 
-        // Kalman gain: K = P @ H.T @ inv(S)
+        // Kalman gain: K = P @ H.T @ inv(S), with S inverted through its
+        // Cholesky factorisation (valid for any observation dimension).
         let p_ht = self.covariance.matmul(&self.observation.transpose(0, 1)?)?;
-
-        // For simplicity, use pseudoinverse approach by adding regularization
-        // S_reg = S + lambda * I for numerical stability
-        let lambda = 1e-6f32;
-        let reg_eye = eye(self.obs_dim)?.mul_scalar(lambda)?;
-        let innovation_cov_reg = innovation_cov.add(&reg_eye)?;
-
-        // Simplified Kalman gain: K = P @ H.T / (S + lambda * I) for scalar case
-        // For multivariate case, we would need matrix inverse
-        let kalman_gain = if self.obs_dim == 1 {
-            // Scalar case: K = P @ H.T / s_scalar
-            let s_scalar = innovation_cov_reg.get_item_flat(0)? + 1e-10f32; // Add small epsilon for stability
-            p_ht.div_scalar(s_scalar)?
-        } else {
-            // For multivariate case, use a simplified approach
-            // In practice, you would use LU decomposition or SVD for matrix inverse
-            p_ht.div_scalar(innovation_cov_reg.get_item_flat(0)? + 1e-10f32)?
-        };
+        let kalman_gain = Self::gain_from(&p_ht, &innovation_cov, self.obs_dim)?;
 
         // State update: x = x + K @ y
         let k_times_innovation = kalman_gain.matmul(&innovation)?;
         self.state = self.state.add(&k_times_innovation)?;
 
-        // Covariance update: P = (I - K @ H) @ P (Joseph form for numerical stability)
+        // Covariance update in Joseph form, which stays symmetric and positive
+        // semi-definite even with an approximate gain:
+        // P = (I - K H) P (I - K H)^T + K R K^T
         let k_h = kalman_gain.matmul(&self.observation)?;
         let identity = eye(self.state_dim)?;
         let i_minus_kh = identity.add(&k_h.mul_scalar(-1.0)?)?;
-        self.covariance = i_minus_kh.matmul(&self.covariance)?;
+        let term1 = i_minus_kh
+            .matmul(&self.covariance)?
+            .matmul(&i_minus_kh.transpose(0, 1)?)?;
+        let term2 = kalman_gain
+            .matmul(&self.measurement_noise)?
+            .matmul(&kalman_gain.transpose(0, 1)?)?;
+        let updated = term1.add(&term2)?;
+        // Symmetrise to suppress accumulated round-off.
+        self.covariance = updated.add(&updated.transpose(0, 1)?)?.mul_scalar(0.5)?;
 
         Ok(())
+    }
+
+    /// Compute `K = P H^T S^{-1}` from `P H^T` and the innovation covariance
+    /// `S`, using a Cholesky inverse with a small diagonal regularisation.
+    fn gain_from(p_ht: &Tensor, innovation_cov: &Tensor, obs_dim: usize) -> Result<Tensor> {
+        let mut s_flat = vec![0.0f64; obs_dim * obs_dim];
+        for i in 0..obs_dim {
+            for j in 0..obs_dim {
+                s_flat[i * obs_dim + j] = innovation_cov.get_item_flat(i * obs_dim + j)? as f64;
+            }
+            // Regularisation for numerical stability.
+            s_flat[i * obs_dim + i] += 1e-9;
+        }
+
+        let s_inv = kalman_cholesky_invert_f64(&s_flat, obs_dim).ok_or_else(|| {
+            torsh_core::error::TorshError::ComputeError(
+                "Kalman innovation covariance is not positive definite; cannot invert".to_string(),
+            )
+        })?;
+
+        let s_inv_tensor = Tensor::from_vec(
+            s_inv.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+            &[obs_dim, obs_dim],
+        )?;
+        p_ht.matmul(&s_inv_tensor)
     }
 
     /// Run filter on time series
@@ -482,22 +501,7 @@ impl KalmanFilter {
         let innovation_cov = self.innovation_covariance()?;
         let p_ht = self.covariance.matmul(&self.observation.transpose(0, 1)?)?;
 
-        // Add regularization for numerical stability
-        let lambda = 1e-6f32;
-        let reg_eye = eye(self.obs_dim)?.mul_scalar(lambda)?;
-        let innovation_cov_reg = innovation_cov.add(&reg_eye)?;
-
-        // Compute Kalman gain
-        let kalman_gain = if self.obs_dim == 1 {
-            // Scalar case: K = P @ H.T / s_scalar
-            let s_scalar = innovation_cov_reg.get_item_flat(0)? + 1e-10f32;
-            p_ht.div_scalar(s_scalar)?
-        } else {
-            // For multivariate case, use simplified approach
-            p_ht.div_scalar(innovation_cov_reg.get_item_flat(0)? + 1e-10f32)?
-        };
-
-        Ok(kalman_gain)
+        Self::gain_from(&p_ht, &innovation_cov, self.obs_dim)
     }
 
     /// Compute log-likelihood of observations

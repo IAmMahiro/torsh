@@ -6,6 +6,7 @@
 
 use crate::device::DeviceType;
 use crate::error::Result;
+use crate::sync::{MutexExt, RwLockExt};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -67,16 +68,8 @@ impl TransferState {
 
     /// Read the current status of a transfer, if it is still tracked.
     fn status_of(&self, id: TransferId) -> Option<TransferStatus> {
-        let active = self
-            .active_transfers
-            .read()
-            .expect("lock should not be poisoned");
-        active.get(&id).map(|t| {
-            t.lock()
-                .expect("lock should not be poisoned")
-                .status
-                .clone()
-        })
+        let active = self.active_transfers.read_or_recover();
+        active.get(&id).map(|t| t.lock_or_recover().status.clone())
     }
 }
 
@@ -136,10 +129,7 @@ impl TransferManager {
 
         // Add to queue
         {
-            let mut queue = self
-                .transfer_queue
-                .lock()
-                .expect("lock should not be poisoned");
+            let mut queue = self.transfer_queue.lock_or_recover();
             queue.push_back(queued_transfer);
         }
 
@@ -177,10 +167,7 @@ impl TransferManager {
 
         // Insert with priority ordering
         {
-            let mut queue = self
-                .transfer_queue
-                .lock()
-                .expect("lock should not be poisoned");
+            let mut queue = self.transfer_queue.lock_or_recover();
             let insert_pos = queue
                 .iter()
                 .position(|t| t.priority < priority)
@@ -226,10 +213,7 @@ impl TransferManager {
     pub fn cancel_transfer(&self, transfer_id: TransferId) -> Result<bool> {
         // Remove from queue if not started
         {
-            let mut queue = self
-                .transfer_queue
-                .lock()
-                .expect("lock should not be poisoned");
+            let mut queue = self.transfer_queue.lock_or_recover();
             if let Some(pos) = queue.iter().position(|t| t.id == transfer_id) {
                 queue.remove(pos);
                 return Ok(true);
@@ -238,13 +222,9 @@ impl TransferManager {
 
         // Cancel active transfer
         {
-            let active = self
-                .state
-                .active_transfers
-                .read()
-                .expect("lock should not be poisoned");
+            let active = self.state.active_transfers.read_or_recover();
             if let Some(transfer) = active.get(&transfer_id) {
-                let mut transfer = transfer.lock().expect("lock should not be poisoned");
+                let mut transfer = transfer.lock_or_recover();
                 transfer.status = TransferStatus::Cancelled;
                 return Ok(true);
             }
@@ -255,30 +235,19 @@ impl TransferManager {
 
     /// Get transfer statistics
     pub fn get_statistics(&self) -> TransferStatistics {
-        let stats = self
-            .state
-            .transfer_stats
-            .read()
-            .expect("lock should not be poisoned");
+        let stats = self.state.transfer_stats.read_or_recover();
         stats.clone()
     }
 
     /// Get active transfer count
     pub fn active_transfer_count(&self) -> usize {
-        let active = self
-            .state
-            .active_transfers
-            .read()
-            .expect("lock should not be poisoned");
+        let active = self.state.active_transfers.read_or_recover();
         active.len()
     }
 
     /// Get queued transfer count
     pub fn queued_transfer_count(&self) -> usize {
-        let queue = self
-            .transfer_queue
-            .lock()
-            .expect("lock should not be poisoned");
+        let queue = self.transfer_queue.lock_or_recover();
         queue.len()
     }
 
@@ -288,15 +257,8 @@ impl TransferManager {
     }
 
     fn process_queue(&self) -> Result<()> {
-        let mut queue = self
-            .transfer_queue
-            .lock()
-            .expect("lock should not be poisoned");
-        let mut active = self
-            .state
-            .active_transfers
-            .write()
-            .expect("lock should not be poisoned");
+        let mut queue = self.transfer_queue.lock_or_recover();
+        let mut active = self.state.active_transfers.write_or_recover();
 
         // Check if we can start more transfers
         while active.len() < self.config.max_concurrent_transfers && !queue.is_empty() {
@@ -313,21 +275,14 @@ impl TransferManager {
 
                 // Start the transfer
                 let active_transfer = self.start_transfer(queued)?;
-                let id = active_transfer
-                    .lock()
-                    .expect("lock should not be poisoned")
-                    .id;
+                let id = active_transfer.lock_or_recover().id;
                 active.insert(id, active_transfer);
             }
         }
 
         // Refresh aggregate statistics so `get_statistics` reflects reality.
         {
-            let mut stats = self
-                .state
-                .transfer_stats
-                .write()
-                .expect("lock should not be poisoned");
+            let mut stats = self.state.transfer_stats.write_or_recover();
             stats.total_transfers = stats.total_transfers.max(active.len() as u64);
         }
 
@@ -368,17 +323,13 @@ impl TransferManager {
         let state = Arc::clone(&self.state);
 
         std::thread::spawn(move || {
-            let request = transfer_arc
-                .lock()
-                .expect("lock should not be poisoned")
-                .request
-                .clone();
+            let request = transfer_arc.lock_or_recover().request.clone();
 
             let result = Self::perform_transfer(Arc::clone(&transfer_arc));
 
             // Update status based on result, in place on the shared entry.
             let completed = {
-                let mut transfer = transfer_arc.lock().expect("lock should not be poisoned");
+                let mut transfer = transfer_arc.lock_or_recover();
                 match result {
                     Ok(transfer_result) => {
                         transfer.status = TransferStatus::Completed(transfer_result);
@@ -395,10 +346,7 @@ impl TransferManager {
             let _ = bandwidth_manager.deallocate_bandwidth(&request);
 
             // Record the outcome in the aggregate statistics.
-            let mut stats = state
-                .transfer_stats
-                .write()
-                .expect("lock should not be poisoned");
+            let mut stats = state.transfer_stats.write_or_recover();
             if completed {
                 stats.completed_transfers += 1;
                 stats.total_bytes_transferred += request.size_bytes as u64;
@@ -412,7 +360,7 @@ impl TransferManager {
 
     fn perform_transfer(transfer: Arc<Mutex<ActiveTransfer>>) -> Result<TransferResult> {
         let (_transfer_id, request, method, _start_time) = {
-            let t = transfer.lock().expect("lock should not be poisoned");
+            let t = transfer.lock_or_recover();
             (t.id, t.request.clone(), t.method, t.start_time)
         };
 
@@ -449,7 +397,7 @@ impl TransferManager {
 
             // Update progress
             {
-                let mut t = transfer.lock().expect("lock should not be poisoned");
+                let mut t = transfer.lock_or_recover();
                 if let TransferStatus::InProgress {
                     bytes_transferred: ref mut bt,
                     ..
@@ -463,12 +411,7 @@ impl TransferManager {
         // Capture the start time with a single lock acquisition. Locking the
         // same non-reentrant mutex more than once inside a single expression
         // would self-deadlock, so the duration and bandwidth are derived here.
-        let start_time = {
-            transfer
-                .lock()
-                .expect("lock should not be poisoned")
-                .start_time
-        };
+        let start_time = { transfer.lock_or_recover().start_time };
         let duration = Instant::now().duration_since(start_time);
         let bandwidth_gbps = Self::bandwidth_gbps(total_bytes, duration);
 
@@ -509,7 +452,7 @@ impl TransferManager {
 
         // Update to completed
         {
-            let mut t = transfer.lock().expect("lock should not be poisoned");
+            let mut t = transfer.lock_or_recover();
             if let TransferStatus::InProgress {
                 bytes_transferred: ref mut bt,
                 ..
@@ -537,7 +480,7 @@ impl TransferManager {
         let total_bytes = request.size_bytes;
 
         {
-            let mut t = transfer.lock().expect("lock should not be poisoned");
+            let mut t = transfer.lock_or_recover();
             if let TransferStatus::InProgress {
                 bytes_transferred: ref mut bt,
                 ..
@@ -849,10 +792,7 @@ impl BandwidthManager {
         let bandwidth_key = (request.source, request.destination);
         let required_bandwidth = self.estimate_required_bandwidth(request);
 
-        let allocated = self
-            .allocated_bandwidth
-            .lock()
-            .expect("lock should not be poisoned");
+        let allocated = self.allocated_bandwidth.lock_or_recover();
         let current_usage = allocated.get(&bandwidth_key).copied().unwrap_or(0);
 
         Ok(current_usage + required_bandwidth <= self.config.max_bandwidth_per_link)
@@ -862,10 +802,7 @@ impl BandwidthManager {
         let bandwidth_key = (request.source, request.destination);
         let required_bandwidth = self.estimate_required_bandwidth(request);
 
-        let mut allocated = self
-            .allocated_bandwidth
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut allocated = self.allocated_bandwidth.lock_or_recover();
         let current_usage = allocated.get(&bandwidth_key).copied().unwrap_or(0);
         allocated.insert(bandwidth_key, current_usage + required_bandwidth);
 
@@ -876,10 +813,7 @@ impl BandwidthManager {
         let bandwidth_key = (request.source, request.destination);
         let required_bandwidth = self.estimate_required_bandwidth(request);
 
-        let mut allocated = self
-            .allocated_bandwidth
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut allocated = self.allocated_bandwidth.lock_or_recover();
         if let Some(current_usage) = allocated.get_mut(&bandwidth_key) {
             *current_usage = current_usage.saturating_sub(required_bandwidth);
             if *current_usage == 0 {
@@ -926,10 +860,7 @@ impl P2PManager {
 
         // Check cache
         {
-            let cache = self
-                .p2p_capabilities
-                .read()
-                .expect("lock should not be poisoned");
+            let cache = self.p2p_capabilities.read_or_recover();
             if let Some(&can_use) = cache.get(&key) {
                 return Ok(can_use);
             }
@@ -946,10 +877,7 @@ impl P2PManager {
 
         // Cache result
         {
-            let mut cache = self
-                .p2p_capabilities
-                .write()
-                .expect("lock should not be poisoned");
+            let mut cache = self.p2p_capabilities.write_or_recover();
             cache.insert(key, can_use);
         }
 
@@ -959,20 +887,14 @@ impl P2PManager {
     pub fn enable_p2p(&self, source: DeviceType, destination: DeviceType) -> Result<()> {
         // In a real implementation, this would enable P2P access between devices
         let key = (source, destination);
-        let mut cache = self
-            .p2p_capabilities
-            .write()
-            .expect("lock should not be poisoned");
+        let mut cache = self.p2p_capabilities.write_or_recover();
         cache.insert(key, true);
         Ok(())
     }
 
     pub fn disable_p2p(&self, source: DeviceType, destination: DeviceType) -> Result<()> {
         let key = (source, destination);
-        let mut cache = self
-            .p2p_capabilities
-            .write()
-            .expect("lock should not be poisoned");
+        let mut cache = self.p2p_capabilities.write_or_recover();
         cache.insert(key, false);
         Ok(())
     }

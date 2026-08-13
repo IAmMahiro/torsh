@@ -5,7 +5,7 @@
 
 use crate::{Tensor, TensorElement};
 use std::marker::PhantomData;
-use torsh_core::error::Result;
+use torsh_core::error::{Result, TorshError};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -132,13 +132,37 @@ impl Tensor<f32> {
         self.convert_simd_generic()
     }
 
-    /// Convert to i32 tensor with SIMD optimization (with bounds checking)
+    /// Convert to i32 tensor, rejecting values that do not fit
+    ///
+    /// # Errors
+    /// Returns [`TorshError::InvalidArgument`] if any element is NaN, infinite,
+    /// or outside the `i32` range, instead of silently saturating.
     pub fn to_i32_simd(&self) -> Result<Tensor<i32>> {
         let data = self.data()?;
-        let converted_data: Vec<i32> = data.iter().map(|&x| x as i32).collect();
+        let converted_data = data
+            .iter()
+            .map(|&x| checked_f64_to_i32(x as f64))
+            .collect::<Result<Vec<i32>>>()?;
 
         Tensor::from_data(converted_data, self.shape().dims().to_vec(), self.device)
     }
+}
+
+/// Convert a floating-point value to `i32`, rejecting non-finite and
+/// out-of-range inputs rather than saturating them.
+fn checked_f64_to_i32(value: f64) -> Result<i32> {
+    if !value.is_finite() {
+        return Err(TorshError::InvalidArgument(format!(
+            "cannot convert non-finite value {value} to i32"
+        )));
+    }
+    let truncated = value.trunc();
+    if truncated < i32::MIN as f64 || truncated > i32::MAX as f64 {
+        return Err(TorshError::InvalidArgument(format!(
+            "value {value} is out of range for i32"
+        )));
+    }
+    Ok(truncated as i32)
 }
 
 /// i32 tensor conversions with SIMD optimization
@@ -208,10 +232,22 @@ impl Tensor<i64> {
         Tensor::from_data(converted_data, self.shape().dims().to_vec(), self.device)
     }
 
-    /// Convert to i32 tensor with SIMD optimization (with bounds checking)
+    /// Convert to i32 tensor, rejecting values that do not fit
+    ///
+    /// # Errors
+    /// Returns [`TorshError::InvalidArgument`] if any element is outside the
+    /// `i32` range, instead of silently truncating it (`2i64.pow(40)` used to
+    /// become `0`).
     pub fn to_i32_simd(&self) -> Result<Tensor<i32>> {
         let data = self.data()?;
-        let converted_data: Vec<i32> = data.iter().map(|&x| x as i32).collect();
+        let converted_data = data
+            .iter()
+            .map(|&x| {
+                i32::try_from(x).map_err(|_| {
+                    TorshError::InvalidArgument(format!("value {x} is out of range for i32"))
+                })
+            })
+            .collect::<Result<Vec<i32>>>()?;
 
         Tensor::from_data(converted_data, self.shape().dims().to_vec(), self.device)
     }

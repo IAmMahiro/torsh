@@ -7,6 +7,7 @@ use super::graph_types::*;
 use petgraph::Direction;
 use std::collections::{HashMap, HashSet, VecDeque};
 use torsh_core::error::Result;
+use torsh_core::sync::RwLockExt;
 
 impl OptimizedGraph {
     /// Apply all enabled optimization passes to the graph
@@ -36,10 +37,7 @@ impl OptimizedGraph {
         self.compute_execution_order()?;
 
         let optimization_time = start_time.elapsed().as_millis() as u64;
-        self.stats
-            .write()
-            .expect("lock should not be poisoned")
-            .total_execution_time_ms += optimization_time;
+        self.stats.write_or_recover().total_execution_time_ms += optimization_time;
 
         tracing::info!("Graph optimization completed in {}ms", optimization_time);
         Ok(())
@@ -102,10 +100,7 @@ impl OptimizedGraph {
             }
         }
 
-        self.stats
-            .write()
-            .expect("lock should not be poisoned")
-            .eliminated_nodes += eliminated_count;
+        self.stats.write_or_recover().eliminated_nodes += eliminated_count;
         tracing::debug!("Eliminated {} dead nodes", eliminated_count);
 
         Ok(())
@@ -166,10 +161,7 @@ impl OptimizedGraph {
             }
         }
 
-        self.stats
-            .write()
-            .expect("lock should not be poisoned")
-            .eliminated_nodes += eliminated_count;
+        self.stats.write_or_recover().eliminated_nodes += eliminated_count;
         tracing::debug!("Eliminated {} common subexpressions", eliminated_count);
 
         Ok(())
@@ -248,10 +240,7 @@ impl OptimizedGraph {
             }
         }
 
-        self.stats
-            .write()
-            .expect("lock should not be poisoned")
-            .fused_operations += fused_count;
+        self.stats.write_or_recover().fused_operations += fused_count;
         tracing::debug!("Fused {} operations", fused_count);
 
         Ok(())

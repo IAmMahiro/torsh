@@ -8,7 +8,14 @@ use torsh_tensor::{creation::rand_like, Tensor};
 ///
 /// During training, randomly zeroes some elements of the input tensor
 /// with probability p using samples from a Bernoulli distribution.
-pub fn dropout(input: &Tensor, p: f64, training: bool, inplace: bool) -> TorshResult<Tensor> {
+///
+/// # In-place semantics
+/// `inplace` is accepted for PyTorch API compatibility and has no effect: the
+/// input is borrowed immutably and tensor buffers are shared between clones, so
+/// mutating it here would also mutate the caller's tensor. The masked result is
+/// always a freshly allocated tensor. The same applies to every other function in
+/// this module.
+pub fn dropout(input: &Tensor, p: f64, training: bool, _inplace: bool) -> TorshResult<Tensor> {
     if !training || p == 0.0 {
         return Ok(input.clone());
     }
@@ -35,21 +42,14 @@ pub fn dropout(input: &Tensor, p: f64, training: bool, inplace: bool) -> TorshRe
     let mask = Tensor::from_data(mask_data, input.shape().dims().to_vec(), input.device())?;
 
     // Apply mask
-    let output = if inplace {
-        // TODO: Implement inplace operations when available
-        input.clone().mul_op(&mask)?
-    } else {
-        input.mul_op(&mask)?
-    };
-
-    Ok(output)
+    input.mul_op(&mask)
 }
 
 /// Dropout1d
 ///
 /// Randomly zero out entire channels (a channel is a 1D feature map).
 /// Usually used after Conv1d modules.
-pub fn dropout1d(input: &Tensor, p: f64, training: bool, inplace: bool) -> TorshResult<Tensor> {
+pub fn dropout1d(input: &Tensor, p: f64, training: bool, _inplace: bool) -> TorshResult<Tensor> {
     if !training || p == 0.0 {
         return Ok(input.clone());
     }
@@ -92,20 +92,14 @@ pub fn dropout1d(input: &Tensor, p: f64, training: bool, inplace: bool) -> Torsh
     let mask = Tensor::from_data(broadcast_data, shape.clone(), input.device())?;
 
     // Apply mask
-    let output = if inplace {
-        input.clone().mul_op(&mask)?
-    } else {
-        input.mul_op(&mask)?
-    };
-
-    Ok(output)
+    input.mul_op(&mask)
 }
 
 /// Dropout2d
 ///
 /// Randomly zero out entire channels (a channel is a 2D feature map).
 /// Usually used after Conv2d modules.
-pub fn dropout2d(input: &Tensor, p: f64, training: bool, inplace: bool) -> TorshResult<Tensor> {
+pub fn dropout2d(input: &Tensor, p: f64, training: bool, _inplace: bool) -> TorshResult<Tensor> {
     if !training || p == 0.0 {
         return Ok(input.clone());
     }
@@ -150,20 +144,14 @@ pub fn dropout2d(input: &Tensor, p: f64, training: bool, inplace: bool) -> Torsh
     let mask = Tensor::from_data(broadcast_data, shape.clone(), input.device())?;
 
     // Apply mask
-    let output = if inplace {
-        input.clone().mul_op(&mask)?
-    } else {
-        input.mul_op(&mask)?
-    };
-
-    Ok(output)
+    input.mul_op(&mask)
 }
 
 /// Dropout3d
 ///
 /// Randomly zero out entire channels (a channel is a 3D feature map).
 /// Usually used after Conv3d modules.
-pub fn dropout3d(input: &Tensor, p: f64, training: bool, inplace: bool) -> TorshResult<Tensor> {
+pub fn dropout3d(input: &Tensor, p: f64, training: bool, _inplace: bool) -> TorshResult<Tensor> {
     if !training || p == 0.0 {
         return Ok(input.clone());
     }
@@ -211,20 +199,19 @@ pub fn dropout3d(input: &Tensor, p: f64, training: bool, inplace: bool) -> Torsh
     let mask = Tensor::from_data(broadcast_data, shape.clone(), input.device())?;
 
     // Apply mask
-    let output = if inplace {
-        input.clone().mul_op(&mask)?
-    } else {
-        input.mul_op(&mask)?
-    };
-
-    Ok(output)
+    input.mul_op(&mask)
 }
 
 /// Alpha dropout
 ///
 /// Applies alpha dropout to the input. Alpha Dropout is a type of Dropout
 /// that maintains the self-normalizing property.
-pub fn alpha_dropout(input: &Tensor, p: f64, training: bool, inplace: bool) -> TorshResult<Tensor> {
+pub fn alpha_dropout(
+    input: &Tensor,
+    p: f64,
+    training: bool,
+    _inplace: bool,
+) -> TorshResult<Tensor> {
     if !training || p == 0.0 {
         return Ok(input.clone());
     }
@@ -260,14 +247,7 @@ pub fn alpha_dropout(input: &Tensor, p: f64, training: bool, inplace: bool) -> T
 
     // Apply alpha dropout
 
-    if inplace {
-        // x = x * mask + alpha_p * (1 - mask)
-        // x = a * x + b
-        let not_mask = mask.neg()?.add_scalar(1.0)?;
-        let alpha_term = not_mask.mul_scalar(alpha_p)?;
-        let x = input.clone().mul_op(&mask)?.add_op(&alpha_term)?;
-        x.mul_scalar(a)?.add_scalar(b)
-    } else {
+    {
         let not_mask = mask.neg()?.add_scalar(1.0)?;
         let alpha_term = not_mask.mul_scalar(alpha_p)?;
         let x = input.mul_op(&mask)?.add_op(&alpha_term)?;
@@ -282,7 +262,7 @@ pub fn feature_alpha_dropout(
     input: &Tensor,
     p: f64,
     training: bool,
-    inplace: bool,
+    _inplace: bool,
 ) -> TorshResult<Tensor> {
     if !training || p == 0.0 {
         return Ok(input.clone());
@@ -342,12 +322,7 @@ pub fn feature_alpha_dropout(
 
     // Apply feature alpha dropout
 
-    if inplace {
-        let not_mask = mask.neg()?.add_scalar(1.0)?;
-        let alpha_term = not_mask.mul_scalar(alpha_p)?;
-        let x = input.clone().mul_op(&mask)?.add_op(&alpha_term)?;
-        x.mul_scalar(a)?.add_scalar(b)
-    } else {
+    {
         let not_mask = mask.neg()?.add_scalar(1.0)?;
         let alpha_term = not_mask.mul_scalar(alpha_p)?;
         let x = input.mul_op(&mask)?.add_op(&alpha_term)?;
@@ -543,7 +518,7 @@ pub fn gaussian_dropout(
     input: &Tensor,
     p: f64,
     training: bool,
-    inplace: bool,
+    _inplace: bool,
 ) -> TorshResult<Tensor> {
     if !training || p == 0.0 {
         return Ok(input.clone());
@@ -565,11 +540,7 @@ pub fn gaussian_dropout(
 
     // Apply multiplicative noise
 
-    if inplace {
-        input.clone().mul_op(&noise)
-    } else {
-        input.mul_op(&noise)
-    }
+    input.mul_op(&noise)
 }
 
 #[cfg(test)]

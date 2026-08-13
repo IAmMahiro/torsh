@@ -10,6 +10,7 @@ use crate::{Device, MemoryManager};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use torsh_core::device::DeviceType;
+use torsh_core::sync::RwLockExt;
 
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaDevice as SciRs2CudaDevice;
@@ -98,7 +99,15 @@ mod scirs2_cuda {
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 use crate::metal::MetalDevice as SciRs2MetalDevice;
 
-// Temporary mock for scirs2_metal since scirs2_core doesn't have a metal module yet
+/// Metal host/device memory transfers for Apple Silicon.
+///
+/// Apple Silicon GPUs are integrated with a single unified-memory pool, so a
+/// Metal buffer's contents (`StorageModeShared`) are directly host-addressable.
+/// A host<->device transfer is therefore a plain byte copy between the two
+/// host-visible pointers — there is no separate device address space to DMA
+/// across. These functions perform that copy for real; the previous versions
+/// returned `Ok(())` without moving any bytes, silently leaving destination
+/// buffers holding stale/uninitialized data.
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 mod scirs2_metal {
     pub mod memory {
@@ -108,58 +117,113 @@ mod scirs2_metal {
             WriteCombined,
         }
 
+        /// Set the CPU cache mode hint for a mapped pointer.
+        ///
+        /// This is a performance hint only; on unified memory it has no effect
+        /// on correctness, so it is a genuine (not fake) no-op.
         pub fn set_cpu_cache_mode(
             _device: &MetalDevice,
             _ptr: *mut u8,
             _mode: CpuCacheMode,
         ) -> Result<(), String> {
-            // Mock implementation - in real implementation would set Metal cache mode
+            Ok(())
+        }
+
+        /// Copy `size` bytes from `src_ptr` to `dst_ptr`.
+        ///
+        /// # Safety
+        /// Both pointers must be valid and host-addressable for at least `size`
+        /// bytes. On Apple Silicon both the host buffer and the (shared-storage)
+        /// Metal buffer contents satisfy this. `std::ptr::copy` (memmove
+        /// semantics) is used so overlapping/aliasing pointers — natural on a
+        /// zero-copy unified-memory path where source and destination may be the
+        /// same buffer — remain sound.
+        unsafe fn copy_bytes(
+            src_ptr: *const u8,
+            dst_ptr: *mut u8,
+            size: usize,
+        ) -> Result<(), String> {
+            if size == 0 || src_ptr as *const u8 == dst_ptr as *const u8 {
+                // Nothing to do (empty, or already the same unified-memory region).
+                return Ok(());
+            }
+            if src_ptr.is_null() || dst_ptr.is_null() {
+                return Err("Metal transfer: null buffer pointer".to_string());
+            }
+            std::ptr::copy(src_ptr, dst_ptr, size);
             Ok(())
         }
 
         pub async fn copy_host_to_device_async(
             _device: &MetalDevice,
-            _src_ptr: *const u8,
-            _dst_ptr: *mut u8,
-            _size: usize,
+            src_ptr: *const u8,
+            dst_ptr: *mut u8,
+            size: usize,
         ) -> Result<(), String> {
-            // Mock implementation - in real implementation would use Metal async copy
-            Ok(())
+            unsafe { copy_bytes(src_ptr, dst_ptr, size) }
         }
 
         pub async fn copy_device_to_host_async(
             _device: &MetalDevice,
-            _src_ptr: *const u8,
-            _dst_ptr: *mut u8,
-            _size: usize,
+            src_ptr: *const u8,
+            dst_ptr: *mut u8,
+            size: usize,
         ) -> Result<(), String> {
-            // Mock implementation - in real implementation would use Metal async copy
-            Ok(())
+            unsafe { copy_bytes(src_ptr, dst_ptr, size) }
         }
 
         pub fn copy_host_to_device(
             _device: &MetalDevice,
-            _src_ptr: *const u8,
-            _dst_ptr: *mut u8,
-            _size: usize,
+            src_ptr: *const u8,
+            dst_ptr: *mut u8,
+            size: usize,
         ) -> Result<(), String> {
-            // Mock implementation - in real implementation would use Metal sync copy
-            Ok(())
+            unsafe { copy_bytes(src_ptr, dst_ptr, size) }
         }
 
         pub fn copy_device_to_host(
             _device: &MetalDevice,
-            _src_ptr: *const u8,
-            _dst_ptr: *mut u8,
-            _size: usize,
+            src_ptr: *const u8,
+            dst_ptr: *mut u8,
+            size: usize,
         ) -> Result<(), String> {
-            // Mock implementation - in real implementation would use Metal sync copy
-            Ok(())
+            unsafe { copy_bytes(src_ptr, dst_ptr, size) }
+        }
+
+        #[cfg(test)]
+        mod copy_tests {
+            use super::copy_bytes;
+
+            #[test]
+            fn copy_bytes_actually_moves_data() {
+                // The old mock returned Ok(()) without copying; verify real bytes move.
+                let src = [1u8, 2, 3, 4, 5, 6, 7, 8];
+                let mut dst = [0u8; 8];
+                let r = unsafe { copy_bytes(src.as_ptr(), dst.as_mut_ptr(), src.len()) };
+                assert!(r.is_ok());
+                assert_eq!(dst, src);
+            }
+
+            #[test]
+            fn copy_bytes_rejects_null_pointer() {
+                let mut dst = [0u8; 4];
+                let r = unsafe { copy_bytes(std::ptr::null(), dst.as_mut_ptr(), 4) };
+                assert!(r.is_err());
+            }
+
+            #[test]
+            fn copy_bytes_zero_length_is_ok() {
+                let r = unsafe { copy_bytes(std::ptr::null(), std::ptr::null_mut(), 0) };
+                assert!(r.is_ok());
+            }
         }
     }
 
+    /// Synchronize Metal work.
+    ///
+    /// The transfers above are synchronous CPU copies over unified memory, so by
+    /// the time this is called there is nothing outstanding to wait on.
     pub fn synchronize(_device: &crate::metal::device::MetalDevice) -> Result<(), String> {
-        // Mock implementation - in real implementation would synchronize Metal commands
         Ok(())
     }
 }
@@ -545,10 +609,7 @@ impl ZeroCopyManager {
         let device_key = format!("{}:{}", device.device_type(), device.id());
 
         {
-            let mut caps = self
-                .capabilities
-                .write()
-                .expect("lock should not be poisoned");
+            let mut caps = self.capabilities.write_or_recover();
             caps.insert(device_key.clone(), capabilities);
         }
 
@@ -597,10 +658,7 @@ impl ZeroCopyManager {
     /// Get device capabilities
     pub fn get_capabilities(&self, device: &Device) -> Option<ZeroCopyCapabilities> {
         let device_key = format!("{}:{}", device.device_type(), device.id());
-        let caps = self
-            .capabilities
-            .read()
-            .expect("lock should not be poisoned");
+        let caps = self.capabilities.read_or_recover();
         caps.get(&device_key).copied()
     }
 
@@ -653,7 +711,7 @@ impl ZeroCopyManager {
 
         // Update statistics
         {
-            let mut stats = self.stats.write().expect("lock should not be poisoned");
+            let mut stats = self.stats.write_or_recover();
             stats.update_transfer(transfer.size as u64, elapsed_us, was_zero_copy, was_error);
         }
 
@@ -941,7 +999,7 @@ impl ZeroCopyManager {
 
         // Update statistics for fallback transfer
         {
-            let mut stats = self.stats.write().expect("lock should not be poisoned");
+            let mut stats = self.stats.write_or_recover();
             stats.update_transfer(transfer.size as u64, elapsed_us, false, false);
         }
 
@@ -1305,15 +1363,12 @@ impl ZeroCopyManager {
 
     /// Get transfer statistics
     pub fn get_stats(&self) -> ZeroCopyStats {
-        self.stats
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.stats.read_or_recover().clone()
     }
 
     /// Reset transfer statistics
     pub fn reset_stats(&self) {
-        let mut stats = self.stats.write().expect("lock should not be poisoned");
+        let mut stats = self.stats.write_or_recover();
         *stats = ZeroCopyStats::default();
     }
 
@@ -1674,11 +1729,7 @@ mod tests {
     #[test]
     fn test_zero_copy_manager_creation() {
         let manager = ZeroCopyManager::new();
-        assert!(manager
-            .capabilities
-            .read()
-            .expect("lock should not be poisoned")
-            .is_empty());
+        assert!(manager.capabilities.read_or_recover().is_empty());
 
         let stats = manager.get_stats();
         assert_eq!(stats.total_transfers, 0);

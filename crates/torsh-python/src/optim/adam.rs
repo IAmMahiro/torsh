@@ -1,6 +1,9 @@
 //! Adam and AdamW optimizers
 
-use super::base::{create_param_group, extract_parameters, PyOptimizer};
+use super::base::{
+    create_param_group, extract_parameters, get_field, optim_result_to_py, optim_state_to_pydict,
+    param_index_error, pydict_to_optim_state, PyOptimizer,
+};
 use crate::{error::PyResult, tensor::PyTensor};
 use parking_lot::RwLock;
 use pyo3::prelude::*;
@@ -24,6 +27,7 @@ pub struct PyAdam {
 #[pymethods]
 impl PyAdam {
     #[new]
+    #[pyo3(signature = (params, lr=None, betas=None, eps=None, weight_decay=None, amsgrad=None))]
     fn new(
         params: Vec<PyTensor>,
         lr: Option<f32>,
@@ -31,7 +35,7 @@ impl PyAdam {
         eps: Option<f32>,
         weight_decay: Option<f32>,
         amsgrad: Option<bool>,
-    ) -> (Self, PyOptimizer) {
+    ) -> PyClassInitializer<Self> {
         let lr = lr.unwrap_or(0.001);
         let betas = betas.unwrap_or((0.9, 0.999));
         let eps = eps.unwrap_or(1e-8);
@@ -101,6 +105,7 @@ impl PyAdam {
             },
             PyOptimizer {},
         )
+            .into()
     }
 
     /// Perform a single optimization step
@@ -138,42 +143,132 @@ impl PyAdam {
         })
     }
 
-    /// Get current state
+    /// Get current state: the real per-parameter Adam buffers (`exp_avg`,
+    /// `exp_avg_sq`, `step`, and `max_exp_avg_sq` when `amsgrad=True`), keyed
+    /// by ordinal parameter index.
     fn state(&self) -> PyResult<HashMap<String, Py<PyAny>>> {
-        let mut state = HashMap::new();
+        Python::attach(|py| self.build_state_pydict(py))
+    }
+
+    /// Get state dictionary: `{"state": {...}, "param_groups": [...]}`,
+    /// matching PyTorch's `Optimizer.state_dict()` shape. `"state"` holds the
+    /// real Adam buffers so a full checkpoint/resume round-trip is possible.
+    fn state_dict(&self) -> PyResult<HashMap<String, Py<PyAny>>> {
         Python::attach(|py| {
-            state.insert(
-                "step".to_string(),
-                0i64.into_pyobject(py)
+            let mut state_dict: HashMap<String, Py<PyAny>> = HashMap::new();
+
+            let state = self.build_state_pydict(py)?;
+            state_dict.insert(
+                "state".to_string(),
+                state
+                    .into_pyobject(py)
                     .expect("Python object conversion should succeed")
                     .into_any()
                     .unbind(),
             );
-            state.insert(
-                "exp_avg".to_string(),
-                "{}".into_pyobject(py)
+
+            let group = self.build_param_group_pydict(py)?;
+            state_dict.insert(
+                "param_groups".to_string(),
+                vec![group]
+                    .into_pyobject(py)
                     .expect("Python object conversion should succeed")
                     .into_any()
                     .unbind(),
             );
-            state.insert(
-                "exp_avg_sq".to_string(),
-                "{}".into_pyobject(py)
-                    .expect("Python object conversion should succeed")
-                    .into_any()
-                    .unbind(),
-            );
-            if self.amsgrad {
-                state.insert(
-                    "max_exp_avg_sq".to_string(),
-                    "{}".into_pyobject(py)
-                        .expect("Python object conversion should succeed")
-                        .into_any()
-                        .unbind(),
-                );
+
+            Ok(state_dict)
+        })
+    }
+
+    /// Load a state dictionary produced by [`Self::state_dict`].
+    ///
+    /// `torsh_optim::Adam` has no in-place setter for `betas`/`eps`/
+    /// `weight_decay`/`amsgrad`, so restoring them faithfully (as PyTorch
+    /// does: `load_state_dict` fully replaces param-group hyperparameters)
+    /// requires reconstructing the wrapped optimizer. The SAME parameter
+    /// handles are reused (only the hyperparameters and per-parameter
+    /// buffers change), so gradient/data identity is preserved.
+    fn load_state_dict(&mut self, state_dict: HashMap<String, Py<PyAny>>) -> PyResult<()> {
+        Python::attach(|py| {
+            let groups: Vec<HashMap<String, Py<PyAny>>> =
+                get_field(&state_dict, "param_groups")?.extract(py)?;
+            let group0 = groups.first().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "state_dict 'param_groups' must contain at least one group",
+                )
+            })?;
+
+            let parameters = self.adam.parameters();
+            if let Some(params_obj) = group0.get("params") {
+                let params: Vec<i64> = params_obj.extract(py)?;
+                if params.len() != parameters.len() {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "loaded state dict has {} parameters, but this optimizer has {}",
+                        params.len(),
+                        parameters.len()
+                    )));
+                }
             }
-        });
-        Ok(state)
+
+            let lr: f32 = get_field(group0, "lr")?.extract(py)?;
+            let betas: (f32, f32) = get_field(group0, "betas")?.extract(py)?;
+            let eps: f32 = get_field(group0, "eps")?.extract(py)?;
+            let weight_decay: f32 = get_field(group0, "weight_decay")?.extract(py)?;
+            let amsgrad: bool = get_field(group0, "amsgrad")?.extract(py)?;
+
+            let mut new_adam = Adam::new(
+                parameters.clone(),
+                Some(lr),
+                Some(betas),
+                Some(eps),
+                Some(weight_decay),
+                amsgrad,
+            );
+
+            if let Some(state_obj) = state_dict.get("state") {
+                let per_param: HashMap<String, Py<PyAny>> = state_obj.extract(py)?;
+                let restored = pydict_to_optim_state(py, &parameters, &per_param)?;
+                let mut rust_state = optim_result_to_py("Adam state_dict", new_adam.state_dict())?;
+                rust_state.state = restored;
+                optim_result_to_py("Adam load_state_dict", new_adam.load_state_dict(rust_state))?;
+            }
+
+            self.adam = new_adam;
+            self.lr = lr;
+            self.betas = betas;
+            self.eps = eps;
+            self.weight_decay = weight_decay;
+            self.amsgrad = amsgrad;
+
+            let group = self.build_param_group_pydict(py)?;
+            self.param_groups = vec![group];
+
+            Ok(())
+        })
+    }
+
+    /// Manually set the gradient for the parameter at `index`.
+    ///
+    /// Useful for driving `step()` without a full autograd pass (e.g. tests,
+    /// or custom training loops that compute gradients out-of-band).
+    fn set_param_grad(&mut self, index: usize, grad: PyTensor) -> PyResult<()> {
+        let parameters = self.adam.parameters();
+        let param = parameters
+            .get(index)
+            .ok_or_else(|| param_index_error(index, parameters.len()))?;
+        param.read().set_grad(Some(grad.tensor));
+        Ok(())
+    }
+
+    /// Read the current value of the parameter at `index`.
+    fn get_param_data(&self, index: usize) -> PyResult<PyTensor> {
+        let parameters = self.adam.parameters();
+        let param = parameters
+            .get(index)
+            .ok_or_else(|| param_index_error(index, parameters.len()))?;
+        let tensor = param.read().clone();
+        Ok(PyTensor { tensor })
     }
 
     /// String representation
@@ -238,6 +333,10 @@ impl PyAdam {
     #[setter]
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
+        // Propagate to the wrapped real optimizer too -- without this, `step()`
+        // keeps using whatever `lr` it was constructed with, since it reads its
+        // OWN internal param-group `lr`, not this pyclass's `self.lr` field.
+        self.adam.set_lr(lr);
         Python::attach(|py| {
             for param_group in &mut self.param_groups {
                 param_group.insert(
@@ -276,6 +375,68 @@ impl PyAdam {
     }
 }
 
+impl PyAdam {
+    /// Build the real per-parameter state dict (`exp_avg`, `exp_avg_sq`,
+    /// `step`, ...) keyed by ordinal parameter index.
+    fn build_state_pydict(&self, py: Python<'_>) -> PyResult<HashMap<String, Py<PyAny>>> {
+        let parameters = self.adam.parameters();
+        let rust_state = optim_result_to_py("Adam state_dict", self.adam.state_dict())?;
+        optim_state_to_pydict(py, &parameters, &rust_state)
+    }
+
+    /// Build the `param_groups[0]` dict: lr + every Adam hyperparameter,
+    /// plus `"params"` (ordinal indices, for shape-fidelity/validation).
+    fn build_param_group_pydict(&self, py: Python<'_>) -> PyResult<HashMap<String, Py<PyAny>>> {
+        let mut group: HashMap<String, Py<PyAny>> = HashMap::new();
+        group.insert(
+            "lr".to_string(),
+            self.lr
+                .into_pyobject(py)
+                .expect("Python object conversion should succeed")
+                .into_any()
+                .unbind(),
+        );
+        group.insert(
+            "betas".to_string(),
+            self.betas
+                .into_pyobject(py)
+                .expect("Python object conversion should succeed")
+                .into_any()
+                .unbind(),
+        );
+        group.insert(
+            "eps".to_string(),
+            self.eps
+                .into_pyobject(py)
+                .expect("Python object conversion should succeed")
+                .into_any()
+                .unbind(),
+        );
+        group.insert(
+            "weight_decay".to_string(),
+            self.weight_decay
+                .into_pyobject(py)
+                .expect("Python object conversion should succeed")
+                .into_any()
+                .unbind(),
+        );
+        group.insert(
+            "amsgrad".to_string(),
+            PyBool::new(py, self.amsgrad).to_owned().into(),
+        );
+        let param_indices: Vec<i64> = (0..self.adam.parameters().len() as i64).collect();
+        group.insert(
+            "params".to_string(),
+            param_indices
+                .into_pyobject(py)
+                .expect("Python object conversion should succeed")
+                .into_any()
+                .unbind(),
+        );
+        Ok(group)
+    }
+}
+
 /// AdamW optimizer - Adam with decoupled weight decay
 #[pyclass(name = "AdamW", extends = PyOptimizer)]
 pub struct PyAdamW {
@@ -291,6 +452,7 @@ pub struct PyAdamW {
 #[pymethods]
 impl PyAdamW {
     #[new]
+    #[pyo3(signature = (params, lr=None, betas=None, eps=None, weight_decay=None, amsgrad=None))]
     fn new(
         params: Vec<PyTensor>,
         lr: Option<f32>,
@@ -298,7 +460,7 @@ impl PyAdamW {
         eps: Option<f32>,
         weight_decay: Option<f32>,
         amsgrad: Option<bool>,
-    ) -> (Self, PyOptimizer) {
+    ) -> PyClassInitializer<Self> {
         let lr = lr.unwrap_or(0.001);
         let betas = betas.unwrap_or((0.9, 0.999));
         let eps = eps.unwrap_or(1e-8);
@@ -368,6 +530,7 @@ impl PyAdamW {
             },
             PyOptimizer {},
         )
+            .into()
     }
 
     /// Perform a single optimization step
@@ -405,42 +568,136 @@ impl PyAdamW {
         })
     }
 
-    /// Get current state
+    /// Get current state: the real per-parameter AdamW buffers (`exp_avg`,
+    /// `exp_avg_sq`, `step`, and `max_exp_avg_sq` when `amsgrad=True`), keyed
+    /// by ordinal parameter index.
     fn state(&self) -> PyResult<HashMap<String, Py<PyAny>>> {
-        let mut state = HashMap::new();
+        Python::attach(|py| self.build_state_pydict(py))
+    }
+
+    /// Get state dictionary: `{"state": {...}, "param_groups": [...]}`,
+    /// matching PyTorch's `Optimizer.state_dict()` shape. `"state"` holds the
+    /// real AdamW buffers so a full checkpoint/resume round-trip is possible.
+    fn state_dict(&self) -> PyResult<HashMap<String, Py<PyAny>>> {
         Python::attach(|py| {
-            state.insert(
-                "step".to_string(),
-                0i64.into_pyobject(py)
+            let mut state_dict: HashMap<String, Py<PyAny>> = HashMap::new();
+
+            let state = self.build_state_pydict(py)?;
+            state_dict.insert(
+                "state".to_string(),
+                state
+                    .into_pyobject(py)
                     .expect("Python object conversion should succeed")
                     .into_any()
                     .unbind(),
             );
-            state.insert(
-                "exp_avg".to_string(),
-                "{}".into_pyobject(py)
+
+            let group = self.build_param_group_pydict(py)?;
+            state_dict.insert(
+                "param_groups".to_string(),
+                vec![group]
+                    .into_pyobject(py)
                     .expect("Python object conversion should succeed")
                     .into_any()
                     .unbind(),
             );
-            state.insert(
-                "exp_avg_sq".to_string(),
-                "{}".into_pyobject(py)
-                    .expect("Python object conversion should succeed")
-                    .into_any()
-                    .unbind(),
-            );
-            if self.amsgrad {
-                state.insert(
-                    "max_exp_avg_sq".to_string(),
-                    "{}".into_pyobject(py)
-                        .expect("Python object conversion should succeed")
-                        .into_any()
-                        .unbind(),
-                );
+
+            Ok(state_dict)
+        })
+    }
+
+    /// Load a state dictionary produced by [`Self::state_dict`].
+    ///
+    /// `torsh_optim::AdamW` has no in-place setter for `betas`/`eps`/
+    /// `weight_decay`/`amsgrad`, so restoring them faithfully (as PyTorch
+    /// does: `load_state_dict` fully replaces param-group hyperparameters)
+    /// requires reconstructing the wrapped optimizer. The SAME parameter
+    /// handles are reused (only the hyperparameters and per-parameter
+    /// buffers change), so gradient/data identity is preserved.
+    fn load_state_dict(&mut self, state_dict: HashMap<String, Py<PyAny>>) -> PyResult<()> {
+        Python::attach(|py| {
+            let groups: Vec<HashMap<String, Py<PyAny>>> =
+                get_field(&state_dict, "param_groups")?.extract(py)?;
+            let group0 = groups.first().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "state_dict 'param_groups' must contain at least one group",
+                )
+            })?;
+
+            let parameters = self.adamw.parameters();
+            if let Some(params_obj) = group0.get("params") {
+                let params: Vec<i64> = params_obj.extract(py)?;
+                if params.len() != parameters.len() {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "loaded state dict has {} parameters, but this optimizer has {}",
+                        params.len(),
+                        parameters.len()
+                    )));
+                }
             }
-        });
-        Ok(state)
+
+            let lr: f32 = get_field(group0, "lr")?.extract(py)?;
+            let betas: (f32, f32) = get_field(group0, "betas")?.extract(py)?;
+            let eps: f32 = get_field(group0, "eps")?.extract(py)?;
+            let weight_decay: f32 = get_field(group0, "weight_decay")?.extract(py)?;
+            let amsgrad: bool = get_field(group0, "amsgrad")?.extract(py)?;
+
+            let mut new_adamw = AdamW::new(
+                parameters.clone(),
+                Some(lr),
+                Some(betas),
+                Some(eps),
+                Some(weight_decay),
+                amsgrad,
+            );
+
+            if let Some(state_obj) = state_dict.get("state") {
+                let per_param: HashMap<String, Py<PyAny>> = state_obj.extract(py)?;
+                let restored = pydict_to_optim_state(py, &parameters, &per_param)?;
+                let mut rust_state =
+                    optim_result_to_py("AdamW state_dict", new_adamw.state_dict())?;
+                rust_state.state = restored;
+                optim_result_to_py(
+                    "AdamW load_state_dict",
+                    new_adamw.load_state_dict(rust_state),
+                )?;
+            }
+
+            self.adamw = new_adamw;
+            self.lr = lr;
+            self.betas = betas;
+            self.eps = eps;
+            self.weight_decay = weight_decay;
+            self.amsgrad = amsgrad;
+
+            let group = self.build_param_group_pydict(py)?;
+            self.param_groups = vec![group];
+
+            Ok(())
+        })
+    }
+
+    /// Manually set the gradient for the parameter at `index`.
+    ///
+    /// Useful for driving `step()` without a full autograd pass (e.g. tests,
+    /// or custom training loops that compute gradients out-of-band).
+    fn set_param_grad(&mut self, index: usize, grad: PyTensor) -> PyResult<()> {
+        let parameters = self.adamw.parameters();
+        let param = parameters
+            .get(index)
+            .ok_or_else(|| param_index_error(index, parameters.len()))?;
+        param.read().set_grad(Some(grad.tensor));
+        Ok(())
+    }
+
+    /// Read the current value of the parameter at `index`.
+    fn get_param_data(&self, index: usize) -> PyResult<PyTensor> {
+        let parameters = self.adamw.parameters();
+        let param = parameters
+            .get(index)
+            .ok_or_else(|| param_index_error(index, parameters.len()))?;
+        let tensor = param.read().clone();
+        Ok(PyTensor { tensor })
     }
 
     /// String representation
@@ -505,6 +762,10 @@ impl PyAdamW {
     #[setter]
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
+        // Propagate to the wrapped real optimizer too -- without this, `step()`
+        // keeps using whatever `lr` it was constructed with, since it reads its
+        // OWN internal param-group `lr`, not this pyclass's `self.lr` field.
+        self.adamw.set_lr(lr);
         Python::attach(|py| {
             for param_group in &mut self.param_groups {
                 param_group.insert(
@@ -540,5 +801,67 @@ impl PyAdamW {
     #[getter]
     fn amsgrad(&self) -> bool {
         self.amsgrad
+    }
+}
+
+impl PyAdamW {
+    /// Build the real per-parameter state dict (`exp_avg`, `exp_avg_sq`,
+    /// `step`, ...) keyed by ordinal parameter index.
+    fn build_state_pydict(&self, py: Python<'_>) -> PyResult<HashMap<String, Py<PyAny>>> {
+        let parameters = self.adamw.parameters();
+        let rust_state = optim_result_to_py("AdamW state_dict", self.adamw.state_dict())?;
+        optim_state_to_pydict(py, &parameters, &rust_state)
+    }
+
+    /// Build the `param_groups[0]` dict: lr + every AdamW hyperparameter,
+    /// plus `"params"` (ordinal indices, for shape-fidelity/validation).
+    fn build_param_group_pydict(&self, py: Python<'_>) -> PyResult<HashMap<String, Py<PyAny>>> {
+        let mut group: HashMap<String, Py<PyAny>> = HashMap::new();
+        group.insert(
+            "lr".to_string(),
+            self.lr
+                .into_pyobject(py)
+                .expect("Python object conversion should succeed")
+                .into_any()
+                .unbind(),
+        );
+        group.insert(
+            "betas".to_string(),
+            self.betas
+                .into_pyobject(py)
+                .expect("Python object conversion should succeed")
+                .into_any()
+                .unbind(),
+        );
+        group.insert(
+            "eps".to_string(),
+            self.eps
+                .into_pyobject(py)
+                .expect("Python object conversion should succeed")
+                .into_any()
+                .unbind(),
+        );
+        group.insert(
+            "weight_decay".to_string(),
+            self.weight_decay
+                .into_pyobject(py)
+                .expect("Python object conversion should succeed")
+                .into_any()
+                .unbind(),
+        );
+        group.insert(
+            "amsgrad".to_string(),
+            PyBool::new(py, self.amsgrad).to_owned().into(),
+        );
+        let param_indices: Vec<i64> = (0..self.adamw.parameters().len() as i64).collect();
+        group.insert(
+            "params".to_string(),
+            param_indices
+                .into_pyobject(py)
+                .expect("Python object conversion should succeed")
+                .into_any()
+                .unbind(),
+        );
+        Ok(group)
     }
 }

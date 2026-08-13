@@ -68,6 +68,9 @@ pub mod hybrid;
 pub mod layers;
 pub mod linalg;
 pub mod matlab_compat;
+/// MATLAB Level-5 MAT-file container used by [`matlab_compat`].
+#[cfg(feature = "matlab")]
+pub mod matlab_mat5;
 pub mod matrix_market;
 pub mod memory_management;
 pub mod nn;

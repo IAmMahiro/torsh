@@ -792,6 +792,7 @@ impl Default for CpuBackend {
 mod tests {
     use super::*;
     use tokio;
+    use torsh_core::sync::MutexExt;
 
     #[tokio::test]
     async fn test_cpu_backend_initialization() {
@@ -1025,7 +1026,7 @@ mod tests {
                     .num_threads(2 + i) // Different thread counts
                     .build();
 
-                let mut results = results_clone.lock().expect("lock should not be poisoned");
+                let mut results = results_clone.lock_or_recover();
                 results.push(backend.is_ok());
             });
             handles.push(handle);
@@ -1035,7 +1036,7 @@ mod tests {
             handle.join().expect("join should succeed");
         }
 
-        let results = results.lock().expect("lock should not be poisoned");
+        let results = results.lock_or_recover();
         // At least some should succeed
         assert!(results.iter().any(|&success| success));
     }

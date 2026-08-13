@@ -78,11 +78,11 @@ tracing.workspace = true
 # Utilities
 once_cell.workspace = true
 parking_lot = { workspace = true }
-num_cpus = "1.17"
+num_cpus = { workspace = true }
 chrono = { workspace = true }
-walkdir = "2.5"
+walkdir = { workspace = true }
 uuid = { workspace = true }
-fastrand = "2.4"
+fastrand = { workspace = true }
 oxicode = { workspace = true }
 # rand_distr = "0.5.1"    # REMOVED: Use scirs2_core::random::prelude instead (SciRS2 POLICY)
 
@@ -92,7 +92,7 @@ tempfile = { workspace = true }
 [build-dependencies]
 # pyo3-build-config is always compiled (it's a build dep) but only emits Python
 # link args when the "python" feature is active (controlled via build.rs).
-pyo3-build-config = { version = "0.28", features = ["resolve-config"] }
+pyo3-build-config = { workspace = true }
 
 # Examples temporarily disabled - need API updates after refactoring
 # [[example]]

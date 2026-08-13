@@ -31,11 +31,10 @@ numpy = { workspace = true }
 # ToRSh crates
 torsh-core = { workspace = true }
 torsh-tensor = { workspace = true }
-torsh-nn = { workspace = true }
 torsh-optim = { workspace = true }
 torsh-data = { workspace = true }
 torsh-autograd = { workspace = true }
-torsh-distributed = { workspace = true }
+torsh-functional = { workspace = true }
 
 # ✅ SciRS2 POLICY: Use scirs2-core for all scientific computing needs
 scirs2-core = { workspace = true }
@@ -52,9 +51,13 @@ default = []
 extension-module = ["pyo3/extension-module", "pyo3/abi3-py38"]
 
 [build-dependencies]
-pyo3-build-config = { version = "0.28", features = ["resolve-config"] }
+pyo3-build-config = { workspace = true }
 
+# NOTE: The single canonical maturin manifest is the workspace-root
+# `pyproject.toml` (project `torsh`), which sets `manifest-path` to this crate
+# and `module-name = "rstorch._C"`. The values below only matter if this crate
+# is built directly with maturin; keep them consistent with the root config.
 [package.metadata.maturin]
-python-source = "python"
-module-name = "rstorch"
+python-source = "../../python"
+module-name = "rstorch._C"
 bindings = "pyo3"

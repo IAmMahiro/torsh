@@ -600,7 +600,9 @@ impl InteractiveGraphEditor {
     fn remove_node(&self, node_id: NodeIndex) -> Result<()> {
         let mut graph = self.graph.write().expect("lock should not be poisoned");
         if graph.graph.node_weight(node_id).is_some() {
-            graph.graph.remove_node(node_id);
+            // Go through FxGraph so the input/output lists are remapped instead of
+            // being left pointing at swap-removed indices.
+            graph.remove_node(node_id);
             Ok(())
         } else {
             Err(torsh_core::error::TorshError::InvalidArgument(

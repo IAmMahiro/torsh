@@ -16,6 +16,7 @@
 use std::cmp::min;
 use std::collections::HashMap;
 use std::time::Instant;
+use torsh_core::sync::RwLockExt;
 
 // SciRS2 Parallel Operations for algorithmic optimizations
 use scirs2_core::parallel_ops::*;
@@ -144,12 +145,7 @@ impl AlgorithmicOptimizer {
         }
 
         // Check performance history
-        if let Some(metrics) = self
-            .performance_history
-            .read()
-            .expect("lock should not be poisoned")
-            .get(signature)
-        {
+        if let Some(metrics) = self.performance_history.read_or_recover().get(signature) {
             return metrics
                 .best_algorithm
                 .clone()
@@ -706,10 +702,7 @@ impl AlgorithmicOptimizer {
         algorithm: MatMulAlgorithm,
         duration: std::time::Duration,
     ) {
-        let mut history = self
-            .performance_history
-            .write()
-            .expect("lock should not be poisoned");
+        let mut history = self.performance_history.write_or_recover();
         let metrics = history
             .entry(signature)
             .or_insert_with(PerformanceMetrics::default);
@@ -945,10 +938,7 @@ impl AlgorithmicOptimizer {
 
     /// Get algorithm performance statistics
     pub fn get_performance_stats(&self) -> AlgorithmPerformanceStats {
-        let history = self
-            .performance_history
-            .read()
-            .expect("lock should not be poisoned");
+        let history = self.performance_history.read_or_recover();
 
         let mut total_operations = 0;
         let mut algorithm_counts = HashMap::new();

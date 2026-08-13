@@ -11,9 +11,12 @@
 //! - Time-aware graph attention mechanisms
 //! - Temporal pooling and aggregation operations
 //! - Causal temporal modeling with proper time ordering
-
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
+
 use crate::parameter::Parameter;
 use crate::{GraphData, GraphLayer};
 use std::collections::{BTreeMap, HashMap};
@@ -87,7 +90,11 @@ impl TemporalGraphData {
     }
 
     /// Add a temporal event to the graph
-    pub fn add_event(&mut self, event: TemporalEvent) {
+    ///
+    /// # Errors
+    /// Returns an error when the event's feature tensor cannot be written into
+    /// the current graph.
+    pub fn add_event(&mut self, event: TemporalEvent) -> Result<()> {
         let timestamp = (event.time * 1000.0) as u64; // Convert to milliseconds for ordering
         self.events
             .entry(timestamp)
@@ -98,19 +105,21 @@ impl TemporalGraphData {
         self.current_time = self.current_time.max(event.time);
 
         // Apply event to current graph structure
-        self.apply_event(&event);
+        self.apply_event(&event)?;
 
         // Clean up old events outside time window
         self.cleanup_old_events();
+
+        Ok(())
     }
 
     /// Apply an event to the current graph structure
-    fn apply_event(&mut self, event: &TemporalEvent) {
+    fn apply_event(&mut self, event: &TemporalEvent) -> Result<()> {
         match event.event_type {
             EventType::NodeFeatureUpdate => {
                 if let (Some(node), Some(ref features)) = (event.node, &event.features) {
                     // Update node features in current graph
-                    self.update_node_features(node, features.clone());
+                    self.update_node_features(node, features.clone())?;
 
                     // Store in history
                     let timestamp = (event.time * 1000.0) as u64;
@@ -136,18 +145,16 @@ impl TemporalGraphData {
                 // In a complete implementation, these would modify the graph structure
             }
         }
+
+        Ok(())
     }
 
     /// Update node features in the current graph
-    fn update_node_features(&mut self, node_id: usize, features: Tensor) {
+    fn update_node_features(&mut self, node_id: usize, features: Tensor) -> Result<()> {
         // Simplified implementation - would need proper tensor slicing in practice
-        let current_features = self
-            .current_graph
-            .x
-            .to_vec()
-            .expect("conversion should succeed");
+        let current_features = self.current_graph.x.to_vec()?;
         let feature_dim = self.current_graph.x.shape().dims()[1];
-        let new_features = features.to_vec().expect("conversion should succeed");
+        let new_features = features.to_vec()?;
 
         let mut updated_features = current_features;
         let start_idx = node_id * feature_dim;
@@ -163,8 +170,9 @@ impl TemporalGraphData {
             updated_features,
             &[self.current_graph.num_nodes, feature_dim],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec updated_features should succeed");
+        )?;
+
+        Ok(())
     }
 
     /// Clean up old events outside the time window
@@ -247,22 +255,16 @@ impl TGCNConv {
         temporal_dim: usize,
         memory_size: usize,
         bias: bool,
-    ) -> Self {
-        let spatial_weight = Parameter::new(
-            randn(&[in_features, out_features]).expect("randn spatial_weight should succeed"),
-        );
-        let temporal_weight = Parameter::new(
-            randn(&[temporal_dim, out_features]).expect("randn temporal_weight should succeed"),
-        );
+    ) -> Result<Self> {
+        let spatial_weight = Parameter::new(randn(&[in_features, out_features])?);
+        let temporal_weight = Parameter::new(randn(&[temporal_dim, out_features])?);
         let bias = if bias {
-            Some(Parameter::new(
-                zeros(&[out_features]).expect("zeros bias should succeed"),
-            ))
+            Some(Parameter::new(zeros(&[out_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             temporal_dim,
@@ -271,31 +273,26 @@ impl TGCNConv {
             bias,
             memory_size,
             time_encoding_dim: temporal_dim,
-        }
+        })
     }
 
     /// Forward pass through TGCN layer
-    pub fn forward(&self, temporal_graph: &TemporalGraphData) -> TemporalGraphData {
+    pub fn forward(&self, temporal_graph: &TemporalGraphData) -> Result<TemporalGraphData> {
         // Step 1: Spatial convolution on current graph
         let spatial_features = temporal_graph
             .current_graph
             .x
-            .matmul(&self.spatial_weight.clone_data())
-            .expect("matmul spatial_features should succeed");
+            .matmul(&self.spatial_weight.clone_data())?;
 
         // Step 2: Temporal encoding based on recent events
-        let temporal_features = self.encode_temporal_context(temporal_graph);
+        let temporal_features = self.encode_temporal_context(temporal_graph)?;
 
         // Step 3: Combine spatial and temporal features
-        let combined_features = spatial_features
-            .add(&temporal_features)
-            .expect("operation should succeed");
+        let combined_features = spatial_features.add(&temporal_features)?;
 
         // Step 4: Add bias if present
         let output_features = if let Some(ref bias) = self.bias {
-            combined_features
-                .add(&bias.clone_data())
-                .expect("operation should succeed")
+            combined_features.add(&bias.clone_data())?
         } else {
             combined_features
         };
@@ -303,11 +300,11 @@ impl TGCNConv {
         // Create output temporal graph
         let mut output_graph = temporal_graph.clone();
         output_graph.current_graph.x = output_features;
-        output_graph
+        Ok(output_graph)
     }
 
     /// Encode temporal context from recent events
-    fn encode_temporal_context(&self, temporal_graph: &TemporalGraphData) -> Tensor {
+    fn encode_temporal_context(&self, temporal_graph: &TemporalGraphData) -> Result<Tensor> {
         let num_nodes = temporal_graph.current_graph.num_nodes;
         let current_time = temporal_graph.current_time;
         let lookback_time = current_time - temporal_graph.time_window;
@@ -316,8 +313,7 @@ impl TGCNConv {
         let recent_events = temporal_graph.get_events_in_range(lookback_time, current_time);
 
         // Initialize temporal encoding
-        let _temporal_encoding = zeros::<f32>(&[num_nodes, self.out_features])
-            .expect("zeros temporal_encoding should succeed");
+        let _temporal_encoding = zeros::<f32>(&[num_nodes, self.out_features])?;
 
         // Simple temporal encoding based on event recency and frequency
         let mut node_event_counts = vec![0.0; num_nodes];
@@ -342,21 +338,20 @@ impl TGCNConv {
             })
             .collect();
 
-        from_vec(
+        Ok(from_vec(
             temporal_data,
             &[num_nodes, self.out_features],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec temporal_data should succeed")
+        )?)
     }
 }
 
 impl GraphLayer for TGCNConv {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         // Convert to temporal graph for processing
         let temporal_graph = TemporalGraphData::new(graph.clone(), 1.0, 1000);
-        let output_temporal = self.forward(&temporal_graph);
-        output_temporal.current_graph
+        let output_temporal = TGCNConv::forward(self, &temporal_graph)?;
+        Ok(output_temporal.current_graph)
     }
 
     fn parameters(&self) -> Vec<Tensor> {
@@ -396,32 +391,20 @@ impl TGATConv {
         time_encoding_dim: usize,
         dropout: f32,
         bias: bool,
-    ) -> Self {
-        let query_weight = Parameter::new(
-            randn(&[in_features, out_features]).expect("randn query_weight should succeed"),
-        );
-        let key_weight = Parameter::new(
-            randn(&[in_features, out_features]).expect("randn key_weight should succeed"),
-        );
-        let value_weight = Parameter::new(
-            randn(&[in_features, out_features]).expect("randn value_weight should succeed"),
-        );
-        let time_weight = Parameter::new(
-            randn(&[time_encoding_dim, out_features]).expect("randn time_weight should succeed"),
-        );
-        let output_weight = Parameter::new(
-            randn(&[out_features, out_features]).expect("randn output_weight should succeed"),
-        );
+    ) -> Result<Self> {
+        let query_weight = Parameter::new(randn(&[in_features, out_features])?);
+        let key_weight = Parameter::new(randn(&[in_features, out_features])?);
+        let value_weight = Parameter::new(randn(&[in_features, out_features])?);
+        let time_weight = Parameter::new(randn(&[time_encoding_dim, out_features])?);
+        let output_weight = Parameter::new(randn(&[out_features, out_features])?);
 
         let bias = if bias {
-            Some(Parameter::new(
-                zeros(&[out_features]).expect("zeros bias should succeed"),
-            ))
+            Some(Parameter::new(zeros(&[out_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             heads,
@@ -433,11 +416,11 @@ impl TGATConv {
             output_weight,
             bias,
             dropout,
-        }
+        })
     }
 
     /// Forward pass through TGAT layer
-    pub fn forward(&self, temporal_graph: &TemporalGraphData) -> TemporalGraphData {
+    pub fn forward(&self, temporal_graph: &TemporalGraphData) -> Result<TemporalGraphData> {
         let num_nodes = temporal_graph.current_graph.num_nodes;
         let head_dim = self.out_features / self.heads;
 
@@ -445,63 +428,47 @@ impl TGATConv {
         let queries = temporal_graph
             .current_graph
             .x
-            .matmul(&self.query_weight.clone_data())
-            .expect("matmul queries should succeed");
+            .matmul(&self.query_weight.clone_data())?;
         let keys = temporal_graph
             .current_graph
             .x
-            .matmul(&self.key_weight.clone_data())
-            .expect("matmul keys should succeed");
+            .matmul(&self.key_weight.clone_data())?;
         let values = temporal_graph
             .current_graph
             .x
-            .matmul(&self.value_weight.clone_data())
-            .expect("matmul values should succeed");
+            .matmul(&self.value_weight.clone_data())?;
 
         // Compute time encoding for each node based on recent activity
         let time_encoding = self.compute_time_encoding(temporal_graph);
-        let time_transformed = time_encoding
-            .matmul(&self.time_weight.clone_data())
-            .expect("matmul time_transformed should succeed");
+        let time_transformed = time_encoding?.matmul(&self.time_weight.clone_data())?;
 
         // Reshape for multi-head attention
-        let q = queries
-            .view(&[num_nodes as i32, self.heads as i32, head_dim as i32])
-            .expect("view queries should succeed");
-        let k = keys
-            .view(&[num_nodes as i32, self.heads as i32, head_dim as i32])
-            .expect("view keys should succeed");
-        let v = values
-            .view(&[num_nodes as i32, self.heads as i32, head_dim as i32])
-            .expect("view values should succeed");
+        let q = queries.view(&[num_nodes as i32, self.heads as i32, head_dim as i32])?;
+        let k = keys.view(&[num_nodes as i32, self.heads as i32, head_dim as i32])?;
+        let v = values.view(&[num_nodes as i32, self.heads as i32, head_dim as i32])?;
 
         // Perform temporal attention
         let attended_features =
             self.temporal_attention(&q, &k, &v, &time_transformed, temporal_graph);
 
         // Reshape and apply output transformation
-        let concatenated = attended_features
-            .view(&[num_nodes as i32, self.out_features as i32])
-            .expect("view concatenated should succeed");
-        let mut output = concatenated
-            .matmul(&self.output_weight.clone_data())
-            .expect("matmul output should succeed");
+        let concatenated =
+            attended_features?.view(&[num_nodes as i32, self.out_features as i32])?;
+        let mut output = concatenated.matmul(&self.output_weight.clone_data())?;
 
         // Add bias if present
         if let Some(ref bias) = self.bias {
-            output = output
-                .add(&bias.clone_data())
-                .expect("operation should succeed");
+            output = output.add(&bias.clone_data())?;
         }
 
         // Create output temporal graph
         let mut output_graph = temporal_graph.clone();
         output_graph.current_graph.x = output;
-        output_graph
+        Ok(output_graph)
     }
 
     /// Compute time encoding for nodes based on recent events
-    fn compute_time_encoding(&self, temporal_graph: &TemporalGraphData) -> Tensor {
+    fn compute_time_encoding(&self, temporal_graph: &TemporalGraphData) -> Result<Tensor> {
         let num_nodes = temporal_graph.current_graph.num_nodes;
         let current_time = temporal_graph.current_time;
 
@@ -525,12 +492,11 @@ impl TGATConv {
             }
         }
 
-        from_vec(
+        Ok(from_vec(
             time_features,
             &[num_nodes, self.time_encoding_dim],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec time_features should succeed")
+        )?)
     }
 
     /// Temporal attention mechanism
@@ -541,31 +507,23 @@ impl TGATConv {
         v: &Tensor,
         _time_encoding: &Tensor,
         temporal_graph: &TemporalGraphData,
-    ) -> Tensor {
+    ) -> Result<Tensor> {
         let num_nodes = temporal_graph.current_graph.num_nodes;
         let head_dim = self.out_features / self.heads;
 
         // Simplified temporal attention
-        let mut output =
-            zeros(&[num_nodes, self.heads, head_dim]).expect("zeros output should succeed");
+        let mut output = zeros(&[num_nodes, self.heads, head_dim])?;
 
         // For each head, compute attention with temporal bias
         for head in 0..self.heads {
             // Extract head-specific features
-            let _q_head = q
-                .slice_tensor(1, head, head + 1)
-                .expect("slice_tensor q_head should succeed");
-            let _k_head = k
-                .slice_tensor(1, head, head + 1)
-                .expect("slice_tensor k_head should succeed");
-            let v_head = v
-                .slice_tensor(1, head, head + 1)
-                .expect("slice_tensor v_head should succeed");
+            let _q_head = q.slice_tensor(1, head, head + 1)?;
+            let _k_head = k.slice_tensor(1, head, head + 1)?;
+            let v_head = v.slice_tensor(1, head, head + 1)?;
 
             // Simplified attention computation (using dot product)
             for i in 0..num_nodes {
-                let mut attended_value =
-                    zeros(&[head_dim]).expect("zeros attended_value should succeed");
+                let mut attended_value = zeros(&[head_dim])?;
                 let mut attention_sum = 0.0;
 
                 for j in 0..num_nodes {
@@ -574,48 +532,39 @@ impl TGATConv {
 
                     // Get value for node j
                     let v_j = v_head
-                        .slice_tensor(0, j, j + 1)
-                        .expect("slice_tensor v_j should succeed")
-                        .squeeze_tensor(0)
-                        .expect("squeeze_tensor should succeed")
-                        .squeeze_tensor(0)
-                        .expect("squeeze_tensor should succeed");
+                        .slice_tensor(0, j, j + 1)?
+                        .squeeze_tensor(0)?
+                        .squeeze_tensor(0)?;
 
-                    let weighted_value = v_j.mul_scalar(score).expect("mul_scalar should succeed");
-                    attended_value = attended_value
-                        .add(&weighted_value)
-                        .expect("operation should succeed");
+                    let weighted_value = v_j.mul_scalar(score)?;
+                    attended_value = attended_value.add(&weighted_value)?;
                     attention_sum += score;
                 }
 
                 // Normalize
                 if attention_sum > 0.0 {
-                    attended_value = attended_value
-                        .div_scalar(attention_sum)
-                        .expect("div_scalar should succeed");
+                    attended_value = attended_value.div_scalar(attention_sum)?;
                 }
 
                 // Store in output (simplified assignment)
-                let attended_data = attended_value.to_vec().expect("conversion should succeed");
+                let attended_data = attended_value.to_vec()?;
                 for (dim, &val) in attended_data.iter().enumerate() {
                     if dim < head_dim {
-                        output
-                            .set_item(&[i, head, dim], val)
-                            .expect("set_item should succeed");
+                        output.set_item(&[i, head, dim], val)?;
                     }
                 }
             }
         }
 
-        output
+        Ok(output)
     }
 }
 
 impl GraphLayer for TGATConv {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         let temporal_graph = TemporalGraphData::new(graph.clone(), 1.0, 1000);
-        let output_temporal = self.forward(&temporal_graph);
-        output_temporal.current_graph
+        let output_temporal = TGATConv::forward(self, &temporal_graph)?;
+        Ok(output_temporal.current_graph)
     }
 
     fn parameters(&self) -> Vec<Tensor> {
@@ -656,27 +605,19 @@ impl TGNConv {
         memory_dim: usize,
         time_encoding_dim: usize,
         bias: bool,
-    ) -> Self {
-        let message_function = Parameter::new(
-            randn(&[in_features + time_encoding_dim, memory_dim])
-                .expect("randn message_function should succeed"),
-        );
-        let memory_updater = Parameter::new(
-            randn(&[memory_dim * 2, memory_dim]).expect("randn memory_updater should succeed"),
-        );
-        let node_embedding = Parameter::new(
-            randn(&[memory_dim, out_features]).expect("randn node_embedding should succeed"),
-        );
+    ) -> Result<Self> {
+        let message_function =
+            Parameter::new(randn(&[in_features + time_encoding_dim, memory_dim])?);
+        let memory_updater = Parameter::new(randn(&[memory_dim * 2, memory_dim])?);
+        let node_embedding = Parameter::new(randn(&[memory_dim, out_features])?);
 
         let bias = if bias {
-            Some(Parameter::new(
-                zeros(&[out_features]).expect("zeros bias should succeed"),
-            ))
+            Some(Parameter::new(zeros(&[out_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             memory_dim,
@@ -687,25 +628,28 @@ impl TGNConv {
             bias,
             node_memories: HashMap::new(),
             last_update_times: HashMap::new(),
-        }
+        })
     }
 
     /// Forward pass through TGN layer
-    pub fn forward(&mut self, temporal_graph: &TemporalGraphData) -> TemporalGraphData {
+    ///
+    /// # Errors
+    /// Propagates memory-update and embedding tensor-operation failures.
+    pub fn forward(&mut self, temporal_graph: &TemporalGraphData) -> Result<TemporalGraphData> {
         // Update node memories based on recent events
-        self.update_memories(temporal_graph);
+        self.update_memories(temporal_graph)?;
 
         // Generate node embeddings from memories
-        let output_features = self.generate_embeddings(temporal_graph);
+        let output_features = self.generate_embeddings(temporal_graph)?;
 
         // Create output temporal graph
         let mut output_graph = temporal_graph.clone();
         output_graph.current_graph.x = output_features;
-        output_graph
+        Ok(output_graph)
     }
 
     /// Update node memories based on temporal events
-    fn update_memories(&mut self, temporal_graph: &TemporalGraphData) {
+    fn update_memories(&mut self, temporal_graph: &TemporalGraphData) -> Result<()> {
         let current_time = temporal_graph.current_time;
         let lookback_time = current_time - temporal_graph.time_window;
 
@@ -715,16 +659,18 @@ impl TGNConv {
         for event in recent_events {
             if let Some(node_id) = event.node {
                 // Generate message from event
-                let message = self.compute_message(event, current_time);
+                let message = self.compute_message(event, current_time)?;
 
                 // Update node memory
-                self.update_node_memory(node_id, message, event.time);
+                self.update_node_memory(node_id, message, event.time)?;
             }
         }
+
+        Ok(())
     }
 
     /// Compute message from temporal event
-    fn compute_message(&self, event: &TemporalEvent, current_time: f64) -> Tensor {
+    fn compute_message(&self, event: &TemporalEvent, current_time: f64) -> Result<Tensor> {
         // Time encoding
         let time_diff = (current_time - event.time) as f32;
         let mut time_encoding = Vec::new();
@@ -736,7 +682,7 @@ impl TGNConv {
 
         // Combine event features with time encoding
         let mut message_input = if let Some(ref features) = event.features {
-            features.to_vec().expect("conversion should succeed")
+            features.to_vec()?
         } else {
             vec![1.0; self.in_features] // Default features
         };
@@ -747,27 +693,28 @@ impl TGNConv {
             message_input,
             &[1, self.in_features + self.time_encoding_dim],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec input_tensor should succeed");
+        )?;
 
         // Apply message function
-        input_tensor
-            .matmul(&self.message_function.clone_data())
-            .expect("matmul message should succeed")
+        Ok(input_tensor.matmul(&self.message_function.clone_data())?)
     }
 
     /// Update memory for a specific node
-    fn update_node_memory(&mut self, node_id: usize, message: Tensor, event_time: f64) {
+    fn update_node_memory(
+        &mut self,
+        node_id: usize,
+        message: Tensor,
+        event_time: f64,
+    ) -> Result<()> {
         // Get current memory or initialize
-        let current_memory = self
-            .node_memories
-            .get(&node_id)
-            .cloned()
-            .unwrap_or_else(|| zeros(&[1, self.memory_dim]).expect("zeros memory should succeed"));
+        let current_memory = match self.node_memories.get(&node_id).cloned() {
+            Some(memory) => memory,
+            None => zeros(&[1, self.memory_dim])?,
+        };
 
         // Concatenate current memory and message
-        let current_data = current_memory.to_vec().expect("conversion should succeed");
-        let message_data = message.to_vec().expect("conversion should succeed");
+        let current_data = current_memory.to_vec()?;
+        let message_data = message.to_vec()?;
         let mut combined_data = current_data;
         combined_data.extend(message_data);
 
@@ -775,36 +722,30 @@ impl TGNConv {
             combined_data,
             &[1, self.memory_dim * 2],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec combined_tensor should succeed");
+        )?;
 
         // Update memory using memory updater
-        let new_memory = combined_tensor
-            .matmul(&self.memory_updater.clone_data())
-            .expect("matmul new_memory should succeed");
+        let new_memory = combined_tensor.matmul(&self.memory_updater.clone_data())?;
 
         self.node_memories.insert(node_id, new_memory);
         self.last_update_times.insert(node_id, event_time);
+
+        Ok(())
     }
 
     /// Generate node embeddings from memories
-    fn generate_embeddings(&self, temporal_graph: &TemporalGraphData) -> Tensor {
+    fn generate_embeddings(&self, temporal_graph: &TemporalGraphData) -> Result<Tensor> {
         let num_nodes = temporal_graph.current_graph.num_nodes;
         let mut embeddings = Vec::new();
 
         for node_id in 0..num_nodes {
-            let memory = self
-                .node_memories
-                .get(&node_id)
-                .cloned()
-                .unwrap_or_else(|| {
-                    zeros(&[1, self.memory_dim]).expect("zeros memory should succeed")
-                });
+            let memory = match self.node_memories.get(&node_id).cloned() {
+                Some(memory) => memory,
+                None => zeros(&[1, self.memory_dim])?,
+            };
 
-            let embedding = memory
-                .matmul(&self.node_embedding.clone_data())
-                .expect("operation should succeed");
-            let embedding_data = embedding.to_vec().expect("conversion should succeed");
+            let embedding = memory.matmul(&self.node_embedding.clone_data())?;
+            let embedding_data = embedding.to_vec()?;
             embeddings.extend(embedding_data);
         }
 
@@ -812,17 +753,14 @@ impl TGNConv {
             embeddings,
             &[num_nodes, self.out_features],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("from_vec embeddings should succeed");
+        )?;
 
         // Add bias if present
         if let Some(ref bias) = self.bias {
-            output = output
-                .add(&bias.clone_data())
-                .expect("operation should succeed");
+            output = output.add(&bias.clone_data())?;
         }
 
-        output
+        Ok(output)
     }
 }
 
@@ -843,15 +781,11 @@ pub mod pooling {
     pub fn temporal_pool(
         temporal_graph: &TemporalGraphData,
         method: TemporalPoolingMethod,
-    ) -> Tensor {
+    ) -> Result<Tensor> {
         match method {
             TemporalPoolingMethod::MostRecent => {
                 // Use current graph features
-                temporal_graph
-                    .current_graph
-                    .x
-                    .mean(Some(&[0]), false)
-                    .expect("mean pooling should succeed")
+                Ok(temporal_graph.current_graph.x.mean(Some(&[0]), false)?)
             }
             TemporalPoolingMethod::TimeWeightedMean => time_weighted_pool(temporal_graph),
             TemporalPoolingMethod::ExponentialDecay => exponential_decay_pool(temporal_graph),
@@ -860,36 +794,27 @@ pub mod pooling {
     }
 
     /// Time-weighted pooling based on event recency
-    fn time_weighted_pool(temporal_graph: &TemporalGraphData) -> Tensor {
+    fn time_weighted_pool(temporal_graph: &TemporalGraphData) -> Result<Tensor> {
         let current_time = temporal_graph.current_time;
         let lookback_time = current_time - temporal_graph.time_window;
         let recent_events = temporal_graph.get_events_in_range(lookback_time, current_time);
 
         if recent_events.is_empty() {
-            return temporal_graph
-                .current_graph
-                .x
-                .mean(Some(&[0]), false)
-                .expect("mean pooling should succeed");
+            return Ok(temporal_graph.current_graph.x.mean(Some(&[0]), false)?);
         }
 
         // Weight events by recency
-        let mut weighted_sum = zeros(&[temporal_graph.current_graph.x.shape().dims()[1]])
-            .expect("zeros weighted_sum should succeed");
+        let mut weighted_sum = zeros(&[temporal_graph.current_graph.x.shape().dims()[1]])?;
         let mut total_weight = 0.0;
 
         for event in recent_events {
             if let Some(ref features) = event.features {
                 let weight = 1.0 - (current_time - event.time) / temporal_graph.time_window;
-                let weighted_features = features
-                    .mul_scalar(weight as f32)
-                    .expect("mul_scalar should succeed");
+                let weighted_features = features.mul_scalar(weight as f32)?;
 
                 // Sum the features (simplified)
-                let features_data = weighted_features
-                    .to_vec()
-                    .expect("conversion should succeed");
-                let current_data = weighted_sum.to_vec().expect("conversion should succeed");
+                let features_data = weighted_features.to_vec()?;
+                let current_data = weighted_sum.to_vec()?;
                 let mut new_data = Vec::new();
 
                 for (_i, (&current, &new)) in
@@ -902,60 +827,43 @@ pub mod pooling {
                     new_data,
                     &[weighted_sum.shape().dims()[0]],
                     torsh_core::device::DeviceType::Cpu,
-                )
-                .expect("from_vec weighted_sum should succeed");
+                )?;
 
                 total_weight += weight;
             }
         }
 
         if total_weight > 0.0 {
-            weighted_sum
-                .div_scalar(total_weight as f32)
-                .expect("div_scalar should succeed")
+            Ok(weighted_sum.div_scalar(total_weight as f32)?)
         } else {
-            temporal_graph
-                .current_graph
-                .x
-                .mean(Some(&[0]), false)
-                .expect("mean pooling should succeed")
+            Ok(temporal_graph.current_graph.x.mean(Some(&[0]), false)?)
         }
     }
 
     /// Exponential decay pooling
-    fn exponential_decay_pool(temporal_graph: &TemporalGraphData) -> Tensor {
+    fn exponential_decay_pool(temporal_graph: &TemporalGraphData) -> Result<Tensor> {
         let decay_rate = 0.1; // Decay parameter
         let current_time = temporal_graph.current_time;
 
         // Simple exponential decay - use current features
         let decay_factor = (-decay_rate * current_time).exp() as f32;
-        temporal_graph
+        Ok(temporal_graph
             .current_graph
             .x
-            .mul_scalar(decay_factor)
-            .expect("mul_scalar should succeed")
-            .mean(Some(&[0]), false)
-            .expect("mean pooling should succeed")
+            .mul_scalar(decay_factor)?
+            .mean(Some(&[0]), false)?)
     }
 
     /// Attention-based temporal pooling
-    fn attention_temporal_pool(temporal_graph: &TemporalGraphData) -> Tensor {
+    fn attention_temporal_pool(temporal_graph: &TemporalGraphData) -> Result<Tensor> {
         // Simplified attention pooling
         let features = &temporal_graph.current_graph.x;
-        let attention_scores = features
-            .sum_dim(&[1], false)
-            .expect("sum_dim should succeed");
-        let attention_weights = attention_scores.softmax(0).expect("softmax should succeed");
-        let attention_expanded = attention_weights
-            .unsqueeze(-1)
-            .expect("unsqueeze should succeed");
+        let attention_scores = features.sum_dim(&[1], false)?;
+        let attention_weights = attention_scores.softmax(0)?;
+        let attention_expanded = attention_weights.unsqueeze(-1)?;
 
-        let weighted_features = features
-            .mul(&attention_expanded)
-            .expect("operation should succeed");
-        weighted_features
-            .sum_dim(&[0], false)
-            .expect("sum_dim should succeed")
+        let weighted_features = features.mul(&attention_expanded)?;
+        Ok(weighted_features.sum_dim(&[0], false)?)
     }
 }
 
@@ -969,7 +877,7 @@ pub mod utils {
         num_nodes: usize,
         time_span: f64,
         feature_dim: usize,
-    ) -> Vec<TemporalEvent> {
+    ) -> Result<Vec<TemporalEvent>> {
         let mut rng = scirs2_core::random::thread_rng();
         let mut events = Vec::new();
 
@@ -996,7 +904,7 @@ pub mod utils {
             };
 
             let features = if matches!(event_type, EventType::NodeFeatureUpdate) {
-                Some(randn(&[feature_dim]).expect("randn features should succeed"))
+                Some(randn(&[feature_dim])?)
             } else {
                 None
             };
@@ -1016,9 +924,9 @@ pub mod utils {
         events.sort_by(|a, b| {
             a.time
                 .partial_cmp(&b.time)
-                .expect("time comparison should succeed")
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
-        events
+        Ok(events)
     }
 
     /// Create temporal graph from event sequence
@@ -1026,14 +934,14 @@ pub mod utils {
         initial_graph: GraphData,
         events: Vec<TemporalEvent>,
         time_window: f64,
-    ) -> TemporalGraphData {
+    ) -> Result<TemporalGraphData> {
         let mut temporal_graph = TemporalGraphData::new(initial_graph, time_window, 10000);
 
         for event in events {
-            temporal_graph.add_event(event);
+            temporal_graph.add_event(event)?;
         }
 
-        temporal_graph
+        Ok(temporal_graph)
     }
 
     /// Compute temporal graph metrics
@@ -1113,7 +1021,7 @@ mod tests {
             weight: None,
         };
 
-        temporal_graph.add_event(event);
+        temporal_graph.add_event(event).expect("add event");
 
         assert_eq!(temporal_graph.current_time, 1.0);
         assert!(!temporal_graph.events.is_empty());
@@ -1127,9 +1035,11 @@ mod tests {
         let graph = GraphData::new(features, edge_index);
 
         let temporal_graph = TemporalGraphData::new(graph, 1.0, 100);
-        let tgcn = TGCNConv::new(4, 8, 16, 64, true);
+        let tgcn = TGCNConv::new(4, 8, 16, 64, true).expect("operation should succeed");
 
-        let output = tgcn.forward(&temporal_graph);
+        let output = tgcn
+            .forward(&temporal_graph)
+            .expect("operation should succeed");
         assert_eq!(output.current_graph.x.shape().dims(), &[3, 8]);
     }
 
@@ -1141,9 +1051,11 @@ mod tests {
         let graph = GraphData::new(features, edge_index);
 
         let temporal_graph = TemporalGraphData::new(graph, 2.0, 200);
-        let tgat = TGATConv::new(6, 12, 3, 8, 0.1, true);
+        let tgat = TGATConv::new(6, 12, 3, 8, 0.1, true).expect("operation should succeed");
 
-        let output = tgat.forward(&temporal_graph);
+        let output = tgat
+            .forward(&temporal_graph)
+            .expect("operation should succeed");
         assert_eq!(output.current_graph.x.shape().dims(), &[4, 12]);
     }
 
@@ -1157,19 +1069,22 @@ mod tests {
         let temporal_graph = TemporalGraphData::new(graph, 3.0, 150);
 
         let pooled =
-            pooling::temporal_pool(&temporal_graph, pooling::TemporalPoolingMethod::MostRecent);
+            pooling::temporal_pool(&temporal_graph, pooling::TemporalPoolingMethod::MostRecent)
+                .expect("operation should succeed");
         assert_eq!(pooled.shape().dims(), &[4]);
 
         let weighted_pooled = pooling::temporal_pool(
             &temporal_graph,
             pooling::TemporalPoolingMethod::TimeWeightedMean,
-        );
+        )
+        .expect("operation should succeed");
         assert_eq!(weighted_pooled.shape().dims(), &[4]);
     }
 
     #[test]
     fn test_temporal_utils() {
-        let events = utils::generate_random_events(10, 5, 10.0, 3);
+        let events =
+            utils::generate_random_events(10, 5, 10.0, 3).expect("operation should succeed");
         assert_eq!(events.len(), 10);
 
         // Check that events are sorted by time
@@ -1182,7 +1097,8 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 5], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let temporal_graph = utils::create_temporal_graph_from_events(graph, events, 5.0);
+        let temporal_graph = utils::create_temporal_graph_from_events(graph, events, 5.0)
+            .expect("operation should succeed");
         let metrics = utils::temporal_metrics(&temporal_graph);
 
         assert!(metrics.total_events > 0);
@@ -1209,7 +1125,7 @@ mod tests {
                 features: Some(randn(&[2]).unwrap()),
                 weight: None,
             };
-            temporal_graph.add_event(event);
+            temporal_graph.add_event(event).expect("add event");
         }
 
         let events_in_range = temporal_graph.get_events_in_range(1.0, 3.0);

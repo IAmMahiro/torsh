@@ -73,79 +73,42 @@ let augmix = AugMix::new(severity=3, width=3, depth=-1, alpha=1.0);
 ### Datasets
 
 ```rust
-use torsh_vision::datasets::*;
+use torsh_vision::datasets_impl::*;
 
-// ImageNet dataset
-let imagenet = ImageNet::new(
-    root="./data/imagenet",
-    split="train",
-    transform=Some(transform),
-    download=false,
-)?;
+// ImageNet dataset — NOTE: currently a placeholder. It prints a warning and
+// returns a single dummy zero tensor rather than loading real ImageNet data.
+let imagenet = ImageNet::new("./data/imagenet", true)?;
 
-// COCO dataset
-let coco = COCODetection::new(
-    root="./data/coco",
-    split="train2017",
-    transform=Some(transform),
-    target_transform=None,
-)?;
+// COCO dataset (CocoDataset) — also a placeholder implementation today.
+let coco = CocoDataset::new("./data/coco", true)?;
 
-// CIFAR datasets
-let cifar10 = CIFAR10::new(
-    root="./data",
-    train=true,
-    transform=Some(transform),
-    download=true,
-)?;
+// CIFAR-10 — real loader (parses the actual binary batch files)
+let cifar10 = CIFAR10::new("./data", true, true)?;
 
-// Custom folder dataset
-let dataset = ImageFolder::new(
-    root="./data/custom",
-    transform=Some(transform),
-    extensions=Some(vec!["jpg", "jpeg", "png"]),
-)?;
-
-// Video dataset
-let video_dataset = VideoFolder::new(
-    root="./data/videos",
-    clip_len=16,
-    frame_interval=1,
-    num_clips=1,
-    transform=Some(video_transform),
-)?;
+// Custom folder dataset — real loader, scans subdirectories as classes
+let dataset = ImageFolder::new("./data/custom")?;
 ```
+
+There is currently no `VideoFolder` dataset type; video-specific data loading utilities
+live in `torsh_vision::video` (see Video Processing below).
 
 ### Pre-trained Models
 
 ```rust
 use torsh_vision::models::*;
 
-// Classification models
-let resnet = resnet50(pretrained=true, num_classes=1000)?;
-let efficientnet = efficientnet_b0(pretrained=true)?;
-let vit = vit_base_patch16_224(pretrained=true)?;
+// Classification models. NOTE: `ModelConfig` carries a `pretrained` flag, but
+// weight download/loading is not wired up yet — models always initialize
+// with fresh, randomly-initialized weights (see TODO.md "Model Zoo").
+let resnet = ResNet::resnet50(ModelConfig::default())?;
+let efficientnet = EfficientNet::efficientnet_b0(ModelConfig::default())?;
+let vit = VisionTransformer::vit_base_patch16_224(ModelConfig::default())?;
 
-// Object detection
-let faster_rcnn = fasterrcnn_resnet50_fpn(
-    pretrained=true,
-    num_classes=91,
-    pretrained_backbone=true,
-)?;
-
-// Segmentation
-let deeplabv3 = deeplabv3_resnet101(
-    pretrained=true,
-    num_classes=21,
-    aux_loss=true,
-)?;
-
-// Feature extraction
-let features = resnet.features(&input)?;
-let backbone = create_feature_extractor(
-    &resnet,
-    return_nodes=vec!["layer1", "layer2", "layer3", "layer4"],
-)?;
+// Object detection — real factory functions (YOLOv5 / RetinaNet / SSD).
+// There is no Faster R-CNN or DeepLabV3 implementation in this crate yet.
+let yolo = yolo_v5_small(80)?;
+let retina_net = retina_net_resnet50(80)?;
+let ssd = ssd_300(80)?;
 ```
 
 ### Image Operations
@@ -154,45 +117,40 @@ let backbone = create_feature_extractor(
 use torsh_vision::ops::*;
 
 // Basic operations (leveraging scirs2-vision)
-let resized = resize(&image, size=[224, 224], interpolation="bilinear")?;
-let cropped = crop(&image, top=10, left=10, height=200, width=200)?;
-let flipped = hflip(&image)?;
-let rotated = rotate(&image, angle=45.0, fill=vec![0, 0, 0])?;
+let resized = resize(&image, (224, 224))?;
+let flipped = horizontal_flip(&image)?;
+let rotated = rotate(&image, 45.0)?;
 
 // Filtering
-let blurred = gaussian_blur(&image, kernel_size=[5, 5], sigma=[1.0, 1.0])?;
-let sharpened = adjust_sharpness(&image, sharpness_factor=2.0)?;
+let blurred = gaussian_blur(&image, 1.0)?;
 let edge = sobel_edge_detection(&image)?;
 
 // Color adjustments
-let bright = adjust_brightness(&image, brightness_factor=1.5)?;
-let contrast = adjust_contrast(&image, contrast_factor=1.5)?;
-let saturated = adjust_saturation(&image, saturation_factor=1.5)?;
-
-// Advanced operations
-let slic = slic_superpixels(&image, n_segments=100, compactness=10.0)?;
-let optical_flow = dense_optical_flow(&frame1, &frame2, method="farneback")?;
+let bright = adjust_brightness(&image, 1.5)?;
+let contrast = adjust_contrast(&image, 1.5)?;
+let saturated = adjust_saturation(&image, 1.5)?;
 ```
+
+Note: there is no generic `crop()`, `adjust_sharpness()`, `slic_superpixels()`, or
+`dense_optical_flow()` free function today. Cropping is available via the
+`CenterCrop`/`RandomCrop` transforms, and Lucas-Kanade optical flow is available
+through `torsh_vision::video::OpticalFlow`.
 
 ### Object Detection Utilities
 
 ```rust
-use torsh_vision::utils::*;
+use torsh_vision::{box_iou, nms, generate_anchors};
+use torsh_vision::ops::detection::{roi_pool, ROIPoolConfig, AnchorConfig};
 
-// Bounding box operations
-let iou = box_iou(&boxes1, &boxes2)?;
-let nms_keep = nms(&boxes, &scores, iou_threshold=0.5)?;
-let converted = box_convert(&boxes, in_fmt="xyxy", out_fmt="cxcywh")?;
+// Bounding box IoU (single pair) and NMS
+let iou = box_iou(&box1, &box2); // f32, not a batched tensor op
+let kept = nms(detections, NMSConfig::default())?;
 
-// Anchor generation
-let anchors = AnchorGenerator::new(
-    sizes=vec![vec![32], vec![64], vec![128], vec![256], vec![512]],
-    aspect_ratios=vec![vec![0.5, 1.0, 2.0]; 5],
-)?;
+// Anchor generation is a function, not a builder struct
+let anchors = generate_anchors(feature_height, feature_width, AnchorConfig::default())?;
 
-// ROI operations
-let roi_pool = roi_pool(&features, &boxes, output_size=[7, 7], spatial_scale=0.25)?;
-let roi_align = roi_align(&features, &boxes, output_size=[7, 7], spatial_scale=0.25)?;
+// ROI pooling (there is no roi_align yet)
+let pooled = roi_pool(&features, &rois, ROIPoolConfig::default())?;
 ```
 
 ### Visualization
@@ -200,91 +158,40 @@ let roi_align = roi_align(&features, &boxes, output_size=[7, 7], spatial_scale=0
 ```rust
 use torsh_vision::utils::*;
 
-// Draw bounding boxes
-let annotated = draw_bounding_boxes(
-    &image,
-    &boxes,
-    labels=Some(&labels),
-    colors=None,
-    width=2,
-)?;
+// Draw bounding boxes (mutates `image` in place)
+draw_bounding_boxes(&mut image, &boxes, Some(&labels), None, None)?;
 
-// Draw segmentation masks
-let masked = draw_segmentation_masks(
-    &image,
-    &masks,
-    alpha=0.7,
-    colors=None,
-)?;
+// Create image grid (tensors, nrow, padding)
+let grid = make_grid(&tensor_list, 8, 2)?;
 
-// Draw keypoints
-let keypoint_image = draw_keypoints(
-    &image,
-    &keypoints,
-    connectivity=Some(&COCO_PERSON_SKELETON),
-    colors=None,
-    radius=3,
-)?;
-
-// Create image grid
-let grid = make_grid(
-    &tensor_list,
-    nrow=8,
-    padding=2,
-    normalize=true,
-    value_range=None,
-)?;
-
-// Save visualization
-save_image(&grid, "visualization.png")?;
+// Save a tensor as an image (tensor, path, normalize)
+save_tensor_as_image(&grid, "visualization.png", true)?;
 ```
+
+Note: there is currently no `draw_segmentation_masks()` or `draw_keypoints()` helper
+(and no `COCO_PERSON_SKELETON` constant) in this crate.
 
 ### Video Processing
 
 ```rust
 use torsh_vision::video::*;
 
-// Read video
-let video = read_video("input.mp4", start_pts=0, end_pts=None)?;
-let frames = video.frames;  // Tensor of shape [T, C, H, W]
-let audio = video.audio;    // Optional audio tensor
+// There is no read_video()/write_video() free function (and no audio
+// support) yet — video I/O goes through the VideoReader/VideoWriter
+// traits and their Simple* implementations.
+let reader = SimpleVideoReader::from_images(&["frame1.png", "frame2.png"], 30.0)?;
+let mut writer = SimpleVideoWriter::new("output.mp4", 30.0);
 
-// Write video
-write_video(
-    "output.mp4",
-    &frames,
-    fps=30.0,
-    video_codec="h264",
-    audio=audio,
-    audio_codec="aac",
-)?;
-
-// Video transforms
-let video_transform = VideoCompose::new(vec![
-    Box::new(VideoResize::new(256)),
-    Box::new(VideoCenterCrop::new(224)),
-    Box::new(VideoNormalize::imagenet()),
-]);
+// Apply a frame-wise transform across a video
+let video_transform = VideoTransform::new(my_frame_transform);
 ```
 
 ### Feature Extraction and Similarity
 
-```rust
-// Extract features
-let feature_extractor = create_feature_extractor(
-    &model,
-    return_nodes=vec!["avgpool"],
-)?;
-let features = feature_extractor(&images)?;
-
-// Image similarity
-let similarity = cosine_similarity(&features1, &features2)?;
-
-// Image retrieval
-let retrieval_system = ImageRetrieval::new(feature_extractor);
-retrieval_system.add_images(&database_images)?;
-let similar_images = retrieval_system.search(&query_image, top_k=10)?;
-```
+There is currently no `create_feature_extractor()`, `cosine_similarity()`, or
+`ImageRetrieval` public API in this crate — feature-map extraction is limited to
+whatever a given model architecture exposes directly (e.g. intermediate forward
+outputs), and there is no built-in CBIR/image-retrieval system yet.
 
 ## Integration with SciRS2
 

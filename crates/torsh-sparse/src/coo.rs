@@ -2,7 +2,7 @@
 
 use crate::{CsrTensor, SparseFormat, SparseTensor, TorshResult};
 use torsh_core::{device::DeviceType, DType, Shape, TorshError};
-use torsh_tensor::{creation::zeros, Tensor};
+use torsh_tensor::Tensor;
 
 /// COO (Coordinate) format sparse tensor
 #[derive(Debug, Clone)]
@@ -19,6 +19,8 @@ pub struct CooTensor {
     dtype: DType,
     /// Device
     device: DeviceType,
+    /// Whether the entries are sorted by (row, col) and free of duplicates
+    is_coalesced: bool,
 }
 
 impl CooTensor {
@@ -52,6 +54,8 @@ impl CooTensor {
             }
         }
 
+        let is_coalesced = Self::entries_are_coalesced(&row_indices, &col_indices);
+
         Ok(Self {
             row_indices,
             col_indices,
@@ -59,7 +63,82 @@ impl CooTensor {
             shape,
             dtype: DType::F32,
             device: DeviceType::Cpu,
+            is_coalesced,
         })
+    }
+
+    /// True when the entries are strictly increasing in (row, col) order, which
+    /// implies there are no duplicate coordinates.
+    fn entries_are_coalesced(row_indices: &[usize], col_indices: &[usize]) -> bool {
+        row_indices
+            .windows(2)
+            .zip(col_indices.windows(2))
+            .all(|(rows, cols)| (rows[0], cols[0]) < (rows[1], cols[1]))
+    }
+
+    /// Whether this tensor is coalesced: entries sorted by `(row, col)` with no
+    /// duplicate coordinates.
+    ///
+    /// PyTorch semantics: duplicate coordinates are *summed*, so a tensor that
+    /// is not coalesced still denotes the sum of its entries.
+    pub fn is_coalesced(&self) -> bool {
+        self.is_coalesced
+    }
+
+    /// Sort the entries by `(row, col)`, sum duplicate coordinates and drop
+    /// entries that become exactly zero.
+    ///
+    /// This is what makes `matvec`, `to_dense` and the CSR/CSC conversions agree
+    /// on the value of a tensor built with repeated coordinates.
+    pub fn coalesce(&mut self) {
+        if self.is_coalesced {
+            return;
+        }
+
+        let mut entries: Vec<(usize, usize, f32)> = self.triplets();
+        entries.sort_by_key(|&(row, col, _)| (row, col));
+
+        let mut row_indices = Vec::with_capacity(entries.len());
+        let mut col_indices = Vec::with_capacity(entries.len());
+        let mut values = Vec::with_capacity(entries.len());
+
+        for (row, col, value) in entries {
+            if let (Some(&last_row), Some(&last_col)) = (row_indices.last(), col_indices.last()) {
+                if last_row == row && last_col == col {
+                    if let Some(last) = values.last_mut() {
+                        *last += value;
+                    }
+                    continue;
+                }
+            }
+            row_indices.push(row);
+            col_indices.push(col);
+            values.push(value);
+        }
+
+        // Drop coordinates whose accumulated value cancelled out.
+        let mut kept_rows = Vec::with_capacity(values.len());
+        let mut kept_cols = Vec::with_capacity(values.len());
+        let mut kept_values = Vec::with_capacity(values.len());
+        for i in 0..values.len() {
+            if values[i] != 0.0 {
+                kept_rows.push(row_indices[i]);
+                kept_cols.push(col_indices[i]);
+                kept_values.push(values[i]);
+            }
+        }
+
+        self.row_indices = kept_rows;
+        self.col_indices = kept_cols;
+        self.values = kept_values;
+        self.is_coalesced = true;
+    }
+
+    /// Return a coalesced copy, leaving `self` untouched.
+    pub fn coalesced(&self) -> Self {
+        let mut result = self.clone();
+        result.coalesce();
+        result
     }
 
     /// Create from dense tensor
@@ -107,6 +186,7 @@ impl CooTensor {
             shape,
             dtype,
             device: DeviceType::Cpu,
+            is_coalesced: true,
         })
     }
 
@@ -140,9 +220,19 @@ impl CooTensor {
             )));
         }
 
+        // Appending keeps the coalesced property only if the new coordinate is
+        // strictly after the current last one.
+        let still_coalesced = match (self.row_indices.last(), self.col_indices.last()) {
+            (Some(&last_row), Some(&last_col)) => {
+                self.is_coalesced && (last_row, last_col) < (row, col)
+            }
+            _ => true,
+        };
+
         self.row_indices.push(row);
         self.col_indices.push(col);
         self.values.push(value);
+        self.is_coalesced = still_coalesced;
 
         Ok(())
     }
@@ -186,17 +276,22 @@ impl CooTensor {
         self.row_indices = row_indices;
         self.col_indices = col_indices;
         self.values = values;
+        self.is_coalesced = Self::entries_are_coalesced(&self.row_indices, &self.col_indices);
     }
 
     /// Transpose the sparse tensor
     pub fn transpose(&self) -> Self {
+        let row_indices = self.col_indices.clone();
+        let col_indices = self.row_indices.clone();
+        let is_coalesced = Self::entries_are_coalesced(&row_indices, &col_indices);
         Self {
-            row_indices: self.col_indices.clone(),
-            col_indices: self.row_indices.clone(),
+            row_indices,
+            col_indices,
             values: self.values.clone(),
             shape: Shape::new(vec![self.shape.dims()[1], self.shape.dims()[0]]),
             dtype: self.dtype,
             device: self.device,
+            is_coalesced,
         }
     }
 }
@@ -223,13 +318,16 @@ impl SparseTensor for CooTensor {
     }
 
     fn to_dense(&self) -> TorshResult<Tensor> {
-        let dense = zeros::<f32>(self.shape.dims())?;
+        // Duplicate coordinates are summed (PyTorch semantics), which is what
+        // `CsrTensor::matvec` and the sparse kernels do as well.
+        let (rows, cols) = (self.shape.dims()[0], self.shape.dims()[1]);
+        let mut data = vec![0.0f32; rows * cols];
 
         for i in 0..self.nnz() {
-            dense.set(&[self.row_indices[i], self.col_indices[i]], self.values[i])?;
+            data[self.row_indices[i] * cols + self.col_indices[i]] += self.values[i];
         }
 
-        Ok(dense)
+        Tensor::from_data(data, vec![rows, cols], self.device)
     }
 
     fn to_coo(&self) -> TorshResult<CooTensor> {
@@ -237,11 +335,7 @@ impl SparseTensor for CooTensor {
     }
 
     fn to_csr(&self) -> TorshResult<CsrTensor> {
-        // Sort by row if not already sorted
-        let mut coo = self.clone();
-        coo.sort_indices();
-
-        CsrTensor::from_coo(&coo)
+        CsrTensor::from_coo(self)
     }
 
     fn to_csc(&self) -> TorshResult<crate::CscTensor> {

@@ -376,6 +376,7 @@ impl StressTestRunner {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_high_concurrency_stress() -> Result<()> {
     let config = StressTestConfig {
         max_concurrent_ops: 50, // Reduced for test
@@ -398,6 +399,7 @@ async fn test_high_concurrency_stress() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_memory_pressure_stress() -> Result<()> {
     let config = StressTestConfig {
         test_duration: Duration::from_secs(10),
@@ -425,6 +427,7 @@ async fn test_memory_pressure_stress() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_endurance_stress() -> Result<()> {
     let config = StressTestConfig {
         endurance_iterations: 200, // Reduced for test
@@ -447,6 +450,7 @@ async fn test_endurance_stress() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_network_saturation_stress() -> Result<()> {
     let config = StressTestConfig {
         test_duration: Duration::from_secs(8),
@@ -471,6 +475,7 @@ async fn test_network_saturation_stress() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_large_tensor_stress() -> Result<()> {
     let pg = init_process_group(BackendType::Gloo, 0, 2, "127.0.0.1", 50040).await?;
 
@@ -516,6 +521,7 @@ async fn test_large_tensor_stress() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_rapid_world_size_changes() -> Result<()> {
     // Test rapidly changing world sizes
     let world_sizes = [2, 4, 8, 4, 2];
@@ -547,6 +553,7 @@ async fn test_rapid_world_size_changes() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_mixed_operation_stress() -> Result<()> {
     let pg = init_process_group(BackendType::Gloo, 0, 4, "127.0.0.1", 50060).await?;
     let test_duration = Duration::from_secs(10);
@@ -610,6 +617,7 @@ async fn test_mixed_operation_stress() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_compression_under_stress() -> Result<()> {
     let compression_config = CompressionConfig {
         method: CompressionMethod::TopK { k: 0.1 },
@@ -660,6 +668,7 @@ async fn test_compression_under_stress() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_scheduler_stress() -> Result<()> {
     let scheduler_config = SchedulerConfig {
         strategy: SchedulingStrategy::PriorityBased,

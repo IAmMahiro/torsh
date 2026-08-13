@@ -85,6 +85,7 @@ pub struct RandomSampler {
     num_samples: Option<usize>,
     replacement: bool,
     generator: Option<u64>,
+    epoch: usize,
 }
 
 impl RandomSampler {
@@ -115,6 +116,7 @@ impl RandomSampler {
             num_samples,
             replacement,
             generator: None,
+            epoch: 0,
         }
     }
 
@@ -179,6 +181,32 @@ impl RandomSampler {
     pub fn generator(&self) -> Option<u64> {
         self.generator
     }
+
+    /// Set the current epoch, so that the next call to [`Sampler::iter`] draws a
+    /// fresh permutation derived from `(seed, epoch)` instead of repeating the
+    /// same order every epoch (mirrors
+    /// `torch.utils.data.distributed.DistributedSampler.set_epoch`).
+    ///
+    /// The permutation is fully determined by `(generator, epoch)`, so calling
+    /// `set_epoch` with the same value always reproduces the same order, while
+    /// different epochs (with no explicit generator) still vary from each other.
+    pub fn set_epoch(&mut self, epoch: usize) {
+        self.epoch = epoch;
+    }
+
+    /// Get the current epoch
+    pub fn epoch(&self) -> usize {
+        self.epoch
+    }
+
+    /// Effective seed for the current epoch: `generator.unwrap_or(42)` advanced
+    /// by the epoch counter. At epoch 0 this reproduces the exact seed used
+    /// before per-epoch reseeding existed (`generator` unchanged, or the
+    /// historical default of 42), so existing callers that never call
+    /// `set_epoch` see no behavior change.
+    fn seed_for_epoch(&self) -> u64 {
+        self.generator.unwrap_or(42).wrapping_add(self.epoch as u64)
+    }
 }
 
 impl Sampler for RandomSampler {
@@ -203,10 +231,7 @@ impl RandomSampler {
     /// Generate iterator for sampling with replacement
     fn iter_with_replacement(&self, num_samples: usize) -> SamplerIterator {
         // ✅ SciRS2 Policy Compliant - Using scirs2_core for random operations
-        let mut rng = match self.generator {
-            Some(seed) => Random::seed(seed),
-            None => Random::seed(42),
-        };
+        let mut rng = Random::seed(self.seed_for_epoch());
 
         let indices: Vec<usize> = (0..num_samples)
             .map(|_| rng.gen_range(0..self.dataset_size))
@@ -217,14 +242,15 @@ impl RandomSampler {
 
     /// Generate iterator for sampling without replacement
     fn iter_without_replacement(&self, num_samples: usize) -> SamplerIterator {
+        let epoch_seed = Some(self.seed_for_epoch());
         if num_samples == self.dataset_size {
             // Return all indices shuffled
             let indices: Vec<usize> = (0..self.dataset_size).collect();
-            SamplerIterator::shuffled(indices, self.generator)
+            SamplerIterator::shuffled(indices, epoch_seed)
         } else {
             // Use utility function for efficient sampling
             let indices =
-                super::core::utils::random_indices(self.dataset_size, num_samples, self.generator);
+                super::core::utils::random_indices(self.dataset_size, num_samples, epoch_seed);
             SamplerIterator::new(indices)
         }
     }

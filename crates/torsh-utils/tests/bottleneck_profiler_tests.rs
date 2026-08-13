@@ -96,23 +96,26 @@ mod tests {
             peak_usage_mb: 120.0,
             current_usage_mb: 110.0,
             allocation_timeline: memory_snapshots,
-            memory_leaks,
-            fragmentation_ratio: 0.15,
+            memory_leaks: Some(memory_leaks),
+            fragmentation_ratio: Some(0.15),
             gc_pressure: None,
-            memory_bandwidth_utilization: 75.0,
+            memory_bandwidth_utilization: Some(75.0),
             cache_performance: CachePerformance {
-                l1_hit_rate: 0.95,
-                l2_hit_rate: 0.88,
+                l1_hit_rate: Some(0.95),
+                l2_hit_rate: Some(0.88),
                 l3_hit_rate: Some(0.82),
-                cache_misses_per_instruction: 0.05,
-                memory_stalls_percentage: 12.0,
+                cache_misses_per_instruction: Some(0.05),
+                memory_stalls_percentage: Some(12.0),
             },
         };
 
         assert_eq!(memory_profile.peak_usage_mb, 120.0);
-        assert_eq!(memory_profile.memory_leaks.len(), 1);
-        assert_eq!(memory_profile.fragmentation_ratio, 0.15);
-        assert_eq!(memory_profile.cache_performance.l1_hit_rate, 0.95);
+        assert_eq!(
+            memory_profile.memory_leaks.as_ref().map(|l| l.len()),
+            Some(1)
+        );
+        assert_eq!(memory_profile.fragmentation_ratio, Some(0.15));
+        assert_eq!(memory_profile.cache_performance.l1_hit_rate, Some(0.95));
     }
 
     /// Test GPU profiling data
@@ -423,26 +426,25 @@ mod tests {
     #[test]
     fn test_cache_performance() {
         let cache_perf = CachePerformance {
-            l1_hit_rate: 0.95,
-            l2_hit_rate: 0.85,
+            l1_hit_rate: Some(0.95),
+            l2_hit_rate: Some(0.85),
             l3_hit_rate: Some(0.75),
-            cache_misses_per_instruction: 0.08,
-            memory_stalls_percentage: 15.0,
+            cache_misses_per_instruction: Some(0.08),
+            memory_stalls_percentage: Some(15.0),
         };
 
-        assert_eq!(cache_perf.l1_hit_rate, 0.95);
-        assert_eq!(cache_perf.l2_hit_rate, 0.85);
+        assert_eq!(cache_perf.l1_hit_rate, Some(0.95));
+        assert_eq!(cache_perf.l2_hit_rate, Some(0.85));
         assert_eq!(cache_perf.l3_hit_rate.unwrap(), 0.75);
 
         // Test cache efficiency calculation
-        let overall_hit_rate = cache_perf.l1_hit_rate
-            + (1.0 - cache_perf.l1_hit_rate) * cache_perf.l2_hit_rate
-            + (1.0 - cache_perf.l1_hit_rate)
-                * (1.0 - cache_perf.l2_hit_rate)
-                * cache_perf.l3_hit_rate.unwrap_or(0.0);
+        let l1 = cache_perf.l1_hit_rate.unwrap_or(0.0);
+        let l2 = cache_perf.l2_hit_rate.unwrap_or(0.0);
+        let l3 = cache_perf.l3_hit_rate.unwrap_or(0.0);
+        let overall_hit_rate = l1 + (1.0 - l1) * l2 + (1.0 - l1) * (1.0 - l2) * l3;
 
         assert!(overall_hit_rate > 0.95);
-        assert!(cache_perf.memory_stalls_percentage < 20.0);
+        assert!(cache_perf.memory_stalls_percentage.unwrap() < 20.0);
     }
 
     /// Test profiling configuration validation

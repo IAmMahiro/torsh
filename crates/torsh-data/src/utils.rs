@@ -189,8 +189,13 @@ macro_rules! simple_random_transform {
 
             fn transform(&self, input: $input) -> Result<Self::Output> {
                 // ✅ SciRS2 Policy Compliant - Using scirs2_core::random instead of direct rand
-                use scirs2_core::random::{Random, Rng};
-                let mut rng = Random::seed(42);
+                //
+                // NOTE: uses the thread-local entropy-seeded RNG rather than a
+                // fixed-literal `Random::seed(<n>)`, which would draw the
+                // identical value on every call and make the transform either
+                // always fire or never fire regardless of $prob_field (F007).
+                use scirs2_core::random::{thread_rng, Rng};
+                let mut rng = thread_rng();
 
                 if rng.random::<f32>() < self.$prob_field {
                     $transform_fn(input, &mut rng)

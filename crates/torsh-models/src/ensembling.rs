@@ -1487,8 +1487,8 @@ impl<M: Module> ModelEnsemble<M> {
     /// Factory: construct a meta-learner module suitable for stacking.
     ///
     /// For `RidgeRegression` and `LinearRegression`, returns a
-    /// [`StackingMetaLearner`] initialised with uniform per-model weights.
-    /// For other learner types a [`SimpleMeta`] pass-through is returned as a
+    /// `StackingMetaLearner` initialised with uniform per-model weights.
+    /// For other learner types a `SimpleMeta` pass-through is returned as a
     /// safe fallback — the stacking training loop replaces it with a trained
     /// `StackingMetaLearner` anyway.
     pub fn create_meta_learner(&self, config: &MetaLearnerConfig) -> Result<Box<dyn Module>> {

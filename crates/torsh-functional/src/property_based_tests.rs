@@ -17,6 +17,44 @@ fn random_tensor(shape: &[usize], min: f32, max: f32) -> TorshResult<Tensor> {
     random_01.mul_scalar(range)?.add_scalar(min)
 }
 
+/// Assert that two floating-point values agree to within a *relative* tolerance.
+///
+/// The property tests run on real random data, so an absolute bound is the wrong
+/// instrument: `f32` keeps roughly seven significant digits, and a value of
+/// magnitude 30 already rounds at ~2e-6. The tolerance is therefore scaled by the
+/// magnitude of the operands (with a floor of 1.0 so values near zero still get an
+/// absolute bound).
+fn assert_relative_eq(actual: f32, expected: f32, relative_tolerance: f32, property: &str) {
+    assert_within(
+        actual,
+        expected,
+        relative_tolerance,
+        actual.abs().max(expected.abs()),
+        property,
+    );
+}
+
+/// Assert agreement to within `relative_tolerance * magnitude`.
+///
+/// Reductions can cancel to a result far smaller than the values that were
+/// accumulated, so the tolerance has to be scaled by the *accumulated* magnitude
+/// rather than by the result. `magnitude` has a floor of 1.0.
+fn assert_within(
+    actual: f32,
+    expected: f32,
+    relative_tolerance: f32,
+    magnitude: f32,
+    property: &str,
+) {
+    let scale = magnitude.max(1.0);
+    let difference = (actual - expected).abs();
+    assert!(
+        difference <= relative_tolerance * scale,
+        "{property}: |difference| = {difference} exceeds {relative_tolerance} * {scale} \
+         (actual = {actual}, expected = {expected})"
+    );
+}
+
 /// Property tests for activation functions
 pub mod activation_properties {
     use super::*;
@@ -274,11 +312,24 @@ pub mod linalg_properties {
             let ab_t_data = ab_t.data()?;
             let bt_at_data = bt_at.data()?;
 
+            // Bound on the magnitude accumulated by a single dot product.
+            let inner_dim = a.shape().dims()[1] as f32;
+            let max_a = a
+                .data()?
+                .iter()
+                .fold(0.0f32, |acc, value| acc.max(value.abs()));
+            let max_b = b
+                .data()?
+                .iter()
+                .fold(0.0f32, |acc, value| acc.max(value.abs()));
+            let magnitude = max_a * max_b * inner_dim;
             for (i, (&left, &right)) in ab_t_data.iter().zip(bt_at_data.iter()).enumerate() {
-                assert!(
-                    (left - right).abs() < 1e-5,
-                    "Transpose of product property failed at index {}",
-                    i
+                assert_within(
+                    left,
+                    right,
+                    1e-6,
+                    magnitude,
+                    &format!("Transpose of product property failed at index {i}"),
                 );
             }
         }
@@ -329,12 +380,11 @@ pub mod linalg_properties {
             let expected_norm = c.abs() * norm_x_val;
             let actual_norm = norm_cx.data()?[0];
 
-            assert!(
-                (actual_norm - expected_norm).abs() < 1e-5,
-                "Homogeneity property violated: ||{}*x||={}, expected {}",
-                c,
+            assert_relative_eq(
                 actual_norm,
-                expected_norm
+                expected_norm,
+                1e-6,
+                &format!("Homogeneity property violated for c = {c}"),
             );
         }
         Ok(())
@@ -363,12 +413,13 @@ pub mod reduction_properties {
 
             let lhs = sum_x_plus_y.data()?[0];
             let rhs = sum_x_plus_sum_y.data()?[0];
-            assert!(
-                (lhs - rhs).abs() < 1e-5,
-                "Sum linearity failed: sum(x+y)={}, sum(x)+sum(y)={}",
-                lhs,
-                rhs
-            );
+            let magnitude: f32 = x
+                .data()?
+                .iter()
+                .zip(y.data()?.iter())
+                .map(|(a, b)| a.abs() + b.abs())
+                .sum();
+            assert_within(lhs, rhs, 1e-6, magnitude, "Sum linearity failed");
 
             // Property 2: Scaling: sum(c*x) = c*sum(x)
             let cx = x.mul_scalar(c)?;
@@ -377,13 +428,13 @@ pub mod reduction_properties {
 
             let sum_cx_val = sum_cx.data()?[0];
             let c_sum_x_val = c_sum_x.data()?[0];
-            assert!(
-                (sum_cx_val - c_sum_x_val).abs() < 1e-5,
-                "Sum scaling failed: sum({}*x)={}, {}*sum(x)={}",
-                c,
+            let magnitude: f32 = c * x.data()?.iter().map(|v| v.abs()).sum::<f32>();
+            assert_within(
                 sum_cx_val,
-                c,
-                c_sum_x_val
+                c_sum_x_val,
+                1e-6,
+                magnitude,
+                &format!("Sum scaling failed for c = {c}"),
             );
         }
         Ok(())
@@ -551,14 +602,21 @@ pub mod advanced_mathematical_properties {
             let ac = a.mul(&c)?;
             let right_side = ab.add(&ac)?;
 
-            // Check distributive property with tolerance
-            let diff = left_side.sub(&right_side)?;
-            let diff_data = diff.data()?;
-            for &val in diff_data.iter() {
-                assert!(
-                    val.abs() < 1e-5,
-                    "Distributive property violated: |difference| = {}",
-                    val.abs()
+            // Check the distributive property against the magnitude of the products
+            // that were formed, since a * b and a * c can cancel each other.
+            let left_data = left_side.data()?;
+            let right_data = right_side.data()?;
+            let a_data = a.data()?;
+            let b_data = b.data()?;
+            let c_data = c.data()?;
+            for (index, (&left, &right)) in left_data.iter().zip(right_data.iter()).enumerate() {
+                let magnitude = a_data[index].abs() * (b_data[index].abs() + c_data[index].abs());
+                assert_within(
+                    left,
+                    right,
+                    1e-6,
+                    magnitude,
+                    "Distributive property violated",
                 );
             }
         }
@@ -581,14 +639,22 @@ pub mod advanced_mathematical_properties {
             let bc = b.add(&c)?;
             let right_side = a.add(&bc)?;
 
-            // Check associativity with tolerance
-            let diff = left_side.sub(&right_side)?;
-            let diff_data = diff.data()?;
-            for &val in diff_data.iter() {
-                assert!(
-                    val.abs() < 1e-6,
-                    "Addition associativity violated: |difference| = {}",
-                    val.abs()
+            // Check associativity against the magnitude that was actually summed:
+            // the two groupings can cancel to a small result while the operands
+            // reach |10| each, where an f32 rounding step is already ~1e-6.
+            let left_data = left_side.data()?;
+            let right_data = right_side.data()?;
+            let a_data = a.data()?;
+            let b_data = b.data()?;
+            let c_data = c.data()?;
+            for (index, (&left, &right)) in left_data.iter().zip(right_data.iter()).enumerate() {
+                let magnitude = a_data[index].abs() + b_data[index].abs() + c_data[index].abs();
+                assert_within(
+                    left,
+                    right,
+                    1e-6,
+                    magnitude,
+                    "Addition associativity violated",
                 );
             }
         }

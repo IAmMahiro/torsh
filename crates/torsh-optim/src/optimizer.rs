@@ -34,7 +34,8 @@ impl BaseOptimizer {
             let decay = param
                 .mul_scalar(weight_decay)
                 .map_err(OptimizerError::TensorError)?;
-            *param = param.sub(&decay).map_err(OptimizerError::TensorError)?;
+            crate::param_update::sub_assign(&mut *param, &decay)
+                .map_err(OptimizerError::TensorError)?;
         }
         Ok(())
     }
@@ -295,6 +296,12 @@ impl Optimizer for BaseOptimizer {
 
     fn set_lr(&mut self, lr: f32) {
         for group in &mut self.param_groups {
+            group.lr = lr;
+        }
+    }
+
+    fn set_lrs(&mut self, lrs: &[f32]) {
+        for (group, &lr) in self.param_groups.iter_mut().zip(lrs.iter()) {
             group.lr = lr;
         }
     }

@@ -40,11 +40,11 @@ fn main() {
     pyo3_build_config::use_pyo3_cfgs();
     let config = pyo3_build_config::get();
 
-    if let Some(lib_dir) = &config.lib_dir {
+    if let Some(lib_dir) = config.lib_dir() {
         println!("cargo:rustc-link-search=native={lib_dir}");
     }
 
-    if let Some(lib_name) = &config.lib_name {
+    if let Some(lib_name) = config.lib_name() {
         // Normal path: pyo3_build_config resolved the library name directly.
         println!("cargo:rustc-link-lib={lib_name}");
     } else {
@@ -60,9 +60,8 @@ fn emit_python_link_fallback(config: &pyo3_build_config::InterpreterConfig) {
     // Prefer the executable pyo3 already resolved; fall back to env vars or
     // plain `python3`.
     let python = config
-        .executable
-        .as_ref()
-        .map(|p| p.clone())
+        .executable()
+        .map(|p| p.to_owned())
         .or_else(|| std::env::var("PYO3_PYTHON").ok())
         .or_else(|| std::env::var("PYTHON_SYS_EXECUTABLE").ok())
         .unwrap_or_else(|| "python3".to_owned());

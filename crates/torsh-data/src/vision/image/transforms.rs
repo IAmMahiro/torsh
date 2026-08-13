@@ -148,14 +148,63 @@ impl<T: 'static> Default for Compose<T> {
     }
 }
 
+/// Interior-mutable RNG shared by the random image transforms in this file.
+///
+/// Each transform owns one of these instead of constructing a fresh
+/// `Random::seed(<literal>)` inside `transform()`: recreating an RNG from the
+/// same constant on every call made the draw identical every time (F007),
+/// which either flipped/rotated every sample or none, independent of the
+/// configured probability. Seeding this holder once (from real entropy by
+/// default, or from an explicit seed via `with_seed` for reproducibility) and
+/// reusing it across calls restores genuine per-sample randomness while
+/// keeping an opt-in deterministic mode.
+struct TransformRng(parking_lot::Mutex<scirs2_core::random::Random<scirs2_core::rngs::StdRng>>);
+
+impl TransformRng {
+    /// Seed from real entropy so augmentation varies from run to run.
+    fn from_entropy() -> Self {
+        use scirs2_core::random::Random;
+        let mut entropy_rng = Random::default();
+        let seed: u64 = entropy_rng.gen_range(0..=u64::MAX);
+        Self(parking_lot::Mutex::new(Random::seed(seed)))
+    }
+
+    /// Seed from a fixed value for reproducible augmentation.
+    fn from_seed(seed: u64) -> Self {
+        Self(parking_lot::Mutex::new(scirs2_core::random::Random::seed(
+            seed,
+        )))
+    }
+
+    fn random_f32(&self) -> f32 {
+        // `Rng::random` resolves via the `scirs2_core::RngExt` import at the
+        // top of this file, already in scope for the whole module.
+        self.0.lock().random::<f32>()
+    }
+
+    fn gen_range_f32(&self, low: f32, high: f32) -> f32 {
+        self.0.lock().gen_range(low..=high)
+    }
+}
+
 /// Random horizontal flip
 pub struct RandomHorizontalFlip {
     prob: f32,
+    rng: TransformRng,
 }
 
 impl RandomHorizontalFlip {
     pub fn new(prob: f32) -> Self {
-        Self { prob }
+        Self {
+            prob,
+            rng: TransformRng::from_entropy(),
+        }
+    }
+
+    /// Use a fixed seed instead of entropy, for reproducible augmentation.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.rng = TransformRng::from_seed(seed);
+        self
     }
 }
 
@@ -165,11 +214,7 @@ impl Transform<DynamicImage> for RandomHorizontalFlip {
     fn transform(&self, input: DynamicImage) -> Result<Self::Output> {
         #[cfg(feature = "image-support")]
         {
-            // ✅ SciRS2 Policy Compliant - Using scirs2_core::random instead of direct rand
-            #[allow(unused_imports)] // Rng trait needed for random() method
-            use scirs2_core::random::{Random, Rng};
-            let mut rng = Random::seed(0);
-            if rng.random::<f32>() < self.prob {
+            if self.rng.random_f32() < self.prob {
                 Ok(input.fliph())
             } else {
                 Ok(input)
@@ -184,16 +229,30 @@ impl Transform<DynamicImage> for RandomHorizontalFlip {
             })
         }
     }
+
+    fn is_deterministic(&self) -> bool {
+        false
+    }
 }
 
 /// Random vertical flip
 pub struct RandomVerticalFlip {
     prob: f32,
+    rng: TransformRng,
 }
 
 impl RandomVerticalFlip {
     pub fn new(prob: f32) -> Self {
-        Self { prob }
+        Self {
+            prob,
+            rng: TransformRng::from_entropy(),
+        }
+    }
+
+    /// Use a fixed seed instead of entropy, for reproducible augmentation.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.rng = TransformRng::from_seed(seed);
+        self
     }
 }
 
@@ -203,11 +262,7 @@ impl Transform<DynamicImage> for RandomVerticalFlip {
     fn transform(&self, input: DynamicImage) -> Result<Self::Output> {
         #[cfg(feature = "image-support")]
         {
-            // ✅ SciRS2 Policy Compliant - Using scirs2_core::random instead of direct rand
-            #[allow(unused_imports)] // Rng trait needed for random() method
-            use scirs2_core::random::{Random, Rng};
-            let mut rng = Random::seed(0);
-            if rng.random::<f32>() < self.prob {
+            if self.rng.random_f32() < self.prob {
                 Ok(input.flipv())
             } else {
                 Ok(input)
@@ -222,16 +277,30 @@ impl Transform<DynamicImage> for RandomVerticalFlip {
             })
         }
     }
+
+    fn is_deterministic(&self) -> bool {
+        false
+    }
 }
 
 /// Random rotation
 pub struct RandomRotation {
     degrees: f32,
+    rng: TransformRng,
 }
 
 impl RandomRotation {
     pub fn new(degrees: f32) -> Self {
-        Self { degrees }
+        Self {
+            degrees,
+            rng: TransformRng::from_entropy(),
+        }
+    }
+
+    /// Use a fixed seed instead of entropy, for reproducible augmentation.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.rng = TransformRng::from_seed(seed);
+        self
     }
 }
 
@@ -241,11 +310,7 @@ impl Transform<DynamicImage> for RandomRotation {
     fn transform(&self, input: DynamicImage) -> Result<Self::Output> {
         #[cfg(all(feature = "image-support", feature = "imageproc"))]
         {
-            // ✅ SciRS2 Policy Compliant - Using scirs2_core::random instead of direct rand
-            #[allow(unused_imports)] // Rng trait needed for random() method
-            use scirs2_core::random::{Random, Rng};
-            let mut rng = Random::seed(0);
-            let angle_deg = rng.gen_range(-self.degrees..=self.degrees);
+            let angle_deg = self.rng.gen_range_f32(-self.degrees, self.degrees);
             let angle_rad = angle_deg.to_radians();
 
             // Convert to RGB8 for processing
@@ -265,11 +330,7 @@ impl Transform<DynamicImage> for RandomRotation {
 
         #[cfg(all(feature = "image-support", not(feature = "imageproc")))]
         {
-            // ✅ SciRS2 Policy Compliant - Using scirs2_core::random instead of direct rand
-            #[allow(unused_imports)] // Rng trait needed for random() method
-            use scirs2_core::random::{Random, Rng};
-            let mut rng = Random::seed(0);
-            let _angle = rng.gen_range(-self.degrees..=self.degrees);
+            let _angle = self.rng.gen_range_f32(-self.degrees, self.degrees);
             // imageproc not available, return input unchanged
             // In production, you might want to log a warning here
             Ok(input)
@@ -282,6 +343,10 @@ impl Transform<DynamicImage> for RandomRotation {
                 dtype: "DynamicImage".to_string(),
             })
         }
+    }
+
+    fn is_deterministic(&self) -> bool {
+        false
     }
 }
 

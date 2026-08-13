@@ -70,21 +70,21 @@
 ## 🚀 High Priority TODOs
 
 ### 1. Fix Critical API Compatibility Issues
-- [ ] **Resolve tensor operations**
+- [x] **Resolve tensor operations** ✅ `sum_all()` is now implemented on `Tensor` (see `torsh-tensor/src/ops/reduction.rs`) and used throughout `torsh-metrics`; `argmax`/`topk` usages confirmed working
   ```rust
-  // Current issues to fix:
+  // Previously open issues, now resolved:
   let pred_classes = predictions.argmax(Some(-1)).unwrap();  // ✅ Fixed
-  let correct = pred_classes.eq(targets).unwrap().sum_all(); // Need sum_all() method
+  let correct = pred_classes.eq(targets).unwrap().sum_all(); // ✅ Fixed - sum_all() now exists
 
-  // Fix topk operation
+  // topk operation
   let (_, top_k_indices) = predictions.topk(k, Some(-1), true, true).unwrap(); // ✅ Fixed
   ```
-- [ ] **Fix tensor creation APIs**
+- [x] **Fix tensor creation APIs** ✅ `torsh_tensor::creation::from_vec` (and `zeros`/`ones`) are used throughout `src/`
   ```rust
   // Replace Tensor::zeros with creation functions
   use torsh_tensor::creation::{zeros, ones, from_vec};
   ```
-- [ ] **Resolve scirs2_metrics import issues**
+- [x] **Resolve scirs2_metrics import issues** ✅ No direct `scirs2_metrics` imports remain; all metrics are implemented directly against `torsh-tensor`
   ```rust
   // Remove unavailable imports, implement directly
   // use scirs2_metrics::prelude::*;  // Not available
@@ -297,7 +297,7 @@
   };
   ```
 - [ ] **Leverage scirs2-stats for statistical tests**
-- [ ] **Use scirs2-core for numerical stability**
+- [x] **Use scirs2-core for numerical stability** ✅ `scirs2_core::ndarray`/`ndarray_ext::stats`/`random` are used across `clustering.rs`, `deep_learning.rs`, `advanced_ml.rs`, `streaming.rs`, `statistics.rs`, etc.
 
 ### 2. Cross-Crate Coordination
 - [ ] **Integration with torsh-nn for model evaluation**
@@ -314,10 +314,10 @@
 - [x] **Reporting**: Multi-format report generation (Markdown/JSON/HTML) ✅
 
 ## ⚠️ Known Issues
-- [ ] **Missing sum_all() method on tensors** (High priority)
-- [ ] **to_vec() API changes needed** (Medium priority)
-- [ ] **Type mismatches in tensor operations** (Medium priority)
-- [ ] **Missing scirs2_metrics imports** (Low priority - implement directly)
+- [x] **Missing sum_all() method on tensors** (High priority) ✅ Resolved - `sum_all()` implemented in `torsh-tensor`
+- [x] **to_vec() API changes needed** (Medium priority) ✅ Resolved - `to_vec()` used throughout `src/`
+- [x] **Type mismatches in tensor operations** (Medium priority) ✅ Resolved - crate compiles cleanly with full test suite passing
+- [x] **Missing scirs2_metrics imports** (Low priority - implement directly) ✅ Resolved - metrics implemented directly, no `scirs2_metrics` import needed
 
 ## 🔗 Integration Dependencies
 - **torsh-tensor**: For tensor operations and data manipulation

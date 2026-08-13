@@ -195,23 +195,51 @@ pub fn higher_order_gradient_example() -> AutogradResult<(f32, f32)> {
 pub fn checkpointing_example() -> AutogradResult<()> {
     tracing::info!("Running gradient checkpointing example");
 
-    // Simulate a large model with many layers
+    // The tensor and checkpoint APIs report `TorshError`; translate once, at the
+    // boundary, instead of at every call site.
+    run_checkpointing().map_err(|error| {
+        crate::error_handling::AutogradError::gradient_computation(
+            "checkpointing_example",
+            error.to_string(),
+        )
+    })
+}
+
+/// Body of [`checkpointing_example`], in the tensor crate's error type.
+fn run_checkpointing() -> torsh_core::error::Result<()> {
+    use crate::checkpoint::{checkpoint_sequential, CheckpointRng};
+    use torsh_core::device::DeviceType;
+    use torsh_tensor::Tensor;
+
+    // A deep chain of cheap layers: each one doubles its input.
     let num_layers = 100;
-    let checkpoint_frequency = 10;
+    let num_segments = 10;
+    let layers: Vec<_> = (0..num_layers)
+        .map(|_| {
+            |input: &Tensor<f32>,
+             _rng: &mut CheckpointRng|
+             -> torsh_core::error::Result<Tensor<f32>> { input.add(input) }
+        })
+        .collect();
 
-    for layer_idx in 0..num_layers {
-        // Perform forward pass
-        let _output = layer_idx as f32 * 0.1;
+    let input = Tensor::from_data(vec![1.0f32], vec![1], DeviceType::Cpu)?;
+    let sequence = checkpoint_sequential(layers, num_segments, &input)?;
 
-        if layer_idx % checkpoint_frequency == 0 {
-            tracing::debug!("Checkpointing at layer {}", layer_idx);
-            // In real usage: checkpoint current activations
-        }
-    }
-
+    // Only the ten segment boundaries were kept; the other ninety activations
+    // are recomputed when the backward pass below asks for them.
+    let output = sequence.output()?.clone();
     tracing::info!(
-        "Forward pass complete with {} checkpoints",
-        num_layers / checkpoint_frequency
+        "Forward pass complete: {} layers in {} checkpointed segments, output {:?}",
+        num_layers,
+        sequence.len(),
+        output.to_vec()?
+    );
+
+    let upstream = Tensor::from_data(vec![1.0f32], vec![1], DeviceType::Cpu)?;
+    let gradient = sequence.backward(&upstream)?;
+    tracing::info!(
+        "Backward pass complete via recomputation, d(output)/d(input) = {:?}",
+        gradient.to_vec()?
     );
 
     Ok(())

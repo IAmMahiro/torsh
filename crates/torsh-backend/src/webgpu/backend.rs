@@ -6,11 +6,12 @@ use crate::profiler::SimpleProfiler;
 #[cfg(feature = "webgpu")]
 use crate::webgpu::wgpu;
 use crate::webgpu::{
-    WebGpuBackendConfig, WebGpuDevice, WebGpuError, WebGpuKernelExecutor, WebGpuMemoryManager,
+    WebGpuBackendConfig, WebGpuBuffer, WebGpuDevice, WebGpuError, WebGpuKernelExecutor,
+    WebGpuMemoryManager,
 };
 use crate::{
-    BackendCore, BackendResult, Buffer, BufferDescriptor, BufferHandle, Device, Kernel,
-    KernelDescriptor, KernelHandle, MemoryManager, MemoryStats, Profiler,
+    BackendCore, BackendResult, Buffer, BufferDescriptor, BufferHandle, BufferUsage, Device,
+    Kernel, KernelDescriptor, KernelHandle, MemoryLocation, MemoryManager, MemoryStats, Profiler,
 };
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -133,35 +134,33 @@ impl WebGpuBackend {
         TorshError::BackendError(error.to_string())
     }
 
-    /// Extract WebGPU buffer from buffer handle
-    fn extract_webgpu_buffer(&self, buffer: &Buffer) -> BackendResult<&wgpu::Buffer> {
-        match &buffer.handle {
-            BufferHandle::WebGpu {
-                buffer_ptr,
-                size: _,
-            } => {
-                // Safety: This is a simplified approach
-                // Real implementation would use proper pointer management
-                unsafe {
-                    let wgpu_buffer_ptr = *buffer_ptr as *const wgpu::Buffer;
-                    Ok(&*wgpu_buffer_ptr)
-                }
-            }
-            _ => Err(TorshError::BackendError(
-                "Buffer is not a WebGPU buffer".to_string(),
-            )),
-        }
-    }
-
-    /// Extract WebGPU buffers from buffer handles
-    fn extract_webgpu_buffers(
-        &self,
-        src: &Buffer,
-        dst: &Buffer,
-    ) -> BackendResult<(&wgpu::Buffer, &wgpu::Buffer)> {
-        let src_buf = self.extract_webgpu_buffer(src)?;
-        let dst_buf = self.extract_webgpu_buffer(dst)?;
-        Ok((src_buf, dst_buf))
+    /// Resolve the live `WebGpuBuffer` backing a generic `Buffer` handle.
+    ///
+    /// `Buffer` only carries a lightweight, backend-agnostic `BufferHandle`;
+    /// the actual GPU-side `WebGpuBuffer` (and its underlying `wgpu::Buffer`)
+    /// is owned and tracked by the `WebGpuMemoryManager` that allocated it,
+    /// keyed by that same handle (see `WebGpuMemoryManager::find_active_buffer`).
+    /// This looks the real buffer back up so operations like `copy_buffer`,
+    /// `copy_to_device` and `copy_from_device` can reach the actual GPU
+    /// resource instead of having nothing to operate on.
+    ///
+    /// Note: this deliberately replaces an earlier approach that cast the
+    /// handle's opaque id directly to a `*const wgpu::Buffer` pointer. That
+    /// id is a small sequential counter (see `WebGpuBufferPool`/
+    /// `WebGpuMemoryManager`'s `next_handle`), not a real pointer, so
+    /// dereferencing it was undefined behavior. Looking the handle up in the
+    /// memory manager's active-buffer registry is the sound equivalent.
+    fn resolve_webgpu_buffer(&self, buffer: &Buffer) -> BackendResult<Arc<WebGpuBuffer>> {
+        let device_id = buffer.device().id();
+        let memory_manager = self.get_memory_manager(device_id)?;
+        let found = memory_manager.read().find_active_buffer(buffer.handle());
+        found.ok_or_else(|| {
+            TorshError::BackendError(format!(
+                "WebGPU buffer not found for handle {:?} on device {}",
+                buffer.handle(),
+                device_id
+            ))
+        })
     }
 }
 
@@ -395,95 +394,132 @@ impl crate::backend::BackendExecutor for WebGpuBackend {
 
     async fn copy_buffer(
         &self,
-        _src: &Buffer,
-        _dst: &Buffer,
-        _src_offset: usize,
-        _dst_offset: usize,
-        _size: usize,
+        src: &Buffer,
+        dst: &Buffer,
+        src_offset: usize,
+        dst_offset: usize,
+        size: usize,
     ) -> BackendResult<()> {
-        // Extract device ID from buffer (assuming both buffers are on same device)
-        let device_id = 0; // Default device for now
+        if src_offset + size > src.size() {
+            return Err(TorshError::InvalidArgument(
+                "copy_buffer: source range exceeds buffer size".to_string(),
+            ));
+        }
+        if dst_offset + size > dst.size() {
+            return Err(TorshError::InvalidArgument(
+                "copy_buffer: destination range exceeds buffer size".to_string(),
+            ));
+        }
+
+        let device_id = src.device().id();
         let webgpu_device = self.get_device(device_id)?;
 
-        // Create command encoder
-        let _encoder = webgpu_device.create_command_encoder(Some("Buffer Copy"));
+        let src_buf = self.resolve_webgpu_buffer(src)?;
+        let dst_buf = self.resolve_webgpu_buffer(dst)?;
 
-        // We need to downcast the buffers to WebGpuBuffer
-        // This is a simplified approach - real implementation would use proper buffer traits
-        // TODO: Fix as_any() method calls when trait is in scope
-        // For now, return success to test basic compilation
-        Ok(())
+        // Real GPU-to-GPU copy via a command encoder, mirroring the
+        // encode -> submit -> wait-for-completion pattern used elsewhere in
+        // this backend (see `WebGpuDevice::benchmark_memory_bandwidth`).
+        let mut encoder = webgpu_device.create_command_encoder(Some("Buffer Copy"));
+        dst_buf
+            .copy_from_buffer(
+                &mut encoder,
+                &src_buf,
+                src_offset as u64,
+                dst_offset as u64,
+                size as u64,
+            )
+            .map_err(Self::convert_error)?;
 
-        // Temporarily disabled until as_any trait is available:
-        // if let (Some(src_buf), Some(dst_buf)) = (
-        //     src.as_any().downcast_ref::<WebGpuBuffer>(),
-        //     dst.as_any().downcast_ref::<WebGpuBuffer>(),
-        // ) {
-        //     dst_buf.copy_from_buffer(...);
-        //     ...
-        // }
+        webgpu_device.submit([encoder.finish()]);
+        webgpu_device
+            .wait_for_completion()
+            .await
+            .map_err(Self::convert_error)
     }
 
     async fn copy_to_device(
         &self,
-        _src: &[u8],
-        _dst: &Buffer,
-        _dst_offset: usize,
+        src: &[u8],
+        dst: &Buffer,
+        dst_offset: usize,
     ) -> BackendResult<()> {
-        // Extract device ID
-        let device_id = 0; // Default device for now
-        let _webgpu_device = self.get_device(device_id)?;
+        if dst_offset + src.len() > dst.size() {
+            return Err(TorshError::InvalidArgument(
+                "copy_to_device: write range exceeds destination buffer size".to_string(),
+            ));
+        }
 
-        // TODO: Fix as_any() method calls when trait is in scope
-        // For now, return success to test basic compilation
-        Ok(())
+        let device_id = dst.device().id();
+        let webgpu_device = self.get_device(device_id)?;
+        let dst_buf = self.resolve_webgpu_buffer(dst)?;
 
-        // Temporarily disabled:
-        // if let Some(dst_buf) = dst.as_any().downcast_ref::<WebGpuBuffer>() {
-        //     webgpu_device.queue().write_buffer(dst_buf.wgpu_buffer(), dst_offset as u64, src);
-        //     Ok(())
-        // } else {
-        //     Err(TorshError::BackendError("Buffer is not a WebGPU buffer".to_string()))
-        // }
+        // WebGpuBuffer::write_data picks the right strategy itself (direct
+        // mapping when MAP_WRITE is supported, otherwise a queued write).
+        dst_buf
+            .write_data(dst_offset as u64, src)
+            .await
+            .map_err(Self::convert_error)?;
+
+        webgpu_device
+            .wait_for_completion()
+            .await
+            .map_err(Self::convert_error)
     }
 
     async fn copy_from_device(
         &self,
-        _src: &Buffer,
-        _dst: &mut [u8],
-        _src_offset: usize,
+        src: &Buffer,
+        dst: &mut [u8],
+        src_offset: usize,
     ) -> BackendResult<()> {
-        // Extract device ID
-        let device_id = 0; // Default device for now
-        let _webgpu_device = self.get_device(device_id)?;
+        if src_offset + dst.len() > src.size() {
+            return Err(TorshError::InvalidArgument(
+                "copy_from_device: read range exceeds source buffer size".to_string(),
+            ));
+        }
 
-        // TODO: Fix as_any() method calls when trait is in scope
-        // For now, return success to test basic compilation
+        let device_id = src.device().id();
+        let webgpu_device = self.get_device(device_id)?;
+        let src_buf = self.resolve_webgpu_buffer(src)?;
+
+        let size = dst.len() as u64;
+
+        // WebGPU storage buffers generally cannot be mapped directly (a
+        // buffer's usage may only combine MAP_READ with COPY_DST), so
+        // read-back goes through a host-visible staging buffer: copy the
+        // device data into it on the GPU timeline, then map and read it.
+        let staging_descriptor =
+            BufferDescriptor::new(dst.len(), BufferUsage::MAP_READ | BufferUsage::COPY_DST)
+                .with_location(MemoryLocation::Host);
+        let staging_handle = BufferHandle::WebGpu {
+            buffer_ptr: generate_buffer_id() as u64,
+            size: dst.len(),
+        };
+        let staging_buffer = WebGpuBuffer::new(
+            Arc::clone(&webgpu_device),
+            staging_descriptor,
+            staging_handle,
+        )
+        .map_err(Self::convert_error)?;
+
+        let mut encoder = webgpu_device.create_command_encoder(Some("Buffer Readback"));
+        staging_buffer
+            .copy_from_buffer(&mut encoder, &src_buf, src_offset as u64, 0, size)
+            .map_err(Self::convert_error)?;
+        webgpu_device.submit([encoder.finish()]);
+        webgpu_device
+            .wait_for_completion()
+            .await
+            .map_err(Self::convert_error)?;
+
+        let data: Vec<u8> = staging_buffer
+            .read_data(0, dst.len())
+            .await
+            .map_err(Self::convert_error)?;
+        dst.copy_from_slice(&data);
+
         Ok(())
-
-        // Temporarily disabled:
-        // if let Some(src_buf) = src.as_any().downcast_ref::<WebGpuBuffer>() {
-        //     // Create staging buffer for reading
-        //     let staging_desc = crate::BufferDescriptor {
-        //         name: "staging_read_buffer".to_string(),
-        //         size: dst.len() as u64,
-        //         usage: crate::BufferUsage::MAP_READ | crate::BufferUsage::COPY_DST,
-        //         memory_location: crate::MemoryLocation::HostVisible,
-        //     };
-
-        //     let staging_handle = crate::BufferHandle::new(999999); // Temporary handle
-        //     let staging_buffer =
-        //         WebGpuBuffer::new(Arc::clone(&webgpu_device), staging_desc, staging_handle)
-        //             .map_err(Self::convert_error)?;
-        //
-        //     // Copy from source to staging buffer and other operations...
-        //     // All temporarily commented out until as_any trait is available
-        //     Ok(())
-        // } else {
-        //     Err(TorshError::BackendError(
-        //         "Buffer is not a WebGPU buffer".to_string(),
-        //     ))
-        // }
     }
 
     async fn execute_kernel(
@@ -884,190 +920,13 @@ impl MemoryManager for WebGpuMemoryManagerWrapper {
     }
 }
 
-/// Stub implementation of WebGPU RNN operations
-pub struct WebGpuRnnOps;
-
-impl WebGpuRnnOps {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-// TODO: Implement RnnOps trait when it becomes available
-/*
-#[async_trait::async_trait]
-impl crate::rnn::RnnOps for WebGpuRnnOps {
-    async fn lstm_forward(
-        &self,
-        _device: &crate::Device,
-        _input: &crate::Buffer,
-        _hidden: &crate::Buffer,
-        _cell: &crate::Buffer,
-        _weights: &[&crate::Buffer],
-        _biases: &[&crate::Buffer],
-        _output: &crate::Buffer,
-        _new_hidden: &crate::Buffer,
-        _new_cell: &crate::Buffer,
-        _batch_size: usize,
-        _input_size: usize,
-        _hidden_size: usize,
-        _num_layers: usize,
-        _dropout: f32,
-        _bidirectional: bool,
-    ) -> crate::BackendResult<()> {
-        Err(torsh_core::error::TorshError::BackendError(
-            "WebGPU RNN operations not yet implemented".to_string(),
-        ))
-    }
-
-    async fn gru_forward(
-        &self,
-        _device: &crate::Device,
-        _input: &crate::Buffer,
-        _hidden: &crate::Buffer,
-        _weights: &[&crate::Buffer],
-        _biases: &[&crate::Buffer],
-        _output: &crate::Buffer,
-        _new_hidden: &crate::Buffer,
-        _batch_size: usize,
-        _input_size: usize,
-        _hidden_size: usize,
-        _num_layers: usize,
-        _dropout: f32,
-        _bidirectional: bool,
-    ) -> crate::BackendResult<()> {
-        Err(torsh_core::error::TorshError::BackendError(
-            "WebGPU RNN operations not yet implemented".to_string(),
-        ))
-    }
-
-    async fn rnn_forward(
-        &self,
-        _device: &crate::Device,
-        _input: &crate::Buffer,
-        _hidden: &crate::Buffer,
-        _weights: &[&crate::Buffer],
-        _biases: &[&crate::Buffer],
-        _output: &crate::Buffer,
-        _new_hidden: &crate::Buffer,
-        _batch_size: usize,
-        _input_size: usize,
-        _hidden_size: usize,
-        _num_layers: usize,
-        _activation: crate::rnn::RnnActivation,
-        _dropout: f32,
-        _bidirectional: bool,
-    ) -> crate::BackendResult<()> {
-        Err(torsh_core::error::TorshError::BackendError(
-            "WebGPU RNN operations not yet implemented".to_string(),
-        ))
-    }
-
-    fn supports_lstm(&self) -> bool {
-        false
-    }
-
-    fn supports_gru(&self) -> bool {
-        false
-    }
-
-    fn supports_bidirectional(&self) -> bool {
-        false
-    }
-
-    fn supports_dropout(&self) -> bool {
-        false
-    }
-
-    fn optimal_workgroup_size(&self) -> (u32, u32, u32) {
-        (64, 1, 1)
-    }
-}
-*/
-
-/// Stub implementation of WebGPU quantization operations
-pub struct WebGpuQuantizationOps;
-
-impl WebGpuQuantizationOps {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-// TODO: Implement QuantizationOps trait with correct method signatures
-/*
-#[async_trait::async_trait]
-impl crate::quantization::QuantizationOps for WebGpuQuantizationOps {
-    async fn quantize_int8(
-        &self,
-        _device: &crate::Device,
-        _input: &crate::Buffer,
-        _output: &crate::Buffer,
-        _scale: f32,
-        _zero_point: i8,
-    ) -> crate::BackendResult<()> {
-        Err(torsh_core::error::TorshError::BackendError(
-            "WebGPU quantization operations not yet implemented".to_string(),
-        ))
-    }
-
-    async fn dequantize_int8(
-        &self,
-        _device: &crate::Device,
-        _input: &crate::Buffer,
-        _output: &crate::Buffer,
-        _scale: f32,
-        _zero_point: i8,
-    ) -> crate::BackendResult<()> {
-        Err(torsh_core::error::TorshError::BackendError(
-            "WebGPU quantization operations not yet implemented".to_string(),
-        ))
-    }
-
-    async fn quantize_int4(
-        &self,
-        _device: &crate::Device,
-        _input: &crate::Buffer,
-        _output: &crate::Buffer,
-        _scale: f32,
-        _zero_point: i8,
-    ) -> crate::BackendResult<()> {
-        Err(torsh_core::error::TorshError::BackendError(
-            "WebGPU quantization operations not yet implemented".to_string(),
-        ))
-    }
-
-    async fn dequantize_int4(
-        &self,
-        _device: &crate::Device,
-        _input: &crate::Buffer,
-        _output: &crate::Buffer,
-        _scale: f32,
-        _zero_point: i8,
-    ) -> crate::BackendResult<()> {
-        Err(torsh_core::error::TorshError::BackendError(
-            "WebGPU quantization operations not yet implemented".to_string(),
-        ))
-    }
-
-    fn supports_int8(&self) -> bool {
-        false
-    }
-
-    fn supports_int4(&self) -> bool {
-        false
-    }
-
-    fn optimal_workgroup_size(&self) -> (u32, u32, u32) {
-        (64, 1, 1)
-    }
-}
-*/
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendCore, BackendDeviceManager, BackendLifecycle, BackendOps};
+    use crate::backend::{
+        BackendCore, BackendDeviceManager, BackendExecutor, BackendLifecycle, BackendOps,
+        BackendResourceManager,
+    };
     use crate::BackendType;
     use torsh_core::DType;
 
@@ -1178,5 +1037,106 @@ mod tests {
         assert!(hints.prefer_vectorized);
         assert!(hints.prefer_async);
         assert!(hints.cache_kernels);
+    }
+
+    /// Regression test for a real correctness bug: `copy_buffer`,
+    /// `copy_to_device` and `copy_from_device` used to unconditionally
+    /// `return Ok(())` without moving any data, so every cross-backend
+    /// transfer through the WebGPU backend silently no-op'd while reporting
+    /// success. This round-trips a distinguishable, non-zero payload through
+    /// `copy_to_device` -> `copy_from_device` and checks it survives
+    /// byte-for-byte.
+    ///
+    /// Against the old (buggy) implementation, `copy_from_device` never
+    /// touches `readback`, so it stays all-zero and the final `assert_eq!`
+    /// fails. Against the fix, the payload is actually written to the GPU
+    /// buffer and actually read back, so the assertion passes.
+    ///
+    /// Gracefully skipped (not failed) when no real WebGPU adapter is
+    /// available, e.g. in headless CI.
+    #[tokio::test]
+    async fn test_copy_to_device_and_back_round_trips_real_data() {
+        if !(cfg!(feature = "webgpu") && crate::webgpu::is_available()) {
+            eprintln!("Skipping: no WebGPU adapter available in this environment");
+            return;
+        }
+
+        let mut backend = WebGpuBackend::with_default_config();
+        if backend.initialize().await.is_err() {
+            eprintln!("Skipping: failed to initialize WebGPU backend");
+            return;
+        }
+
+        let device = match backend.default_device() {
+            Ok(device) => device,
+            Err(_) => {
+                eprintln!("Skipping: no default WebGPU device");
+                return;
+            }
+        };
+
+        const LEN: usize = 4096;
+        let descriptor = BufferDescriptor::new(
+            LEN,
+            BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
+        );
+
+        let buffer = match backend.create_buffer(&device, &descriptor) {
+            Ok(buffer) => buffer,
+            Err(e) => {
+                eprintln!("Skipping: failed to create WebGPU buffer: {e}");
+                return;
+            }
+        };
+
+        // Distinguishable, non-zero, non-constant payload so a silent no-op
+        // (old buggy behavior) is unambiguously distinguishable from a real
+        // transfer: a zero-filled or unmodified `readback` cannot match it.
+        let payload: Vec<u8> = (0..LEN as u32)
+            .map(|i| ((i * 37 + 11) % 256) as u8)
+            .collect();
+        assert!(
+            payload.iter().any(|&b| b != 0),
+            "test payload must contain non-zero bytes"
+        );
+
+        backend
+            .copy_to_device(&payload, &buffer, 0)
+            .await
+            .expect("copy_to_device should succeed");
+
+        let mut readback = vec![0u8; LEN];
+        backend
+            .copy_from_device(&buffer, &mut readback, 0)
+            .await
+            .expect("copy_from_device should succeed");
+
+        assert_eq!(
+            payload, readback,
+            "data must survive a copy_to_device -> copy_from_device round trip byte-for-byte"
+        );
+
+        // Also exercise copy_buffer (device-to-device), the third
+        // previously-broken function: copy into a second buffer and verify
+        // it independently reads back correctly.
+        let buffer2 = backend
+            .create_buffer(&device, &descriptor)
+            .expect("second buffer allocation should succeed");
+
+        backend
+            .copy_buffer(&buffer, &buffer2, 0, 0, LEN)
+            .await
+            .expect("copy_buffer should succeed");
+
+        let mut readback2 = vec![0u8; LEN];
+        backend
+            .copy_from_device(&buffer2, &mut readback2, 0)
+            .await
+            .expect("copy_from_device on the copy_buffer target should succeed");
+
+        assert_eq!(
+            payload, readback2,
+            "data must survive a copy_buffer device-to-device copy byte-for-byte"
+        );
     }
 }

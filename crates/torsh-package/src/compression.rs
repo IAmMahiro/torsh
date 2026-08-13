@@ -410,22 +410,16 @@ impl AdvancedCompressor {
 
     /// Compress with LZMA
     fn compress_lzma(&self, data: &[u8], _level: u32) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-        lzma_rs::lzma_compress(&mut std::io::Cursor::new(data), &mut output).map_err(|e| {
-            TorshError::SerializationError(format!("LZMA compression failed: {}", e))
-        })?;
-
-        Ok(output)
+        // Pure-Rust LZMA via oxiarc-lzma (COOLJAPAN policy replacement for lzma-rs).
+        oxiarc_lzma::compress_bytes(data)
+            .map_err(|e| TorshError::SerializationError(format!("LZMA compression failed: {}", e)))
     }
 
     /// Decompress LZMA
     fn decompress_lzma(&self, data: &[u8]) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-        lzma_rs::lzma_decompress(&mut std::io::Cursor::new(data), &mut output).map_err(|e| {
+        oxiarc_lzma::decompress_bytes(data).map_err(|e| {
             TorshError::SerializationError(format!("LZMA decompression failed: {}", e))
-        })?;
-
-        Ok(output)
+        })
     }
 
     /// Compress with Brotli
@@ -872,5 +866,28 @@ mod tests {
         for result in &results {
             assert_eq!(result.original_size, test_data.len());
         }
+    }
+
+    #[test]
+    fn test_lzma_roundtrip_oxiarc() {
+        // Regression test for the lzma-rs -> oxiarc-lzma substitution (COOLJAPAN
+        // Pure-Rust policy): compress_lzma/decompress_lzma must still round-trip.
+        let compressor = AdvancedCompressor::new();
+        let test_data = "LZMA round-trip via oxiarc-lzma. ".repeat(64);
+
+        let compressed = compressor
+            .compress_data(
+                test_data.as_bytes(),
+                CompressionAlgorithm::Lzma,
+                CompressionLevel(6),
+            )
+            .unwrap();
+        assert_eq!(compressed.algorithm, CompressionAlgorithm::Lzma);
+        assert!(compressed.compressed_size < compressed.original_size);
+
+        let decompressed = compressor
+            .decompress_data(&compressed.data, CompressionAlgorithm::Lzma)
+            .unwrap();
+        assert_eq!(decompressed.data, test_data.as_bytes());
     }
 }

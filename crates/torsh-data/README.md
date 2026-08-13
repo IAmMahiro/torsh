@@ -37,7 +37,7 @@ Note: This crate can leverage scirs2-datasets for additional dataset utilities a
 
 ### GPU Acceleration (Experimental)
 - `gpu-acceleration`: Enable GPU-accelerated data preprocessing
-- `cuda`: CUDA backend support (implemented)
+- `cuda`: CUDA backend feature flag (placeholder — backend handle is a null/mock context, no real GPU dispatch yet)
 - `opencl`: OpenCL backend support (placeholder for future)
 - `vulkan`: Vulkan backend support (placeholder for future)
 - `metal`: Metal backend support for Apple Silicon (placeholder for future)
@@ -101,7 +101,7 @@ impl Dataset for ImageDataset {
         
         // Apply transformations if any
         let image = if let Some(transform) = &self.transform {
-            transform.apply(image)?
+            transform.transform(image)?
         } else {
             image
         };
@@ -118,51 +118,45 @@ impl Dataset for ImageDataset {
 // Sequential sampling
 let sampler = SequentialSampler::new(dataset.len());
 
-// Random sampling with replacement
-let sampler = RandomSampler::new(dataset.len())
-    .with_replacement(true)
-    .num_samples(10000);
+// Random sampling with replacement (dataset_size, num_samples, replacement)
+let sampler = RandomSampler::new(dataset.len(), Some(10000), true);
 
-// Batch sampling
+// Batch sampling (inner sampler, batch_size, drop_last)
 let batch_sampler = BatchSampler::new(sampler, 32, false);
-
-// Use with DataLoader
-let dataloader = DataLoader::builder(dataset)
-    .batch_sampler(batch_sampler)
-    .build()?;
 ```
 
 ### Data Transformations
 
 ```rust
-use torsh_data::transforms::{Compose, Normalize, RandomCrop, ToTensor};
+use torsh_data::core_framework::{Compose, Normalize};
+use torsh_data::tensor_transforms::RandomCrop;
 
-// Create a transformation pipeline
+// Compose chains same-type tensor transforms (e.g. crop -> crop)
 let transform = Compose::new(vec![
-    Box::new(RandomCrop::new(224)),
-    Box::new(ToTensor::new()),
-    Box::new(Normalize::new(
-        vec![0.485, 0.456, 0.406],
-        vec![0.229, 0.224, 0.225],
-    )),
+    Box::new(RandomCrop::new((224, 224))),
 ]);
+let cropped = transform.transform(image)?;
 
-// Apply to data
-let transformed = transform.apply(image)?;
+// Normalize::new validates mean/std lengths and returns a Result
+let normalize = Normalize::new(
+    vec![0.485, 0.456, 0.406],
+    vec![0.229, 0.224, 0.225],
+)?;
+let normalized = normalize.transform(cropped)?;
 ```
 
 ### Collate Functions
 
 ```rust
-use torsh_data::collate::{collate_fn, PadSequence};
+use torsh_data::collate::{collate_fn, PadCollate};
 
 // Default collate function (stacks tensors)
 let dataloader = DataLoader::builder(dataset)
     .collate_fn(collate_fn)
     .build()?;
 
-// Custom collate for variable-length sequences
-let pad_collate = PadSequence::new(0.0, true, -100);
+// Custom collate for variable-length sequences (padding_value)
+let pad_collate = PadCollate::new(0.0);
 let dataloader = DataLoader::builder(dataset)
     .collate_fn(move |batch| pad_collate.collate(batch))
     .build()?;
@@ -178,9 +172,9 @@ use torsh_data::vision::{ImageFolder, CIFAR10, MNIST};
 let dataset = ImageFolder::new("path/to/images")?
     .with_transform(transform);
 
-// Built-in datasets
-let mnist = MNIST::new("./data", true, Some(transform), true)?;
-let cifar = CIFAR10::new("./data", true, Some(transform), true)?;
+// Built-in datasets (root, train) — no transform/download params yet
+let mnist = MNIST::new("./data", true)?;
+let cifar = CIFAR10::new("./data", true)?;
 ```
 
 ### Tabular Data (with `dataframe` feature)
@@ -189,21 +183,18 @@ let cifar = CIFAR10::new("./data", true, Some(transform), true)?;
 #[cfg(feature = "dataframe")]
 use torsh_data::tabular::CSVDataset;
 
-let dataset = CSVDataset::new("data.csv")?
-    .with_target_column("label")
-    .with_features(vec!["feature1", "feature2", "feature3"])
-    .with_dtype(DType::F32);
+// new(path, target_column, has_header) — reads via the `csv` crate (no Polars dependency)
+let dataset = CSVDataset::new("data.csv", Some("label"), true)?;
 ```
 
 ### Audio Support (with `audio-support` feature)
 
 ```rust
 #[cfg(feature = "audio-support")]
-use torsh_data::audio::{AudioDataset, Spectrogram};
+use torsh_data::audio::AudioFolder;
 
-let dataset = AudioDataset::new(audio_files)?
-    .with_sample_rate(16000)
-    .with_transform(Spectrogram::new(n_fft, hop_length));
+// Loads class-labeled audio samples from a directory structure (like ImageFolder)
+let dataset = AudioFolder::new("path/to/audio", Some(16000))?;
 ```
 
 ### Multi-Processing and Performance
@@ -213,27 +204,20 @@ let dataset = AudioDataset::new(audio_files)?
 let dataloader = DataLoader::builder(dataset)
     .batch_size(64)
     .num_workers(8)  // Parallel loading threads
-    .prefetch_factor(2)  // Prefetch batches
     .persistent_workers(true)  // Keep workers alive
     .pin_memory(true)  // Pin memory for faster GPU transfer
     .build()?;
 ```
 
-## Integration with Polars
+## Tabular Data Backend
 
-When the `dataframe` feature is enabled, torsh-data integrates with Polars for efficient tabular data handling:
+The `dataframe` feature reads CSV files directly through the `csv` crate (COOLJAPAN policy — Polars is intentionally not a dependency). `CSVDataset` parses the file eagerly into in-memory `f32` feature/target vectors:
 
 ```rust
-use polars::prelude::*;
-use torsh_data::tabular::DataFrameDataset;
+use torsh_data::tabular::CSVDataset;
 
-let df = CsvReader::from_path("data.csv")?
-    .has_header(true)
-    .finish()?;
-
-let dataset = DataFrameDataset::from_dataframe(df)
-    .with_features(["col1", "col2"])
-    .with_target("label");
+let dataset = CSVDataset::new("data.csv", Some("label"), true)?;
+println!("{} features: {:?}", dataset.num_features(), dataset.feature_names());
 ```
 
 ## License

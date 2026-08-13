@@ -47,13 +47,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stop_profiling();
 
     // Get statistics
-    if let Ok((ops, flops, bytes, flops_per_sec, bandwidth)) = get_global_stats() {
+    if let Ok(stats) = get_global_stats() {
         println!("Profile Statistics:");
-        println!("  Total Operations: {ops}");
-        println!("  Total FLOPS: {flops}");
-        println!("  Total Bytes: {bytes}");
-        println!("  FLOPS/sec: {flops_per_sec:.2}");
-        println!("  Bandwidth (GB/s): {bandwidth:.2}");
+        println!("  Event Count: {}", stats.event_count);
+        println!("  Inclusive Total (us): {}", stats.inclusive_total_us);
+        println!("  Exclusive Total (us): {}", stats.exclusive_total_us);
+        println!("  Wall Clock (us): {}", stats.wall_clock_us);
+        println!("  Avg Duration (us): {:.2}", stats.avg_duration_us);
     }
 
     // Export to different formats

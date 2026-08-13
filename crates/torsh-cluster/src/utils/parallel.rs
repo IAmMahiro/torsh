@@ -167,17 +167,17 @@ pub fn parallel_nearest_centroids_f32(
 /// * `centroids` - Current cluster centroids (n_clusters x n_features)
 ///
 /// # Returns
-/// Tuple of (new_centroids, labels, inertia)
+/// Tuple of (new_centroids, labels, inertia, n_empty_cluster_reseeds)
 pub fn parallel_kmeans_iteration_f32(
     data: &Array2<f32>,
     centroids: &Array2<f32>,
-) -> ClusterResult<(Array2<f32>, Array1<usize>, f32)> {
+) -> ClusterResult<(Array2<f32>, Array1<usize>, f32, usize)> {
     let n_samples = data.nrows();
     let n_features = data.ncols();
     let n_clusters = centroids.nrows();
 
     // Step 1: Assign points to nearest centroids in parallel
-    let (labels, _) = parallel_nearest_centroids_f32(data, centroids)?;
+    let (labels, distances) = parallel_nearest_centroids_f32(data, centroids)?;
 
     // Step 2: Compute new centroids in parallel (one per cluster)
     let cluster_indices: Vec<usize> = (0..n_clusters).collect();
@@ -206,8 +206,41 @@ pub fn parallel_kmeans_iteration_f32(
         centroid
     });
 
+    // Convert to a flat buffer so empty clusters can be reseeded below.
+    let mut new_centroids_flat: Vec<f32> = new_centroids_vec.into_iter().flatten().collect();
+
+    // Step 2b: any cluster that received no points this iteration is
+    // reseeded to the data point currently farthest from its assigned
+    // centroid, rather than left at the origin (mirrors the sequential
+    // path's `algorithms::kmeans::reseed_empty_clusters`). `distances`
+    // (from Step 1) is exactly the per-point distance to its assigned
+    // centroid needed to rank candidates.
+    let mut cluster_counts = vec![0usize; n_clusters];
+    for &label in &labels_vec {
+        cluster_counts[label] += 1;
+    }
+    let empty_clusters: Vec<usize> = (0..n_clusters)
+        .filter(|&k| cluster_counts[k] == 0)
+        .collect();
+    let n_empty_cluster_reseeds = empty_clusters.len();
+    if !empty_clusters.is_empty() {
+        let distances_vec = distances.to_vec();
+        let mut order: Vec<usize> = (0..n_samples).collect();
+        order.sort_by(|&a, &b| {
+            distances_vec[b]
+                .partial_cmp(&distances_vec[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (slot, &k) in empty_clusters.iter().enumerate() {
+            if let Some(&point_idx) = order.get(slot) {
+                for j in 0..n_features {
+                    new_centroids_flat[k * n_features + j] = data[[point_idx, j]];
+                }
+            }
+        }
+    }
+
     // Convert to Array2
-    let new_centroids_flat: Vec<f32> = new_centroids_vec.into_iter().flatten().collect();
     let new_centroids = Array2::from_shape_vec((n_clusters, n_features), new_centroids_flat)
         .map_err(|_| ClusterError::InvalidInput("Failed to create centroids".to_string()))?;
 
@@ -223,7 +256,7 @@ pub fn parallel_kmeans_iteration_f32(
     });
     let inertia: f32 = per_sample_sq.into_iter().sum();
 
-    Ok((new_centroids, labels, inertia))
+    Ok((new_centroids, labels, inertia, n_empty_cluster_reseeds))
 }
 
 /// Compute silhouette scores for all samples in parallel
@@ -378,11 +411,13 @@ mod tests {
         let centroids = Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 5.0, 5.0])
             .map_err(|_| ClusterError::InvalidInput("Failed to create centroids".to_string()))?;
 
-        let (new_centroids, labels, inertia) = parallel_kmeans_iteration_f32(&data, &centroids)?;
+        let (new_centroids, labels, inertia, n_reseeds) =
+            parallel_kmeans_iteration_f32(&data, &centroids)?;
 
         assert_eq!(new_centroids.shape(), &[2, 2]);
         assert_eq!(labels.len(), 4);
         assert!(inertia >= 0.0);
+        assert_eq!(n_reseeds, 0); // every cluster receives points here
 
         // New centroids should be means of assigned points
         assert_relative_eq!(new_centroids[[0, 0]], 0.05, epsilon = 1e-4);
@@ -415,7 +450,9 @@ mod tests {
         let centroids = Array2::from_shape_vec((3, 2), centroids_flat)
             .map_err(|_| ClusterError::InvalidInput("Failed to create centroids".to_string()))?;
 
-        let (new_centroids, labels, inertia) = parallel_kmeans_iteration_f32(&data, &centroids)?;
+        let (new_centroids, labels, inertia, n_reseeds) =
+            parallel_kmeans_iteration_f32(&data, &centroids)?;
+        assert_eq!(n_reseeds, 0); // every cluster receives points here
 
         // Serial reference loop to validate the parallel result
         let mut expected_inertia = 0.0f32;

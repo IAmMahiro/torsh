@@ -9,6 +9,7 @@ use crate::device::implementations::CpuDevice;
 use crate::device::implementations::DeviceFactory;
 use crate::device::{Device, DeviceCapabilities, DeviceType};
 use crate::error::Result;
+use crate::sync::{MutexExt, RwLockExt};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -101,19 +102,19 @@ impl DeviceManager {
 
     /// Get device by ID
     pub fn get_device(&self, device_id: &str) -> Option<Arc<dyn Device>> {
-        let devices = self.devices.read().expect("lock should not be poisoned");
+        let devices = self.devices.read_or_recover();
         devices.get(device_id).cloned()
     }
 
     /// Get all devices
     pub fn get_all_devices(&self) -> Vec<Arc<dyn Device>> {
-        let devices = self.devices.read().expect("lock should not be poisoned");
+        let devices = self.devices.read_or_recover();
         devices.values().cloned().collect()
     }
 
     /// Get devices by type
     pub fn get_devices_by_type(&self, device_type: DeviceType) -> Vec<Arc<dyn Device>> {
-        let devices = self.devices.read().expect("lock should not be poisoned");
+        let devices = self.devices.read_or_recover();
         devices
             .values()
             .filter(|device| device.device_type() == device_type)
@@ -138,7 +139,7 @@ impl DeviceManager {
 
     /// Get devices that are currently available
     pub fn get_available_devices(&self) -> Result<Vec<Arc<dyn Device>>> {
-        let devices = self.devices.read().expect("lock should not be poisoned");
+        let devices = self.devices.read_or_recover();
         let mut available = Vec::new();
 
         for device in devices.values() {
@@ -163,15 +164,9 @@ impl DeviceManager {
         let health = DeviceHealth::new();
 
         {
-            let mut devices = self.devices.write().expect("lock should not be poisoned");
-            let mut states = self
-                .device_states
-                .write()
-                .expect("lock should not be poisoned");
-            let mut health_map = self
-                .device_health
-                .write()
-                .expect("lock should not be poisoned");
+            let mut devices = self.devices.write_or_recover();
+            let mut states = self.device_states.write_or_recover();
+            let mut health_map = self.device_health.write_or_recover();
 
             devices.insert(device_id.clone(), arc_device);
             states.insert(device_id.clone(), lifecycle);
@@ -183,15 +178,9 @@ impl DeviceManager {
 
     /// Remove a device from the manager
     pub fn remove_device(&self, device_id: &str) -> Option<Arc<dyn Device>> {
-        let mut devices = self.devices.write().expect("lock should not be poisoned");
-        let mut states = self
-            .device_states
-            .write()
-            .expect("lock should not be poisoned");
-        let mut health_map = self
-            .device_health
-            .write()
-            .expect("lock should not be poisoned");
+        let mut devices = self.devices.write_or_recover();
+        let mut states = self.device_states.write_or_recover();
+        let mut health_map = self.device_health.write_or_recover();
 
         states.remove(device_id);
         health_map.remove(device_id);
@@ -200,17 +189,14 @@ impl DeviceManager {
 
     /// Get device count
     pub fn device_count(&self) -> usize {
-        let devices = self.devices.read().expect("lock should not be poisoned");
+        let devices = self.devices.read_or_recover();
         devices.len()
     }
 
     /// Get manager statistics
     pub fn statistics(&self) -> ManagerStatistics {
-        let devices = self.devices.read().expect("lock should not be poisoned");
-        let health_map = self
-            .device_health
-            .read()
-            .expect("lock should not be poisoned");
+        let devices = self.devices.read_or_recover();
+        let health_map = self.device_health.read_or_recover();
 
         let total_devices = devices.len();
         let available_devices = devices
@@ -239,7 +225,7 @@ impl DeviceManager {
 
     /// Synchronize all devices
     pub fn synchronize_all(&self) -> Result<()> {
-        let devices = self.devices.read().expect("lock should not be poisoned");
+        let devices = self.devices.read_or_recover();
         for device in devices.values() {
             device.synchronize()?;
         }
@@ -248,7 +234,7 @@ impl DeviceManager {
 
     /// Reset all devices
     pub fn reset_all(&self) -> Result<()> {
-        let devices = self.devices.read().expect("lock should not be poisoned");
+        let devices = self.devices.read_or_recover();
         for device in devices.values() {
             device.reset()?;
         }
@@ -261,18 +247,27 @@ impl DeviceManager {
         Ok(())
     }
 
+    /// Discover CUDA devices
+    ///
+    /// torsh-core has no direct CUDA driver bindings, so it cannot enumerate
+    /// how many CUDA devices actually exist (real enumeration is available
+    /// through `torsh-tensor`'s oxicuda-backed `cuda_backend`). This used to
+    /// unconditionally attempt indices `0..2`, always reporting exactly two
+    /// CUDA devices whenever the `cuda` feature was enabled, regardless of
+    /// what hardware (if any) was actually present. `DeviceFactory::create_device`
+    /// now honestly fails for every CUDA index (see
+    /// `DeviceCapabilities::detect_cuda_capabilities`), so this attempts
+    /// only index `0` and, consistent with that honesty, discovers zero
+    /// devices rather than fabricating a device count.
     fn discover_cuda_devices(&self) -> Result<usize> {
         #[allow(unused_mut)] // mut needed for conditional compilation features
         let mut count = 0;
 
         #[cfg(feature = "cuda")]
         {
-            // In a real implementation, this would query CUDA runtime for device count
-            for index in 0..2 {
-                if let Ok(device) = DeviceFactory::create_device(DeviceType::Cuda(index)) {
-                    self.add_device(device)?;
-                    count += 1;
-                }
+            if let Ok(device) = DeviceFactory::create_device(DeviceType::Cuda(0)) {
+                self.add_device(device)?;
+                count += 1;
             }
         }
 
@@ -312,7 +307,7 @@ impl DeviceManager {
     }
 
     fn start_health_monitoring(&self) -> Result<()> {
-        let devices = self.devices.read().expect("lock should not be poisoned");
+        let devices = self.devices.read_or_recover();
         for (device_id, device) in devices.iter() {
             self.health_monitor
                 .add_device(device_id.clone(), device.clone())?;
@@ -321,10 +316,7 @@ impl DeviceManager {
     }
 
     fn is_device_healthy(&self, device: &dyn Device) -> Result<bool> {
-        let health_map = self
-            .device_health
-            .read()
-            .expect("lock should not be poisoned");
+        let health_map = self.device_health.read_or_recover();
         let device_id = device.device_id();
         Ok(health_map
             .get(&device_id)
@@ -524,19 +516,13 @@ impl HealthMonitor {
     }
 
     pub fn add_device(&self, device_id: String, device: Arc<dyn Device>) -> Result<()> {
-        let mut devices = self
-            .monitored_devices
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut devices = self.monitored_devices.lock_or_recover();
         devices.insert(device_id, device);
         Ok(())
     }
 
     pub fn remove_device(&self, device_id: &str) {
-        let mut devices = self
-            .monitored_devices
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut devices = self.monitored_devices.lock_or_recover();
         devices.remove(device_id);
     }
 

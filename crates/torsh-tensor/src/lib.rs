@@ -54,6 +54,24 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+/// Decide whether an operation should record an autograd graph node.
+///
+/// Recording needs *both* halves to be true: at least one operand must require
+/// gradients, and gradient mode must be enabled. The second half is what makes
+/// `torsh_autograd::guards::no_grad()` (and `inference_mode()`) actually
+/// suppress graph construction — the flag lives in [`torsh_core::grad_mode`]
+/// rather than in `torsh-autograd`, because that crate sits *above* this one and
+/// its state would otherwise be invisible here.
+///
+/// `requires_grad` is passed pre-combined (e.g. `lhs.requires_grad ||
+/// rhs.requires_grad`) and checked first: it is a plain field read, so the
+/// common non-differentiable case never touches the mode at all, and the mode
+/// itself is a single relaxed atomic load.
+#[inline]
+pub(crate) fn should_record_grad(requires_grad: bool) -> bool {
+    requires_grad && torsh_core::grad_mode::is_grad_enabled()
+}
+
 // Core modules providing the tensor implementation
 pub mod adaptive_auto_tuner;
 pub mod advanced_ops;
@@ -65,11 +83,13 @@ pub mod computation_graph;
 pub mod core_ops;
 pub mod cross_platform_validator;
 pub mod data_ops;
+pub mod dim_ops;
 pub mod expression_optimizer;
 pub mod expression_templates;
 pub mod hardware_accelerators;
 pub mod manipulation;
 pub mod math_ops;
+pub mod matmul_ops;
 pub mod memory_optimization;
 pub mod optimization_cli;
 pub mod shape_ops;
@@ -93,12 +113,12 @@ pub mod creation;
 mod cuda_backend;
 pub mod custom_dtype;
 pub mod custom_ops;
+pub mod fft;
 /// GPU compute dispatch backed by oxicuda's `ComputeBackend` (replaces scirs2-core GPU).
 #[cfg(feature = "gpu")]
 pub mod gpu_dispatch;
 pub mod indexing;
 pub mod lazy_loading;
-// pub mod lazy_ops; // Temporarily disabled due to complex trait bounds - using fluent API instead
 pub mod lockfree_cache;
 pub mod memory_pool;
 #[cfg(feature = "memory-profiling")]
@@ -106,8 +126,6 @@ pub mod memory_profiler;
 pub mod nan_inf_detection;
 #[cfg(feature = "operation-logging")]
 pub mod operation_logging;
-// pub mod ops; // Disabled due to duplicate definitions with core modules (all, any, sum, mean, matmul, cat, etc.)
-pub mod fft;
 pub mod scirs2_backend;
 pub mod scirs2_stats_integration;
 pub mod shape_inference_debugger;
@@ -141,9 +159,6 @@ pub use core_ops::{Operation, Tensor};
 // Re-export convenience methods
 pub use convenience::{FluentTensor, TensorConvenience, TensorFluentExt};
 
-// Re-export lazy evaluation functionality (temporarily disabled)
-// pub use lazy_ops::{LazyTensor, TensorLazyExt};
-
 // Re-export sparse tensor functionality (COO, CSR, CSC formats)
 pub use sparse::{SparseCSC, SparseCSR, SparseTensor};
 
@@ -154,6 +169,8 @@ pub use custom_ops::{
 };
 
 // Re-export storage types for advanced usage
+#[cfg(feature = "gpu")]
+pub use storage::DeviceBuffer;
 pub use storage::{MemoryMappedStorage, TensorStorage};
 
 // Re-export zero-copy view types (CRITICAL #1)
@@ -220,79 +237,31 @@ impl<T: TensorElement> Tensor<T> {
             TensorStorage::Aligned(data) => Arc::strong_count(data),
             #[cfg(feature = "simd")]
             TensorStorage::SimdOptimized(storage) => Arc::strong_count(storage),
+            #[cfg(feature = "gpu")]
+            TensorStorage::Device { buffer, .. } => Arc::strong_count(buffer),
         }
     }
 
-    /// Create from vec with shape (convenience method)
+    /// Create from vec with shape (convenience method).
+    ///
+    /// Rejects a `data` length that does not match `shape`'s element count so
+    /// the mismatch is reported here rather than as a later out-of-bounds error.
     pub fn from_vec(data: Vec<T>, shape: &[usize]) -> Result<Self>
     where
         T: Copy,
     {
+        let numel: usize = shape.iter().product();
+        if data.len() != numel {
+            return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                "from_vec: data has {} elements but shape {:?} requires {}",
+                data.len(),
+                shape,
+                numel
+            )));
+        }
         Self::from_data(data, shape.to_vec(), DeviceType::Cpu)
     }
 }
-
-// TODO: Conditional AutogradTensor trait implementation - torsh-autograd not yet available
-// #[cfg(feature = "autograd")]
-// impl<T: TensorElement> torsh_autograd::AutogradTensor<T> for Tensor<T> {
-//     fn shape(&self) -> Shape {
-//         self.shape()
-//     }
-//
-//     fn requires_grad(&self) -> bool {
-//         self.requires_grad()
-//     }
-//
-//     fn data(&self) -> Box<dyn std::ops::Deref<Target = [T]> + '_> {
-//         // Return a boxed vector that can be dereferenced as a slice
-//         Box::new(self.to_vec().unwrap_or_default())
-//     }
-//
-//     fn clone_tensor(&self) -> Box<dyn torsh_autograd::AutogradTensor<T>> {
-//         Box::new(self.clone())
-//     }
-//
-//     fn to_vec(&self) -> Vec<T>
-//     where
-//         T: Copy,
-//     {
-//         self.to_vec().unwrap_or_default()
-//     }
-//
-//     fn device(&self) -> &dyn torsh_core::Device {
-//         match &self.device {
-//             DeviceType::Cpu => {
-//                 static CPU_DEVICE: torsh_core::device::CpuDevice =
-//                     torsh_core::device::CpuDevice::new();
-//                 &CPU_DEVICE
-//             }
-//             DeviceType::Cuda(_) => {
-//                 static CPU_DEVICE: torsh_core::device::CpuDevice =
-//                     torsh_core::device::CpuDevice::new();
-//                 &CPU_DEVICE // TODO: Return proper CUDA device
-//             }
-//             _ => {
-//                 static CPU_DEVICE: torsh_core::device::CpuDevice =
-//                     torsh_core::device::CpuDevice::new();
-//                 &CPU_DEVICE
-//             }
-//         }
-//     }
-//
-//     fn ones_like(&self) -> Box<dyn torsh_autograd::AutogradTensor<T>>
-//     where
-//         T: Copy,
-//     {
-//         Box::new(self.ones_like().unwrap_or_else(|_| self.clone()))
-//     }
-//
-//     fn zeros_like(&self) -> Box<dyn torsh_autograd::AutogradTensor<T>>
-//     where
-//         T: Copy,
-//     {
-//         Box::new(self.zeros_like().unwrap_or_else(|_| self.clone()))
-//     }
-// }
 
 // Re-export commonly used functions and types for convenience
 pub mod prelude {

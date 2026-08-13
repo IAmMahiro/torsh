@@ -25,21 +25,27 @@ impl SparseWeightGenerator {
         }
 
         let total_elements = rows * cols;
-        let nnz = ((1.0 - sparsity) * total_elements as f32) as usize;
+        let nnz = (((1.0 - sparsity) * total_elements as f32) as usize).min(total_elements);
 
         let mut rng = scirs2_core::random::thread_rng();
 
-        // Generate random indices for non-zero elements
+        // Generate random *distinct* coordinates for the non-zero elements:
+        // drawing with replacement would collide, and colliding coordinates are
+        // summed when the matrix is coalesced, silently lowering the density.
         let mut row_indices = Vec::with_capacity(nnz);
         let mut col_indices = Vec::with_capacity(nnz);
         let mut values = Vec::with_capacity(nnz);
+        let mut taken = std::collections::HashSet::with_capacity(nnz);
 
         // Use std for weight initialization
         let std = (2.0 / (rows + cols) as f32).sqrt();
 
-        for _ in 0..nnz {
+        while taken.len() < nnz {
             let row = rng.gen_range(0..rows);
             let col = rng.gen_range(0..cols);
+            if !taken.insert((row, col)) {
+                continue;
+            }
             let value: f32 = rng.gen_range(-1.0..1.0) * std;
 
             row_indices.push(row);

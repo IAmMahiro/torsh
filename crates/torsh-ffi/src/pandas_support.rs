@@ -9,10 +9,12 @@
 use crate::error::FfiError;
 use crate::numpy_compatibility::NumpyCompat;
 use crate::tensor::PyTensor;
+use numpy::PyArrayDyn;
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyAny, PyDict, PyModule};
+use pyo3::types::{IntoPyDict, PyAny, PyDict, PyList, PyModule, PyTuple};
 use pyo3::Bound;
 use std::collections::HashMap;
+use torsh_core::DType;
 
 /// Pandas integration layer providing data manipulation capabilities
 #[pyclass(name = "PandasSupport")]
@@ -206,36 +208,49 @@ impl PandasSupport {
         _py: Python,
         dataframe: Bound<'_, PyAny>,
     ) -> PyResult<TorshDataFrame> {
-        // Get the underlying numpy array
-        let _values = dataframe.getattr("_values")?;
-        // TODO: Implement proper NumPy array conversion
-        return Err(FfiError::UnsupportedOperation {
-            operation: "DataFrame to Tensor conversion not implemented".to_string(),
-        }
-        .into());
+        // Get the underlying numpy array and convert it (see `extract_f32_array`
+        // for why an `.astype("float32")` normalization is required here).
+        let values = dataframe.getattr("_values")?;
+        let data = self.extract_f32_array(&values)?;
 
-        /*
-        // Extract metadata
+        // Column labels. Read as raw Python objects (not yet stringified) so
+        // that the `dtypes` lookup below can index positionally via `.iloc`
+        // rather than assuming labels are string keys (a plain
+        // `pd.DataFrame(np.zeros((r, c)))` has an integer `RangeIndex` for
+        // its columns, not strings).
         let columns_py = dataframe.getattr("columns")?;
-        let columns: Vec<String> = columns_py.call_method("tolist", (), None)?.extract()?;
+        let raw_columns = columns_py.call_method("tolist", (), None)?;
+        let raw_columns = raw_columns.cast::<PyList>()?;
 
+        let dtypes_iloc = dataframe.getattr("dtypes")?.getattr("iloc")?;
+        let mut columns = Vec::with_capacity(raw_columns.len());
+        let mut dtypes = HashMap::new();
+        for (i, item) in raw_columns.iter().enumerate() {
+            let col_name: String = item.str()?.extract()?;
+            let dtype_str: String = dtypes_iloc.get_item(i)?.str()?.extract()?;
+            dtypes.insert(col_name.clone(), dtype_str);
+            columns.push(col_name);
+        }
+
+        // Row index. Stringify defensively: the default `RangeIndex` is
+        // integer-valued, and arbitrary index dtypes (datetime, etc.) are
+        // not directly extractable as Rust `String`.
         let index_py = dataframe.getattr("index")?;
-        let index: Vec<String> = index_py.call_method("tolist", (), None)?.extract()?;
+        let index: Vec<String> = index_py
+            .call_method("tolist", (), None)?
+            .cast::<PyList>()?
+            .iter()
+            .map(|item| item.str().and_then(|s| s.extract::<String>()))
+            .collect::<PyResult<Vec<String>>>()?;
 
         let shape_py = dataframe.getattr("shape")?;
-        let shape_tuple: &PyTuple = shape_py.downcast()?;
-        let shape = (
+        let shape_tuple = shape_py.cast::<PyTuple>()?;
+        let shape: (usize, usize) = (
             shape_tuple.get_item(0)?.extract()?,
             shape_tuple.get_item(1)?.extract()?,
         );
 
-        // Get data types
-        let dtypes_py = dataframe.getattr("dtypes")?;
-        let mut dtypes = HashMap::new();
-        for (i, col) in columns.iter().enumerate() {
-            let dtype_str: String = dtypes_py.get_item(i)?.str()?.extract()?;
-            dtypes.insert(col.clone(), dtype_str);
-        }
+        let tensor = PyTensor::from_raw(data, vec![shape.0, shape.1], DType::F32, false);
 
         Ok(TorshDataFrame {
             data: tensor,
@@ -244,7 +259,6 @@ impl PandasSupport {
             dtypes,
             shape,
         })
-        */
     }
 
     /// Convert ToRSh tensor to Pandas Series
@@ -278,30 +292,32 @@ impl PandasSupport {
 
     /// Convert Pandas Series to ToRSh tensor
     pub fn from_series(&self, _py: Python, series: Bound<'_, PyAny>) -> PyResult<TorshSeries> {
-        // Get the underlying numpy array
-        let _values = series.getattr("values")?;
-        // TODO: Implement proper NumPy array conversion
-        return Err(FfiError::UnsupportedOperation {
-            operation: "Series to Tensor conversion not implemented".to_string(),
-        }
-        .into());
+        // Get the underlying numpy array and convert it
+        let values = series.getattr("values")?;
+        let data = self.extract_f32_array(&values)?;
 
-        /*
         // Extract metadata
         let name_py = series.getattr("name")?;
         let name = if name_py.is_none() {
             None
         } else {
-            Some(name_py.extract()?)
+            Some(name_py.str()?.extract()?)
         };
 
         let index_py = series.getattr("index")?;
-        let index: Vec<String> = index_py.call_method("tolist", (), None)?.extract()?;
+        let index: Vec<String> = index_py
+            .call_method("tolist", (), None)?
+            .cast::<PyList>()?
+            .iter()
+            .map(|item| item.str().and_then(|s| s.extract::<String>()))
+            .collect::<PyResult<Vec<String>>>()?;
 
         let dtype_py = series.getattr("dtype")?;
         let dtype: String = dtype_py.str()?.extract()?;
 
-        let length: usize = series.call_method("__len__", (), None)?.extract()?;
+        let length: usize = series.len()?;
+
+        let tensor = PyTensor::from_raw(data, vec![length], DType::F32, false);
 
         Ok(TorshSeries {
             data: tensor,
@@ -310,7 +326,6 @@ impl PandasSupport {
             dtype,
             length,
         })
-        */
     }
 
     /// Perform data grouping operations
@@ -459,51 +474,115 @@ impl PandasSupport {
     pub fn merge_dataframes(
         &self,
         py: Python,
-        _left: Bound<'_, PyAny>,
-        _right: Bound<'_, PyAny>,
-        _on: Vec<String>,
+        left: Bound<'_, PyAny>,
+        right: Bound<'_, PyAny>,
+        on: Vec<String>,
         how: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
         let _pandas = self.get_pandas_module(py)?;
-        let _how_str = how.unwrap_or("inner");
+        let how_str = how.unwrap_or("inner");
 
-        // TODO: Implement proper DataFrame merging
-        Err(FfiError::UnsupportedOperation {
-            operation: "DataFrame merging not implemented".to_string(),
+        let kwargs = PyDict::new(py);
+        // An empty `on` means "let pandas infer the common columns" (its
+        // `on=None` default); passing an empty list explicitly would instead
+        // make pandas raise `MergeError: No common columns`.
+        if !on.is_empty() {
+            kwargs.set_item("on", on)?;
         }
-        .into())
+        kwargs.set_item("how", how_str)?;
+
+        Ok(left.call_method("merge", (right,), Some(&kwargs))?.into())
     }
 
     /// Pivot table operations
     pub fn pivot_table(
         &self,
-        _py: Python,
-        _dataframe: Bound<'_, PyAny>,
-        _values: Vec<String>,
-        _index: Vec<String>,
-        _columns: Vec<String>,
-        _aggfunc: Option<&str>,
+        py: Python,
+        dataframe: Bound<'_, PyAny>,
+        values: Vec<String>,
+        index: Vec<String>,
+        columns: Vec<String>,
+        aggfunc: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
-        // TODO: Implement proper pivot table operations
-        Err(FfiError::UnsupportedOperation {
-            operation: "Pivot table operations not implemented".to_string(),
+        let kwargs = PyDict::new(py);
+        // Empty vectors mean "unspecified" for each of these -- pandas'
+        // `pivot_table` treats `values`/`index`/`columns=None` as "use all
+        // remaining columns", which is a more useful default than forcing
+        // an empty list (which pandas would otherwise reject).
+        if !values.is_empty() {
+            kwargs.set_item("values", values)?;
         }
-        .into())
+        if !index.is_empty() {
+            kwargs.set_item("index", index)?;
+        }
+        if !columns.is_empty() {
+            kwargs.set_item("columns", columns)?;
+        }
+        kwargs.set_item("aggfunc", aggfunc.unwrap_or("mean"))?;
+
+        Ok(dataframe
+            .call_method("pivot_table", (), Some(&kwargs))?
+            .into())
     }
 
     /// Time series operations
+    ///
+    /// Design choice: `resample(freq)` and `rolling(window)` are mutually
+    /// exclusive pandas time-series transforms, so exactly one selects the
+    /// operation to perform (preferring `freq`/resample if both are given).
+    /// Plain descriptive statistics without either are already covered by
+    /// [`Self::statistical_analysis`], so neither being present is an error.
     pub fn time_series_analysis(
         &self,
-        _py: Python,
-        _series: Bound<'_, PyAny>,
-        _freq: Option<&str>,
-        _window: Option<usize>,
+        py: Python,
+        series: Bound<'_, PyAny>,
+        freq: Option<&str>,
+        window: Option<usize>,
     ) -> PyResult<DataAnalysisResult> {
-        // TODO: Implement proper time series analysis
-        Err(FfiError::UnsupportedOperation {
-            operation: "Time series analysis not implemented".to_string(),
+        let (result, operation) = if let Some(freq) = freq {
+            let resampled = series.call_method1("resample", (freq,))?;
+            (resampled.call_method("mean", (), None)?, "resample")
+        } else if let Some(window) = window {
+            let rolling = series.call_method1("rolling", (window,))?;
+            (rolling.call_method("mean", (), None)?, "rolling")
+        } else {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "time_series_analysis requires either `freq` (for resample) or `window` (for rolling)",
+            ));
+        };
+
+        // Normalize a Series result (the common case for a single input
+        // Series) into a single-column DataFrame so it can flow through the
+        // shared `from_dataframe` extraction path used elsewhere in this file.
+        let result_df = if result.hasattr("columns")? {
+            result
+        } else {
+            result.call_method("to_frame", (), None)?
+        };
+
+        let torsh_df = self.from_dataframe(py, result_df)?;
+
+        let mut statistics = HashMap::new();
+        statistics.insert(
+            "num_observations".to_string(),
+            torsh_df.data.data.len() as f64,
+        );
+        if let Some(window) = window {
+            statistics.insert("window".to_string(), window as f64);
         }
-        .into())
+
+        let mut metadata = HashMap::new();
+        metadata.insert("operation".to_string(), operation.to_string());
+        if let Some(freq) = freq {
+            metadata.insert("freq".to_string(), freq.to_string());
+        }
+
+        Ok(DataAnalysisResult {
+            data: torsh_df.data,
+            statistics,
+            metadata,
+            columns: torsh_df.columns,
+        })
     }
 
     /// Get Pandas version information
@@ -576,6 +655,29 @@ impl PandasSupport {
         let module = py.import("pandas")?;
         Ok(module.into())
     }
+
+    /// Coerce an arbitrary NumPy-array-like Python object (e.g. the result
+    /// of `DataFrame._values` / `Series.values`) into a `Vec<f32>` via
+    /// [`NumpyCompat::from_numpy_array`].
+    ///
+    /// Pandas defaults essentially all numeric columns to `float64`, so an
+    /// unconditional `.astype("float32")` normalization is applied before
+    /// casting to `PyArrayDyn<f32>`. Without it, this conversion would only
+    /// work for the rare caller that already has float32-typed data, making
+    /// DataFrame/Series ingestion effectively unusable for ordinary pandas
+    /// output.
+    fn extract_f32_array(&self, array: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
+        let float32_array = array.call_method1("astype", ("float32",))?;
+        let py_array =
+            float32_array
+                .cast::<PyArrayDyn<f32>>()
+                .map_err(|e| FfiError::InvalidConversion {
+                    message: format!("Expected a NumPy-array-convertible value: {}", e),
+                })?;
+        self.numpy_compat
+            .from_numpy_array(py_array)
+            .map_err(|e| FfiError::InvalidConversion { message: e }.into())
+    }
 }
 
 /// Create Pandas support utilities
@@ -610,5 +712,222 @@ mod tests {
             MissingValueStrategy::FillValue(val) => assert_eq!(val, 42.0),
             _ => panic!("Expected FillValue strategy"),
         }
+    }
+
+    /// Skip a pandas-dependent test cleanly if pandas isn't importable in
+    /// this environment, rather than failing the whole suite.
+    fn require_pandas(py: Python<'_>) -> bool {
+        py.import("pandas").is_ok()
+    }
+
+    /// Compare two `f32` slices elementwise within a small tolerance, rather
+    /// than via `assert_eq!` -- avoids relying on bit-exact float equality
+    /// after a round trip through Python/pandas/NumPy.
+    fn assert_f32_slice_approx_eq(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len(), "length mismatch");
+        for (a, e) in actual.iter().zip(expected.iter()) {
+            assert!((a - e).abs() < 1e-5, "{:?} vs {:?}", actual, expected);
+        }
+    }
+
+    #[test]
+    fn test_from_dataframe_round_trip() {
+        Python::initialize();
+        Python::attach(|py| {
+            if !require_pandas(py) {
+                eprintln!("skipping test_from_dataframe_round_trip: pandas not installed");
+                return;
+            }
+            let support = PandasSupport::new().expect("PandasSupport::new should succeed");
+            let df = py
+                .eval(
+                    c"__import__('pandas').DataFrame({'a': [1.0, 2.0, 3.0], 'b': [4.0, 5.0, 6.0]})",
+                    None,
+                    None,
+                )
+                .expect("failed to build test dataframe");
+
+            let torsh_df = support
+                .from_dataframe(py, df)
+                .expect("from_dataframe should succeed on a real, non-empty numeric DataFrame");
+
+            assert_eq!(torsh_df.shape, (3, 2));
+            assert_eq!(torsh_df.columns, vec!["a".to_string(), "b".to_string()]);
+            assert_eq!(
+                torsh_df.index,
+                vec!["0".to_string(), "1".to_string(), "2".to_string()]
+            );
+            assert_eq!(torsh_df.data.shape, vec![3, 2]);
+            // `_values` is row-major: row i is [a[i], b[i]].
+            assert_f32_slice_approx_eq(&torsh_df.data.data, &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+            assert_eq!(
+                torsh_df.dtypes.get("a").map(String::as_str),
+                Some("float64")
+            );
+        });
+    }
+
+    #[test]
+    fn test_from_series_round_trip() {
+        Python::initialize();
+        Python::attach(|py| {
+            if !require_pandas(py) {
+                eprintln!("skipping test_from_series_round_trip: pandas not installed");
+                return;
+            }
+            let support = PandasSupport::new().expect("PandasSupport::new should succeed");
+            let series = py
+                .eval(
+                    c"__import__('pandas').Series([1.5, 2.5, 3.5, 4.5], name='s')",
+                    None,
+                    None,
+                )
+                .expect("failed to build test series");
+
+            let torsh_series = support
+                .from_series(py, series)
+                .expect("from_series should succeed on a real, non-empty numeric Series");
+
+            assert_eq!(torsh_series.length, 4);
+            assert_eq!(torsh_series.name, Some("s".to_string()));
+            assert_f32_slice_approx_eq(&torsh_series.data.data, &[1.5, 2.5, 3.5, 4.5]);
+            assert_eq!(torsh_series.data.shape, vec![4]);
+        });
+    }
+
+    #[test]
+    fn test_merge_dataframes() {
+        Python::initialize();
+        Python::attach(|py| {
+            if !require_pandas(py) {
+                eprintln!("skipping test_merge_dataframes: pandas not installed");
+                return;
+            }
+            let support = PandasSupport::new().expect("PandasSupport::new should succeed");
+            let left = py
+                .eval(
+                    c"__import__('pandas').DataFrame({'key': ['a', 'b', 'c'], 'left_val': [1, 2, 3]})",
+                    None,
+                    None,
+                )
+                .expect("failed to build left dataframe");
+            let right = py
+                .eval(
+                    c"__import__('pandas').DataFrame({'key': ['a', 'b', 'd'], 'right_val': [10, 20, 30]})",
+                    None,
+                    None,
+                )
+                .expect("failed to build right dataframe");
+
+            let merged = support
+                .merge_dataframes(py, left, right, vec!["key".to_string()], Some("inner"))
+                .expect("merge_dataframes should succeed");
+            let merged = merged.bind(py);
+
+            // Inner join on 'key' only matches 'a' and 'b' ('c' vs 'd' don't).
+            assert_eq!(merged.len().expect("merged result should have a length"), 2);
+            let columns: Vec<String> = merged
+                .getattr("columns")
+                .expect("columns")
+                .call_method("tolist", (), None)
+                .expect("tolist")
+                .extract()
+                .expect("extract columns");
+            assert!(columns.contains(&"left_val".to_string()));
+            assert!(columns.contains(&"right_val".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_pivot_table() {
+        Python::initialize();
+        Python::attach(|py| {
+            if !require_pandas(py) {
+                eprintln!("skipping test_pivot_table: pandas not installed");
+                return;
+            }
+            let support = PandasSupport::new().expect("PandasSupport::new should succeed");
+            let df = py
+                .eval(
+                    c"__import__('pandas').DataFrame({'cat': ['x', 'x', 'y', 'y'], 'val': [1.0, 3.0, 2.0, 4.0]})",
+                    None,
+                    None,
+                )
+                .expect("failed to build test dataframe");
+
+            let pivoted = support
+                .pivot_table(
+                    py,
+                    df,
+                    vec!["val".to_string()],
+                    vec!["cat".to_string()],
+                    vec![],
+                    Some("mean"),
+                )
+                .expect("pivot_table should succeed");
+            let pivoted = pivoted.bind(py);
+
+            // Two distinct categories ('x', 'y') become two index rows.
+            assert_eq!(
+                pivoted.len().expect("pivoted result should have a length"),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn test_time_series_analysis_rolling() {
+        Python::initialize();
+        Python::attach(|py| {
+            if !require_pandas(py) {
+                eprintln!("skipping test_time_series_analysis_rolling: pandas not installed");
+                return;
+            }
+            let support = PandasSupport::new().expect("PandasSupport::new should succeed");
+            let series = py
+                .eval(
+                    c"__import__('pandas').Series([1.0, 2.0, 3.0, 4.0, 5.0])",
+                    None,
+                    None,
+                )
+                .expect("failed to build test series");
+
+            let result = support
+                .time_series_analysis(py, series, None, Some(2))
+                .expect("time_series_analysis with a rolling window should succeed");
+
+            assert_eq!(
+                result.metadata.get("operation").map(String::as_str),
+                Some("rolling")
+            );
+            assert_eq!(result.data.data.len(), 5);
+            // First rolling(2).mean() observation is NaN (not enough history).
+            assert!(result.data.data[0].is_nan());
+            assert!((result.data.data[1] - 1.5).abs() < 1e-6);
+            assert!((result.data.data[4] - 4.5).abs() < 1e-6);
+        });
+    }
+
+    #[test]
+    fn test_time_series_analysis_requires_freq_or_window() {
+        Python::initialize();
+        Python::attach(|py| {
+            if !require_pandas(py) {
+                eprintln!(
+                    "skipping test_time_series_analysis_requires_freq_or_window: pandas not installed"
+                );
+                return;
+            }
+            let support = PandasSupport::new().expect("PandasSupport::new should succeed");
+            let series = py
+                .eval(c"__import__('pandas').Series([1.0, 2.0, 3.0])", None, None)
+                .expect("failed to build test series");
+
+            let result = support.time_series_analysis(py, series, None, None);
+            assert!(
+                result.is_err(),
+                "expected an error when neither freq nor window is given"
+            );
+        });
     }
 }

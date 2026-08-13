@@ -107,7 +107,7 @@ pub use core::{Compose, Transform};
 // Basic transforms
 //
 
-pub use basic::{CenterCrop, Normalize, Pad, Resize, ToTensor};
+pub use basic::{CenterCrop, ImageLayout, Normalize, Pad, Resize, ToTensor};
 
 //
 // Random transforms

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Mutex, RwLock};
+use torsh_core::sync::MutexExt;
 
 /// Supported specialized gradient computation libraries
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -846,11 +847,7 @@ impl SpecializedLibraryManager {
     }
 
     pub fn get_usage_report(&self) -> LibraryUsageReport {
-        let stats = self
-            .usage_stats
-            .lock()
-            .expect("lock should not be poisoned")
-            .clone();
+        let stats = self.usage_stats.lock_or_recover().clone();
 
         LibraryUsageReport {
             library_stats: stats.clone(),

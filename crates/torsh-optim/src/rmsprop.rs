@@ -680,8 +680,7 @@ impl Optimizer for RMSprop {
                 let step_update = update
                     .mul_scalar(group.lr)
                     .map_err(OptimizerError::TensorError)?;
-                *param_write = param_write
-                    .sub(&step_update)
+                crate::param_update::sub_assign(&mut param_write, &step_update)
                     .map_err(OptimizerError::TensorError)?;
             }
         }

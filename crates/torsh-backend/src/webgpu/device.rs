@@ -533,7 +533,10 @@ impl WebGpuDevice {
 
         // Write test data
         {
-            let mut buffer_slice = src_buffer.slice(..).get_mapped_range_mut();
+            let mut buffer_slice = src_buffer
+                .slice(..)
+                .get_mapped_range_mut()
+                .map_err(|e| WebGpuError::BufferMapping(e.to_string()))?;
             buffer_slice.copy_from_slice(bytemuck::cast_slice::<f32, u8>(&data));
         }
         src_buffer.unmap();

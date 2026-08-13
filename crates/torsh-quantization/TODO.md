@@ -1699,15 +1699,15 @@ Even though the framework is production-ready and comprehensive, there are alway
 
 #### **User Experience & Tooling**
 - [ ] **Visual Profiler**: GUI-based profiling and optimization tool
-- [ ] **Auto-Configuration**: AI-powered automatic configuration recommendation
+- [x] **Auto-Configuration**: AI-powered automatic configuration recommendation - **COMPLETED** (2025-11-14): `auto_config` module with `AutoConfigurator`, `ConfigObjective`, `recommend()`/`recommend_ranked()`
 - [ ] **Benchmark Suite**: Comprehensive benchmarking against industry standards
 - [ ] **Documentation Enhancement**: Interactive tutorials and examples
 - [ ] **CLI Tools**: Command-line utilities for batch processing
 
 #### **Quality & Reliability**
 - [ ] **Formal Verification**: Mathematical verification of quantization correctness
-- [ ] **Property-Based Testing**: Enhanced property-based test coverage
-- [ ] **Fuzzing Integration**: Automated fuzz testing for edge case discovery
+- [x] **Property-Based Testing**: Enhanced property-based test coverage - **COMPLETED** (2025-11-14): `tests/property_based_tests.rs`, 22 proptest-based tests
+- [x] **Fuzzing Integration**: Automated fuzz testing for edge case discovery - **COMPLETED** (2025-11-14): `fuzz/fuzz_targets/` with 3 targets (quantize_per_tensor, observer_update, specialized_schemes)
 - [ ] **Security Audit**: Security analysis for adversarial robustness
 - [ ] **Compliance Standards**: ISO/IEC standards compliance verification
 
@@ -2147,3 +2147,7 @@ The torsh-quantization framework is confirmed to be in exceptional production-re
 **Status**: 🏆 **ENHANCED PRODUCTION-READY FRAMEWORK** - All placeholder implementations replaced with fully functional, production-quality code
 
 **Status**: 🏆 **VERIFIED PRODUCTION-READY FRAMEWORK** - Comprehensive maintenance confirms continued excellence with cutting-edge features and exceptional code quality
+
+## Proposed follow-ups
+
+- **Unblock the experimental PTQ/QAT surface (surfaced 2026-07-03 by /nagare Phase 1 iteration 1, not actioned this run):** `quantize_auto`, `ptq_pipeline`, `calibrate_model`, `prepare_qat`, `quantize_post_training`, `quantize_dynamic` (in `quantize.rs`/`post_training.rs`/`qat.rs`) are gated behind an `experimental` feature that is declared empty (`experimental = []`) and enabled nowhere in the workspace, AND require a local placeholder `Module` trait (defined separately in `post_training.rs:11` and `qat.rs:13`, NOT `torsh_nn::Module`) with no concrete implementor — pipeline bodies are partly simulated (e.g. `simulate_observer_updates`). Recommend either: (a) provide a real `Module` adapter once torsh-nn/autograd stabilizes, or (b) promote the per-tensor API (`quantize_with_config`, `dequantize`, `calculate_quantization_metrics` in `algorithms.rs`/`metrics.rs`, already non-experimental and default-feature) as the primary supported surface for callers like torsh-cli.

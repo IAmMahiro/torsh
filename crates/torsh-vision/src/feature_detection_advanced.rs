@@ -156,9 +156,11 @@ impl LearnedSiftDetector {
 #[derive(Debug, Clone)]
 pub struct AttentionMatcherConfig {
     /// Number of attention heads
+    ///
+    /// The descriptor dimension is split into this many equally sized
+    /// sub-spaces and one attention map is computed per sub-space, so the
+    /// descriptor length must be divisible by `num_heads`.
     pub num_heads: usize,
-    /// Hidden dimension size
-    pub hidden_dim: usize,
     /// Match confidence threshold
     pub match_threshold: f32,
     /// Whether to enforce mutual best match
@@ -169,7 +171,6 @@ impl Default for AttentionMatcherConfig {
     fn default() -> Self {
         Self {
             num_heads: 8,
-            hidden_dim: 256,
             match_threshold: 0.5,
             mutual_match: true,
         }
@@ -191,7 +192,10 @@ pub struct FeatureMatch {
 
 /// Attention-based feature matcher
 ///
-/// Uses transformer-style attention mechanism for robust feature matching
+/// Uses a multi-head cross-attention message-passing step (SuperGlue-style, with
+/// identity projections since no trained weights are available) to contextualise
+/// the descriptors of each image with the descriptors of the other image before
+/// matching them by cosine similarity.
 pub struct AttentionMatcher {
     config: AttentionMatcherConfig,
 }
@@ -250,17 +254,56 @@ impl AttentionMatcher {
         Ok(descriptors)
     }
 
-    /// Compute attention-based similarity matrix
+    /// Compute the attention-based similarity matrix
+    ///
+    /// This is a multi-head cross-attention message-passing step in the spirit of
+    /// SuperGlue's attentional graph network, with identity query/key/value
+    /// projections (this matcher carries no trained weights, and applying random
+    /// projections would only destroy the descriptor geometry):
+    ///
+    /// 1. The descriptor dimension is split into `num_heads` sub-spaces.
+    /// 2. For every head, scaled dot-product attention from each descriptor of one
+    ///    image over all descriptors of the other image produces a context message.
+    /// 3. The messages are added to the descriptors as a residual, so each
+    ///    descriptor is contextualised by the other image before matching.
+    /// 4. The final similarity is the cosine similarity of the contextualised
+    ///    descriptors.
+    ///
+    /// `num_heads` genuinely changes the result: the softmax is computed
+    /// independently inside each sub-space, so more heads yield a sharper,
+    /// more localised context.
     fn compute_attention_similarity(
         &self,
         desc1: &Array2<f32>,
         desc2: &Array2<f32>,
     ) -> Result<Array2<f32>> {
-        let n1 = desc1.nrows();
-        let n2 = desc2.nrows();
+        let dim = desc1.ncols();
 
-        // Simplified attention: compute dot product similarity
-        // TODO: Implement full transformer-style attention with learned parameters
+        if desc2.ncols() != dim {
+            return Err(VisionError::InvalidParameter(format!(
+                "Descriptor dimensions must match, got {} and {}",
+                dim,
+                desc2.ncols()
+            )));
+        }
+        if self.config.num_heads == 0 {
+            return Err(VisionError::InvalidParameter(
+                "AttentionMatcherConfig::num_heads must be at least 1".to_string(),
+            ));
+        }
+        if dim == 0 || dim % self.config.num_heads != 0 {
+            return Err(VisionError::InvalidParameter(format!(
+                "Descriptor dimension {} is not divisible by num_heads {}",
+                dim, self.config.num_heads
+            )));
+        }
+
+        // Cross-attention in both directions.
+        let context1 = self.cross_attend(desc1, desc2)?;
+        let context2 = self.cross_attend(desc2, desc1)?;
+
+        let n1 = context1.nrows();
+        let n2 = context2.nrows();
         let mut similarity = Array2::zeros((n1, n2));
 
         for i in 0..n1 {
@@ -269,9 +312,9 @@ impl AttentionMatcher {
                 let mut norm1 = 0.0;
                 let mut norm2 = 0.0;
 
-                for k in 0..desc1.ncols() {
-                    let v1 = desc1[[i, k]];
-                    let v2 = desc2[[j, k]];
+                for k in 0..dim {
+                    let v1 = context1[[i, k]];
+                    let v2 = context2[[j, k]];
                     dot += v1 * v2;
                     norm1 += v1 * v1;
                     norm2 += v2 * v2;
@@ -287,6 +330,73 @@ impl AttentionMatcher {
         }
 
         Ok(similarity)
+    }
+
+    /// Multi-head scaled dot-product cross-attention with a residual connection
+    ///
+    /// Returns `queries + concat_h(softmax(Q_h K_h^T / sqrt(d_h)) V_h)`.
+    fn cross_attend(&self, queries: &Array2<f32>, keys: &Array2<f32>) -> Result<Array2<f32>> {
+        let dim = queries.ncols();
+        let num_heads = self.config.num_heads;
+        let head_dim = dim / num_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let n_queries = queries.nrows();
+        let n_keys = keys.nrows();
+
+        // Residual connection: start from the original descriptors.
+        let mut output = queries.clone();
+
+        if n_keys == 0 {
+            return Ok(output);
+        }
+
+        let mut weights = vec![0.0f32; n_keys];
+
+        for head in 0..num_heads {
+            let lo = head * head_dim;
+            let hi = lo + head_dim;
+
+            for i in 0..n_queries {
+                // Scaled dot-product scores restricted to this head's sub-space.
+                let mut max_score = f32::NEG_INFINITY;
+                for (j, weight) in weights.iter_mut().enumerate() {
+                    let mut dot = 0.0;
+                    for k in lo..hi {
+                        dot += queries[[i, k]] * keys[[j, k]];
+                    }
+                    let score = dot * scale;
+                    *weight = score;
+                    if score > max_score {
+                        max_score = score;
+                    }
+                }
+
+                // Numerically stable softmax over the keys.
+                let mut sum = 0.0;
+                for weight in weights.iter_mut() {
+                    *weight = (*weight - max_score).exp();
+                    sum += *weight;
+                }
+                if sum <= 0.0 || !sum.is_finite() {
+                    continue;
+                }
+                for weight in weights.iter_mut() {
+                    *weight /= sum;
+                }
+
+                // Attention-weighted value aggregation for this head.
+                for k in lo..hi {
+                    let mut message = 0.0;
+                    for (j, weight) in weights.iter().enumerate() {
+                        message += weight * keys[[j, k]];
+                    }
+                    output[[i, k]] += message;
+                }
+            }
+        }
+
+        Ok(output)
     }
 
     /// Extract matches from similarity matrix
@@ -573,7 +683,6 @@ mod tests {
     fn test_attention_matcher_config_default() {
         let config = AttentionMatcherConfig::default();
         assert_eq!(config.num_heads, 8);
-        assert_eq!(config.hidden_dim, 256);
         assert_eq!(config.match_threshold, 0.5);
         assert!(config.mutual_match);
     }

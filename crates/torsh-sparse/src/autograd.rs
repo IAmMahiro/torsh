@@ -511,7 +511,10 @@ impl SparseGradFn for SparseAddGradFn {
 
 /// Extension trait for COO tensors to add autograd methods
 impl CooTensor {
-    /// Add two COO tensors
+    /// Element-wise addition of two COO tensors
+    ///
+    /// Both operands are coalesced and merged, so duplicate coordinates in
+    /// either input are summed (PyTorch semantics) and the result is coalesced.
     pub fn add_coo(&self, other: &CooTensor) -> TorshResult<CooTensor> {
         if self.shape() != other.shape() {
             return Err(TorshError::ComputeError(
@@ -519,24 +522,66 @@ impl CooTensor {
             ));
         }
 
-        // Placeholder: Implement actual COO addition
-        Err(TorshError::ComputeError(
-            "COO addition not yet implemented".to_string(),
-        ))
+        let mut triplets = self.triplets();
+        triplets.extend(other.triplets());
+
+        let (rows, cols): (Vec<usize>, Vec<usize>) =
+            triplets.iter().map(|&(r, c, _)| (r, c)).unzip();
+        let values: Vec<f32> = triplets.iter().map(|&(_, _, v)| v).collect();
+
+        let mut result = CooTensor::new(rows, cols, values, self.shape().clone())?;
+        result.coalesce();
+        Ok(result)
     }
 
-    /// Multiply two COO tensors
-    pub fn multiply_coo(&self, _other: &CooTensor) -> TorshResult<CooTensor> {
-        // Placeholder: Implement actual COO multiplication
-        Err(TorshError::ComputeError(
-            "COO multiplication not yet implemented".to_string(),
-        ))
+    /// Element-wise (Hadamard) multiplication of two COO tensors
+    ///
+    /// Only coordinates present in *both* operands can be non-zero, so the
+    /// result is the intersection of the two sparsity patterns.
+    pub fn multiply_coo(&self, other: &CooTensor) -> TorshResult<CooTensor> {
+        if self.shape() != other.shape() {
+            return Err(TorshError::ComputeError(
+                "Shape mismatch for sparse multiplication".to_string(),
+            ));
+        }
+
+        let left = self.coalesced();
+        let right = other.coalesced();
+        let left_triplets = left.triplets();
+        let right_triplets = right.triplets();
+
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut values = Vec::new();
+
+        // Both sides are sorted by (row, col): merge them with two pointers.
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < left_triplets.len() && j < right_triplets.len() {
+            let (lr, lc, lv) = left_triplets[i];
+            let (rr, rc, rv) = right_triplets[j];
+            match (lr, lc).cmp(&(rr, rc)) {
+                std::cmp::Ordering::Equal => {
+                    let product = lv * rv;
+                    if product != 0.0 {
+                        rows.push(lr);
+                        cols.push(lc);
+                        values.push(product);
+                    }
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+            }
+        }
+
+        CooTensor::new(rows, cols, values, self.shape().clone())
     }
 }
 
 /// Extension trait for CSR tensors to add autograd methods
 impl CsrTensor {
-    /// Add two CSR tensors
+    /// Element-wise addition of two CSR tensors
     pub fn add_csr(&self, other: &CsrTensor) -> TorshResult<CsrTensor> {
         if self.shape() != other.shape() {
             return Err(TorshError::ComputeError(
@@ -544,18 +589,20 @@ impl CsrTensor {
             ));
         }
 
-        // Placeholder: Implement actual CSR addition
-        Err(TorshError::ComputeError(
-            "CSR addition not yet implemented".to_string(),
-        ))
+        let sum = self.to_coo()?.add_coo(&other.to_coo()?)?;
+        CsrTensor::from_coo(&sum)
     }
 
-    /// Multiply two CSR tensors
-    pub fn multiply_csr(&self, _other: &CsrTensor) -> TorshResult<CsrTensor> {
-        // Placeholder: Implement actual CSR multiplication
-        Err(TorshError::ComputeError(
-            "CSR multiplication not yet implemented".to_string(),
-        ))
+    /// Element-wise (Hadamard) multiplication of two CSR tensors
+    pub fn multiply_csr(&self, other: &CsrTensor) -> TorshResult<CsrTensor> {
+        if self.shape() != other.shape() {
+            return Err(TorshError::ComputeError(
+                "Shape mismatch for sparse multiplication".to_string(),
+            ));
+        }
+
+        let product = self.to_coo()?.multiply_coo(&other.to_coo()?)?;
+        CsrTensor::from_coo(&product)
     }
 }
 

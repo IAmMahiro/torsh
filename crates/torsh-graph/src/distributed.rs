@@ -2,6 +2,9 @@
 //!
 //! This module provides distributed training and inference capabilities
 //! for graph neural networks across multiple devices and machines.
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
 
 use crate::{GraphData, GraphLayer};
 use std::collections::HashMap;
@@ -186,7 +189,7 @@ impl DistributedGNN {
         let augmented_graph = self.augment_local_graph(&boundary_features)?;
 
         // Step 3: Perform local forward pass
-        let local_output = layer.forward(&augmented_graph);
+        let local_output = layer.forward(&augmented_graph)?;
 
         // Step 4: Extract and communicate updated boundary features
         self.communicate_boundary_updates(&local_output)?;
@@ -243,14 +246,14 @@ impl DistributedGNN {
         let summed_params = self.sum_parameters(parameters)?;
         let num_workers = self.config.num_workers as f32;
 
-        Ok(summed_params
+        summed_params
             .into_iter()
             .map(|param| {
                 param
                     .div_scalar(num_workers)
-                    .expect("parameter division should succeed")
+                    .map_err(DistributedError::from)
             })
-            .collect())
+            .collect()
     }
 
     /// Sum parameters across workers
@@ -283,23 +286,19 @@ impl DistributedGNN {
 
         let weighted_params = parameters
             .iter()
-            .map(|param| {
-                param
-                    .mul_scalar(local_weight)
-                    .expect("parameter weighting should succeed")
-            })
-            .collect::<Vec<_>>();
+            .map(|param| param.mul_scalar(local_weight))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let summed_params = self.sum_parameters(&weighted_params)?;
 
-        Ok(summed_params
+        summed_params
             .into_iter()
             .map(|param| {
                 param
                     .div_scalar(total_weight)
-                    .expect("weighted parameter division should succeed")
+                    .map_err(DistributedError::from)
             })
-            .collect())
+            .collect()
     }
 
     /// Parameter server synchronization
@@ -328,9 +327,7 @@ impl DistributedGNN {
             // Accumulate updates (simplified)
             for (i, update) in worker_updates.iter().enumerate() {
                 if i < accumulated_updates.len() {
-                    accumulated_updates[i] = accumulated_updates[i]
-                        .add(update)
-                        .expect("operation should succeed");
+                    accumulated_updates[i] = accumulated_updates[i].add(update)?;
                 }
             }
         }
@@ -339,12 +336,8 @@ impl DistributedGNN {
         let num_workers = self.config.num_workers as f32;
         let averaged_params: Vec<Tensor> = accumulated_updates
             .into_iter()
-            .map(|param| {
-                param
-                    .div_scalar(num_workers)
-                    .expect("parameter server division should succeed")
-            })
-            .collect();
+            .map(|param| param.div_scalar(num_workers))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         // Broadcast to all workers
         for worker_rank in 1..self.config.num_workers {
@@ -503,10 +496,8 @@ impl DistributedGNN {
 
         if nodes.is_empty() {
             return Ok(GraphData::new(
-                torsh_tensor::creation::zeros(&[0, graph.x.shape().dims()[1]])
-                    .expect("empty features tensor creation should succeed"),
-                torsh_tensor::creation::zeros(&[2, 0])
-                    .expect("empty edge index tensor creation should succeed"),
+                torsh_tensor::creation::zeros(&[0, graph.x.shape().dims()[1]])?,
+                torsh_tensor::creation::zeros(&[2, 0])?,
             ));
         }
 
@@ -533,8 +524,7 @@ impl DistributedGNN {
         })?;
 
         // Create minimal edge index (simplified)
-        let edge_index = torsh_tensor::creation::zeros(&[2, 0])
-            .expect("minimal edge index creation should succeed");
+        let edge_index = torsh_tensor::creation::zeros(&[2, 0])?;
 
         Ok(GraphData::new(x, edge_index))
     }
@@ -703,6 +693,12 @@ pub enum DistributedError {
     SynchronizationError(String),
 }
 
+impl From<torsh_core::error::TorshError> for DistributedError {
+    fn from(error: torsh_core::error::TorshError) -> Self {
+        DistributedError::TensorError(error.to_string())
+    }
+}
+
 impl std::fmt::Display for DistributedError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -744,7 +740,7 @@ impl DistributedGraphLayer {
 }
 
 impl GraphLayer for DistributedGraphLayer {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         // Simplified distributed forward pass
         // In practice, would use the coordinator's distributed_forward method
         self.base_layer.forward(graph)

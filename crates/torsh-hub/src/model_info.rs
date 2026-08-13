@@ -469,6 +469,73 @@ impl ModelInfo {
 
         Ok(())
     }
+
+    /// Download every file listed in [`Self::files`] into `dest_dir`,
+    /// verifying each downloaded file's SHA-256 hash against
+    /// [`FileInfo::sha256`] before it is kept (fail closed on mismatch).
+    ///
+    /// Each file's source URL is `base_url` joined with [`FileInfo::path`]
+    /// (e.g. `base_url = "https://example.com/models/bert"`,
+    /// `path = "pytorch_model.bin"` downloads
+    /// `"https://example.com/models/bert/pytorch_model.bin"`).
+    ///
+    /// A `sha256` value is only trusted as an expected hash when it looks
+    /// like a real SHA-256 digest (64 hex characters) — the same rule
+    /// [`Self::validate`] enforces on length. Anything else (empty,
+    /// placeholder, malformed) is treated as "no checksum available" and
+    /// the file is downloaded unverified, matching
+    /// [`crate::download::core::download_file`]'s documented behavior for
+    /// `expected_hash: None`. This avoids the trap of passing an empty
+    /// string as the expected hash, which would make every unhashed file
+    /// fail closed (a real hash never matches the empty string).
+    ///
+    /// Every [`FileInfo::path`] is resolved strictly underneath `dest_dir`
+    /// via [`crate::utils::sanitize_archive_entry_path`], so a compromised
+    /// or malicious registry entry cannot use `path` (e.g. `"../../etc/x"`)
+    /// to write outside the destination directory.
+    ///
+    /// # Errors
+    /// Returns `Err` if `dest_dir` cannot be created, if `path` escapes
+    /// `dest_dir`, if the download itself fails, or if a well-formed
+    /// `sha256` is present and does not match the downloaded bytes.
+    pub fn download_files(
+        &self,
+        base_url: &str,
+        dest_dir: &Path,
+        progress: bool,
+    ) -> Result<Vec<PathBuf>> {
+        use crate::download::core::download_file;
+        use crate::utils::sanitize_archive_entry_path;
+
+        std::fs::create_dir_all(dest_dir)?;
+
+        let mut downloaded = Vec::with_capacity(self.files.len());
+        for file in &self.files {
+            let dest = sanitize_archive_entry_path(dest_dir, &file.path)?;
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let url = format!(
+                "{}/{}",
+                base_url.trim_end_matches('/'),
+                file.path.trim_start_matches('/')
+            );
+
+            let is_real_sha256 =
+                file.sha256.len() == 64 && file.sha256.chars().all(|c| c.is_ascii_hexdigit());
+            let expected_hash = if is_real_sha256 {
+                Some(file.sha256.as_str())
+            } else {
+                None
+            };
+
+            download_file(&url, &dest, progress, expected_hash)?;
+            downloaded.push(dest);
+        }
+
+        Ok(downloaded)
+    }
 }
 
 /// Load model info from a repository

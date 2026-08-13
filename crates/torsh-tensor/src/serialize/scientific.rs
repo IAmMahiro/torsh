@@ -74,8 +74,13 @@ pub mod hdf5 {
             TorshError::SerializationError(format!("Failed to create HDF5 dataset: {}", e))
         })?;
 
-        // Write tensor data
-        dataset.write(&*data).map_err(|e| {
+        // Write tensor data.
+        //
+        // `write` requires the source array's shape to match the dataset's, and
+        // the tensor's data is a flat `Vec`, so any tensor with rank != 1 failed
+        // with a shape mismatch. `write_raw` writes the flat buffer into the
+        // dataset's own (already correct) shape.
+        dataset.write_raw(&data).map_err(|e| {
             TorshError::SerializationError(format!("Failed to write tensor data to HDF5: {}", e))
         })?;
 
@@ -87,14 +92,8 @@ pub mod hdf5 {
             data.len() * std::mem::size_of::<T>(),
         );
 
-        // Store metadata as HDF5 attributes
+        // Store metadata (including every custom entry) as HDF5 attributes
         store_metadata_as_attributes(&dataset, &metadata)?;
-
-        // Store custom metadata - temporarily disabled due to HDF5 API compatibility
-        // TODO: Implement proper string metadata storage when HDF5 API is updated
-        for (_key, _value) in &options.metadata {
-            // Custom metadata storage disabled for now
-        }
 
         Ok(())
     }
@@ -204,11 +203,41 @@ pub mod hdf5 {
         read_metadata_from_attributes(&dataset)
     }
 
+    /// Prefix under which user-supplied metadata keys are stored as attributes.
+    const CUSTOM_ATTR_PREFIX: &str = "torsh_meta_";
+
+    /// Write one variable-length unicode string attribute.
+    fn write_string_attribute(dataset: &Dataset, name: &str, value: &str) -> Result<()> {
+        let encoded: VarLenUnicode = value.parse().map_err(|e| {
+            TorshError::SerializationError(format!(
+                "Attribute '{}' is not storable as HDF5 text: {}",
+                name, e
+            ))
+        })?;
+
+        dataset
+            .new_attr::<VarLenUnicode>()
+            .create(name)
+            .map_err(|e| {
+                TorshError::SerializationError(format!(
+                    "Failed to create {} attribute: {}",
+                    name, e
+                ))
+            })?
+            .write_scalar(&encoded)
+            .map_err(|e| {
+                TorshError::SerializationError(format!("Failed to write {} attribute: {}", name, e))
+            })
+    }
+
     /// Helper function to store metadata as HDF5 attributes
+    ///
+    /// Everything the format promises to be self-describing is written: device,
+    /// dtype, version, timestamp, gradient flag and every custom metadata entry.
+    /// A value that cannot be represented is an error, never a silent drop.
     fn store_metadata_as_attributes(dataset: &Dataset, metadata: &TensorMetadata) -> Result<()> {
-        // Store device information - temporarily disabled due to HDF5 API compatibility
-        // TODO: Implement proper device storage when HDF5 string API is updated
-        let _device_info = format!("{:?}", metadata.device);
+        // Store device information
+        write_string_attribute(dataset, "device", &format!("{:?}", metadata.device))?;
 
         // Store gradient requirement
         dataset
@@ -228,13 +257,9 @@ pub mod hdf5 {
                 ))
             })?;
 
-        // Store data type - temporarily disabled due to HDF5 API compatibility
-        // TODO: Implement proper dtype storage when HDF5 string API is updated
-        let _dtype_info = &metadata.dtype_name;
-
-        // Store version - temporarily disabled due to HDF5 API compatibility
-        // TODO: Implement proper version storage when HDF5 string API is updated
-        let _version_info = &metadata.version;
+        // Store data type and the ToRSh version that wrote the file
+        write_string_attribute(dataset, "dtype", &metadata.dtype_name)?;
+        write_string_attribute(dataset, "version", &metadata.version)?;
 
         // Store timestamp
         dataset
@@ -254,20 +279,47 @@ pub mod hdf5 {
                 ))
             })?;
 
+        // Store every custom metadata entry under a reserved prefix.
+        for (key, value) in &metadata.custom_metadata {
+            write_string_attribute(dataset, &format!("{}{}", CUSTOM_ATTR_PREFIX, key), value)?;
+        }
+
         Ok(())
     }
 
+    /// Read back the custom metadata entries written by
+    /// [`store_metadata_as_attributes`].
+    fn read_custom_metadata(dataset: &Dataset) -> std::collections::HashMap<String, String> {
+        let mut custom = std::collections::HashMap::new();
+        let Ok(names) = dataset.attr_names() else {
+            return custom;
+        };
+        for name in names {
+            let Some(key) = name.strip_prefix(CUSTOM_ATTR_PREFIX) else {
+                continue;
+            };
+            if let Ok(value) = dataset
+                .attr(&name)
+                .and_then(|attr| attr.read_scalar::<VarLenUnicode>())
+            {
+                custom.insert(key.to_string(), value.to_string());
+            }
+        }
+        custom
+    }
+
     /// Helper function to read device information from HDF5 attributes
+    ///
+    /// Files written by another tool (or by a ToRSh version that did not yet
+    /// persist the attribute) simply have no `device` attribute; those load onto
+    /// the CPU rather than failing.
     fn read_device_from_attributes(dataset: &Dataset) -> Result<DeviceType> {
-        let device_str: VarLenUnicode = dataset
-            .attr("device")
-            .map_err(|e| {
-                TorshError::SerializationError(format!("Failed to read device attribute: {}", e))
-            })?
-            .read_scalar()
-            .map_err(|e| {
-                TorshError::SerializationError(format!("Failed to read device value: {}", e))
-            })?;
+        let Ok(attr) = dataset.attr("device") else {
+            return Ok(DeviceType::Cpu);
+        };
+        let device_str: VarLenUnicode = attr.read_scalar().map_err(|e| {
+            TorshError::SerializationError(format!("Failed to read device value: {}", e))
+        })?;
 
         let device = match device_str.as_str() {
             "Cpu" => DeviceType::Cpu,
@@ -324,7 +376,7 @@ pub mod hdf5 {
             dtype_name,
             version,
             timestamp,
-            custom_metadata: std::collections::HashMap::new(),
+            custom_metadata: read_custom_metadata(dataset),
             format: "Hdf5".to_string(),
             data_size: shape_dims.iter().product::<usize>() * std::mem::size_of::<f32>(), // Approximate
             compressed: false, // HDF5 compression is transparent

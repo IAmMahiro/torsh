@@ -20,6 +20,7 @@ pub struct PyMaxPool2d {
 #[pymethods]
 impl PyMaxPool2d {
     #[new]
+    #[pyo3(signature = (kernel_size, stride=None, padding=None, dilation=None, ceil_mode=None, return_indices=None))]
     fn new(
         kernel_size: Py<PyAny>,
         stride: Option<Py<PyAny>>,
@@ -27,7 +28,7 @@ impl PyMaxPool2d {
         dilation: Option<Py<PyAny>>,
         ceil_mode: Option<bool>,
         return_indices: Option<bool>,
-    ) -> PyResult<(Self, PyModule)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         // Parse kernel size
         let kernel_size = Python::attach(|py| -> PyResult<(usize, usize)> {
             if let Ok(size) = kernel_size.extract::<usize>(py) {
@@ -102,7 +103,8 @@ impl PyMaxPool2d {
                 return_indices: return_indices.unwrap_or(false),
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through max pool 2d
@@ -215,6 +217,7 @@ pub struct PyAvgPool2d {
 #[pymethods]
 impl PyAvgPool2d {
     #[new]
+    #[pyo3(signature = (kernel_size, stride=None, padding=None, ceil_mode=None, count_include_pad=None, divisor_override=None))]
     fn new(
         kernel_size: Py<PyAny>,
         stride: Option<Py<PyAny>>,
@@ -222,7 +225,7 @@ impl PyAvgPool2d {
         ceil_mode: Option<bool>,
         count_include_pad: Option<bool>,
         divisor_override: Option<usize>,
-    ) -> PyResult<(Self, PyModule)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         // Parse kernel size
         let kernel_size = Python::attach(|py| -> PyResult<(usize, usize)> {
             if let Ok(size) = kernel_size.extract::<usize>(py) {
@@ -280,7 +283,8 @@ impl PyAvgPool2d {
                 divisor_override,
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through average pool 2d
@@ -408,7 +412,8 @@ pub struct PyAdaptiveAvgPool2d {
 #[pymethods]
 impl PyAdaptiveAvgPool2d {
     #[new]
-    fn new(output_size: Py<PyAny>) -> PyResult<(Self, PyModule)> {
+    #[pyo3(signature = (output_size))]
+    fn new(output_size: Py<PyAny>) -> PyResult<PyClassInitializer<Self>> {
         // Parse output size
         let output_size = Python::attach(|py| -> PyResult<(usize, usize)> {
             if let Ok(size) = output_size.extract::<usize>(py) {
@@ -422,7 +427,7 @@ impl PyAdaptiveAvgPool2d {
             }
         })?;
 
-        Ok((Self { output_size }, PyModule::new()))
+        Ok((Self { output_size }, PyModule::new()).into())
     }
 
     /// Forward pass through adaptive average pool 2d
@@ -510,7 +515,11 @@ pub struct PyAdaptiveMaxPool2d {
 #[pymethods]
 impl PyAdaptiveMaxPool2d {
     #[new]
-    fn new(output_size: Py<PyAny>, return_indices: Option<bool>) -> PyResult<(Self, PyModule)> {
+    #[pyo3(signature = (output_size, return_indices=None))]
+    fn new(
+        output_size: Py<PyAny>,
+        return_indices: Option<bool>,
+    ) -> PyResult<PyClassInitializer<Self>> {
         // Parse output size
         let output_size = Python::attach(|py| -> PyResult<(usize, usize)> {
             if let Ok(size) = output_size.extract::<usize>(py) {
@@ -530,7 +539,8 @@ impl PyAdaptiveMaxPool2d {
                 return_indices: return_indices.unwrap_or(false),
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through adaptive max pool 2d

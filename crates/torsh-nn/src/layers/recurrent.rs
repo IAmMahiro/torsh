@@ -12,7 +12,14 @@ use hashbrown::HashMap;
 use torsh_core::error::Result;
 use torsh_tensor::{creation::*, Tensor};
 
-/// Basic RNN layer
+/// Multi-layer Elman RNN with a `tanh` non-linearity.
+///
+/// # PyTorch compatibility
+///
+/// Parameters follow `torch.nn.RNN` naming: `weight_ih_l{k}`, `weight_hh_l{k}`,
+/// `bias_ih_l{k}`, `bias_hh_l{k}`, with a `_reverse` suffix for the backward
+/// direction of a bidirectional layer. Layer `k > 0` consumes the previous
+/// layer's output, so its input size is `hidden_size * num_directions`.
 pub struct RNN {
     base: ModuleBase,
     input_size: usize,
@@ -26,33 +33,7 @@ pub struct RNN {
 
 impl RNN {
     pub fn new(input_size: usize, hidden_size: usize, num_layers: usize) -> Result<Self> {
-        let mut base = ModuleBase::new();
-
-        // Initialize weights for each layer
-        for layer in 0..num_layers {
-            let input_dim = if layer == 0 { input_size } else { hidden_size };
-
-            let weight_ih = crate::init::xavier_uniform(&[hidden_size, input_dim]);
-            let weight_hh = crate::init::xavier_uniform(&[hidden_size, hidden_size]);
-            let bias_ih = zeros(&[hidden_size]).expect("zeros tensor for bias_ih should succeed");
-            let bias_hh = zeros(&[hidden_size]).expect("zeros tensor for bias_hh should succeed");
-
-            base.register_parameter(format!("weight_ih_l{}", layer), Parameter::new(weight_ih?));
-            base.register_parameter(format!("weight_hh_l{}", layer), Parameter::new(weight_hh?));
-            base.register_parameter(format!("bias_ih_l{}", layer), Parameter::new(bias_ih));
-            base.register_parameter(format!("bias_hh_l{}", layer), Parameter::new(bias_hh));
-        }
-
-        Ok(Self {
-            base,
-            input_size,
-            hidden_size,
-            num_layers,
-            bias: true,
-            batch_first: false,
-            dropout: 0.0,
-            bidirectional: false,
-        })
+        Self::with_config(input_size, hidden_size, num_layers, true, false, 0.0, false)
     }
 
     pub fn with_config(
@@ -64,40 +45,242 @@ impl RNN {
         dropout: f32,
         bidirectional: bool,
     ) -> Result<Self> {
-        let mut rnn = Self::new(input_size, hidden_size, num_layers)?;
-        rnn.bias = bias;
-        rnn.batch_first = batch_first;
-        rnn.dropout = dropout;
-        rnn.bidirectional = bidirectional;
-        Ok(rnn)
+        if num_layers == 0 {
+            return Err(torsh_core::TorshError::InvalidArgument(
+                "RNN requires at least one layer".to_string(),
+            ));
+        }
+
+        let mut base = ModuleBase::new();
+        let directions = if bidirectional { 2 } else { 1 };
+
+        // Initialize weights for each layer and direction.
+        for layer in 0..num_layers {
+            let layer_input = if layer == 0 {
+                input_size
+            } else {
+                hidden_size * directions
+            };
+
+            for direction in 0..directions {
+                let suffix = recurrent_gated::direction_suffix(direction);
+                let weight_ih = crate::init::xavier_uniform(&[hidden_size, layer_input])?;
+                let weight_hh = crate::init::xavier_uniform(&[hidden_size, hidden_size])?;
+
+                base.register_parameter(
+                    format!("weight_ih_l{}{}", layer, suffix),
+                    Parameter::new(weight_ih),
+                );
+                base.register_parameter(
+                    format!("weight_hh_l{}{}", layer, suffix),
+                    Parameter::new(weight_hh),
+                );
+
+                if bias {
+                    base.register_parameter(
+                        format!("bias_ih_l{}{}", layer, suffix),
+                        Parameter::new(zeros(&[hidden_size])?),
+                    );
+                    base.register_parameter(
+                        format!("bias_hh_l{}{}", layer, suffix),
+                        Parameter::new(zeros(&[hidden_size])?),
+                    );
+                }
+            }
+        }
+
+        Ok(Self {
+            base,
+            input_size,
+            hidden_size,
+            num_layers,
+            bias,
+            batch_first,
+            dropout,
+            bidirectional,
+        })
+    }
+
+    /// Number of directions (2 when bidirectional).
+    fn directions(&self) -> usize {
+        if self.bidirectional {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Fallible parameter lookup: a renamed or missing key must not panic.
+    fn parameter(&self, name: &str) -> Result<Tensor> {
+        Ok(self
+            .base
+            .parameters
+            .get(name)
+            .ok_or_else(|| {
+                torsh_core::TorshError::InvalidArgument(format!("RNN is missing parameter {name}"))
+            })?
+            .tensor()
+            .read()
+            .clone())
+    }
+
+    /// Single Elman step for one layer and direction:
+    /// `h_t = tanh(x_t @ W_ih^T + b_ih + h_{t-1} @ W_hh^T + b_hh)`.
+    fn rnn_cell_directional(
+        &self,
+        input: &Tensor,
+        hidden: &Tensor,
+        layer: usize,
+        direction: usize,
+    ) -> Result<Tensor> {
+        let suffix = recurrent_gated::direction_suffix(direction);
+        let weight_ih = self.parameter(&format!("weight_ih_l{}{}", layer, suffix))?;
+        let weight_hh = self.parameter(&format!("weight_hh_l{}{}", layer, suffix))?;
+
+        let mut gi = input.matmul(&weight_ih.transpose(0, 1)?)?;
+        let mut gh = hidden.matmul(&weight_hh.transpose(0, 1)?)?;
+        if self.bias {
+            gi = gi.add_op(&self.parameter(&format!("bias_ih_l{}{}", layer, suffix))?)?;
+            gh = gh.add_op(&self.parameter(&format!("bias_hh_l{}{}", layer, suffix))?)?;
+        }
+
+        gi.add_op(&gh)?.tanh()
+    }
+
+    /// Run every layer (and direction) over a time-major input sequence.
+    ///
+    /// Returns the last layer's output sequence together with the final hidden
+    /// state of every (layer, direction) pair, in PyTorch order
+    /// (`layer 0 forward, layer 0 reverse, layer 1 forward, ...`).
+    fn run_layers(&self, input: &Tensor, state: Option<&Tensor>) -> Result<(Tensor, Vec<Tensor>)> {
+        let binding = input.shape();
+        let input_shape = binding.dims();
+        let seq_len = input_shape[0];
+        let batch_size = input_shape[1];
+        let directions = self.directions();
+
+        if input_shape[2] != self.input_size {
+            return Err(torsh_core::TorshError::InvalidShape(format!(
+                "RNN expects an input of size {}, got {}",
+                self.input_size, input_shape[2]
+            )));
+        }
+
+        let h0 = match state {
+            Some(h) => {
+                let expected = [self.num_layers * directions, batch_size, self.hidden_size];
+                if h.shape().dims() != expected {
+                    return Err(torsh_core::TorshError::InvalidShape(format!(
+                        "RNN h0 must have shape {:?}, got {:?}",
+                        expected,
+                        h.shape().dims()
+                    )));
+                }
+                Some(h.clone())
+            }
+            None => None,
+        };
+
+        let mut layer_input = input.clone();
+        let mut final_hidden = Vec::with_capacity(self.num_layers * directions);
+
+        for layer in 0..self.num_layers {
+            let mut direction_outputs: Vec<Vec<Tensor>> = Vec::with_capacity(directions);
+
+            for direction in 0..directions {
+                let state_index = layer * directions + direction;
+                let mut hidden = match &h0 {
+                    Some(h) => h.narrow(0, state_index as i64, 1)?.squeeze(0)?,
+                    None => zeros(&[batch_size, self.hidden_size])?,
+                };
+
+                let mut outputs = Vec::with_capacity(seq_len);
+                for step in 0..seq_len {
+                    let t = if direction == 0 {
+                        step
+                    } else {
+                        seq_len - 1 - step
+                    };
+                    let x_t = layer_input.narrow(0, t as i64, 1)?.squeeze(0)?;
+                    hidden = self.rnn_cell_directional(&x_t, &hidden, layer, direction)?;
+                    outputs.push(hidden.clone());
+                }
+
+                if direction == 1 {
+                    // The reverse pass produced outputs from the last step
+                    // backwards; restore time order before concatenating.
+                    outputs.reverse();
+                }
+
+                final_hidden.push(hidden);
+                direction_outputs.push(outputs);
+            }
+
+            // Concatenate the directions along the feature axis, then stack time.
+            let mut steps = Vec::with_capacity(seq_len);
+            for t in 0..seq_len {
+                if directions == 1 {
+                    steps.push(direction_outputs[0][t].clone());
+                } else {
+                    steps.push(recurrent_gated::concat_features(
+                        &direction_outputs[0][t],
+                        &direction_outputs[1][t],
+                    )?);
+                }
+            }
+
+            let mut stacked = recurrent_gated::stack_time_major(&steps)?;
+            // Inter-layer dropout, exactly as PyTorch: applied to the output of
+            // every layer except the last, and only while training.
+            if layer + 1 < self.num_layers && self.dropout > 0.0 && self.base.training() {
+                stacked = crate::functional::dropout(&stacked, self.dropout, true)?;
+            }
+            layer_input = stacked;
+        }
+
+        Ok((layer_input, final_hidden))
+    }
+
+    /// Forward pass with an explicit initial hidden state.
+    ///
+    /// `state` is `h_0` shaped `[num_layers * num_directions, batch, hidden_size]`
+    /// (`None` starts from zeros). Returns `(output, h_n)` following
+    /// `torch.nn.RNN`, honouring `Self::batch_first` for `output`.
+    pub fn forward_with_state(
+        &self,
+        input: &Tensor,
+        state: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        if input.shape().ndim() != 3 {
+            return Err(torsh_core::TorshError::InvalidShape(format!(
+                "RNN expects a 3-D input, got {}-D",
+                input.shape().ndim()
+            )));
+        }
+
+        // Work time-major internally.
+        let time_major = if self.batch_first {
+            input.transpose(0, 1)?
+        } else {
+            input.clone()
+        };
+
+        let (output, hidden) = self.run_layers(&time_major, state)?;
+        let h_n = recurrent_gated::stack_time_major(&hidden)?;
+
+        let output = if self.batch_first {
+            output.transpose(0, 1)?
+        } else {
+            output
+        };
+
+        Ok((output, h_n))
     }
 }
 
 impl Module for RNN {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        // RNN forward pass
-        // Input shape: [seq_len, batch, input_size] or [batch, seq_len, input_size] if batch_first
-
-        let binding = input.shape();
-        let input_shape = binding.dims();
-        let (seq_len, batch_size) = if self.batch_first {
-            (input_shape[1], input_shape[0])
-        } else {
-            (input_shape[0], input_shape[1])
-        };
-
-        // Initialize hidden state
-        let _h0 = zeros::<f32>(&[self.num_layers, batch_size, self.hidden_size])
-            .expect("zeros tensor for hidden state should succeed");
-
-        // Simplified RNN computation - real implementation would unroll over time steps
-        let output_shape = if self.batch_first {
-            [batch_size, seq_len, self.hidden_size]
-        } else {
-            [seq_len, batch_size, self.hidden_size]
-        };
-
-        let output = zeros(&output_shape).expect("zeros tensor for output should succeed");
+        let (output, _) = self.forward_with_state(input, None)?;
         Ok(output)
     }
 

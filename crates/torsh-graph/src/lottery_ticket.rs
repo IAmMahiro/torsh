@@ -20,6 +20,9 @@
 //! - Frankle & Carbin "The Lottery Ticket Hypothesis" (ICLR 2019)
 //! - Chen et al. "Lottery Ticket Preserves Weight Correlation" (ICML 2021)
 //! - Chen et al. "The Lottery Ticket Hypothesis for Graph Neural Networks" (2021)
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
 
 use crate::GraphData;
 use std::collections::HashMap;
@@ -274,12 +277,15 @@ impl LotteryTicketFinder {
             }
 
             let param_data = param.to_vec()?;
-            let mask_data = self
-                .mask
-                .masks
-                .get(name)
-                .expect("mask should exist for prunable param")
-                .to_vec()?;
+            let mask_data = match self.mask.masks.get(name) {
+                Some(mask) => mask.to_vec()?,
+                None => {
+                    // A prunable parameter without a mask means the mask set is
+                    // out of sync with the model; silently skipping it would
+                    // under-prune without any signal.
+                    return Err(format!("no pruning mask registered for parameter '{name}'").into());
+                }
+            };
 
             for (i, &weight) in param_data.iter().enumerate() {
                 if mask_data[i] > 0.5 {
@@ -546,7 +552,10 @@ impl GraphPruning {
         // Add destination indices
         for &e in &kept_edge_indices {
             let dst = edge_data[graph.num_edges + e] as usize;
-            new_edges.push(node_map[dst].expect("destination node should be in node map") as f32);
+            let mapped = node_map[dst].ok_or_else(|| -> Box<dyn std::error::Error> {
+                format!("node {dst} missing from the kept-node map").into()
+            })?;
+            new_edges.push(mapped as f32);
         }
 
         let num_new_edges = kept_edge_indices.len();

@@ -1,16 +1,29 @@
 //! Statistical tests for time series analysis
 //!
-//! This module provides various statistical hypothesis tests for time series,
-//! including stationarity tests, autocorrelation tests, and normality tests.
+//! This module provides genuine implementations of several standard
+//! hypothesis tests used in time series analysis: the Augmented
+//! Dickey-Fuller, Phillips-Perron and KPSS stationarity tests, the
+//! Ljung-Box autocorrelation test, and the Jarque-Bera normality test. Each
+//! computes real test statistics from the input series (regression via
+//! Cholesky solve/invert for the ADF/PP long-run-variance corrections, the
+//! sample mean/variance/autocorrelations for Ljung-Box, etc.) rather than
+//! stubbed or fabricated results.
 //!
-//! NOTE: These implementations use placeholder calculations until scirs2-stats
-//! provides the full hypothesis testing API.
+//! The one genuine approximation in this module is the chi-squared
+//! survival function `chi2_sf` (used to turn test statistics into
+//! p-values): it is computed via a continued-fraction expansion of the
+//! regularised incomplete gamma function (Lentz's algorithm) rather than
+//! scirs2-stats' distribution machinery, and is accurate to roughly four
+//! decimal places for typical degrees-of-freedom/statistic ranges. Some
+//! p-values (e.g. KPSS, ADF) instead use interpolation over published
+//! critical-value tables, noted on the relevant function.
 
 use crate::TimeSeries;
 use torsh_core::error::{Result, TorshError};
 
-// Placeholder result types for statistical tests
-// These will be replaced with scirs2-stats types when available
+// Result types for statistical tests. These are this crate's own types,
+// not placeholders; scirs2-stats does not currently provide equivalents for
+// several of these tests (e.g. KPSS, Phillips-Perron).
 
 /// Result of Augmented Dickey-Fuller test
 #[derive(Debug, Clone)]

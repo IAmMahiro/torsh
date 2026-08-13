@@ -161,7 +161,7 @@ pub async fn quantize_model(
         ));
     }
 
-    let (result_wrapped, _duration) = time::measure_time(async {
+    let (result_wrapped, elapsed) = time::measure_time(async {
         info!(
             "Quantizing model using {} method to {} precision",
             args.method, args.precision
@@ -169,99 +169,112 @@ pub async fn quantize_model(
 
         let pb = progress::create_spinner("Quantizing model...");
 
-        let size_before = fs::format_file_size(tokio::fs::metadata(&args.input).await?.len());
+        // Read the real model file and interpret its numeric payload as a
+        // little-endian f32 weight blob. This is the CLI's honest model
+        // contract: it quantizes real stored weights, never fabricated ones.
+        let original_bytes = tokio::fs::read(&args.input).await?;
+        let size_before = fs::format_file_size(original_bytes.len() as u64);
 
-        // Real quantization process using torsh-quantization
-        let original_model = load_torsh_model(&args.input).await?;
-        let quantized_model = match args.method.as_str() {
-            "dynamic" => {
-                info!("Applying dynamic quantization");
-                apply_dynamic_quantization(original_model, &args.precision).await?
-            }
-            "static" => {
-                if let Some(calib_path) = &args.calibration_data {
-                    validation::validate_directory_exists(calib_path)?;
-                    info!("Loading calibration data from {}", calib_path.display());
-                    let calibration_data =
-                        load_calibration_data(calib_path, args.calibration_samples).await?;
-                    apply_static_quantization(original_model, &args.precision, calibration_data)
-                        .await?
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "Calibration data required for static quantization"
-                    ));
-                }
-            }
-            "qat" => {
-                warn!("QAT quantization requires training loop integration");
-                apply_qat_quantization(original_model, &args.precision).await?
-            }
-            _ => {
+        let weights: Vec<f32> = original_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .filter(|v| v.is_finite())
+            .collect();
+        if weights.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no finite f32 weights could be read from '{}'; the CLI quantizer treats the \
+                 model file as a little-endian f32 weight blob",
+                args.input.display()
+            ));
+        }
+
+        // These modes are not (yet) genuinely different in the CLI; be honest
+        // about what is actually performed rather than pretending.
+        match args.method.as_str() {
+            "dynamic" => info!("Applying real post-training weight quantization"),
+            "static" => warn!(
+                "static calibration is not implemented; quantization parameters are derived from \
+                 the weight distribution (post-training)"
+            ),
+            "qat" => warn!(
+                "QAT is not implemented; performing real post-training quantization of the stored \
+                 weights instead"
+            ),
+            other => {
                 return Err(anyhow::anyhow!(
                     "Unsupported quantization method: {}",
-                    args.method
+                    other
                 ));
             }
-        };
+        }
 
-        // Save quantized model
-        save_torsh_model(&quantized_model, &args.output).await?;
+        // Real quantization via torsh-quantization.
+        let q = quantize_weights_real(&weights, &args.precision)?;
 
-        let size_after = fs::format_file_size(tokio::fs::metadata(&args.output).await?.len());
+        // Persist a real, self-describing quantized file (header + integer codes).
+        let quantized_bytes = encode_quantized_file(
+            &q.codes,
+            q.scale,
+            q.zero_point,
+            weights.len(),
+            &args.precision,
+        );
+        tokio::fs::write(&args.output, &quantized_bytes).await?;
+        let size_after = fs::format_file_size(quantized_bytes.len() as u64);
 
         pb.finish_with_message("Model quantization completed");
 
-        // Real accuracy validation using model evaluation
-        let actual_accuracy = evaluate_model_accuracy(&quantized_model).await?;
+        let size_reduction =
+            1.0 - (quantized_bytes.len() as f64 / original_bytes.len().max(1) as f64);
 
         let mut metrics = HashMap::new();
         metrics.insert("method".to_string(), serde_json::json!(args.method));
         metrics.insert("precision".to_string(), serde_json::json!(args.precision));
         metrics.insert(
-            "calibration_samples".to_string(),
-            serde_json::json!(args.calibration_samples),
+            "weights_quantized".to_string(),
+            serde_json::json!(weights.len()),
         );
         metrics.insert(
-            "accuracy_after_quantization".to_string(),
-            serde_json::json!(actual_accuracy),
+            "bytes_per_weight".to_string(),
+            serde_json::json!(q.bytes_per),
+        );
+        metrics.insert("scale".to_string(), serde_json::json!(q.scale));
+        metrics.insert("zero_point".to_string(), serde_json::json!(q.zero_point));
+        metrics.insert(
+            "quantization_error_mse".to_string(),
+            serde_json::json!(q.mse),
         );
         metrics.insert(
-            "accuracy_threshold".to_string(),
-            serde_json::json!(args.accuracy_threshold),
+            "quantization_error_max_abs".to_string(),
+            serde_json::json!(q.max_abs_error),
         );
-
-        // Calculate size reduction
-        let original_size = tokio::fs::metadata(&args.input).await?.len();
-        let quantized_size = tokio::fs::metadata(&args.output).await?.len();
-        let size_reduction = 1.0 - (quantized_size as f64 / original_size as f64);
         metrics.insert(
             "size_reduction".to_string(),
             serde_json::json!(format!("{:.1}%", size_reduction * 100.0)),
         );
-
-        let success = actual_accuracy >= args.accuracy_threshold;
-        let mut errors = Vec::new();
-        if !success {
-            errors.push(format!(
-                "Quantized model accuracy {:.3} is below threshold {:.3}",
-                actual_accuracy, args.accuracy_threshold
-            ));
-        }
+        metrics.insert(
+            "accuracy_note".to_string(),
+            serde_json::json!(
+                "accuracy was NOT measured: the CLI has no eval dataset/model runtime, so only \
+                 the real quantization error is reported (accuracy_threshold is not enforced)"
+            ),
+        );
 
         Ok::<ModelResult, anyhow::Error>(ModelResult {
             operation: "quantize".to_string(),
             input_model: args.input.display().to_string(),
             output_model: Some(args.output.display().to_string()),
-            success,
-            duration: time::format_duration(std::time::Duration::from_secs(3)),
+            success: true,
+            duration: String::new(),
             size_before: Some(size_before),
             size_after: Some(size_after),
             metrics,
-            errors,
+            errors: vec![],
         })
     })
     .await;
-    let result = result_wrapped?;
+    let mut result = result_wrapped?;
+    result.duration = time::format_duration(elapsed);
 
     output::print_table("Quantization Results", &result, output_format)?;
 
@@ -270,9 +283,13 @@ pub async fn quantize_model(
         if let Some(reduction) = result.metrics.get("size_reduction") {
             output::print_info(&format!("Size reduction: {}", reduction));
         }
-        if let Some(accuracy) = result.metrics.get("accuracy_after_quantization") {
-            output::print_info(&format!("Accuracy after quantization: {}", accuracy));
+        if let Some(mse) = result.metrics.get("quantization_error_mse") {
+            output::print_info(&format!("Quantization error (MSE): {}", mse));
         }
+        output::print_warning(
+            "Accuracy was NOT measured (no eval dataset / model runtime); only real quantization \
+             error is reported.",
+        );
     } else {
         output::print_error("Model quantization failed");
         for error in &result.errors {
@@ -281,6 +298,113 @@ pub async fn quantize_model(
     }
 
     Ok(())
+}
+
+/// Outcome of a real weight-quantization pass.
+struct RealQuantResult {
+    /// Packed integer codes (little-endian), `bytes_per` bytes per weight.
+    codes: Vec<u8>,
+    /// Quantization scale.
+    scale: f32,
+    /// Quantization zero point.
+    zero_point: i32,
+    /// Bytes used per weight in the quantized representation.
+    bytes_per: usize,
+    /// Real mean-squared reconstruction error over all weights.
+    mse: f64,
+    /// Real maximum absolute reconstruction error.
+    max_abs_error: f64,
+}
+
+/// Perform a **real** linear quantization of `weights` using torsh-quantization.
+///
+/// Computes quantization parameters and codes with the ecosystem quantizer,
+/// dequantizes to measure the genuine reconstruction error, and returns packed
+/// integer codes for serialization. Never fabricates a metric.
+fn quantize_weights_real(weights: &[f32], precision: &str) -> Result<RealQuantResult> {
+    use torsh::core::device::DeviceType;
+    use torsh::quantization::{dequantize, quantize_tensor_auto, DType, QScheme};
+    use torsh::tensor::Tensor;
+
+    let (dtype, scheme, bytes_per) = match precision {
+        "int8" => (DType::I8, QScheme::PerTensorSymmetric, 1usize),
+        "uint8" => (DType::U8, QScheme::PerTensorAffine, 1usize),
+        "int16" => (DType::I16, QScheme::PerTensorSymmetric, 2usize),
+        other => {
+            return Err(anyhow::anyhow!(
+                "unsupported precision '{}': the CLI quantizer supports int8, uint8, int16 \
+                 (fp16 storage quantization is not implemented)",
+                other
+            ));
+        }
+    };
+
+    let tensor = Tensor::from_data(weights.to_vec(), vec![weights.len()], DeviceType::Cpu)?;
+    let (qtensor, scale, zero_point) = quantize_tensor_auto(&tensor, dtype, scheme)
+        .map_err(|e| anyhow::anyhow!("quantization failed: {e}"))?;
+
+    let dequantized = dequantize(&qtensor, scale, zero_point)
+        .map_err(|e| anyhow::anyhow!("dequantization failed: {e}"))?;
+    let deq_vals = dequantized.to_vec()?;
+
+    let mut sse = 0.0f64;
+    let mut max_abs_error = 0.0f64;
+    for (w, d) in weights.iter().zip(deq_vals.iter()) {
+        let err = (*w - *d) as f64;
+        sse += err * err;
+        if err.abs() > max_abs_error {
+            max_abs_error = err.abs();
+        }
+    }
+    let mse = sse / weights.len() as f64;
+
+    let code_vals = qtensor.to_vec()?;
+    let mut codes = Vec::with_capacity(weights.len() * bytes_per);
+    for &c in &code_vals {
+        match dtype {
+            DType::U8 => codes.push(c.round().clamp(0.0, 255.0) as u8),
+            DType::I8 => codes.push((c.round().clamp(-128.0, 127.0) as i8) as u8),
+            DType::I16 => {
+                let v = c.round().clamp(-32768.0, 32767.0) as i16;
+                codes.extend_from_slice(&v.to_le_bytes());
+            }
+            _ => return Err(anyhow::anyhow!("internal: unexpected quantization dtype")),
+        }
+    }
+
+    Ok(RealQuantResult {
+        codes,
+        scale,
+        zero_point,
+        bytes_per,
+        mse,
+        max_abs_error,
+    })
+}
+
+/// Encode a self-describing quantized model file: magic + precision tag + count
+/// + scale + zero point + packed integer codes.
+fn encode_quantized_file(
+    codes: &[u8],
+    scale: f32,
+    zero_point: i32,
+    count: usize,
+    precision: &str,
+) -> Vec<u8> {
+    let tag: u8 = match precision {
+        "int8" => 0,
+        "uint8" => 1,
+        "int16" => 2,
+        _ => 255,
+    };
+    let mut out = Vec::with_capacity(21 + codes.len());
+    out.extend_from_slice(b"TQ1\0");
+    out.push(tag);
+    out.extend_from_slice(&(count as u64).to_le_bytes());
+    out.extend_from_slice(&scale.to_le_bytes());
+    out.extend_from_slice(&zero_point.to_le_bytes());
+    out.extend_from_slice(codes);
+    out
 }
 
 /// Prune model to remove unnecessary parameters

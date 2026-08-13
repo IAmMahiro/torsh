@@ -73,6 +73,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use torsh_core::error::{Result, TorshError};
+use torsh_core::sync::MutexExt;
 
 /// Real-time gradient memory monitoring
 ///
@@ -378,10 +379,7 @@ impl GradientMemoryMonitor {
             ));
         }
 
-        let mut snapshots = self
-            .memory_snapshots
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut snapshots = self.memory_snapshots.lock_or_recover();
 
         // Calculate allocation delta
         let allocation_delta = if let Some(last_snapshot) = snapshots.last() {
@@ -431,10 +429,7 @@ impl GradientMemoryMonitor {
     pub fn stop_and_analyze(&self) -> Result<GradientMemoryMonitoringResult> {
         self.active.store(false, Ordering::SeqCst);
 
-        let snapshots = self
-            .memory_snapshots
-            .lock()
-            .expect("lock should not be poisoned");
+        let snapshots = self.memory_snapshots.lock_or_recover();
 
         if snapshots.is_empty() {
             return Ok(GradientMemoryMonitoringResult {
@@ -476,10 +471,7 @@ impl GradientMemoryMonitor {
     ///
     /// Returns the number of snapshots currently stored in the monitor.
     pub fn snapshot_count(&self) -> usize {
-        self.memory_snapshots
-            .lock()
-            .expect("lock should not be poisoned")
-            .len()
+        self.memory_snapshots.lock_or_recover().len()
     }
 
     /// Get monitoring duration so far
@@ -769,10 +761,7 @@ mod tests {
         assert_eq!(monitor.snapshot_count(), 2);
 
         // Check snapshots are properly recorded
-        let snapshots = monitor
-            .memory_snapshots
-            .lock()
-            .expect("lock should not be poisoned");
+        let snapshots = monitor.memory_snapshots.lock_or_recover();
         assert_eq!(snapshots[0].allocated_bytes, 1000);
         assert_eq!(snapshots[1].allocated_bytes, 2000);
         assert_eq!(snapshots[1].allocation_delta, 1000); // Increase from previous
@@ -827,10 +816,7 @@ mod tests {
         // Should not exceed max_snapshots
         assert!(monitor.snapshot_count() <= 3);
 
-        let snapshots = monitor
-            .memory_snapshots
-            .lock()
-            .expect("lock should not be poisoned");
+        let snapshots = monitor.memory_snapshots.lock_or_recover();
         // Should keep the latest ones
         assert!(snapshots.iter().any(|s| s.allocated_bytes == 5000));
     }

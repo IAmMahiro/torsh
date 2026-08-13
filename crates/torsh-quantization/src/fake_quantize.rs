@@ -135,11 +135,10 @@ pub fn fake_quantize_auto(tensor: &Tensor, dtype: DType, scheme: QScheme) -> Tor
         .fold(f32::NEG_INFINITY, |a, &b| a.max(b))
         .max(0.0);
 
-    let scale = (max_val - min_val) / (quant_max - quant_min) as f32;
-    let scale = if scale == 0.0 { 1.0 } else { scale };
-
     match scheme {
         QScheme::PerTensorAffine => {
+            let scale = (max_val - min_val) / (quant_max - quant_min) as f32;
+            let scale = if scale == 0.0 { 1.0 } else { scale };
             let zero_point = (quant_min as f32 - min_val / scale)
                 .round()
                 .max(quant_min as f32)
@@ -147,7 +146,24 @@ pub fn fake_quantize_auto(tensor: &Tensor, dtype: DType, scheme: QScheme) -> Tor
             fake_quantize_per_tensor_affine(tensor, scale, zero_point, quant_min, quant_max)
         }
         QScheme::PerTensorSymmetric => {
-            fake_quantize_per_tensor_symmetric(tensor, scale, quant_min, quant_max)
+            // Symmetric quantization must derive the scale from the maximum
+            // absolute value; reusing the affine scale clips every value above
+            // half of the range.
+            let max_abs = min_val.abs().max(max_val.abs());
+            // Unsigned ranges cannot represent negatives with zero_point = 0,
+            // so the symmetric zero sits at the midpoint of the range.
+            let zero_point = if quant_min >= 0 {
+                (((quant_min as i64) + (quant_max as i64) + 1) / 2) as i32
+            } else {
+                0
+            };
+            let headroom = (quant_max - zero_point).max(1) as f32;
+            let scale = if max_abs == 0.0 {
+                1.0
+            } else {
+                max_abs / headroom
+            };
+            fake_quantize_per_tensor_affine(tensor, scale, zero_point, quant_min, quant_max)
         }
         _ => Err(TorshError::InvalidArgument(
             "Quantization scheme not yet implemented".to_string(),
@@ -226,7 +242,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "test hangs - needs investigation"]
     fn test_fake_quantize_auto() {
         let data = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
         let tensor = tensor_1d(&data).unwrap();

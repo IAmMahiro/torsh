@@ -224,12 +224,12 @@ impl Optimizer for RAdam {
                     let denom = corrected_exp_avg_sq.sqrt()?.add_scalar(self.eps)?;
 
                     let update = corrected_exp_avg.div(&denom)?.mul_scalar(r_t * lr)?;
-                    *param_write = param_write.sub(&update)?;
+                    crate::param_update::sub_assign(&mut param_write, &update)?;
                 } else {
                     // Simple momentum update without variance rectification
                     let corrected_exp_avg = new_exp_avg.div_scalar(bias_correction1)?;
                     let update = corrected_exp_avg.mul_scalar(lr)?;
-                    *param_write = param_write.sub(&update)?;
+                    crate::param_update::sub_assign(&mut param_write, &update)?;
                 }
             }
         }

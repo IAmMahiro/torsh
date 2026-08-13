@@ -169,7 +169,7 @@ mod utils {
             }
             Some(invalid_axis) => {
                 validate_axis(invalid_axis)?;
-                panic!("Invalid axis: {invalid_axis}. This should be unreachable after validate_axis check.")
+                unreachable!("axis validated by validate_axis above")
             }
         }
     }
@@ -272,9 +272,7 @@ pub fn sum_axis(tensor: &dyn SparseTensor, axis: usize) -> TorshResult<Vec<f32>>
         match axis {
             0 => result[col] += val, // Sum across rows -> index by col
             1 => result[row] += val, // Sum across columns -> index by row
-            _ => panic!(
-                "Invalid axis: {axis}. This should be unreachable after validate_axis check."
-            ),
+            _ => unreachable!("axis validated by validate_axis above"),
         }
     })
 }

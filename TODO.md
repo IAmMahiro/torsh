@@ -1,6 +1,192 @@
 # ToRSh Development Roadmap
 
-**Status**: v0.1.3 (Released - June 30, 2026)
+**Status**: v0.2.0 (In Development)
+
+---
+
+## 🛡️ 0.2.0 Production-Hardening Campaign (2026-08-12, IN PROGRESS)
+
+A 13-agent exhaustive audit (stubs / bugs / missing features / perf / dependency purity)
+produced **318 verified-by-reading findings (80 critical / 103 high / 110 medium / 25 low)**.
+Implementation runs in parallel subagent waves; every bug fix follows a **verify-first
+protocol** (write a failing reproduction test before touching production code; findings whose
+repro passes are recorded INVALID and left untouched).
+
+**Baseline at campaign start (all green)**: `cargo check --workspace --all-targets`,
+`cargo clippy --all-targets -- -D warnings`, `cargo nextest run --workspace` (9,980 pass / 74 skip).
+Two pre-existing breakages already fixed inline: oxiarc 0.4.0/0.4.1 mixed-lock E0599 (cargo
+update of oxiarc-{lzhuf,brotli,bzip2,lzma,snappy}); torsh-jit E0275 inference overflow
+(explicit HashMap type annotations in `analysis.rs::analyze_dependencies`).
+
+### Headline findings being fixed
+- **torsh-tensor**: dim-ignoring cumsum/sort/argmin/argmax/sum_dim/var/std; mul/div drop the
+  autograd graph; matmul/conv backward holes; naive ijk matmul (no BLAS); hard-coded RNG
+  seed 42; f16/bf16 randn transmute garbage; in-place-on-view stride corruption; SimdOptimized
+  storage rejecting mutation (breaks set/set_slice/in-place ≥10KB); dangling-Weak view design;
+  13k lines of dead `src/ops/**`; buffer pool never recycles.
+- **torsh-nn**: Parameter never sets requires_grad; Dropout is identity; softmax ignores dim;
+  BatchNorm wrong reshape + running stats never updated; conv_transpose returns zeros;
+  cross-attention ignores k/v; LSTM/GRU ignore num_layers.
+- **Security**: tar/zip-slip in torsh-hub + torsh-package extraction; hub downloads never
+  integrity-checked; fake signature verification (string compares); no-op ModelSandbox.
+- **Fabricated data**: CLI train/quantize fabricate losses/accuracy; profiler/bottleneck/
+  benchmark report hardcoded metrics; eig/svd return fabricated results beyond 5×5;
+  distributed collectives no-op with fake success (DDP silently scales grads by 1/N).
+- **Python bindings**: `import rstorch` fails (uint16 import, functional module, sys.modules
+  registration); root pyproject.toml cannot build.
+- **Deps/purity**: default build compiles BoringSSL (reqwest), Oniguruma/esaxx C++ (tokenizers),
+  blake3 asm (scirs2-datasets); banned rustfft via unused imageproc; optirs/tonic/prost/sprs +
+  ~20 deps declared-but-unused; no deny.toml. **NEW POLICY: minimize non-COOLJAPAN deps.**
+
+### Wave plan
+- [x] **Wave 0**: build blockers (oxiarc lock mix, torsh-jit E0275) — done inline.
+- [x] **Wave 1 (done 2026-08-12)**: 10/10 agents green. torsh-core honesty (fabricated GPU specs
+  → real sysctl/honest Err, 21 phantom cfgs removed), torsh-tensor foundation (dim-aware
+  cumsum/sort/argmin/argmax/sum_dim/var/std; BLAS matmul via oxiblas; mul/div + broadcast
+  Add/Sub + ND-matmul backward implemented with finite-difference proofs; conv backward now
+  honest error; visited-set toposort backward; entropy-seeded RNG + manual_seed; f16/bf16
+  randn fixed; mmap per-tensor temp files; SimdOptimized CoW mutation; strong-Arc view design;
+  stride-aware element access), torsh-data (samplers/shuffle/set_epoch/worker ordering; real
+  VideoFolder/IMDB loaders), metrics/cluster formulas, hub/package tar-zip-slip + integrity
+  wiring, profiler/utils fabrication removal (real measurements). Workspace: check+clippy
+  green; 10,242 tests with 5 expected reds folded into Wave 2 (no_grad wiring, 2 test
+  tolerances, 2 latent log-instability bugs exposed by real RNG).
+- [ ] **Wave 2 (running)**: fixup(tensor crosscut)→autograd(no_grad via torsh-core grad-mode)
+  chain, torsh-nn (parameter/dropout/norm/attention/RNN), torsh-optim (amsgrad, F040
+  param-replacement design), torsh-autograd (clip_grad_norm, no_grad wiring, checkpointing),
+  torsh-functional (losses/attention), torsh-linalg (real eig/svd via scirs2/oxiblas),
+  torsh-signal (real filter design), torsh-text (BPE loop, tokenizers purity), torsh-vision,
+  torsh-quantization (scale math), torsh-fx/jit (graph rewrites), torsh-graph (Result forwards).
+- [x] **Wave 3 (done 2026-08-12)**: 7/7 agents green. torsh-tensor dead-code deletion (**36,476
+  lines**: src/ops/**, .bak/.bak2-6, lib_new/ops_legacy/lazy_ops; normal_/multinomial ported
+  live) + autograd completion (cat/stack/narrow/select/slice/log_softmax/unary exp·ln·tanh·
+  sigmoid·relu now record backward; from_vec length validation; CoW-safe copy_from/set_data).
+  torsh-distributed (real TCP process-group backend; every fake-success collective → honest
+  Err; MockBackend confined to cfg(test)). torsh-backend Phase 4 (**73,329 lines** of legacy
+  CUDA FFI deleted, build.rs cuda_available removed → host-independent API, real GPU path is
+  torsh-tensor oxicuda; ConvolutionOps trait signature changed — BREAKING). torsh-python
+  import fixes (uint16/functional/sys.modules/submodules; maturin+pytest green; 27 orphan
+  files deleted; torsh-ffi split DEFERRED — needs root [workspace] surgery). torsh-cli real
+  training loop + real .pt reader (replaced RNG-fabricated losses/quantize accuracy).
+  torsh-models/hub (Ed25519 signing, real checksums, model-zoo orphan wiring, NaN-safe sorts).
+  Post-wave: 10 cross-crate regressions fixed inline — copy_from view write-through restored
+  (PyTorch in-place-on-view semantics; MPNN scatter) + 2 latent test-data bugs exposed by the
+  new from_vec validation. Workspace check+clippy+nextest green.
+- [x] **Wave 4 (done 2026-08-12)**: 3/3 agents green. **deny.toml created** → `cargo deny check
+  bans` OK; dead deps removed (cust/cuda-sys/cudnn-sys workspace decls, optirs/optirs-core,
+  protobuf, sprs, fs2, dead rand); lzma-rs → oxiarc-lzma (roundtrip test); **rustfft/ring/
+  onig-sys/openblas all removed from the default graph** (imageproc default-features=false,
+  tokenizers already pure, text/vision pretrained opt-in); MSRV 1.77 → 1.87; ~35 crate-local
+  version pins hoisted to [workspace.dependencies] (zero tree drift). Lock-poison: new
+  `torsh_core::sync` recovery helpers + **843 poison-expect sites** converted across
+  core/tensor/autograd/backend. Docs: README purity/crate-list/test-count/roadmap truth pass,
+  CHANGELOG 0.2.0 section, docs/ version bump, npm-publish.yml added, per-crate README fixes.
+- [x] **Wave 5 (done 2026-08-12)**: **aws-lc-sys / aws-lc-rs / ring removed from the default
+  build** — reqwest switched to `rustls-no-provider` + pure-Rust `oxitls-rustcrypto-provider`
+  + `webpki-roots` (real cert verification, no weakening); 15 client-build sites rewired in
+  cli/hub/utils via new `tls.rs` helpers; verified by a genuine HTTPS handshake to
+  huggingface.co. 3 more fabrication sites (mock_hf_model / fake mirror health / dummy model
+  bytes) → honest Err. torsh-models `download` feature given the same pure-Rust TLS wiring so
+  its opt-in client cannot panic on the absent default provider.
+- [x] **Gatekeeper review (done)**: independent Opus verification of the critical-fix set —
+  RNG entropy, matmul (ndarray/matrixmultiply SIMD GEMM), autograd backward (finite-diff),
+  archive-slip sanitizer *proven called* + real Ed25519, distributed honest-Err + real TCP —
+  all VERIFIED. One miss caught & fixed post-review: torsh-profiler `ml_analysis.rs`
+  parallel-analysis returned fabricated efficiency constants + seed(42) → now computed from the
+  real event timeline (interval-union CPU util, per-thread load balance, `Option` memory-eff
+  when no bytes data) with deterministic stratified sampling. Also deleted 7 dead
+  `*_original_*lines.rs`/`.bak`/`.backup` files and de-mock'd isend/irecv comments.
+- [x] **Final verification**: workspace check --all-targets/--all-features + clippy -D warnings
+  + nextest + `cargo deny check bans` green; default-graph free of rustfft/ring/onig/openblas/
+  aws-lc-sys.
+
+### Final verification snapshot (campaign complete, 2026-08-12)
+`cargo check --workspace --all-targets` ✓ · `cargo check --workspace --all-features --all-targets` ✓ ·
+`cargo clippy --workspace --all-targets -- -D warnings` ✓ · `cargo nextest run --workspace`
+**10,638 passed / 98 skipped / 0 failed** ✓ · `cargo test --workspace --doc` **all pass** ✓ ·
+feature-gated suites (quant-experimental 299 / sparse-matlab 277 / data-privacy+audio 452 /
+distributed-nccl 377 / tensor-hdf5 748 / models-download 268) all ✓ ·
+`cargo deny check bans` **ok** ✓ · default-graph `cargo tree -i {aws-lc-sys, aws-lc-rs, ring,
+rustfft, onig-sys, openblas, cust}` all **absent** ✓ · 0 files ≥ 2000 lines ✓ · 0 production
+`todo!()`/`unimplemented!()` ✓. Not committed/pushed (awaiting explicit user request).
+
+### Documented follow-ups (post-campaign, not release blockers)
+- torsh-ffi split into torsh-capi/torsh-node/torsh-wasm (needs root [workspace] surgery; imports fixed, split deferred).
+- Lock-poison remaining crates (~700 sites: distributed 317, fx 62, jit 59, vision 46, …) — helper exists, mechanical.
+- Example relocation blocked on an example-rewrite pass (root examples/ have 0.1.x-era API drift); webgpu feature-name fixed, honest status banner added.
+- torsh-core cudnn-sys optional C-FFI leak (F203); blake3 asm transitive via scirs2-datasets; hdf5 → oxih5 when ready.
+- ~~Deeper perf: Storage::Device residency, sum_dim non-keepdim autograd, gelu/leaky_relu backward records, RNN cell narrow-gradient~~ **ALL DONE — see the 2026-08-13 follow-up campaign below.**
+
+Full finding digest: session scratchpad `discovery.json` / `digest.md` (318 items, F000–F317).
+
+---
+
+## ✅ Perf/Autograd Follow-up Campaign (2026-08-13, COMPLETE — 6 waves, all green)
+
+The four "Deeper perf" follow-ups turned out (4-agent investigation, runtime-probed) to be mostly
+SILENT-CORRECTNESS bugs; fixing them cascaded into a full autograd-completeness campaign.
+
+### Landed (uncommitted on branch 0.2.0)
+- **Operation::SumDim** + deleted the silently-TRANSPOSING `Operation::Mean` producer (softmax grad
+  was 0.54 max-abs wrong; nll backward hard-errored; ~106 call sites affected). mean/var/std/
+  softmax/nll/cross_entropy now differentiate correctly by composition (FD-verified).
+- **UnaryKind::Gelu + Operation::LeakyRelu{slope: T}** + 14 more unary records (tan/asin/acos/atan/
+  sinh/cosh/log10/log2/rsqrt/reciprocal/square→Power, abs) + **AddScalar** + recording
+  **maximum/minimum/clamp** (PyTorch tie rules: ties 0.5/0.5, |x|′(0)=0, clamp inclusive-bound).
+- **Tensor::map made forward-only** — it was a silent gradient sink (requires_grad=true Leaf) that
+  produced measurably wrong GRU/GRUCell gradients. **Exact GELU on all paths** (removed scirs2
+  clamped-Pade SIMD kernel: forward was discontinuous at numel=1000, 515% rel err at x=−2.4).
+- **TensorStorage::Device residency** (gpu feature): injectable backend + CountingBackend proof —
+  chained 3 ops went 3×H2D/3×D2H → **1 upload + 1 download**; immutable device buffers, mutation
+  demotes, leak-checked error paths, default build stays oxicuda-free. GPU suite 872 tests.
+- **RNN/LSTM/GRU end-to-end BPTT**: stack/cat/dropout severs fixed; `RNN::forward` real
+  implementation (was a zeros stub; bidirectional params now registered); `slab_along_dim` hoist
+  (LSTM backward O(T²)→O(T)); **ViewKind::Narrow** geometric record (no index_map allocation);
+  **narrow() is now an aliasing view** (PyTorch parity + no slab copy per RNN gate split).
+- **torsh-series**: hand-written BPTT deleted; `LSTMForecaster::fit` trains via real backward
+  (head-to-head vs old BPTT from identical weights before switching; old BPTT mismodeled
+  num_layers≥2).
+- **torsh-nn functional**: softmax/log_softmax delegate (recording); swish (21.6% wrong grad) and
+  mish (SIGN-FLIPPED grad) fixed; relu/sigmoid/tanh/gelu/leaky_relu/elu/selu reconnected
+  (compile_time MLP now trainable); **14 losses reconnected** (l1/huber/smooth_l1/focal/dice/
+  tversky/wing/center/infonce/bce/triplet_margin/contrastive/multi_margin/cosine_embedding — the
+  last had a total batched-call failure, fixed to the PyTorch shape contract).
+- **Module norm layers** (LayerNorm/GroupNorm/BatchNorm/InstanceNorm): statistics now on the graph
+  (were frozen constants → incomplete gradients); running stats stay detached buffers.
+- **Buffer-aware state_dict** (PyTorch parity): running stats survive save/load (were silently
+  dropped — reloaded models evaluated differently); Sequential/ModuleList/ModuleDict
+  named_buffers/named_children; Box<dyn Module> forwards every trait method (macro).
+- **CoW value semantics**: clone-then-set_item no longer writes through (TODO item from
+  2026-06-21 closed); views keep PyTorch write-through; `fill_` stride/offset-blindness fixed
+  (view fill was clobbering the base prefix). t()/gather/index_select now record (duplicate-index
+  gradient accumulation verified).
+- **torsh-functional**: similarity losses (cosine_embedding/contrastive/triplet_margin/
+  hinge_embedding/margin_ranking) reconnected; stale `row_sum` matmul workaround → `sum_dim`.
+- **torsh-text**: padding embedding row is now actually zeroed (fill_ wrote to a dropped local).
+- Test hygiene: grad-mode process-global race serialized (GRAD_MODE_GUARD pattern); memory_pool
+  and torsh-graph flakes fixed/seeded; wave-introduced convergence test seeded (30/30 gates).
+
+### Final verification (2026-08-13)
+`cargo nextest run --workspace` **10,964 passed / 0 failed / 95 skipped** (campaign start: 10,638) ·
+gpu suite 872 ✓ · doctests 614 ✓ · check/clippy `-D warnings` default+all-features+gpu all clean ✓ ·
+fmt clean ✓ · `cargo deny check bans` ok ✓ · default graph free of oxicuda-backend/aws-lc-sys/
+rustfft/onig-sys ✓ · 0 files ≥ 2000 lines ✓ · flake gates 90/90 ✓ · HEAD still `7ec403eb MOS`,
+nothing committed.
+
+### Follow-ups from this campaign (not blockers)
+- extremum (max_dim/min_dim/amin/amax), cumsum/cumprod, sort backward records (need argmax-scatter /
+  reverse-scan / permutation-inverse designs — genuinely different backward rules).
+- grad-mode is a process-global AtomicBool (PyTorch's is thread-local); production use in
+  torsh-autograd checkpoint.rs. Design decision needed before changing.
+- GPU phase 2 on the A4000 Linux box: real-CUDA validation of Device residency (synchronize-before-
+  copy semantics), gemm/conv/attention residency (column-major f64 marshalling), device-side
+  backward, device memory pool.
+- SIMD gelu could be re-added with an exact-tanh vector kernel (upstream scirs2 issue: its
+  simd_gelu_f32 is a clamped-Pade approximation; relu/sigmoid SIMD verified exact and kept).
+- torsh-nn `Tensor::where_tensor`/`eq` still don't record (worked around via constant-mask
+  composition); recording variants would simplify future loss implementations.
+- nll_loss masked-sum formulation: a −inf anywhere in a row poisons that row (documented contract;
+  intrinsic to every differentiable masked-gather formulation).
 
 ---
 
@@ -55,6 +241,13 @@ metrics,core,profiler}; gpu_dispatch tests (CpuBackend + REAL A4000) pass; torsh
 **Pre-existing, UNRELATED to this work** (reproduced at HEAD with my changes `git stash`ed):
 - `torsh-data/src/core_framework.rs:314` — `Tensor::cat(&Vec<Tensor>, isize)` vs expected
   `cat(&[&Tensor], i32)`. Blocks `cargo check --workspace`. Independent of the GPU migration.
+  - **RE-VERIFIED 2026-07-06 (during a trustformers 0.2.0 dependency review): no longer reproduces.**
+    `core_framework.rs:315` now calls `Tensor::cat(&channel_refs, channel_dim as i32)` with
+    `channel_refs: Vec<&Tensor<T>>`, matching the real signature at
+    `torsh-tensor/src/advanced_ops.rs:773` (`pub fn cat(tensors: &[&Self], dim: i32) -> Result<Self>`).
+    Confirmed with a clean `cargo check -p torsh-data` and a full `cargo check --workspace`
+    (both green, no errors) on this HEAD. This was flagged externally as a candidate 0.2.0
+    release blocker for publishing — it is not one; closing this line item as resolved.
 
 ---
 
@@ -1502,3 +1695,209 @@ These are gated on unbuilt/unstable upstream APIs (chiefly `scirs2-core` GPU / p
 - crates/torsh-nn/src/hardware_opts.rs:354,372,376,406,410,440,444 — AVX-512/AVX2/NEON tiled matmul via scirs2_core::simd_ops not exposed.
 - crates/torsh-functional/src/profiling/{core.rs:203,regression.rs:149} — CPU-utilization / memory detection need scirs2 profiling.
 - crates/torsh-python/src/tensor/core.rs:998 — full norm_lp blocked on ops module exposure (p/dim/keepdim currently ignored).
+
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+- [ ] crates/torsh/src/lib.rs: crates/torsh/src/lib.rs:176 — TODO: Implement ShapeBuilder when available
+  - **Approach:** torsh_core::shape::ShapeBuilder does NOT exist anywhere in torsh-core/src (confirmed via direct grep and git log -S search across history — no hits). It genuinely needs to be implemented, not just re-exported. BONUS finding: crates/torsh-core/fuzz/fuzz_targets/fuzz_shape_creation.rs ALREADY references torsh_core::shape::{Shape, ShapeBuilder} and calls ShapeBuilder::new() — this fuzz target would fail `cargo fuzz build` today. Implementing ShapeBuilder in torsh-core fixes both this TODO and that fuzz target simultaneously.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** Low — currently just an inert comment; risk is the fuzz target silently bit-rotting since fuzz crates are typically excluded from normal workspace builds/CI.
+
+- [ ] crates/torsh/src/lib.rs: crates/torsh/src/lib.rs:552 — TODO: Re-enable when tensor ops module is available
+  - **Approach:** NEEDS_CLARIFICATION — stated reason is stale (torsh_tensor::ops confirmed to exist now: real module directory ops/manipulation/{dim_ops,core_ops}.rs, ops/simd/f32_ops.rs, plus an ops.rs.backup showing it was refactored from a single file). The LIKELY REAL blocker (unstated in the comment) is glob-import ambiguity: the very next block re-exports crate::nn::functional::* under #[cfg(feature="nn")], and an adjacent comment explicitly says explicit PascalCase aliases were added "to avoid ambiguous glob imports" with nn::functional's lowercase names (relu, sigmoid, etc.) — re-enabling `pub use crate::tensor::ops::*;` as a second unscoped glob would likely reintroduce that collision. Needs a maintainer decision: re-export tensor::ops with an explicit/aliased list (not a glob) to dodge the collision, or update the comment to state the real (collision) reason and leave permanently disabled by design.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** Low — inert comment today; main risk is that "when tensor ops module is available" reads as an open blocker to future contributors when the module has in fact been available for a while.
+
+- [ ] examples/distributed_gradient_sync.rs: examples/distributed_gradient_sync.rs:187 — TODO: Backward pass would go here when autograd is fully integrated
+  - **Approach:** LIKELY STALE — Tensor::backward() is confirmed fully implemented and documented (torsh-tensor core_ops/types.rs:1448). DDP-specific autograd wiring (whether ddp.forward()'s output stays on the tracked graph through to loss.mean()) was NOT independently re-verified — needs a quick re-test rather than being assumed still-blocked. Example currently fabricates fake gradients via randn() instead of calling the commented-out loss.backward()?. Try re-enabling now that Tensor::backward() exists; if it works, delete the fake-gradient workaround.
+  - **Scope:** small
+  - **Prerequisites:** none (verify DDP autograd wiring first)
+  - **Risk:** Low — example-only code, no library impact. Misleading to readers if left stale.
+
+- [ ] examples/gradient_checkpointing.rs: examples/gradient_checkpointing.rs:6 — TODO: Re-enable when checkpoint functions are properly exported
+  - **Approach:** STALE reasoning, but not simply an "export" fix — confirmed NONE of the referenced free functions (auto_checkpoint_sequence, checkpoint, checkpoint_sequential, configure_checkpointing_with_strategy, get_checkpoint_memory_stats) exist anywhere in torsh-autograd under those names. The module was redesigned: torsh-autograd/src/checkpoint_scheduler.rs now provides a struct-based API (CheckpointScheduler, IntegratedCheckpointScheduler, CheckpointConfig, and a CheckpointStrategy enum that does still exist) with methods like record_operation/force_checkpoint/get_stats/process_operation instead of free functions. This isn't a missing pub-use — the whole example needs PORTING to the new API shape.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** Low (example-only), but misleading to a future maintainer who might just try uncommenting the use block and find it doesn't compile.
+
+- [ ] examples/gradient_checkpointing.rs: examples/gradient_checkpointing.rs:22 — TODO: Re-enable when checkpoint functions are properly exported
+  - **Approach:** Duplicate marker for the same large commented-out block as the item above (examples 1-4 in that file, lines ~24-39) — not a separate piece of work, resolve together.
+  - **Scope:** medium
+  - **Prerequisites:** examples/gradient_checkpointing.rs:6 (same commented-out block)
+  - **Risk:** Low — example-only.
+
+- [ ] examples/gradient_checkpointing.rs: examples/gradient_checkpointing.rs:170 — // let stats = get_checkpoint_memory_stats();
+  - **Approach:** Same root cause as examples/gradient_checkpointing.rs:6 — get_checkpoint_memory_stats() doesn't exist; nearest equivalent is CheckpointScheduler::get_stats()/IntegratedCheckpointScheduler::stats(). memory_statistics_example() currently hardcodes all-zero output (0,0,0,0.0) instead of calling any real stats API. Part of the same example-porting task.
+  - **Scope:** medium
+  - **Prerequisites:** examples/gradient_checkpointing.rs:6 (same commented-out block)
+  - **Risk:** Low — example-only; prints fake zeros which could mislead a reader into thinking checkpointing has no measurable effect.
+
+## Policy Check Findings (added 2026-07-04 by /policy-check)
+
+### Real Tier-A policy violations (need a decision, not a blind fix)
+
+- [ ] **`aws-lc-sys` real FFI crypto code compiling into the workspace.** `cargo tree --workspace -e normal,build` shows `aws-lc-sys v0.42.0` (via `aws-lc-rs v1.17.1` ← `rustls v0.23.41`) actually compiling in — this is real C/assembly cryptography (AWS-LC, a BoringSSL derivative), not a hypothetical. Root cause: `reqwest 0.13`'s rustls-tls feature selects `aws-lc-rs` as its default `CryptoProvider`; none of the 6 dependent crates (`torsh-cli`, `torsh-hub`, `torsh-text`, `torsh-utils`, `torsh-vision`, and `torsh-data` via `ureq`) override it. Per COOLJAPAN Pure Rust Policy, this should be `oxicrypto-*`/`oxitls-*` instead.
+  - **Approach:** investigate whether `reqwest`/`rustls` can be configured to use a pure-Rust `CryptoProvider` (e.g. `rustls`'s own `ring`-free / process-default-provider APIs, or migrating the TLS stack to `oxitls-core` + `oxitls-adapter-rustls-rustcrypto` per the noffi ecosystem — noting `~/work/.pure-rust-governance.md`'s own caveat that this adapter is currently alpha/"DO NOT USE IN PRODUCTION" upstream, so may need `oxitls-adapter-aws-lc` as an explicit, intentionally-quarantined dependency instead if production-readiness matters more than purity right now).
+  - **Scope:** medium — touches 6 crates' TLS-transitive dependency configuration, needs testing against real HTTP calls (hub download/upload, dataset download, pretrained model fetch).
+  - **Risk:** getting this wrong could break real network functionality in torsh-cli/torsh-hub; needs careful testing, not a blind swap.
+
+- [ ] **`cudnn-sys` feature-gated on `torsh-core`, violating the quarantine model.** `crates/torsh-core/Cargo.toml:118` has `cudnn-sys = { version = "0.0.3", optional = true }` under a `cfg(target_arch = "x86_64", target_os = "linux"/"windows")` target-specific dependency, gated behind a `cudnn` feature at `Cargo.toml:72`. This doesn't show up in `cargo tree` on macOS (this dev machine), but is confirmed real via `Cargo.lock`. Per `~/work/.pure-rust-governance.md` v2 §5, the "quarantine model" explicitly forbids a pure/Role-A crate (torsh-core is a math-kernel crate, never Role B) from having a feature that pulls in `-sys`/FFI when enabled — irreducible FFI must live in a separate, suffix-named quarantine crate instead, excluded from the pure-set.
+  - **Approach:** split cuDNN bindings out of `torsh-core` into a separate crate (e.g. `torsh-core-cudnn` or similar suffix-named quarantine crate) that depends on `torsh-core` rather than the reverse, following the governance doc's prescribed pattern.
+  - **Scope:** medium — needs care since `torsh-core` is foundational; must not break existing CUDA-feature consumers.
+  - **Risk:** low if done as a pure refactor (moving code, not changing behavior), but needs Linux/Windows CI or hardware to properly verify (can't be verified on this macOS dev machine).
+
+- [ ] **`optirs`/`optirs-core` (a sibling COOLJAPAN crate) needs a version bump + publish.** Root `Cargo.toml:154-155` pins `optirs`/`optirs-core = "0.3.1"`. This published version still pins `scirs2-optimize ^0.4`, dragging a whole parallel 0.4.4-generation of `scirs2-core`/`scirs2-linalg`/`scirs2-metrics`/`scirs2-neural`/`scirs2-optimize`/`scirs2-sparse`/`scirs2-stats` (each duplicated against torsh's own direct 0.6.0 deps) plus old `nalgebra`/`simba`/`oxiarc-core`/`oxiarc-lz4`/`oxiarc-zstd` versions into the dependency graph — 9 of the 12 total version-duplicate clusters found workspace-wide trace back to this single cause. **Confirmed the fix already exists**: `~/work/optirs`'s local `Cargo.toml` already declares `scirs2-core = "0.6.0"` etc. (git log shows "bump scirs2" commits), but the crate's own `version` field is still `"0.3.1"` — the bump hasn't been published to crates.io yet.
+  - **Approach:** bump the version and `cargo publish` (real publish, not dry-run) from `~/work/optirs`, then update torsh's root `Cargo.toml:154-155` pin to the new version. **This requires explicit user approval before publishing anything** (per the standing "never cargo publish without explicit permission" and "ask User before updating another PJ's codebase" policies) — do not action without asking first.
+  - **Scope:** small once approved (a version bump + publish + one Cargo.toml pin update in torsh).
+  - **Risk:** low — collapses duplicate dependency chains, no expected behavior change.
+
+### Confirmed non-issues (closing the loop, no action needed)
+
+- [x] **`model compress --algorithm gzip` is NOT a compression-policy violation — confirmed to be an unimplemented CLI stub.** `crates/torsh-cli/src/commands/model/conversion.rs`'s `compress_model()` never calls any codec at all: it sleeps 1s, writes the literal string `"compressed model data"` to the output path, and reports a hardcoded fake `compression_ratio: 0.75`. `torsh-cli/Cargo.toml` has zero compression dependencies. This is part of the already-known, already-deferred torsh-cli mock-surface (see this file's existing CLI-related follow-up entries and `crates/torsh-cli/TODO.md`'s own "Proposed follow-ups") — no new action needed here, just noting it's confirmed non-violating rather than an open question.
+
+### Housekeeping (low-risk cleanup, needs a human look before deleting)
+
+- [ ] **Dead/stale files possibly safe to delete** (not confirmed 100% unreferenced — verify with a repo-wide reference search, e.g. `include!()`/build.rs, before removing):
+  - `crates/torsh-cli/src/commands/model.rs.backup` and `crates/torsh-cli/src/commands/model/mod.rs.old` — leftover backup files next to the real `crates/torsh-cli/src/commands/model/mod.rs`.
+  - `crates/torsh-benches/src/metrics_original_1727_lines.rs`, `crates/torsh-backend/src/cpu/platform_optimization_original_1706_lines.rs`, `crates/torsh-distributed/src/store_original_1506_lines.rs` — apparent orphaned leftovers from a prior `splitrs` run (no `mod` declaration referencing any of these three found in their respective crates).
+
+### Workspace hygiene (mechanical, well-scoped, good candidate for a dedicated future pass)
+
+- [ ] **20 of 32 crates have hardcoded dependency versions instead of `dep.workspace = true`.** Full detail (which crate, which dep, which line) was captured by the policy-check subagent and should be re-derived fresh when this is picked up (`grep -E '^\w[\w-]* = "[0-9]'` across every `crates/*/Cargo.toml`) rather than copied stale into this TODO — but headline examples worth naming as high-value quick wins: 3 exact duplicates of an existing root `workspace.dependencies` entry (`tokio-test` in torsh-hub, `hdf5` in torsh-sparse, `cudnn-sys` in torsh-core — trivial, just add `.workspace = true`), plus consolidation candidates repeated across many crates without a root entry yet (`num_cpus` in 8 crates, `dirs` in 5 crates with a "6.0" vs "6.0.0" string inconsistency, `walkdir`/`fastrand`/`indicatif`/`pyo3-build-config` each in 3 crates).
+  - **Approach:** promote each repeated dependency to root `[workspace.dependencies]` once at its current best version, then switch every consuming crate to `dep.workspace = true`.
+  - **Scope:** large (touches ~20 Cargo.toml files) but very low risk (no logic changes, just dependency declaration style) — good candidate for a dedicated, mechanical future pass.
+  - **Risk:** minimal; verify with a full workspace build after.
+
+- [x] **Version-drift clusters not fixable from torsh's own Cargo.toml** (informational only — third-party crates own these, no action possible within this repo): `approx` (0.3.2/0.5.1, via `sprs`→`alga`), `base64` (0.13.1/0.22.1, via `tokenizers`→`spm_precompiled`), `block-buffer` (0.10.4/0.12.1, via `ed25519-dalek` lagging `aes-gcm`'s RustCrypto generation). Also: transitive `flate2`/`miniz_oxide`/`rustfft` leak in via `image`/`imageproc`/`ureq`/`backtrace` (used by torsh-data/torsh-vision/torsh-profiler) — not directly fixable without upstream changes to those crates, a soft self-containment gap rather than an actionable violation.
+
+## Release Check Findings (added 2026-07-04 by /release-check)
+
+### Unused dependencies (needs per-dependency human triage, not a blind removal pass)
+
+- [ ] **`cargo +nightly udeps --all-targets --all-features` flagged 25 of 32 crates with at least one unused dependency.** The tool's own caveat applies: it cannot detect usage in doc-tests, and several flagged items are plausibly platform/feature-gated code the tool's current feature combination doesn't compile (e.g. `cudarc` in torsh-sparse, `objc2-metal-performance-shaders`/`raw-cpuid` in torsh-backend) rather than genuinely dead — each needs individual verification before removal, not a bulk delete. Cross-cutting patterns worth attention: `scirs2-autograd` flagged unused in 9 crates, `anyhow` in 6, `criterion` (dev-dep) in 5, `torsh-autograd` in 4, `tracing` in 3. Full per-crate list (paste verbatim, this is the complete finding, re-derive fresh if picked up rather than trusting it's still accurate by then):
+  - torsh-autograd: anyhow
+  - torsh-backend: anyhow, futures, objc2-metal-performance-shaders, raw-cpuid, sha2, spin
+  - torsh-cli: scirs2-metrics (dep); assert_cmd, predicates (dev-dep)
+  - torsh-cluster: scirs2-cluster, scirs2-linalg, scirs2-metrics, scirs2-stats
+  - torsh-core: anyhow, num-derive, tracing (dep); libfuzzer-sys, proptest (dev-dep)
+  - torsh-data: futures, js-sys, wasm-bindgen, web-sys
+  - torsh-functional: scirs2-autograd, torsh-backend (dep); criterion (dev-dep)
+  - torsh-fx: criterion (dev-dep only)
+  - torsh-graph: scirs2-autograd, scirs2-graph, scirs2-spatial, torsh-autograd, torsh-nn
+  - torsh-hub: indicatif, scirs2-autograd (dep); tokio-test (dev-dep)
+  - torsh-jit: torsh-backend, torsh-tensor, tracing, tracing-subscriber (dep); criterion, proptest (dev-dep)
+  - torsh-linalg: scirs2-autograd
+  - torsh-metrics: scirs2-metrics (dep); scirs2-autograd (dev-dep)
+  - torsh-models: anyhow, torsh-optim
+  - torsh-nn: anyhow, oxiarc-deflate, scirs2-cluster, scirs2-neural, torsh-autograd (dep); criterion (dev-dep)
+  - **torsh-optim: anyhow, optirs, optirs-core, scirs2-optimize, torsh-autograd** — note `optirs`/`optirs-core` themselves flagged unused here; cross-reference against the "optirs/optirs-core version bump" item in this file's `## Policy Check Findings` section, since if torsh-optim's own code genuinely doesn't use them, that changes the urgency/framing of that pending version-bump decision (though verify it's not false-positive macro/re-export usage first)
+  - torsh-package: criterion (dev-dep only)
+  - torsh-profiler: torsh-tensor, tracing
+  - torsh-series: scirs2-signal, scirs2-stats, torsh-autograd
+  - torsh-signal: scirs2-fft, scirs2-signal
+  - torsh-sparse: cudarc, sprs
+  - torsh-tensor: anyhow, oxiarc-deflate, scirs2-autograd, scirs2-stats, torsh-backend (dep); proptest (dev-dep)
+  - torsh-text: scirs2-autograd, torsh-data, torsh-linalg
+  - torsh-utils: fs2
+  - torsh-vision: dirs, imageproc, oxiarc-archive, scirs2-autograd, scirs2-vision, torsh-data
+  - Not flagged (clean): torsh, torsh-benches, torsh-distributed, torsh-ffi, torsh-python, torsh-quantization, torsh-special.
+  - **Approach:** for each flagged dependency, verify actual usage (check for feature-gated code paths, macro-only usage, re-exports) before removing; remove genuinely-dead ones from Cargo.toml.
+  - **Scope:** large (25 crates) but mechanical once triaged — recommend batching by crate, one subagent per crate or small group.
+  - **Risk:** low if properly verified per-dependency first; blind removal risks breaking platform-specific or feature-gated builds this pass's default feature combination didn't exercise.
+
+### Duplicate dependency-version census expanded beyond the previously-documented 12
+
+- [ ] **A fresh `cargo tree --workspace --duplicates` run shows 45 distinct duplicated packages workspace-wide, not the previously-documented 12.** The previously-documented 12-package optirs/oxiarc cluster is unchanged, but the other 33 are ordinary third-party ecosystem generation-churn (e.g. `rand` 0.8/0.9/0.10 three-way, `syn` 1.x/2.x, `thiserror`/`thiserror-impl` 1.x/2.x, `hashbrown` four-way 0.14-0.17, `getrandom`/`rand_core`/`rand_chacha`/`rand_distr` three-way splits, `itertools` three-way, RustCrypto `digest`/`sha2`/`crypto-common` family, `nom`, `gimli`, `darling`/`darling_core`/`darling_macro`, `object`, `core-foundation`, `cpufeatures`, `foldhash`, `num-complex`, `quick-error`, `rustc-hash`, `sysinfo`, `wide`) not directly actionable from torsh's own Cargo.toml. One genuine anomaly worth a maintainer look, not root-caused in this pass: `serde`, `serde_core`, and `winnow` each show up as "duplicates" at identical version strings (1.0.228 / 1.0.228 / 1.0.3 respectively) rather than a real semver split — suggests two non-unified resolution paths (different SourceId/registry path) rather than an actual version conflict.
+  - **Approach:** re-run `cargo tree --workspace --duplicates` fresh when picked up (don't trust this snapshot to still be accurate) and root-cause the serde/serde_core/winnow identical-version anomaly specifically; the other 33 packages are third-party-owned churn, informational only.
+  - **Scope:** small (just the anomaly) to investigate, informational for the rest.
+  - **Risk:** low.
+
+### README.md Roadmap section is stale relative to the actual CHANGELOG
+
+- [ ] **`README.md` lines ~339-367 Roadmap section still marks v0.1.3 as "(Current)" and its v0.2.0 bullet list doesn't reflect what actually shipped.** The `**v0.1.3 (Current)**` marker should no longer say "(Current)" now that 0.2.0 is shipping, and the `**v0.2.0** - *Performance & Polish*` bullet list (generic items like "cuDNN integration", "enhanced distributed training") doesn't reflect what actually shipped in 0.2.0 per the real `## [0.2.0]` CHANGELOG.md entry (pyo3 0.29 migration + Tensor operator overloads, real WebGPU buffer transfers, real autograd hyperparameter gradients, real wavelet transforms, real distributed all_gather/MPI fixes, tensor alignment/mutex-poisoning fixes, CLI unit-conversion/stdout-leak fixes).
+  - **Approach:** rewrite the Roadmap's v0.1.3/v0.2.0 entries to match the real CHANGELOG content; this is a content-authoring task, not a mechanical version-string substitution (a mechanical substitution pass already fixed the plain stale `0.1.3` version pins in the install-instructions section separately).
+  - **Scope:** small, single-file content edit.
+  - **Risk:** low, purely descriptive text.
+
+### 1 real doctest bug found and fixed this pass (informational — already resolved, no action needed)
+
+- [x] **`crates/torsh-ffi/src/c_api/types.rs` (lines 504, 529, 555) had 3 doctest examples using bare `DType`/`TorshDType` with no `use` statement.** Doctests don't inherit the enclosing module's imports — fixed during this release-check pass by adding the correct `use` statements. Also fixed: 8 broken/private rustdoc intra-doc links across `torsh-tensor`, `torsh-signal`, `torsh-nn`, `torsh-sparse`, `torsh-autograd`, `torsh-models`, and `torsh-graph` (links pointing to private items, delinked to plain code spans; one `//!` module-doc scoping quirk in torsh-graph fixed with explicit qualified paths). Marked closed/informational — just recording that it happened, in case a future TODO sweep wonders why these files have small diffs unrelated to the feature work.
+
+### Missing documentation (informational only, out of scope to fix in one pass)
+
+- [ ] **`cargo clippy --all-features -- -W missing_docs` reports 22,186 missing-doc warnings workspace-wide.** Breakdown: 12,977 struct fields, 4,719 enum variants, 1,610 methods, 1,227 associated functions, 972 structs, 233 enums, 170 constants, 105 functions, 67 modules, 57 type aliases, 25 associated types, 13 macros, 8 traits, 2 associated constants, 1 crate. Far too large for a routine pass; if documentation completeness becomes a priority, this would need its own dedicated multi-session effort, likely crate-by-crate.
+
+## Documentation & Code Findings from /readme Pass (added 2026-07-04)
+
+- [ ] **`torsh-autograd`'s `HyperparameterOptimizer` only computes real gradients when a caller explicitly opts out of the default config.** `HyperparameterConfig::default()` sets `second_order: true`, and that code path still calls `compute_second_order_gradient`, an explicit zero-returning placeholder — so by default, the optimizer remains a silent no-op; the real first-order gradient fix from earlier today only activates when a caller explicitly sets `second_order: false`.
+  - **Approach:** either implement real second-order (Hessian-vector product) gradients, or change the default to `second_order: false` with a clear doc note about the tradeoff, or make the function return an explicit error/warning when second-order is requested but unimplemented rather than silently returning zero.
+  - **Scope:** small (change a default) to large (implement real HVP), depending on which fix is chosen.
+  - **Risk:** changing the default could alter behavior for any existing caller relying on `second_order: true`'s current (broken) silent-zero behavior — low likelihood but worth a compatibility note.
+
+- [ ] **`torsh-autograd`'s own internal `src/examples.rs` doesn't exercise real APIs.** Its 13 tests (which `TODO.md` describes as "all examples verified working") compute results by hand (e.g. `basic_gradient_example()` computes `x*x`/`2.0*x` manually rather than calling any real tensor/autograd function; `gradient_clipping_example()` manually norms/scales a `Vec<f32>` instead of calling the crate's real `clip_grad_norm`) with tautological assertions (`assert!(result.is_ok())` on functions that structurally cannot fail).
+  - **Approach:** rewrite `examples.rs` to actually call the real autograd API surface, so its tests exercise genuine behavior.
+  - **Scope:** medium — one file, but needs care to get the real API calls right.
+  - **Risk:** low, this is additive correctness work with no behavior change to production code.
+
+- [ ] **`torsh-python`'s Tensor operator overloads don't support scalar operands.** `tensor + 5` (or any Tensor-scalar arithmetic) still raises `TypeError` — the newly-added `__add__`/`__sub__`/`__mul__`/`__truediv__` only accept another `Tensor`, with no `__radd__`/scalar-promotion path, since the underlying `.add()`/etc. methods themselves don't accept scalars. Also: `sum`/`min`/`flatten`/`argmax`/`argmin` accept `dim`/`keepdim` parameters but silently ignore them (always full-reduce), and tensor-creation functions' `dtype`/`device` parameters are accepted but silently ignored (only `requires_grad` is honored).
+  - **Approach:** add scalar-accepting overloads to the underlying Rust `add`/`sub`/`mul`/`div` methods (or a scalar-specific path) and wire `__radd__` etc.; implement real `dim`/`keepdim` reduction logic where currently ignored; implement real `dtype`/`device` handling in tensor creation.
+  - **Scope:** medium-large, spans multiple methods across `tensor/core.rs` and `tensor/creation.rs`.
+  - **Risk:** low for scalar ops (additive); medium for dim/keepdim and dtype/device since silently-ignored-to-honored is a behavior change existing callers might be relying on (unlikely but possible).
+
+- [ ] **`torsh-python`'s distributed collectives (`all_reduce`/`broadcast`/`scatter`/`gather`) are pure no-op `Ok(())` stubs.** Calling any of them currently succeeds without doing anything.
+  - **Approach:** wire to the real `torsh-distributed` primitives (noting the separate, more fundamental finding below about `torsh-distributed`'s own `ProcessGroup` API).
+  - **Scope:** medium, blocked on the `torsh-distributed` `ProcessGroup` finding below being resolved first.
+  - **Risk:** none currently (already documented as non-functional), but silent no-op success is worse than a loud error — consider making these return an explicit "not implemented" error in the interim rather than a false success.
+
+- [ ] **`torsh-distributed`'s high-level `init_process_group`/`ProcessGroup` API always constructs `MockBackend`, regardless of requested backend type.** This means the real `MpiBackend` fixes made earlier today (real `barrier()`, real `parallel_all_gather` concatenation, the `Universe` lifetime fix) are correct and tested, but unreachable through the standard high-level API most users would call — `create_backend` in `process_group.rs` resolves `Nccl`/`Mpi`/`Gloo` all to mock. `Gloo` additionally has zero real implementation anywhere (no TCP/InfiniBand, silently aliases to mock). The top-level `collectives::all_reduce/broadcast/reduce/send/recv` free functions also have explicitly-commented mock bodies that never touch the tensor.
+  - **Approach:** wire `create_backend`'s `Mpi` case to construct the real `MpiBackend` (already correct and tested); decide whether `Gloo` needs a real implementation or should error clearly instead of silently mocking.
+  - **Scope:** medium — this is the natural, valuable follow-up to today's low-level MPI fix, making it actually reachable.
+  - **Risk:** low if done carefully (the low-level backend is already tested); the main risk is scope creep into implementing Gloo for real, which is a much bigger undertaking and should be split out separately if attempted.
+
+- [ ] **`torsh-functional` has two different `InterpolationMode` enums, and the crate-root re-export resolves to the wrong one for `grid_sample`/`interp2d`.** One enum lives in the `image` module (`Bilinear` variant), another in the `interpolation` module (`Linear` variant) — discovered while verifying README doc examples; worked around in the documentation's import path, but the underlying source-level re-export ambiguity was not fixed and may still confuse real callers who import from the crate root expecting one enum and getting the other.
+  - **Approach:** rename one of the two enums to disambiguate (e.g. `ImageInterpolationMode` vs `InterpolationMode`), or make the crate-root re-export explicit/unambiguous with a clear doc comment about which one it is and why two exist.
+  - **Scope:** small, but touches a public API name (potentially breaking for any existing caller depending on the current — possibly wrong — re-export target).
+  - **Risk:** medium, since it's a public API surface change; needs a decision on which name each enum should keep.
+
+- [ ] **`torsh-hub`'s security/signing feature is placeholder cryptography presented without a clear "not real" caveat until today's README fix.** `security::SecurityManager`'s RSA/Ed25519/ECDSA model-signing are hardcoded placeholder strings, not real cryptographic operations — anyone relying on it to actually verify downloaded-model integrity would have a false sense of security. Also found: `security/sandbox.rs`, `security/signing.rs`, `security/validation.rs` are orphaned dead code (not referenced by any `mod` declaration, logic duplicated in the real `security.rs`). Pretrained-weight factories (ResNet/EfficientNet/ViT/BERT/GPT-2 etc.) silently ignore `pretrained=true` and return random weights with just a log warning — no actual weight download/loading exists. `load_torsh_model()`'s HuggingFace format conversion only covers bert/gpt2/bart/t5, and all 4 conversion directions are literal `Err(NotImplemented)`.
+  - **Approach:** for signing — either implement real cryptographic signing (a real, non-trivial security feature) or very clearly gate/label it as non-functional in all user-facing surfaces, not just the README (e.g. runtime warning on use); for pretrained weights — implement real weight downloading, or clearly document the current no-op behavior everywhere it's surfaced (CLI help text, error messages), not just in one README.
+  - **Scope:** large for real implementations of either; small for clearer non-functional labeling.
+  - **Risk:** the security-signing gap is the more serious one — a security feature that silently does nothing is worse than not having the feature at all, since it creates false confidence. Recommend prioritizing either real implementation or very loud non-functional labeling over leaving it as quiet placeholder code.
+
+- [ ] **`torsh-models` README's code examples use Python-style keyword arguments throughout, which isn't valid Rust and doesn't match real function signatures** (e.g. `resnet18(pretrained=true, num_classes=1000)` when the real signature is `resnet18(num_classes: usize)` with no `pretrained` parameter at all). This is pervasive across most Usage/Tutorial code blocks in that README — fixing it fully means rewriting most of the file's code examples, which was out of scope for a verification-only pass.
+  - **Approach:** systematic rewrite of `torsh-models/README.md`'s code examples against real signatures, likely crate-wide since the same drift pattern was found in several other crates (torsh-vision, torsh-sparse, torsh-graph, torsh-fx also had similar issues, already partially fixed today).
+  - **Scope:** large (one big doc-rewrite file, but similar work may be needed elsewhere too).
+  - **Risk:** none — pure documentation correctness work.
+
+- [ ] **`torsh-profiler`'s README still has 3 of 5 major sections describing a fictional API** (TensorBoard Integration, Advanced Analysis, Multi-GPU Profiling all reference nonexistent types) — only "Basic Profiling" and "Custom Profiling Regions" were fixed today against the real, much lower-level imperative `Profiler` API (`new()`/`start()`/`stop()`/`add_event()`/`get_stats()`, real macros `profile_block!`/`profile_current_function!`).
+  - **Approach:** research what real functionality exists (if any) for TensorBoard export, cross-op analysis, and multi-GPU profiling, and either document it accurately or mark these as not-yet-implemented rather than describing fictional APIs.
+  - **Scope:** medium, needs per-section investigation.
+  - **Risk:** none, pure documentation work, but needs real research to avoid just moving the fabrication elsewhere.
+
+- [ ] **Workspace-policy dependency-declaration violations found during doc verification** (small, mechanical, consistent with the larger "20/32 crates have hardcoded versions" finding already in this file's "Policy Check Findings" section): `torsh-utils/Cargo.toml` pins `base64`, `fs2`, `num_cpus` directly instead of `.workspace = true`.
+  - **Approach:** fold into the existing planned workspace-hygiene pass (the "20 of 32 crates have hardcoded dependency versions" item under "Policy Check Findings" → "Workspace hygiene").
+  - **Scope:** trivial.
+  - **Risk:** none.
+
+## Downstream Dependency Review Findings (added 2026-07-06, from an external trustformers 0.2.0 dependency review)
+
+- [ ] **Publishing 0.2.0 to crates.io is now a concrete unblock for at least one downstream consumer, not just an internal milestone.** The last crates.io release is still `torsh = "0.1.3"` (pinning `scirs2-core 0.5.1`), while this workspace's `Cargo.toml:134` has moved to `scirs2-core = "0.6.0"`. The `trustformers` project (a separate COOLJAPAN ecosystem member) reports it cannot currently adopt torsh as a dependency without pulling in a second, type-incompatible `scirs2` 0.5.x stack alongside its own 0.6.x one — it has deferred a planned `torsh-interop` feature to its own 0.3.x specifically pending a torsh 0.2.0 crates.io release on scirs2 0.6. This doesn't change anything about *how* 0.2.0 should be finished, but it does add external urgency to the existing "no unwrap / zero warnings / all green" release gate already tracked elsewhere in this file — worth factoring into release sequencing/priority.
+  - **Approach:** no code change; just release-planning context. When 0.2.0 is otherwise ready and the user explicitly authorizes it, publishing unblocks this downstream consumer.
+  - **Scope:** none (informational).
+  - **Risk:** none.
+
+- [ ] **No real pure-Rust PyTorch pickle (`.pt`) deserializer exists anywhere in the workspace — three separate partial/placeholder implementations, none of which actually parses the pickle format.** Verified against current HEAD:
+  - `torsh-hub/src/lib.rs:1416` — the model-loading path has a bare comment, `// This would require implementing PyTorch pickle format parsing`, with no implementation behind it.
+  - `torsh-models/src/utils.rs` — `load`/`save` helpers around lines 163–191, 554, 601–620 are all explicitly self-described as "simplified"/"placeholder": comments read "a full implementation would parse the pickle format properly", "real implementation would use PyTorch's pickle deserialization", "this is a placeholder — real PyTorch loading would parse the pickle format". Its own tests (lines ~729–785) assert the *opposite* of a placeholder file — they check that no literal `"placeholder safetensors file"` / `"placeholder safetensors file with tensor data"` byte strings get written — confirming the placeholder nature is a known, tracked gap rather than an oversight.
+  - `torsh-cli/src/commands/model/pytorch_parser.rs` — this crate's `.pt` "parser" is metadata-heuristics only (file/tensor-shape inference), not a real pickle deserializer.
+  - This has a concrete, newly-created downstream customer: `trustformers` just removed its `tch` (libtorch FFI) dependency, so a genuine pure-Rust pickle parser in torsh would become the ecosystem's primary PyTorch-interop path rather than an internal nice-to-have.
+  - **Approach:** implement a real pure-Rust pickle protocol 0–5 opcode interpreter (`torsh-hub` or a new small `torsh-pickle`-style module) sufficient to reconstruct the `OrderedDict[str, Tensor]` state-dict shape PyTorch `.pt`/`.pth` checkpoints use (storage/tensor `REDUCE` opcodes, `BINPERSID` for storage refs, zip-container `.pt` unwrapping via the existing OxiARC pure-Rust archive stack — not `zip`/`flate2`). This is a substantial, well-scoped IMPLEMENT-POLICY item, not a quick fix.
+  - **Scope:** large — a real pickle VM is nontrivial but well-precedented (many pure implementations exist to reference for the opcode set); should be its own dedicated multi-session effort.
+  - **Risk:** low to add (purely additive new capability); the risk is scope-creep into full PyTorch tensor-storage/dtype fidelity (fp16/bf16, quantized dtypes, sparse layouts) which should be staged rather than attempted in one pass.
+
+- [ ] **`torsh-distributed`'s default-members exclusion and `torsh-python`/`torsh-ffi`'s PyO3 surface both remain informal maturity gaps, not yet centrally tracked.** `Cargo.toml:59` excludes `crates/torsh-distributed` from `default-members` with the inline comment "Tests/examples need additional API updates (scheduled for alpha.3)" (it is still a full workspace member per `Cargo.toml:20`/`:118`, just not built by default). This is a distinct, more basic maturity signal than the already-tracked `torsh-distributed` `ProcessGroup`/`MockBackend` functional gap further up in this file (the "`init_process_group`/`ProcessGroup` API always constructs `MockBackend`" entry) — that entry is about *what the code does*, this one is about *whether it's even built/tested by default*; worth cross-referencing together when torsh-distributed maturity is next picked up. Separately, `torsh-python`/`torsh-ffi` compile clean at HEAD (`cargo check --workspace` green, including both crates) and are not currently flagged with open PyO3-version-compatibility build errors in this file — the scalar-operand and no-op-stub gaps already tracked above (`torsh-python`'s Tensor operator overloads / distributed collectives entries) are the real, current maturity gaps for that pair of crates; no additional PyO3 compatibility issue was found to add here.
+  - **Approach:** when torsh-distributed's alpha.3 default-members re-inclusion is scheduled, resolve it alongside the existing `ProcessGroup`/`MockBackend` wiring fix so both the "not built by default" and "mocked when built" gaps close together.
+  - **Scope:** small to re-enable default-members (mechanical); the real work is the already-tracked ProcessGroup wiring (medium, see that entry).
+  - **Risk:** low; re-adding to default-members just changes CI/default build surface, no runtime behavior change.

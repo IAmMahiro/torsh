@@ -3,6 +3,7 @@
 //! This module provides a centralized registry for managing different allocator
 //! implementations and their capabilities across the storage system.
 
+use crate::sync::RwLockExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
@@ -508,9 +509,7 @@ static GLOBAL_REGISTRY: RwLock<Option<Arc<RwLock<AllocatorRegistry>>>> = RwLock:
 
 /// Get the global allocator registry
 pub fn global_registry() -> Arc<RwLock<AllocatorRegistry>> {
-    let mut global = GLOBAL_REGISTRY
-        .write()
-        .expect("lock should not be poisoned");
+    let mut global = GLOBAL_REGISTRY.write_or_recover();
     if global.is_none() {
         *global = Some(Arc::new(RwLock::new(AllocatorRegistry::new())));
     }
@@ -523,7 +522,7 @@ pub fn global_registry() -> Arc<RwLock<AllocatorRegistry>> {
 /// Initialize the global registry with default allocators
 pub fn initialize_global_registry() {
     let registry = global_registry();
-    let mut registry = registry.write().expect("lock should not be poisoned");
+    let mut registry = registry.write_or_recover();
 
     // Register basic allocators
     registry.register_with_metadata(
@@ -871,7 +870,7 @@ mod tests {
         initialize_global_registry();
 
         let registry = global_registry();
-        let registry = registry.read().expect("lock should not be poisoned");
+        let registry = registry.read_or_recover();
 
         assert!(registry.is_registered("cpu_std"));
         assert!(registry.is_registered("cpu_numa"));

@@ -1,7 +1,15 @@
 //! Graph data loading and manipulation utilities
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
 
 use crate::GraphData;
 use torsh_core::device::DeviceType;
+use torsh_core::error::TorshError;
+
+/// Default number of synthetic node features generated for graph formats that
+/// only carry connectivity information.
+pub const DEFAULT_NODE_FEATURES: usize = 16;
 use torsh_tensor::{
     creation::{from_vec, zeros},
     Tensor,
@@ -12,6 +20,7 @@ use torsh_tensor::{
 pub struct GraphDataLoader {
     batch_size: usize,
     shuffle: bool,
+    num_node_features: usize,
 }
 
 impl GraphDataLoader {
@@ -39,7 +48,22 @@ impl GraphDataLoader {
         Ok(Self {
             batch_size,
             shuffle,
+            num_node_features: DEFAULT_NODE_FEATURES,
         })
+    }
+
+    /// Set the number of synthetic node features generated for formats that
+    /// carry connectivity only (edge lists).
+    ///
+    /// Defaults to [`DEFAULT_NODE_FEATURES`].
+    pub fn with_node_features(mut self, num_node_features: usize) -> Self {
+        self.num_node_features = num_node_features.max(1);
+        self
+    }
+
+    /// Number of synthetic node features used for feature-less formats
+    pub fn num_node_features(&self) -> usize {
+        self.num_node_features
     }
 
     /// Get batch size
@@ -52,11 +76,79 @@ impl GraphDataLoader {
         self.shuffle
     }
 
-    /// Load graphs from a directory
-    pub fn from_directory(&self, _path: &str) -> Vec<GraphData> {
-        // Skeleton implementation
-        // Would load graph files and convert to GraphData
-        Vec::new()
+    /// Load every supported graph file in `path` into a `GraphData` list.
+    ///
+    /// Files are dispatched on their extension to the parsers in
+    /// [`crate::datasets`]:
+    ///
+    /// | Extension | Loader |
+    /// |---|---|
+    /// | `edges`, `edgelist`, `txt` | [`EdgeListLoader`] |
+    /// | `gml` | [`GMLLoader`] |
+    /// | `json` | [`JSONLoader`] |
+    ///
+    /// Files with any other extension (and sub-directories) are ignored.
+    /// Entries are visited in sorted order so the returned dataset is
+    /// deterministic.
+    ///
+    /// # Errors
+    /// Returns an error if the directory cannot be read, or if a file with a
+    /// supported extension fails to parse. A failing file is reported rather
+    /// than silently skipped, so a mis-typed path can never masquerade as an
+    /// empty dataset.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use torsh_graph::data::GraphDataLoader;
+    /// let loader = GraphDataLoader::new(4, false).unwrap();
+    /// let graphs = loader.from_directory("./my_graphs").unwrap();
+    /// println!("loaded {} graphs", graphs.len());
+    /// ```
+    pub fn from_directory(&self, path: &str) -> Result<Vec<GraphData>> {
+        use crate::datasets::{EdgeListLoader, GMLLoader, GraphDatasetLoader, JSONLoader};
+
+        let entries = std::fs::read_dir(path)
+            .map_err(|e| TorshError::IoError(format!("failed to read directory '{path}': {e}")))?;
+
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|e| TorshError::IoError(format!("failed to read '{path}' entry: {e}")))?;
+            let file_path = entry.path();
+            if file_path.is_file() {
+                files.push(file_path);
+            }
+        }
+        files.sort();
+
+        let edge_list = EdgeListLoader::new(self.num_node_features, false);
+        let gml = GMLLoader::new();
+        let json = JSONLoader::new(self.num_node_features);
+
+        let mut graphs = Vec::new();
+        for file_path in files {
+            let extension = file_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+
+            let loaded = match extension.as_str() {
+                "edges" | "edgelist" | "txt" => Some(edge_list.load_from_file(&file_path)),
+                "gml" => Some(gml.load_from_file(&file_path)),
+                "json" => Some(json.load_from_file(&file_path)),
+                _ => None,
+            };
+
+            if let Some(result) = loaded {
+                let graph = result.map_err(|e| {
+                    TorshError::IoError(format!("failed to load '{}': {e}", file_path.display()))
+                })?;
+                graphs.push(graph);
+            }
+        }
+
+        Ok(graphs)
     }
 }
 
@@ -413,27 +505,23 @@ pub mod augmentation {
         let mut rng = thread_rng();
         let edge_data = graph.edge_index.to_vec()?;
 
-        let mut kept_edges = Vec::new();
-        let mut kept_count = 0;
-
+        // An edge is a (source, destination) pair: row 0 holds the sources and
+        // row 1 the destinations. The keep/drop decision must be made ONCE per
+        // edge and applied to both endpoints — deciding sources and destinations
+        // with two independent RNG passes (as this did) drops the endpoints out
+        // of sync and produces a malformed, mismatched-length edge_index.
+        let mut kept_sources = Vec::new();
+        let mut kept_dests = Vec::new();
         for i in 0..graph.num_edges {
             if rng.gen_range(0.0..1.0) > drop_rate {
-                kept_edges.push(edge_data[i]); // source
-                kept_count += 1;
+                kept_sources.push(edge_data[i]);
+                kept_dests.push(edge_data[graph.num_edges + i]);
             }
         }
 
-        // Add corresponding destinations
-        let mut dest_edges = Vec::new();
-        let mut kept_idx = 0;
-        for i in 0..graph.num_edges {
-            if rng.gen_range(0.0..1.0) > drop_rate && kept_idx < kept_count {
-                dest_edges.push(edge_data[graph.num_edges + i]); // destination
-                kept_idx += 1;
-            }
-        }
-
-        kept_edges.extend(dest_edges);
+        let kept_count = kept_sources.len();
+        let mut kept_edges = kept_sources;
+        kept_edges.extend(kept_dests);
 
         graph.edge_index = from_vec(kept_edges, &[2, kept_count], DeviceType::Cpu)?;
         graph.num_edges = kept_count;

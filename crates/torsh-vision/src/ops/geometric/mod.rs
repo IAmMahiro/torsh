@@ -27,113 +27,87 @@ pub fn resize_with_mode(
     let (batch_size, channels, height, width) = utils::validate_image_tensor_flexible(image)?;
     let (target_width, target_height) = size;
 
+    if target_width == 0 || target_height == 0 {
+        return Err(VisionError::InvalidArgument(format!(
+            "Target size must be non-zero, got ({}, {})",
+            target_width, target_height
+        )));
+    }
+    if width == 0 || height == 0 {
+        return Err(VisionError::InvalidArgument(format!(
+            "Source image must be non-empty, got ({}, {})",
+            width, height
+        )));
+    }
+
     let is_batched = image.shape().dims().len() == 4;
 
-    if is_batched && batch_size == 1 {
-        // Handle 4D tensor with batch size 1 - squeeze to 3D, resize, then unsqueeze
-        let squeezed = image
-            .view(&[channels as i32, height as i32, width as i32])
-            .map_err(|e| VisionError::TensorError(e))?;
-        let resized_3d = match mode {
-            InterpolationMode::Bilinear => resize_bilinear(
-                &squeezed,
+    if is_batched {
+        // Resize every image of the batch independently and reassemble the batch.
+        let output = zeros_mut(&[batch_size, channels, target_height, target_width]);
+
+        for b in 0..batch_size {
+            let single_image = image
+                .narrow(0, b as i64, 1)
+                .map_err(VisionError::TensorError)?
+                .contiguous()
+                .map_err(VisionError::TensorError)?
+                .view(&[channels as i32, height as i32, width as i32])
+                .map_err(VisionError::TensorError)?;
+
+            let resized = resize_single(
+                &single_image,
                 channels,
                 height,
                 width,
                 target_width,
                 target_height,
-            ),
-            InterpolationMode::Nearest => resize_nearest(
-                &squeezed,
-                channels,
-                height,
-                width,
-                target_width,
-                target_height,
-            ),
-            InterpolationMode::Bicubic => resize_bicubic(
-                &squeezed,
-                channels,
-                height,
-                width,
-                target_width,
-                target_height,
-            ),
-        }?;
-        // Restore batch dimension
-        let result = resized_3d
-            .view(&[
-                1i32,
-                channels as i32,
-                target_height as i32,
-                target_width as i32,
-            ])
-            .map_err(|e| VisionError::TensorError(e))?;
-        Ok(result)
-    } else if is_batched {
-        // KNOWN LIMITATION: Batch processing currently restricted to batch_size=1
-        // Requires tensor stack operation for efficient multi-batch handling
-        // Workaround: Process images individually or use non-batched API
-        // Deferred to v0.2.0 - See ROADMAP.md
-        if batch_size > 1 {
-            return Err(VisionError::InvalidArgument(
-                "Batch resize with batch_size > 1 not yet supported. Use single images or loop over batch manually.".to_string(),
-            ));
+                mode,
+            )?;
+
+            for c in 0..channels {
+                for y in 0..target_height {
+                    for x in 0..target_width {
+                        output.set(&[b, c, y, x], resized.get(&[c, y, x])?)?;
+                    }
+                }
+            }
         }
 
-        let single_image = image
-            .narrow(0, 0, 1)
-            .map_err(|e| VisionError::TensorError(e))?
-            .view(&[channels as i32, height as i32, width as i32])
-            .map_err(|e| VisionError::TensorError(e))?;
-        let resized_single = match mode {
-            InterpolationMode::Bilinear => resize_bilinear(
-                &single_image,
-                channels,
-                height,
-                width,
-                target_width,
-                target_height,
-            ),
-            InterpolationMode::Nearest => resize_nearest(
-                &single_image,
-                channels,
-                height,
-                width,
-                target_width,
-                target_height,
-            ),
-            InterpolationMode::Bicubic => resize_bicubic(
-                &single_image,
-                channels,
-                height,
-                width,
-                target_width,
-                target_height,
-            ),
-        }?;
-        // Restore batch dimension
-        let result = resized_single
-            .view(&[
-                1i32,
-                channels as i32,
-                target_height as i32,
-                target_width as i32,
-            ])
-            .map_err(|e| VisionError::TensorError(e))?;
-        Ok(result)
+        Ok(output)
     } else {
         // Handle 3D tensor directly
-        match mode {
-            InterpolationMode::Bilinear => {
-                resize_bilinear(image, channels, height, width, target_width, target_height)
-            }
-            InterpolationMode::Nearest => {
-                resize_nearest(image, channels, height, width, target_width, target_height)
-            }
-            InterpolationMode::Bicubic => {
-                resize_bicubic(image, channels, height, width, target_width, target_height)
-            }
+        resize_single(
+            image,
+            channels,
+            height,
+            width,
+            target_width,
+            target_height,
+            mode,
+        )
+    }
+}
+
+/// Resize a single (C, H, W) image with the requested interpolation mode
+fn resize_single(
+    image: &Tensor<f32>,
+    channels: usize,
+    height: usize,
+    width: usize,
+    target_width: usize,
+    target_height: usize,
+    mode: InterpolationMode,
+) -> Result<Tensor<f32>> {
+    match mode {
+        InterpolationMode::Bilinear => {
+            resize_bilinear(image, channels, height, width, target_width, target_height)
+        }
+        InterpolationMode::Nearest => {
+            resize_nearest(image, channels, height, width, target_width, target_height)
+        }
+        InterpolationMode::Bicubic => {
+            resize_bicubic(image, channels, height, width, target_width, target_height)
         }
     }
 }
@@ -155,8 +129,12 @@ fn resize_bilinear(
     for c in 0..channels {
         for y in 0..target_height {
             for x in 0..target_width {
-                let src_x = (x as f32 + 0.5) * scale_x - 0.5;
-                let src_y = (y as f32 + 0.5) * scale_y - 0.5;
+                // Clamp the half-pixel source coordinate into the valid range.
+                // Without the clamp the coordinate is negative for the first
+                // row/column when upsampling, which turns the interpolation into
+                // an extrapolation past the border (PyTorch/OpenCV clamp instead).
+                let src_x = ((x as f32 + 0.5) * scale_x - 0.5).clamp(0.0, (width - 1) as f32);
+                let src_y = ((y as f32 + 0.5) * scale_y - 0.5).clamp(0.0, (height - 1) as f32);
 
                 let x1 = src_x.floor() as usize;
                 let y1 = src_y.floor() as usize;
@@ -249,17 +227,10 @@ pub fn random_crop(image: &Tensor<f32>, size: (usize, usize)) -> Result<Tensor<f
     let max_start_x = width - target_width;
     let max_start_y = height - target_height;
 
-    let start_x = if max_start_x > 0 {
-        rng().gen_range(0..max_start_x)
-    } else {
-        0
-    };
-
-    let start_y = if max_start_y > 0 {
-        rng().gen_range(0..max_start_y)
-    } else {
-        0
-    };
+    // Inclusive ranges: `max_start_x` / `max_start_y` are themselves valid crop
+    // origins, so an exclusive range would never produce the last row/column.
+    let start_x = rng().gen_range(0..=max_start_x);
+    let start_y = rng().gen_range(0..=max_start_y);
 
     crop_region(image, start_x, start_y, target_width, target_height)
 }

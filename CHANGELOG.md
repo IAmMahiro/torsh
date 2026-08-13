@@ -5,6 +5,59 @@ All notable changes to ToRSh will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - Unreleased
+
+This release combines the Python-bindings & correctness work with a broad
+**production-hardening campaign** that replaced fabricated "success" paths with
+real implementations (or honest `Err` returns), completed autograd backward
+coverage, consolidated the CUDA backend onto the pure-Rust oxicuda stack, and
+tightened security. Highlights are grouped below.
+
+### Added
+- `rstorch.optim.lr_scheduler` submodule (torsh-python): 6 PyTorch-compatible learning rate schedulers — `StepLR`, `MultiStepLR`, `ExponentialLR`, `CosineAnnealingLR`, `LinearLR`, `ReduceLROnPlateau`
+- Real `state_dict()` / `load_state_dict()` on the Python `SGD`, `Adam`, `AdamW`, `Adagrad`, and `RMSprop` optimizer bindings — checkpoints now carry the actual per-parameter buffers (momentum, `exp_avg`, `exp_avg_sq`, step count, ...) instead of an empty placeholder, so training can be resumed from a saved checkpoint
+- Tensor operator overloads on the Python bindings: `__add__`, `__sub__`, `__mul__`, `__truediv__`, `__matmul__`, `__neg__`, so `a + b`, `a @ b`, `-a`, etc. work directly on `Tensor` objects
+- `Tensor::norm_lp(p, dims, keepdim)` (torsh-tensor): general Lp-norm (L0/L1/L2/max/min/arbitrary finite `p`) with per-dimension reduction and `keepdim`, matching `torch.norm` semantics; backs the Python `Tensor.norm()` binding
+- Full NumPy / pandas / SciPy interop bridge in `torsh-ffi` (previously all placeholder stubs returning "not implemented" errors): tensor <-> NumPy array conversion (contiguous and strided), pandas DataFrame/Series <-> tensor conversion plus DataFrame merge/pivot/time-series helpers, and SciPy `solve`/`eig`/`svd`/`minimize`/`fft`/statistical-test/`interpolate`/sparse-matrix-conversion/benchmark integration
+- `FloatElement` trait implementation for `f16` and `bf16` (torsh-core), enabling `epsilon()`/`infinity()`/`nan()`/`is_finite()` and other float operations on half-precision tensors
+- Real TCP distributed backend (torsh-distributed): a working socket-based collective backend replaces the previous mock, so single-host multi-process flows no longer silently corrupt or drop gradients
+- Completed autograd backward coverage (torsh-autograd): real gradients for `mul`, `div`, `matmul`, `cat`, `stack`, `narrow`, and `log_softmax` (paths that previously returned zero or were unimplemented)
+- Real signal-processing numerics (torsh-signal): FIR/IIR filter design, eigenvalue (`eig`) and SVD paths now compute real results instead of placeholders
+
+### Changed
+- **Dependency truth-up** (versions corrected to what is actually built): scirs2 ecosystem → **0.6.5**, `oxicuda-*` → **0.5.4**, `oxifft` → **0.4.2**, `oxiarc-*` → **0.4.1**, `oxicode` → **0.2.6**, `oxionnx` → **0.1.6**, `wgpu` → **30.0.0**
+- **CUDA backend consolidation** — GPU compute is now provided exclusively by the pure-Rust **oxicuda** stack (`torsh-tensor`'s runtime-loaded `GpuDispatch`, no CUDA SDK at build time). `torsh-backend`'s `cuda` feature is now an honest pure-Rust fallback (ops return an error or route to CPU); the duplicated legacy CUDA C-FFI backend was removed (see **Removed**)
+- scirs2 ecosystem (`scirs2-core` and related `scirs2-*` crates) updated 0.5.1 → 0.6.5
+- `oxicuda-backend`/`oxicuda-driver`/`oxicuda-launch`/`oxicuda-ptx` updated 0.3 → 0.5.4
+- `pyo3` updated 0.28.3 → 0.29.0 (with `numpy` 0.28 → 0.29, `scirs2-numpy` 0.5.1 → 0.6.0, `pyo3-build-config` 0.28 → 0.29); see **Fixed** for a default-argument regression this exposed across `torsh-python`
+- `wgpu` updated 29.0.3 → 30.0.0; WebGPU buffer mapping now handles the new fallible `get_mapped_range`/`get_mapped_range_mut` API, and adapter requests set the new `apply_limit_buckets` option
+- `rand` updated 0.10.1 → 0.10.2; `humantime` (torsh-cli) updated 2.3 → 2.4
+- `TensorParallel::parallel_all_gather` (torsh-distributed) now takes an explicit `shard_dim` parameter (breaking change) — see **Fixed**
+
+### Fixed
+- torsh-python: 31 tensor-creation and reduction methods (`tensor`/`zeros`/`ones`/`randn`/`rand`/`empty`/`full`/`eye`/`arange`/`linspace` and their `*_like` variants, the `Tensor()` constructor, and `std`/`var`/`sum`/`mean`/`max`/`min`/`squeeze`/`flatten`/`clamp`/`argmax`/`argmin`/`uniform_`/`normal_`/`diag`) previously required every optional argument to be passed explicitly, or raised a `TypeError` when a trailing argument was omitted (a pyo3 0.29 signature-annotation gap); optional arguments now actually default as documented
+- torsh-python: `Tensor.norm()` now honors the `p`, `dim`, and `keepdim` arguments (previously always returned the whole-tensor L2 norm no matter what was passed)
+- torsh-python: `set_lr()` on `Adam`/`AdamW`/`Adagrad`/`RMSprop` now propagates the new rate to the wrapped optimizer (previously updated only a Python-side field, so `step()` silently kept using the original learning rate)
+- torsh-backend: WebGPU `copy_buffer`/`copy_to_device`/`copy_from_device` now perform real GPU buffer copies (previously silently returned success without moving any data; the old buffer lookup also cast an opaque handle id to a raw `wgpu::Buffer` pointer, which was undefined behavior)
+- torsh-autograd: `HyperparameterOptimizer` now computes real first-order gradients via central finite differences (previously unconditionally returned zero, so gradient-based hyperparameter search never moved a hyperparameter toward its optimum)
+- torsh-signal: Wavelet Packet Transform (`wpt`/`iwpt`) and lifting-scheme DWT/IDWT now run the real recursive-packet and Sweldens-lifting transforms (previously returned all-zero tensors of the correct shape); `cone_of_influence` now computes the real Torrence & Compo e-folding-time formula per wavelet/scale instead of a placeholder linear approximation
+- torsh-distributed: `parallel_all_gather` now concatenates every gathered shard via `Tensor::cat` instead of silently discarding all but one; MPI `barrier()` now invokes the real collective instead of being a no-op, and the MPI `Universe` handle is now held for the backend's lifetime (it was previously dropped right after construction, which finalizes MPI and made every later MPI call — including `barrier()` — fail)
+- torsh-tensor: fixed an alignment-UB bug in `lazy_loading.rs` where file bytes were reinterpreted as typed elements through a raw pointer cast on an unaligned `Vec<u8>` buffer (found via Miri); fixed a mutex-poisoning cascade in `memory_pool.rs` where one intentional test panic poisoned the global memory-pool lock and cascaded failures into unrelated tests — pool-lock acquisition now recovers from a poisoned lock instead of treating it as fatal
+- torsh-cli: `info`/`info --detailed` no longer inflate memory readings by 1024x (a KB-vs-bytes unit mismatch after a `sysinfo` API change); `completions <shell>` no longer leaks a log line onto stdout, which was breaking the `source <(torsh completions bash)` shell-integration pattern
+- Removed a stray `crates/torsh-ffi/java.d` file that hardcoded a different machine's absolute path (including a mounted backup-drive path) and leaked a username; `.gitignore` now excludes `*.d` files
+- Real RNG seeding: fixed a bug where a fixed seed (e.g. seed 42) did not actually make sampling deterministic; seeded generators now reproduce their sequence
+- torsh-python: import-time fixes so `import rstorch` and its submodules load correctly against pyo3 0.29; the regression suite (`python/tests/`) passes under a maturin-built wheel
+- Numerous crates: fabricated "success" return paths replaced with real computation or an honest `Err` — the framework no longer returns plausible-looking but fake results where an operation is unimplemented or unavailable
+
+### Security
+- Archive extraction (torsh-hub / torsh-package) hardened against **path-traversal (tar-slip / zip-slip)**: entry paths are now validated and rejected if they escape the destination directory
+- **Integrity checks** on downloaded / unpacked artifacts to detect tampering or truncation
+- **Ed25519** package signing / verification wired through the pure-Rust `ed25519-dalek` path (no C/asm crypto)
+
+### Removed
+- Legacy CUDA C-FFI backend and its dead dependencies (`cust`, `cuda-sys`, `cudnn-sys`) — zero remaining use sites after the oxicuda consolidation; the CUDA C-FFI tree was deleted. Real GPU compute now goes through the pure-Rust oxicuda stack in `torsh-tensor`
+- `OptiRS` dependency (zero use sites in `torsh-optim/src`), which also dropped a duplicate SciRS2 0.4.4 stack, `ndarray` 0.15, and `oxiarc` 0.2.8 from the tree
+
 ## [0.1.3] - 2026-06-30
 
 ### Added
@@ -230,4 +283,5 @@ torsh-nn = "0.1.1"      # Neural networks
 torsh-vision = "0.1.1"  # Computer vision
 ```
 
+[0.2.0]: https://github.com/cool-japan/torsh/releases/tag/v0.2.0
 [0.1.3]: https://github.com/cool-japan/torsh/releases/tag/v0.1.3

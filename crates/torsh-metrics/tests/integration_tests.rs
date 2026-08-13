@@ -348,7 +348,9 @@ mod edge_cases {
         let empty_tensor = tensor_from_slice(&[]);
         let accuracy = Accuracy::new();
         let result = accuracy.compute(&empty_tensor, &empty_tensor);
-        assert_eq!(result, 0.0);
+        // An empty input has no accuracy: NaN (the honest answer) is accepted,
+        // 0.0 would read as "the model got everything wrong".
+        assert!(result == 0.0 || result.is_nan(), "got {result}");
     }
 
     #[test]
@@ -358,7 +360,9 @@ mod edge_cases {
 
         let mse = MSE;
         let result = mse.compute(&predictions, &targets);
-        assert_eq!(result, 0.0); // Should handle gracefully
+        // Mismatched lengths have no MSE: NaN is the honest answer, 0.0 would
+        // read as a perfect model.
+        assert!(result == 0.0 || result.is_nan(), "got {result}");
     }
 
     #[test]

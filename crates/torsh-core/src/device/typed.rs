@@ -357,20 +357,49 @@ impl<P: PhantomDevice> Device for TypedDeviceInstance<P> {
         P::device_name()
     }
 
+    /// Check whether this device type is actually available on this build
+    ///
+    /// Delegates to [`crate::device::implementations::DeviceFactory::is_device_type_available`],
+    /// which reflects real compile-time feature/platform gating (e.g. a
+    /// `TypedDeviceInstance<PhantomCuda<0>>` on a build without the `cuda`
+    /// feature honestly reports `false`). This used to unconditionally
+    /// return `Ok(true)` regardless of whether the device type was actually
+    /// supported by this build.
     fn is_available(&self) -> Result<bool> {
-        Ok(true) // Mock implementation
+        Ok(
+            crate::device::implementations::DeviceFactory::is_device_type_available(
+                self.device_type,
+            ),
+        )
     }
 
     fn capabilities(&self) -> Result<DeviceCapabilities> {
         DeviceCapabilities::detect(self.device_type)
     }
 
+    /// Synchronize this device
+    ///
+    /// `TypedDeviceInstance` is a lightweight, type-tagged capability
+    /// descriptor: it holds no stream, command queue, or other live
+    /// device-side resource of its own (see the struct definition), so
+    /// there is genuinely nothing here to wait on. `Ok(())` is the correct
+    /// answer, not a placeholder -- constructing an unrelated throwaway
+    /// `Device` just to call `.synchronize()` on it would perform theatre
+    /// without synchronizing anything this instance actually owns. Callers
+    /// that need to synchronize a live device should hold onto the
+    /// concrete `Device` implementation (`CpuDevice`/`CudaDevice`/etc.)
+    /// directly instead of a `TypedDeviceInstance`.
     fn synchronize(&self) -> Result<()> {
-        Ok(()) // Mock implementation
+        Ok(())
     }
 
+    /// Reset this device
+    ///
+    /// See [`Self::synchronize`]: `TypedDeviceInstance` holds no live
+    /// device-side state to reset, so `Ok(())` is genuinely correct here,
+    /// not a stub.
     fn reset(&self) -> Result<()> {
-        Ok(()) // Mock implementation
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -551,12 +551,18 @@ impl TensorParallel {
         }
     }
 
-    /// Parallel all-gather operation using SciRS2 parallel processing
+    /// Parallel all-gather operation using SciRS2 parallel processing.
+    ///
+    /// Gathers `tensor` from every rank in the tensor-parallel group and
+    /// concatenates the shards along `shard_dim`, reconstructing the full,
+    /// unsharded tensor.
     #[cfg(feature = "scirs2-memory")]
-    pub async fn parallel_all_gather(&self, tensor: &Tensor) -> TorshResult<Tensor> {
-        // TODO: Implement proper parallel all-gather with SciRS2 optimizations
-        // For now, use a simplified approach
-        debug!("Performing parallel all-gather (simplified implementation)");
+    pub async fn parallel_all_gather(
+        &self,
+        tensor: &Tensor,
+        shard_dim: usize,
+    ) -> TorshResult<Tensor> {
+        debug!("Performing parallel all-gather with concatenation along dim {shard_dim}");
 
         // Create output buffer for gathered tensors
         let mut output: Vec<Tensor> = Vec::with_capacity(self.config.tp_size);
@@ -564,16 +570,22 @@ impl TensorParallel {
         // Call all_gather with proper signature
         all_gather(&mut output, tensor, &self.tp_group).await?;
 
-        // Concatenate the gathered tensors
-        // For simplicity, just return the first tensor (this rank's data)
-        // In a real implementation, we'd concatenate all gathered tensors
-        let result = if !output.is_empty() {
+        // Concatenate the gathered shards back into the full, unsharded tensor.
+        let result = if output.is_empty() {
+            tensor.clone()
+        } else if output.len() == 1 {
             output
                 .into_iter()
                 .next()
                 .expect("output should not be empty")
         } else {
-            tensor.clone()
+            let shard_refs: Vec<&Tensor> = output.iter().collect();
+            Tensor::cat(&shard_refs, shard_dim as i32).map_err(|e| {
+                TorshDistributedError::InternalError(format!(
+                    "failed to concatenate {} all-gathered shards along dim {shard_dim}: {e}",
+                    shard_refs.len()
+                ))
+            })?
         };
 
         info!(
@@ -630,7 +642,6 @@ impl TensorParallel {
         }
 
         // Add tensor parallelism specific stats
-        // TODO: Implement get_stats() method or remove this call
         stats.insert(
             "memory_reduction_ratio".to_string(),
             1.0 / self.config.tp_size as f64, // Estimated reduction ratio
@@ -1011,6 +1022,147 @@ mod tests {
 
         let shard = utils::split_tensor_for_tp(&tensor, 1, 0, 2)?;
         assert_eq!(shard.shape().dims(), &[8, 8]);
+
+        Ok(())
+    }
+
+    /// Regression test for the all-gather data-loss bug: `parallel_all_gather`
+    /// used to discard every shard except `output[0]`.
+    ///
+    /// This drives a **genuine 3-rank rendezvous** over the real TCP backend
+    /// rather than following the `world_size == 1` convention used in
+    /// `tests/test_collectives.rs`: with `tp_size == 1` the single-shard branch
+    /// of `parallel_all_gather` returns `output[0]` unchanged, so the assertion
+    /// becomes tautological and cannot guard the bug it was written for. Each
+    /// rank contributes a *distinct* shard, so dropping any shard changes the
+    /// gathered data and not merely its shape, and asserting the same expected
+    /// buffer on all three ranks pins the rank-major ordering of the gather.
+    ///
+    /// All three ranks are driven concurrently on one task via `tokio::join!`;
+    /// they cannot be `tokio::spawn`ed because `TensorParallel` holds a
+    /// `Box<dyn Module>` (no `Send` bound), making the futures non-`Send`.
+    ///
+    /// Every rank's layer is built up front and held for the whole test: rank 0
+    /// hosts the store server, and `Drop for TcpStore` shuts that server down,
+    /// so a rank 0 that dropped its process group as soon as its own gather
+    /// returned would leave ranks 1/2 polling a dead master ("connection
+    /// refused"). Real SPMD keeps every rank alive across the collective; this
+    /// mirrors that, and matches the same rule enforced by the `run_ranks`
+    /// helper in `tests/hardening_distributed.rs`.
+    #[cfg(feature = "scirs2-memory")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_parallel_all_gather_concatenates_all_shards() -> TorshResult<()> {
+        const TP_SIZE: usize = 3;
+        const SHARD_DIM: usize = 0;
+
+        /// Rank `r` contributes the distinct `[2, 3]` block
+        /// `[[10r+1, 10r+2, 10r+3], [10r+4, 10r+5, 10r+6]]`.
+        fn shard_of(rank: usize) -> Vec<f32> {
+            (1..=6).map(|i| (rank * 10 + i) as f32).collect()
+        }
+
+        // Ephemeral master port, so concurrent nextest processes never collide
+        // on a fixed one. Note: `TcpStore::start` only *logs* a bind failure
+        // instead of propagating it, so if this port is taken between the probe
+        // and rank 0's bind, the symptom is ranks 1/2 failing the 30s
+        // `rendezvous waiting for key ...` timeout -- which resembles the
+        // data-loss bug under test. That timeout now reports the underlying
+        // store error, and a "connection refused" there means the master was
+        // never up (lost port race) or went away early (rank 0's process group
+        // dropped before its peers finished) -- check both before suspecting a
+        // regression in the gather itself.
+        let master_port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| {
+                TorshDistributedError::internal_error(format!("failed to reserve a test port: {e}"))
+            })?;
+            let port = probe
+                .local_addr()
+                .map_err(|e| {
+                    TorshDistributedError::internal_error(format!(
+                        "failed to read the reserved test port: {e}"
+                    ))
+                })?
+                .port();
+            drop(probe);
+            port
+        };
+
+        // Every rank must see all shards concatenated in rank order.
+        let expected: Vec<f32> = (0..TP_SIZE).flat_map(shard_of).collect();
+
+        /// Gather on one rank and check it received every peer's shard.
+        async fn gather_on_rank(
+            tp_layer: &TensorParallel,
+            rank: usize,
+            expected: &[f32],
+        ) -> TorshResult<()> {
+            let input = Tensor::from_vec(shard_of(rank), &[2, 3])?;
+            let gathered = tp_layer.parallel_all_gather(&input, SHARD_DIM).await?;
+
+            // Shape must grow tp_size-fold along shard_dim: [2, 3] -> [6, 3].
+            // The old buggy implementation left the shape at [2, 3].
+            assert_eq!(
+                gathered.shape().dims(),
+                &[6, 3],
+                "rank {rank} gathered the wrong shape"
+            );
+            assert_eq!(
+                gathered.to_vec()?,
+                expected,
+                "rank {rank} did not gather every shard in rank order"
+            );
+
+            Ok(())
+        }
+
+        // Build every rank's layer before any collective runs, and keep them all
+        // alive until the test ends (see the note on the store server above).
+        let mut tp_layers = Vec::with_capacity(TP_SIZE);
+        for rank in 0..TP_SIZE {
+            let process_group = Arc::new(
+                init_process_group(
+                    BackendType::Gloo,
+                    rank as u32,
+                    TP_SIZE as u32,
+                    "127.0.0.1",
+                    master_port,
+                )
+                .await?,
+            );
+
+            let config = TensorParallelConfig {
+                tp_size: TP_SIZE,
+                ..Default::default()
+            };
+
+            tp_layers.push(utils::create_row_parallel_linear(
+                128,
+                256,
+                true,
+                false,
+                process_group,
+                Some(config),
+            )?);
+        }
+
+        let (rank0, rank1, rank2) = tokio::join!(
+            gather_on_rank(&tp_layers[0], 0, &expected),
+            gather_on_rank(&tp_layers[1], 1, &expected),
+            gather_on_rank(&tp_layers[2], 2, &expected),
+        );
+
+        // Report every rank's failure, not just the first: a rendezvous fault
+        // is far easier to diagnose with all participants' errors side by side.
+        let failures: Vec<String> = [rank0, rank1, rank2]
+            .into_iter()
+            .enumerate()
+            .filter_map(|(rank, result)| result.err().map(|e| format!("rank {rank}: {e}")))
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "3-rank all-gather failed -- {}",
+            failures.join(" | ")
+        );
 
         Ok(())
     }

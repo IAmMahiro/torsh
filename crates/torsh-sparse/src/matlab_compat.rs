@@ -4,8 +4,6 @@
 //! enabling seamless integration with MATLAB scientific computing environment.
 
 #[cfg(feature = "matlab")]
-use matfile::MatFile;
-#[cfg(feature = "matlab")]
 use serde::{Deserialize, Serialize};
 
 use crate::*;
@@ -179,91 +177,67 @@ impl MatlabSparseCompat {
         Ok(Box::new(coo))
     }
 
-    /// Export sparse tensor to MATLAB .mat file (via script generation)
+    /// Export a sparse tensor to a MATLAB Level-5 `.mat` file
     ///
-    /// Note: Direct .mat file export is not currently implemented due to matfile crate API limitations.
-    /// This function generates a MATLAB script that can be run to create the sparse matrix.
-    /// For a complete working solution, use `export_to_matlab_script()` which creates a .m file
-    /// with the matrix data embedded as code.
+    /// The tensor is written as a genuine MATLAB sparse matrix (`ir`/`jc`/`pr`
+    /// arrays inside an `mxSPARSE_CLASS` `miMATRIX` element), so MATLAB loads it
+    /// with `load('file.mat')` and `issparse(variable)` is true.
     #[cfg(feature = "matlab")]
     pub fn export_to_mat_file(
         sparse: &dyn SparseTensor,
         filepath: &Path,
         variable_name: &str,
     ) -> TorshResult<()> {
-        // Alternative implementation: Generate MATLAB script instead
-        let matlab_matrix = Self::to_matlab(sparse, variable_name.to_string())?;
-        let matlab_code = matlab_matrix.to_matlab_code();
+        use crate::matlab_mat5::{write_sparse_mat, MatSparseMatrix};
 
-        // Change extension to .m for MATLAB script
-        let script_path = filepath.with_extension("m");
+        // MATLAB sparse storage is CSC, which maps directly onto CscTensor.
+        let csc = sparse.to_csc()?;
+        let dims = csc.shape().dims().to_vec();
 
-        std::fs::write(&script_path, matlab_code)
-            .map_err(|e| TorshError::IoError(format!("Failed to write MATLAB script: {}", e)))?;
+        let matrix = MatSparseMatrix {
+            rows: dims[0],
+            cols: dims[1],
+            col_ptr: csc.col_ptr().to_vec(),
+            row_indices: csc.row_indices().to_vec(),
+            values: csc.values().iter().map(|&v| v as f64).collect(),
+        };
 
-        eprintln!(
-            "Note: Exported as MATLAB script (.m) instead of .mat file.\n\
-             To use in MATLAB: run the script '{}'",
-            script_path.display()
-        );
-
-        Ok(())
+        write_sparse_mat(filepath, variable_name, &matrix)
     }
 
-    /// Import sparse tensor from MATLAB .mat file
+    /// Import a sparse tensor from a MATLAB Level-5 `.mat` file
     ///
-    /// Note: Direct .mat file import is not currently implemented due to matfile crate API limitations.
-    /// As a workaround:
-    /// 1. Export your MATLAB matrix to text format (save as CSV or use MATLAB's `save -ascii`)
-    /// 2. Use the Matrix Market format for interchange (`mmwrite` in MATLAB)
-    /// 3. Use HDF5 format which is supported by both MATLAB and torsh-sparse
+    /// Accepts both sparse variables and full `double`/`single` matrices (the
+    /// latter are converted by dropping their exact zeros). Variables written by
+    /// MATLAB are normally zlib compressed; those elements are inflated with
+    /// `oxiarc-deflate`.
     #[cfg(feature = "matlab")]
     pub fn import_from_mat_file(
         filepath: &Path,
         variable_name: &str,
     ) -> TorshResult<Box<dyn SparseTensor>> {
-        // Attempt to use matfile crate for reading (basic implementation)
-        use std::io::Cursor;
+        use crate::matlab_mat5::read_sparse_mat;
 
-        let file_data = std::fs::read(filepath)
-            .map_err(|e| TorshError::IoError(format!("Failed to read .mat file: {}", e)))?;
+        let matrix = read_sparse_mat(filepath, variable_name)?;
 
-        // Create a cursor for the Read trait
-        let cursor = Cursor::new(file_data);
+        let shape = Shape::new(vec![matrix.rows, matrix.cols]);
+        let values: Vec<f32> = matrix.values.iter().map(|&v| v as f32).collect();
+        // MATLAB does not guarantee that `ir` is sorted inside a column, so
+        // normalise the arrays instead of asserting the CSC invariants.
+        let csc = crate::CscTensor::from_unsorted_parts(
+            matrix.col_ptr,
+            matrix.row_indices,
+            values,
+            shape,
+        )?;
 
-        // Try to parse the .mat file
-        let mat_file = MatFile::parse(cursor).map_err(|e| {
-            TorshError::InvalidArgument(format!(
-                "Failed to parse .mat file: {}. Consider using Matrix Market or HDF5 format instead.",
-                e
-            ))
-        })?;
+        Ok(Box::new(csc))
+    }
 
-        // Try to find the variable in the .mat file
-        let _array = mat_file.find_by_name(variable_name).ok_or_else(|| {
-            TorshError::InvalidArgument(format!(
-                "Variable '{}' not found in .mat file. Available variables: {:?}",
-                variable_name,
-                mat_file
-                    .arrays()
-                    .iter()
-                    .map(|a| a.name())
-                    .collect::<Vec<_>>()
-            ))
-        })?;
-
-        // Check if it's a sparse array
-        // Note: This is a basic implementation and may need adjustment based on
-        // the actual matfile crate API and MATLAB sparse matrix encoding
-
-        // For now, return an error with guidance
-        Err(TorshError::InvalidArgument(format!(
-            ".mat file import is partially implemented. The file was parsed successfully, \
-                 but extracting sparse matrix data requires additional matfile crate features. \
-                 Please use Matrix Market (.mtx) or HDF5 (.h5) format for reliable import/export. \
-                 Variable '{}' was found in the file.",
-            variable_name
-        )))
+    /// List the variables stored in a MATLAB Level-5 `.mat` file
+    #[cfg(feature = "matlab")]
+    pub fn list_mat_file_variables(filepath: &Path) -> TorshResult<Vec<String>> {
+        crate::matlab_mat5::list_variables(filepath)
     }
 
     /// Create MATLAB script to load sparse matrix from components

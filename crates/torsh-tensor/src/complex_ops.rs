@@ -14,6 +14,7 @@
 
 use scirs2_core::numeric::Float;
 use std::sync::Arc;
+use torsh_core::sync::RwLockExt;
 use torsh_core::{
     dtype::{ComplexElement, TensorElement},
     error::{Result, TorshError},
@@ -30,10 +31,10 @@ impl<T: ComplexElement + Copy> Tensor<T> {
         let data = self.to_vec()?;
         let conj_data: Vec<T> = data.iter().map(|&z| z.conj()).collect();
         let mut result = Self::from_data(conj_data, self.shape().dims().to_vec(), self.device)?;
-        result.requires_grad = self.requires_grad;
+        result.requires_grad = crate::should_record_grad(self.requires_grad);
 
         // Set up operation tracking for autograd
-        if self.requires_grad {
+        if crate::should_record_grad(self.requires_grad) {
             result.operation = Operation::Custom(
                 "complex_conj".to_string(),
                 vec![Arc::downgrade(&Arc::new(self.clone()))],
@@ -63,14 +64,24 @@ impl<T: ComplexElement + Copy> Tensor<T> {
         Tensor::from_data(imag_data, self.shape().dims().to_vec(), self.device)
     }
 
-    /// Get magnitude (absolute value) of complex tensor
+    /// Get magnitude (absolute value) of complex tensor.
+    ///
+    /// This is also the `abs` that *real* tensors resolve to: `f32` and `f64`
+    /// implement [`ComplexElement`] with `Real = Self`, so `Tensor<f32>::abs`
+    /// is the ordinary `|x|`. Only that real case is differentiable —
+    /// `Tensor::record_abs_if_real` records [`crate::core_ops::UnaryKind::Abs`]
+    /// (sub-gradient `sign(x)`, `0` at the kink) when the input and output
+    /// element types coincide and declines otherwise, leaving genuinely
+    /// complex `abs` detached as before (its derivative is the Wirtinger
+    /// `z/|z|`, which needs a different `Operation`).
     pub fn abs(&self) -> Result<Tensor<T::Real>>
     where
         T::Real: TensorElement + Copy + num_traits::Float,
     {
         let data = self.to_vec()?;
         let abs_data: Vec<T::Real> = data.iter().map(|x| x.abs()).collect();
-        Tensor::from_data(abs_data, self.shape().dims().to_vec(), self.device)
+        let result = Tensor::from_data(abs_data, self.shape().dims().to_vec(), self.device)?;
+        Ok(self.record_abs_if_real(result))
     }
 
     /// Get phase (argument) of complex tensor
@@ -190,7 +201,7 @@ impl<T: ComplexElement + Copy> Tensor<T> {
         match &self.operation {
             Operation::Leaf => {
                 // Accumulate gradient for leaf nodes
-                let mut grad_lock = self.grad.write().expect("lock should not be poisoned");
+                let mut grad_lock = self.grad.write_or_recover();
                 if let Some(existing_grad) = grad_lock.as_ref() {
                     // Add gradients if they exist
                     let new_grad = existing_grad.add_op(grad_output)?;
@@ -325,7 +336,7 @@ impl<T: ComplexElement + Copy> Tensor<T> {
         let mut result = Self::from_data(result_data, self.shape().dims().to_vec(), self.device)?;
 
         // Set up gradient tracking
-        if self.requires_grad || other.requires_grad {
+        if crate::should_record_grad(self.requires_grad || other.requires_grad) {
             result.requires_grad = true;
             result.operation = Operation::Mul {
                 lhs: Arc::new(self.clone()),
@@ -360,7 +371,7 @@ impl<T: ComplexElement + Copy> Tensor<T> {
         let mut result = Self::from_data(result_data, self.shape().dims().to_vec(), self.device)?;
 
         // Set up gradient tracking
-        if self.requires_grad || other.requires_grad {
+        if crate::should_record_grad(self.requires_grad || other.requires_grad) {
             result.requires_grad = true;
             result.operation = Operation::Add {
                 lhs: Arc::new(self.clone()),

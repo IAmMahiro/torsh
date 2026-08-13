@@ -136,11 +136,17 @@ impl Drop for ProfileScope {
     }
 }
 
-/// Get CPU usage statistics
-pub fn get_cpu_usage() -> TorshResult<f64> {
-    // This is a simplified implementation
-    // In a real implementation, you would read from /proc/stat or use platform-specific APIs
-    Ok(0.0) // Placeholder
+/// Get current CPU usage percentage, if it can be measured.
+///
+/// Instantaneous CPU utilization is inherently a *rate*: it requires two
+/// samples of accumulated CPU time (e.g. `/proc/stat` jiffies) separated by
+/// a real time interval, not a single stateless reading. This function has
+/// no such baseline to compare against, so it honestly reports `None`
+/// rather than a fabricated `0.0` that would read as "measured and idle".
+/// Callers that need a real percentage should sample twice with a delay
+/// (e.g. via a stateful sampler) rather than call this repeatedly.
+pub fn get_cpu_usage() -> TorshResult<Option<f64>> {
+    Ok(None)
 }
 
 /// Get CPU frequency information

@@ -424,7 +424,14 @@ impl Optimizer for Adam {
                     .or_insert_with(HashMap::new);
 
                 if needs_init {
-                    state.insert("step".to_string(), zeros_like(&param)?);
+                    // The step counter is a single integer, so it is stored as a
+                    // one-element tensor rather than a parameter-shaped one: a
+                    // parameter-shaped counter costs a full N-element increment
+                    // and a full N-element copy per step to read element 0.
+                    state.insert(
+                        "step".to_string(),
+                        Tensor::scalar(0.0).map_err(OptimizerError::TensorError)?,
+                    );
                     state.insert("exp_avg".to_string(), zeros_like(&param)?);
                     state.insert("exp_avg_sq".to_string(), zeros_like(&param)?);
                     if self.amsgrad {
@@ -432,21 +439,14 @@ impl Optimizer for Adam {
                     }
                 }
 
-                let mut step_tensor = state.get("step").expect("step state should exist").clone();
-                let mut exp_avg = state
-                    .get("exp_avg")
-                    .expect("exp_avg state should exist")
-                    .clone();
-                let mut exp_avg_sq = state
-                    .get("exp_avg_sq")
-                    .expect("exp_avg_sq state should exist")
-                    .clone();
-
-                // Increment step count
-                step_tensor
-                    .add_scalar_(1.0)
-                    .map_err(OptimizerError::TensorError)?;
-                let step = step_tensor.to_vec().map_err(OptimizerError::TensorError)?[0] as i32;
+                // Increment step count (one element, regardless of parameter size).
+                let step = {
+                    let step_tensor = state.get_mut("step").expect("step state should exist");
+                    step_tensor
+                        .add_scalar_(1.0)
+                        .map_err(OptimizerError::TensorError)?;
+                    step_tensor.to_vec().map_err(OptimizerError::TensorError)?[0] as i32
+                };
 
                 // Apply weight decay
                 let mut grad = grad;
@@ -461,61 +461,70 @@ impl Optimizer for Adam {
 
                 // Update biased first moment estimate:
                 // m_t = beta1 * m_{t-1} + (1 - beta1) * g_t
-                // `mul_scalar_` mutates in place, but `add` is non-mutating and
-                // returns a new tensor, so its result MUST be reassigned back into
-                // `exp_avg` — otherwise the moment never accumulates.
-                exp_avg
-                    .mul_scalar_(self.betas.0)
-                    .map_err(OptimizerError::TensorError)?;
+                // Both passes mutate the stored moment in place; optimizer state
+                // never requires grad, so the in-place ops are always permitted.
                 let grad_term = grad
                     .mul_scalar(1.0 - self.betas.0)
                     .map_err(OptimizerError::TensorError)?;
-                exp_avg = exp_avg
-                    .add(&grad_term)
-                    .map_err(OptimizerError::TensorError)?;
+                {
+                    let exp_avg = state
+                        .get_mut("exp_avg")
+                        .expect("exp_avg state should exist");
+                    exp_avg
+                        .mul_scalar_(self.betas.0)
+                        .map_err(OptimizerError::TensorError)?;
+                    exp_avg
+                        .add_(&grad_term)
+                        .map_err(OptimizerError::TensorError)?;
+                }
 
                 // Update biased second raw moment estimate:
                 // v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2
-                exp_avg_sq
-                    .mul_scalar_(self.betas.1)
-                    .map_err(OptimizerError::TensorError)?;
                 let grad_squared = grad.mul_op(&grad).map_err(OptimizerError::TensorError)?;
                 let grad_sq_term = grad_squared
                     .mul_scalar(1.0 - self.betas.1)
                     .map_err(OptimizerError::TensorError)?;
-                exp_avg_sq = exp_avg_sq
-                    .add(&grad_sq_term)
+                {
+                    let exp_avg_sq = state
+                        .get_mut("exp_avg_sq")
+                        .expect("exp_avg_sq state should exist");
+                    exp_avg_sq
+                        .mul_scalar_(self.betas.1)
+                        .map_err(OptimizerError::TensorError)?;
+                    exp_avg_sq
+                        .add_(&grad_sq_term)
+                        .map_err(OptimizerError::TensorError)?;
+                }
+
+                // Bias correction for the second moment. This is applied for BOTH
+                // the plain and the AMSGrad branch: AMSGrad maxes over the
+                // *corrected* second moments (as in the paper and in AdamW below),
+                // otherwise the first steps are inflated by 1/sqrt(1 - beta2^t) —
+                // roughly 31x at t = 1 with the default beta2 = 0.999.
+                let bias_correction2 = 1.0 - self.betas.1.powi(step);
+                let corrected_exp_avg_sq = state
+                    .get("exp_avg_sq")
+                    .expect("exp_avg_sq state should exist")
+                    .div_scalar(bias_correction2)
                     .map_err(OptimizerError::TensorError)?;
 
                 let denom = if self.amsgrad {
-                    // Update max of exp_avg_sq
-                    let mut max_exp_avg_sq = state
-                        .get("max_exp_avg_sq")
-                        .expect("max_exp_avg_sq state should exist")
-                        .clone();
-                    max_exp_avg_sq = max_exp_avg_sq
-                        .maximum(&exp_avg_sq)
+                    let max_exp_avg_sq = state
+                        .get_mut("max_exp_avg_sq")
+                        .expect("max_exp_avg_sq state should exist");
+                    let new_max = max_exp_avg_sq
+                        .maximum(&corrected_exp_avg_sq)
                         .map_err(OptimizerError::TensorError)?;
-                    state.insert("max_exp_avg_sq".to_string(), max_exp_avg_sq.clone());
-
-                    // Use max for denominator
-                    let sqrt_max = max_exp_avg_sq.sqrt().map_err(OptimizerError::TensorError)?;
-                    sqrt_max
+                    *max_exp_avg_sq = new_max;
+                    max_exp_avg_sq
+                        .sqrt()
+                        .map_err(OptimizerError::TensorError)?
                         .add_scalar(self.eps)
                         .map_err(OptimizerError::TensorError)?
                 } else {
-                    // Bias correction for the second moment (the first moment is
-                    // bias-corrected below when forming the update).
-                    let bias_correction2 = 1.0 - self.betas.1.powi(step);
-
-                    let corrected_exp_avg_sq = exp_avg_sq
-                        .div_scalar(bias_correction2)
-                        .map_err(OptimizerError::TensorError)?;
-
-                    let sqrt_corrected = corrected_exp_avg_sq
+                    corrected_exp_avg_sq
                         .sqrt()
-                        .map_err(OptimizerError::TensorError)?;
-                    sqrt_corrected
+                        .map_err(OptimizerError::TensorError)?
                         .add_scalar(self.eps)
                         .map_err(OptimizerError::TensorError)?
                 };
@@ -523,7 +532,9 @@ impl Optimizer for Adam {
                 // Compute step
                 let step_size = group.lr;
                 let bias_correction1 = 1.0 - self.betas.0.powi(step);
-                let corrected_exp_avg = exp_avg
+                let corrected_exp_avg = state
+                    .get("exp_avg")
+                    .expect("exp_avg state should exist")
                     .div_scalar(bias_correction1)
                     .map_err(OptimizerError::TensorError)?;
 
@@ -532,14 +543,10 @@ impl Optimizer for Adam {
                     .map_err(OptimizerError::TensorError)?
                     .mul_scalar(step_size)
                     .map_err(OptimizerError::TensorError)?;
-                // `sub` is non-mutating: the new tensor MUST be written back into
-                // `*param`, otherwise the parameter is never updated.
-                *param = param.sub(&update).map_err(OptimizerError::TensorError)?;
-
-                // Update state
-                state.insert("step".to_string(), step_tensor);
-                state.insert("exp_avg".to_string(), exp_avg);
-                state.insert("exp_avg_sq".to_string(), exp_avg_sq);
+                // The parameter's storage is mutated in place so that its gradient
+                // slot and leaf status survive the step (see `crate::param_update`).
+                crate::param_update::sub_assign(&mut param, &update)
+                    .map_err(OptimizerError::TensorError)?;
             }
         }
 
@@ -556,6 +563,10 @@ impl Optimizer for Adam {
 
     fn set_lr(&mut self, lr: f32) {
         self.base.set_lr(lr);
+    }
+
+    fn set_lrs(&mut self, lrs: &[f32]) {
+        self.base.set_lrs(lrs);
     }
 
     fn add_param_group(&mut self, params: Vec<Arc<RwLock<Tensor>>>, options: HashMap<String, f32>) {
@@ -831,7 +842,11 @@ impl Optimizer for AdamW {
                     .or_insert_with(HashMap::new);
 
                 if needs_init {
-                    state.insert("step".to_string(), zeros_like(&param)?);
+                    // One-element step counter — see the note in `Adam::step`.
+                    state.insert(
+                        "step".to_string(),
+                        Tensor::scalar(0.0).map_err(OptimizerError::TensorError)?,
+                    );
                     state.insert("exp_avg".to_string(), zeros_like(&param)?);
                     state.insert("exp_avg_sq".to_string(), zeros_like(&param)?);
                     if self.amsgrad {
@@ -839,85 +854,90 @@ impl Optimizer for AdamW {
                     }
                 }
 
-                let mut step_tensor = state.get("step").expect("step state should exist").clone();
-                let mut exp_avg = state
-                    .get("exp_avg")
-                    .expect("exp_avg state should exist")
-                    .clone();
-                let mut exp_avg_sq = state
-                    .get("exp_avg_sq")
-                    .expect("exp_avg_sq state should exist")
-                    .clone();
-
-                // Increment step count
-                step_tensor
-                    .add_scalar_(1.0)
-                    .map_err(OptimizerError::TensorError)?;
-                let step = step_tensor.to_vec().map_err(OptimizerError::TensorError)?[0] as i32;
+                // Increment step count (one element, regardless of parameter size).
+                let step = {
+                    let step_tensor = state.get_mut("step").expect("step state should exist");
+                    step_tensor
+                        .add_scalar_(1.0)
+                        .map_err(OptimizerError::TensorError)?;
+                    step_tensor.to_vec().map_err(OptimizerError::TensorError)?[0] as i32
+                };
 
                 // Apply weight decay directly to the parameter (decoupled).
-                // `sub` is non-mutating, so the result MUST be reassigned into
-                // `*param` for the decoupled weight decay to take effect.
+                // The update mutates the parameter's storage in place so that its
+                // gradient slot and leaf status survive the step (see
+                // `crate::param_update`).
                 if self.weight_decay != 0.0 {
                     let weight_decay_update = param
                         .mul_scalar(group.lr * self.weight_decay)
                         .map_err(OptimizerError::TensorError)?;
-                    *param = param
-                        .sub(&weight_decay_update)
+                    crate::param_update::sub_assign(&mut param, &weight_decay_update)
                         .map_err(OptimizerError::TensorError)?;
                 }
 
                 // Update biased first moment estimate:
                 // m_t = beta1 * m_{t-1} + (1 - beta1) * g_t
-                // `add` is non-mutating; reassign its result back into `exp_avg`.
-                exp_avg
-                    .mul_scalar_(self.betas.0)
-                    .map_err(OptimizerError::TensorError)?;
+                // Both passes mutate the stored moment in place.
                 let grad_term = grad
                     .mul_scalar(1.0 - self.betas.0)
                     .map_err(OptimizerError::TensorError)?;
-                exp_avg = exp_avg
-                    .add(&grad_term)
-                    .map_err(OptimizerError::TensorError)?;
+                {
+                    let exp_avg = state
+                        .get_mut("exp_avg")
+                        .expect("exp_avg state should exist");
+                    exp_avg
+                        .mul_scalar_(self.betas.0)
+                        .map_err(OptimizerError::TensorError)?;
+                    exp_avg
+                        .add_(&grad_term)
+                        .map_err(OptimizerError::TensorError)?;
+                }
 
                 // Update biased second raw moment estimate:
                 // v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2
-                exp_avg_sq
-                    .mul_scalar_(self.betas.1)
-                    .map_err(OptimizerError::TensorError)?;
                 let grad_squared = grad.mul_op(&grad).map_err(OptimizerError::TensorError)?;
                 let grad_sq_term = grad_squared
                     .mul_scalar(1.0 - self.betas.1)
                     .map_err(OptimizerError::TensorError)?;
-                exp_avg_sq = exp_avg_sq
-                    .add(&grad_sq_term)
-                    .map_err(OptimizerError::TensorError)?;
+                {
+                    let exp_avg_sq = state
+                        .get_mut("exp_avg_sq")
+                        .expect("exp_avg_sq state should exist");
+                    exp_avg_sq
+                        .mul_scalar_(self.betas.1)
+                        .map_err(OptimizerError::TensorError)?;
+                    exp_avg_sq
+                        .add_(&grad_sq_term)
+                        .map_err(OptimizerError::TensorError)?;
+                }
 
                 // Bias correction
                 let bias_correction1 = 1.0 - self.betas.0.powi(step);
                 let bias_correction2 = 1.0 - self.betas.1.powi(step);
 
-                let corrected_exp_avg = exp_avg
+                let corrected_exp_avg = state
+                    .get("exp_avg")
+                    .expect("exp_avg state should exist")
                     .div_scalar(bias_correction1)
                     .map_err(OptimizerError::TensorError)?;
-                let corrected_exp_avg_sq = exp_avg_sq
+                let corrected_exp_avg_sq = state
+                    .get("exp_avg_sq")
+                    .expect("exp_avg_sq state should exist")
                     .div_scalar(bias_correction2)
                     .map_err(OptimizerError::TensorError)?;
 
                 let denom = if self.amsgrad {
-                    // Update max of exp_avg_sq
-                    let mut max_exp_avg_sq = state
-                        .get("max_exp_avg_sq")
-                        .expect("max_exp_avg_sq state should exist")
-                        .clone();
-                    max_exp_avg_sq = max_exp_avg_sq
+                    // Max over the bias-corrected second moments (AMSGrad).
+                    let max_exp_avg_sq = state
+                        .get_mut("max_exp_avg_sq")
+                        .expect("max_exp_avg_sq state should exist");
+                    let new_max = max_exp_avg_sq
                         .maximum(&corrected_exp_avg_sq)
                         .map_err(OptimizerError::TensorError)?;
-                    state.insert("max_exp_avg_sq".to_string(), max_exp_avg_sq.clone());
-
-                    // Use max for denominator
-                    let sqrt_max = max_exp_avg_sq.sqrt().map_err(OptimizerError::TensorError)?;
-                    sqrt_max
+                    *max_exp_avg_sq = new_max;
+                    max_exp_avg_sq
+                        .sqrt()
+                        .map_err(OptimizerError::TensorError)?
                         .add_scalar(self.eps)
                         .map_err(OptimizerError::TensorError)?
                 } else {
@@ -936,13 +956,10 @@ impl Optimizer for AdamW {
                     .map_err(OptimizerError::TensorError)?
                     .mul_scalar(step_size)
                     .map_err(OptimizerError::TensorError)?;
-                // `sub` is non-mutating: write the new tensor back into `*param`.
-                *param = param.sub(&update).map_err(OptimizerError::TensorError)?;
-
-                // Update state
-                state.insert("step".to_string(), step_tensor);
-                state.insert("exp_avg".to_string(), exp_avg);
-                state.insert("exp_avg_sq".to_string(), exp_avg_sq);
+                // The parameter's storage is mutated in place so that its gradient
+                // slot and leaf status survive the step (see `crate::param_update`).
+                crate::param_update::sub_assign(&mut param, &update)
+                    .map_err(OptimizerError::TensorError)?;
             }
         }
 
@@ -959,6 +976,10 @@ impl Optimizer for AdamW {
 
     fn set_lr(&mut self, lr: f32) {
         self.base.set_lr(lr);
+    }
+
+    fn set_lrs(&mut self, lrs: &[f32]) {
+        self.base.set_lrs(lrs);
     }
 
     fn add_param_group(&mut self, params: Vec<Arc<RwLock<Tensor>>>, options: HashMap<String, f32>) {

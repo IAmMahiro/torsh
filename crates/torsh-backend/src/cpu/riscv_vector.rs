@@ -36,8 +36,8 @@ impl<T> RiscVVectorOps<T> {
 impl RiscVVectorOps<f32> {
     /// Element-wise addition for f32 vectors
     pub fn add(a: &[f32], b: &[f32], result: &mut [f32]) {
-        assert_eq!(a.len(), b.len());
-        assert_eq!(a.len(), result.len());
+        debug_assert_eq!(a.len(), b.len());
+        debug_assert_eq!(a.len(), result.len());
 
         if Self::is_float_available() {
             #[cfg(target_arch = "riscv64")]
@@ -63,8 +63,8 @@ impl RiscVVectorOps<f32> {
 
     /// Element-wise multiplication for f32 vectors
     pub fn mul(a: &[f32], b: &[f32], result: &mut [f32]) {
-        assert_eq!(a.len(), b.len());
-        assert_eq!(a.len(), result.len());
+        debug_assert_eq!(a.len(), b.len());
+        debug_assert_eq!(a.len(), result.len());
 
         if Self::is_float_available() {
             #[cfg(target_arch = "riscv64")]
@@ -90,9 +90,9 @@ impl RiscVVectorOps<f32> {
 
     /// Fused multiply-add for f32 vectors
     pub fn fma(a: &[f32], b: &[f32], c: &[f32], result: &mut [f32]) {
-        assert_eq!(a.len(), b.len());
-        assert_eq!(a.len(), c.len());
-        assert_eq!(a.len(), result.len());
+        debug_assert_eq!(a.len(), b.len());
+        debug_assert_eq!(a.len(), c.len());
+        debug_assert_eq!(a.len(), result.len());
 
         if Self::is_float_available() {
             #[cfg(target_arch = "riscv64")]
@@ -128,7 +128,7 @@ impl RiscVVectorOps<f32> {
 
     /// Dot product for f32 vectors
     pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-        assert_eq!(a.len(), b.len());
+        debug_assert_eq!(a.len(), b.len());
 
         if Self::is_float_available() {
             #[cfg(target_arch = "riscv64")]
@@ -172,9 +172,9 @@ impl RiscVVectorOps<f32> {
 
     /// Matrix multiplication for f32 matrices (row-major)
     pub fn matmul(a: &[f32], b: &[f32], result: &mut [f32], m: usize, n: usize, k: usize) {
-        assert_eq!(a.len(), m * k);
-        assert_eq!(b.len(), k * n);
-        assert_eq!(result.len(), m * n);
+        debug_assert_eq!(a.len(), m * k);
+        debug_assert_eq!(b.len(), k * n);
+        debug_assert_eq!(result.len(), m * n);
 
         if Self::is_float_available() {
             #[cfg(target_arch = "riscv64")]
@@ -211,8 +211,8 @@ impl RiscVVectorOps<f32> {
 impl RiscVVectorOps<f64> {
     /// Element-wise addition for f64 vectors
     pub fn add(a: &[f64], b: &[f64], result: &mut [f64]) {
-        assert_eq!(a.len(), b.len());
-        assert_eq!(a.len(), result.len());
+        debug_assert_eq!(a.len(), b.len());
+        debug_assert_eq!(a.len(), result.len());
 
         if Self::is_available() && global_detector().has_feature(CpuFeature::D) {
             #[cfg(target_arch = "riscv64")]
@@ -238,8 +238,8 @@ impl RiscVVectorOps<f64> {
 
     /// Element-wise multiplication for f64 vectors
     pub fn mul(a: &[f64], b: &[f64], result: &mut [f64]) {
-        assert_eq!(a.len(), b.len());
-        assert_eq!(a.len(), result.len());
+        debug_assert_eq!(a.len(), b.len());
+        debug_assert_eq!(a.len(), result.len());
 
         if Self::is_available() && global_detector().has_feature(CpuFeature::D) {
             #[cfg(target_arch = "riscv64")]
@@ -265,7 +265,7 @@ impl RiscVVectorOps<f64> {
 
     /// Dot product for f64 vectors
     pub fn dot(a: &[f64], b: &[f64]) -> f64 {
-        assert_eq!(a.len(), b.len());
+        debug_assert_eq!(a.len(), b.len());
 
         if Self::is_available() && global_detector().has_feature(CpuFeature::D) {
             #[cfg(target_arch = "riscv64")]
@@ -311,8 +311,8 @@ impl RiscVVectorOps<f64> {
 impl RiscVVectorOps<i32> {
     /// Element-wise addition for i32 vectors
     pub fn add(a: &[i32], b: &[i32], result: &mut [i32]) {
-        assert_eq!(a.len(), b.len());
-        assert_eq!(a.len(), result.len());
+        debug_assert_eq!(a.len(), b.len());
+        debug_assert_eq!(a.len(), result.len());
 
         if Self::is_available() {
             #[cfg(target_arch = "riscv64")]
@@ -338,8 +338,8 @@ impl RiscVVectorOps<i32> {
 
     /// Element-wise multiplication for i32 vectors
     pub fn mul(a: &[i32], b: &[i32], result: &mut [i32]) {
-        assert_eq!(a.len(), b.len());
-        assert_eq!(a.len(), result.len());
+        debug_assert_eq!(a.len(), b.len());
+        debug_assert_eq!(a.len(), result.len());
 
         if Self::is_available() {
             #[cfg(target_arch = "riscv64")]

@@ -376,6 +376,14 @@ impl TextUtilities {
     }
 
     /// Clean and normalize text for analysis
+    ///
+    /// Removes zero-width characters and carriage returns, then collapses every
+    /// run of whitespace into a single space and trims the result.
+    ///
+    /// Whitespace collapsing uses [`str::split_whitespace`], which matches the
+    /// same Unicode `White_Space` property as the `\s+` regex this function used
+    /// to compile *on every call* — bulk preprocessing no longer pays a regex
+    /// compilation per string, and the function can no longer panic.
     pub fn quick_clean(text: &str) -> String {
         // Remove common Unicode issues
         let cleaned = text
@@ -384,9 +392,8 @@ impl TextUtilities {
             .replace('\u{00A0}', " ") // Non-breaking space
             .replace('\r', ""); // Carriage returns
 
-        // Normalize multiple whitespace to single space
-        let re = regex::Regex::new(r"\s+").unwrap_or_else(|_| panic!("Invalid regex"));
-        re.replace_all(&cleaned, " ").trim().to_string()
+        // Normalize multiple whitespace to single space (and trim)
+        cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// Detect if text is likely to be in a specific encoding

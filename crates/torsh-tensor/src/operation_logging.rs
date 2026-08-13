@@ -46,6 +46,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
+use torsh_core::sync::{MutexExt, RwLockExt};
 
 use serde::{Deserialize, Serialize};
 use torsh_core::{
@@ -286,24 +287,18 @@ impl OperationLogger {
         device: DeviceType,
     ) -> OperationContext {
         let id = {
-            let mut next_id = self.next_id.lock().expect("lock should not be poisoned");
+            let mut next_id = self.next_id.lock_or_recover();
             let id = *next_id;
             *next_id += 1;
             id
         };
 
         let parent_id = {
-            let stack = self
-                .operation_stack
-                .lock()
-                .expect("lock should not be poisoned");
+            let stack = self.operation_stack.lock_or_recover();
             stack.last().copied()
         };
 
-        self.operation_stack
-            .lock()
-            .expect("lock should not be poisoned")
-            .push(id);
+        self.operation_stack.lock_or_recover().push(id);
 
         OperationContext {
             id,
@@ -328,10 +323,7 @@ impl OperationLogger {
 
         // Remove from stack
         {
-            let mut stack = self
-                .operation_stack
-                .lock()
-                .expect("lock should not be poisoned");
+            let mut stack = self.operation_stack.lock_or_recover();
             stack.pop();
         }
 
@@ -370,7 +362,7 @@ impl OperationLogger {
 
         // Update statistics
         {
-            let mut stats = self.stats.write().expect("lock should not be poisoned");
+            let mut stats = self.stats.write_or_recover();
             stats.total_operations += 1;
             stats.total_duration_us += entry.duration_us;
             stats.total_memory_allocated += entry.memory_allocated;
@@ -402,7 +394,7 @@ impl OperationLogger {
 
         // Store entry
         {
-            let mut entries = self.entries.write().expect("lock should not be poisoned");
+            let mut entries = self.entries.write_or_recover();
             entries.push(entry);
 
             // Trim if exceeding max entries
@@ -432,27 +424,18 @@ impl OperationLogger {
 
     /// Get current statistics
     pub fn get_statistics(&self) -> LogStatistics {
-        self.stats
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.stats.read_or_recover().clone()
     }
 
     /// Get all log entries
     pub fn get_entries(&self) -> Vec<OperationLogEntry> {
-        self.entries
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.entries.read_or_recover().clone()
     }
 
     /// Clear all log entries
     pub fn clear(&self) {
-        self.entries
-            .write()
-            .expect("lock should not be poisoned")
-            .clear();
-        *self.stats.write().expect("lock should not be poisoned") = LogStatistics::default();
+        self.entries.write_or_recover().clear();
+        *self.stats.write_or_recover() = LogStatistics::default();
     }
 
     /// Export logs to file
@@ -589,15 +572,14 @@ static GLOBAL_LOGGER: once_cell::sync::Lazy<Mutex<Option<OperationLogger>>> =
 
 /// Initialize global logger
 pub fn init_global_logger(config: LogConfig) {
-    let mut global = GLOBAL_LOGGER.lock().expect("lock should not be poisoned");
+    let mut global = GLOBAL_LOGGER.lock_or_recover();
     *global = Some(OperationLogger::with_config(config));
 }
 
 /// Get global logger
 pub fn global_logger() -> Option<OperationLogger> {
     GLOBAL_LOGGER
-        .lock()
-        .expect("lock should not be poisoned")
+        .lock_or_recover()
         .as_ref()
         .map(|l| l.clone_logger())
 }

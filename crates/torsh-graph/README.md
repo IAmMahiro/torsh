@@ -9,15 +9,15 @@ This crate provides comprehensive graph neural network (GNN) implementations wit
 ## Features
 
 - **Graph Representations**: Adjacency matrices, edge lists, COO/CSR formats
-- **Message Passing Layers**: GCN, GAT, GraphSAGE, GIN, EdgeConv
-- **Pooling Operations**: Global pooling, TopK pooling, SAGPool, DiffPool
+- **Message Passing Layers**: GCN, GAT, GraphSAGE, GIN, MPNN, Graph Transformer, heterogeneous convolutions
+- **Pooling Operations**: Global (mean/max/sum) pooling, global attention pooling, TopK pooling, DiffPool, MinCut pooling
 - **Graph Convolutions**: Spectral and spatial convolutions
 - **Attention Mechanisms**: Graph attention, multi-head attention, transformer layers
 - **Graph Generation**: Erdős-Rényi, Barabási-Albert, Watts-Strogatz
 - **Graph Utilities**: Subgraph sampling, neighborhood aggregation, batching
 - **Heterogeneous Graphs**: Support for multiple node/edge types
 - **Temporal Graphs**: Dynamic graph neural networks
-- **Explainability**: GNNExplainer, attention visualization
+- **Explainability**: Layer-wise relevance propagation and gradient-based attribution (`GraphExplainer`, `GraphLRP`), attention visualization
 
 ## Usage
 

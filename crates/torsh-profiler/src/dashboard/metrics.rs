@@ -280,7 +280,7 @@ pub fn collect_system_metrics() -> TorshResult<SystemMetrics> {
             load_average: 0.0,
             available_memory_mb: get_available_memory_mb(),
             disk_usage_percent: get_disk_usage_percent(),
-            network_io_mbps: 0.0,
+            network_io_mbps: None,
         })
     }
 }
@@ -558,9 +558,14 @@ fn get_disk_usage_percent() -> f64 {
     50.0 // Placeholder: 50%
 }
 
-fn get_network_io_mbps() -> f64 {
-    // Platform-agnostic network I/O
-    0.0 // Placeholder
+/// Network I/O throughput, when it can be measured.
+///
+/// This crate has no portable network-interface-counter reader wired up
+/// (would require parsing `/proc/net/dev` on Linux, `netstat`/`sysctl` on
+/// macOS, or `GetIfTable2` on Windows). Returns `None` rather than a
+/// fabricated `0.0` that would read as "measured and idle".
+fn get_network_io_mbps() -> Option<f64> {
+    None
 }
 
 // =============================================================================

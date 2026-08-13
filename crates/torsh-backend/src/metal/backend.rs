@@ -24,6 +24,7 @@ use crate::{
 use metal::foreign_types::ForeignType;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::sync::{Arc, Mutex};
+use torsh_core::sync::MutexExt;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use torsh_core::{device::DeviceType, dtype::DType, error::TorshError};
 
@@ -120,12 +121,7 @@ impl MetalBackend {
             // Get capabilities from the global context
             crate::metal::neural_engine::NeuralEngineContext::global()
                 .ok()
-                .map(|ctx| {
-                    ctx.lock()
-                        .expect("lock should not be poisoned")
-                        .capabilities()
-                        .clone()
-                })
+                .map(|ctx| ctx.lock_or_recover().capabilities().clone())
         })
     }
 
@@ -1262,16 +1258,8 @@ impl MemoryManager for MetalMemoryManager {
             allocations_moved: 0,
             bytes_moved: 0,
             duration_ms: 0.0,
-            largest_free_before: self
-                .stats
-                .lock()
-                .expect("lock should not be poisoned")
-                .available_memory,
-            largest_free_after: self
-                .stats
-                .lock()
-                .expect("lock should not be poisoned")
-                .available_memory,
+            largest_free_before: self.stats.lock_or_recover().available_memory,
+            largest_free_after: self.stats.lock_or_recover().available_memory,
             free_blocks_before: 1,
             free_blocks_after: 1,
             success: true,

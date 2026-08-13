@@ -25,13 +25,14 @@ pub struct PyBatchNorm2d {
 #[pymethods]
 impl PyBatchNorm2d {
     #[new]
+    #[pyo3(signature = (num_features, eps=None, momentum=None, affine=None, track_running_stats=None))]
     fn new(
         num_features: usize,
         eps: Option<f32>,
         momentum: Option<f32>,
         affine: Option<bool>,
         track_running_stats: Option<bool>,
-    ) -> PyResult<(Self, PyModule)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let eps = eps.unwrap_or(1e-5);
         let momentum = momentum.unwrap_or(0.1);
         let affine = affine.unwrap_or(true);
@@ -67,7 +68,8 @@ impl PyBatchNorm2d {
                 num_batches_tracked: 0,
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through batch normalization
@@ -312,13 +314,14 @@ pub struct PyBatchNorm1d {
 #[pymethods]
 impl PyBatchNorm1d {
     #[new]
+    #[pyo3(signature = (num_features, eps=None, momentum=None, affine=None, track_running_stats=None))]
     fn new(
         num_features: usize,
         eps: Option<f32>,
         momentum: Option<f32>,
         affine: Option<bool>,
         track_running_stats: Option<bool>,
-    ) -> PyResult<(Self, PyModule)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let eps = eps.unwrap_or(1e-5);
         let momentum = momentum.unwrap_or(0.1);
         let affine = affine.unwrap_or(true);
@@ -354,7 +357,8 @@ impl PyBatchNorm1d {
                 num_batches_tracked: 0,
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through batch normalization
@@ -559,11 +563,12 @@ pub struct PyLayerNorm {
 #[pymethods]
 impl PyLayerNorm {
     #[new]
+    #[pyo3(signature = (normalized_shape, eps=None, elementwise_affine=None))]
     fn new(
         normalized_shape: Vec<usize>,
         eps: Option<f32>,
         elementwise_affine: Option<bool>,
-    ) -> PyResult<(Self, PyModule)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let eps = eps.unwrap_or(1e-5);
         let elementwise_affine = elementwise_affine.unwrap_or(true);
 
@@ -587,7 +592,8 @@ impl PyLayerNorm {
                 elementwise_affine,
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through layer normalization

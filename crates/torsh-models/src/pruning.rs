@@ -475,8 +475,9 @@ impl ModelPruner {
 
         // Calculate threshold
         let mut sorted_magnitudes = flat_data.iter().map(|&x| x.abs()).collect::<Vec<_>>();
-        sorted_magnitudes
-            .sort_by(|a, b| a.partial_cmp(b).expect("magnitudes should be comparable"));
+        // Use a total order (total_cmp) so NaN weights from a diverged model sort
+        // deterministically instead of panicking on partial_cmp.
+        sorted_magnitudes.sort_by(|a, b| a.total_cmp(b));
 
         let threshold_idx = (flat_data.len() as f64 * sparsity) as usize;
         let threshold = if threshold_idx < sorted_magnitudes.len() {

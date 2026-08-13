@@ -174,6 +174,15 @@ impl<
             max_length = max_length.min(max_len);
         }
 
+        // Clamp reported lengths to the (possibly truncated) max_length: a
+        // sequence longer than max_length gets narrow()'d below, so its
+        // reported length must reflect the truncated size, not the original
+        // one, or downstream masking/packed-sequence code would index past
+        // the end of the padded tensor.
+        for length in &mut lengths {
+            *length = (*length).min(max_length as i64);
+        }
+
         // If packing is enabled, sort by length to minimize padding
         let mut batch_with_indices: Vec<_> = batch.into_iter().enumerate().collect();
         if self.pack_sequences {

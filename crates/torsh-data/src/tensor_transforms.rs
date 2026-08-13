@@ -46,6 +46,13 @@ impl RandomHorizontalFlip {
         );
         Self { prob }
     }
+
+    /// Fallible variant of [`Self::new`] that returns an error instead of
+    /// panicking when `prob` is outside `[0.0, 1.0]`.
+    pub fn try_new(prob: f32) -> Result<Self> {
+        crate::utils::validate_probability(prob, "prob")?;
+        Ok(Self { prob })
+    }
 }
 
 impl<T: FloatElement> Transform<Tensor<T>> for RandomHorizontalFlip {

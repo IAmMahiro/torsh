@@ -39,6 +39,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
+use torsh_core::sync::RwLockExt;
 
 use torsh_core::{
     error::{Result, TorshError},
@@ -181,33 +182,29 @@ impl ShapeInferenceDebugger {
 
     /// Enable or disable tracing
     pub fn enable_tracing(&mut self, enabled: bool) {
-        self.config
-            .write()
-            .expect("lock should not be poisoned")
-            .tracing_enabled = enabled;
+        self.config.write_or_recover().tracing_enabled = enabled;
     }
 
     /// Register a named shape for reference
     pub fn register_shape(&mut self, name: impl Into<String>, shape: Shape) {
         self.named_shapes
-            .write()
-            .expect("rwlock should not be poisoned")
+            .write_or_recover()
             .insert(name.into(), shape);
     }
 
     /// Add a trace step
     fn add_trace_step(&self, step: ShapeTraceStep) {
-        let config = self.config.read().expect("lock should not be poisoned");
+        let config = self.config.read_or_recover();
         if !config.tracing_enabled {
             return;
         }
         drop(config);
 
-        let mut trace = self.trace.write().expect("lock should not be poisoned");
+        let mut trace = self.trace.write_or_recover();
         trace.push(step);
 
         // Trim if needed
-        let config = self.config.read().expect("lock should not be poisoned");
+        let config = self.config.read_or_recover();
         if trace.len() > config.max_trace_steps {
             trace.remove(0);
         }
@@ -215,10 +212,7 @@ impl ShapeInferenceDebugger {
 
     /// Get the next step number
     fn next_step(&self) -> usize {
-        let mut counter = self
-            .step_counter
-            .write()
-            .expect("lock should not be poisoned");
+        let mut counter = self.step_counter.write_or_recover();
         let step = *counter;
         *counter += 1;
         step
@@ -667,7 +661,7 @@ impl ShapeInferenceDebugger {
 
     /// Get the complete trace as a formatted string
     pub fn get_trace(&self) -> String {
-        let trace = self.trace.read().expect("lock should not be poisoned");
+        let trace = self.trace.read_or_recover();
         let mut output = String::new();
         output.push_str("=== Shape Inference Trace ===\n\n");
 
@@ -688,19 +682,13 @@ impl ShapeInferenceDebugger {
 
     /// Clear the trace
     pub fn clear_trace(&mut self) {
-        self.trace
-            .write()
-            .expect("lock should not be poisoned")
-            .clear();
-        *self
-            .step_counter
-            .write()
-            .expect("lock should not be poisoned") = 0;
+        self.trace.write_or_recover().clear();
+        *self.step_counter.write_or_recover() = 0;
     }
 
     /// Get trace statistics
     pub fn get_statistics(&self) -> TraceStatistics {
-        let trace = self.trace.read().expect("lock should not be poisoned");
+        let trace = self.trace.read_or_recover();
         let total_steps = trace.len();
         let successful_steps = trace.iter().filter(|s| s.success).count();
         let failed_steps = total_steps - successful_steps;

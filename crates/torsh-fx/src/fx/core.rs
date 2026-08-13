@@ -5,6 +5,8 @@ use crate::fx::types::{Edge, Node};
 use crate::onnx_export::{export_to_onnx, OnnxExporter, OnnxModel};
 use crate::{FxGraph, TorshResult};
 use petgraph::graph::{Graph, NodeIndex};
+use petgraph::visit::EdgeRef;
+use std::collections::{HashMap, HashSet};
 
 /// FX Graph representation
 #[derive(Debug, Clone)]
@@ -67,6 +69,92 @@ impl FxGraph {
     /// Add an output node
     pub fn add_output(&mut self, output: NodeIndex) {
         self.outputs.push(output);
+    }
+
+    /// Remove a set of nodes, keeping [`FxGraph::inputs`]/[`FxGraph::outputs`] valid.
+    ///
+    /// This is the only supported removal entry point. The backing store is
+    /// petgraph's non-stable `Graph`, whose `remove_node` swap-removes and therefore
+    /// silently re-points the highest node index at the removed slot. Instead of
+    /// relying on that behaviour the graph is rebuilt without the removed nodes, so
+    /// every surviving node keeps a well-defined identity.
+    ///
+    /// Edges whose endpoints both survive are preserved (including their weights),
+    /// the recorded input/output indices are remapped, and any input/output that
+    /// referred to a removed node is dropped.
+    ///
+    /// # Arguments
+    /// * `to_remove` - Indices of the nodes to delete
+    ///
+    /// # Returns
+    /// The old -> new index mapping for every surviving node.
+    pub fn remove_nodes(
+        &mut self,
+        to_remove: &HashSet<NodeIndex>,
+    ) -> HashMap<NodeIndex, NodeIndex> {
+        let mut mapping: HashMap<NodeIndex, NodeIndex> = HashMap::new();
+        let mut rebuilt: Graph<Node, Edge> = Graph::new();
+
+        for idx in self.graph.node_indices() {
+            if to_remove.contains(&idx) {
+                continue;
+            }
+            let new_idx = rebuilt.add_node(self.graph[idx].clone());
+            mapping.insert(idx, new_idx);
+        }
+
+        for edge in self.graph.edge_references() {
+            if let (Some(&source), Some(&target)) =
+                (mapping.get(&edge.source()), mapping.get(&edge.target()))
+            {
+                rebuilt.add_edge(source, target, edge.weight().clone());
+            }
+        }
+
+        self.inputs = self
+            .inputs
+            .iter()
+            .filter_map(|idx| mapping.get(idx).copied())
+            .collect();
+        self.outputs = self
+            .outputs
+            .iter()
+            .filter_map(|idx| mapping.get(idx).copied())
+            .collect();
+        self.graph = rebuilt;
+
+        mapping
+    }
+
+    /// Remove a single node, keeping [`FxGraph::inputs`]/[`FxGraph::outputs`] valid.
+    ///
+    /// See [`FxGraph::remove_nodes`] for the invariants this upholds.
+    ///
+    /// # Arguments
+    /// * `idx` - Index of the node to delete
+    ///
+    /// # Returns
+    /// The old -> new index mapping for every surviving node.
+    pub fn remove_node(&mut self, idx: NodeIndex) -> HashMap<NodeIndex, NodeIndex> {
+        let mut to_remove = HashSet::new();
+        to_remove.insert(idx);
+        self.remove_nodes(&to_remove)
+    }
+
+    /// Replace every occurrence of `from` in the input/output lists with `to`.
+    ///
+    /// Used before removing a node whose value has been taken over by another node
+    /// (for example after fusing a producer and its consumer).
+    ///
+    /// # Arguments
+    /// * `from` - Index that is about to disappear
+    /// * `to` - Index that now produces the same value
+    pub fn redirect_boundary_node(&mut self, from: NodeIndex, to: NodeIndex) {
+        for idx in self.inputs.iter_mut().chain(self.outputs.iter_mut()) {
+            if *idx == from {
+                *idx = to;
+            }
+        }
     }
 
     /// Iterate over all nodes

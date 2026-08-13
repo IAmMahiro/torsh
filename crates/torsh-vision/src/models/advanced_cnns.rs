@@ -108,7 +108,7 @@ impl ConvNeXt {
                 false,
                 1,
             ))
-            .add(LayerNorm2d::new(config.dims[0]));
+            .add(LayerNorm2d::new(config.dims[0])?);
 
         // Build stages
         let mut stages = Vec::new();
@@ -266,7 +266,7 @@ impl ConvNeXtStage {
         let downsample = if add_downsample {
             Some(
                 Sequential::new()
-                    .add(LayerNorm2d::new(in_dim))
+                    .add(LayerNorm2d::new(in_dim)?)
                     .add(Conv2d::new(
                         in_dim,
                         out_dim,
@@ -349,7 +349,7 @@ pub struct ConvNeXtBlock {
 impl ConvNeXtBlock {
     pub fn new(dim: usize, drop_path: f32, layer_scale_init_value: f32) -> Result<Self> {
         let dwconv = Conv2d::new(dim, dim, (7, 7), (1, 1), (3, 3), (1, 1), false, dim); // Depthwise
-        let norm = LayerNorm2d::new(dim);
+        let norm = LayerNorm2d::new(dim)?;
         let pwconv1 = Conv2d::new(dim, 4 * dim, (1, 1), (1, 1), (0, 0), (1, 1), false, 1);
         let act = GELU::new();
         let pwconv2 = Conv2d::new(4 * dim, dim, (1, 1), (1, 1), (0, 0), (1, 1), false, 1);
@@ -436,19 +436,20 @@ pub struct LayerNorm2d {
 }
 
 impl LayerNorm2d {
-    pub fn new(num_channels: usize) -> Self {
-        let weight = Parameter::new(
-            creation::ones(&[num_channels]).expect("tensor creation should succeed"),
-        );
-        let bias = Parameter::new(
-            creation::zeros(&[num_channels]).expect("tensor creation should succeed"),
-        );
+    /// Create a 2D layer normalization over `num_channels` channels
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parameter tensors cannot be allocated.
+    pub fn new(num_channels: usize) -> Result<Self> {
+        let weight = Parameter::new(creation::ones(&[num_channels])?);
+        let bias = Parameter::new(creation::zeros(&[num_channels])?);
 
-        Self {
+        Ok(Self {
             weight,
             bias,
             eps: 1e-6,
-        }
+        })
     }
 }
 
@@ -460,41 +461,47 @@ impl Module for LayerNorm2d {
         // Input shape: [N, C, H, W]
         // Normalize over spatial dimensions for each channel
         let shape = input.shape();
-        let n = shape.dims()[0];
-        let c = shape.dims()[1];
-        let h = shape.dims()[2];
-        let w = shape.dims()[3];
+        let dims = shape.dims();
+
+        if dims.len() != 4 {
+            return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                "LayerNorm2d expects a 4D (N, C, H, W) input, got {}D with shape {:?}",
+                dims.len(),
+                dims
+            )));
+        }
+
+        let n = dims[0];
+        let c = dims[1];
+        let h = dims[2];
+        let w = dims[3];
+
+        if h == 0 || w == 0 {
+            return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                "LayerNorm2d cannot normalize over an empty spatial extent (H={}, W={}); \
+                 the input has been pooled below 1x1",
+                h, w
+            )));
+        }
+        if n == 0 || c == 0 {
+            return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                "LayerNorm2d requires a non-empty batch and channel extent, got N={}, C={}",
+                n, c
+            )));
+        }
 
         // Reshape to [N*C, H*W] for easier computation
         let x_reshaped = input.view(&[n as i32 * c as i32, h as i32 * w as i32])?;
 
-        // Manual computation to avoid .item() issues in variance calculation
-        let mut means = Vec::new();
-        let mut variances = Vec::new();
-
-        for i in 0..(n * c) {
-            let channel_data = x_reshaped.narrow(0, i as i64, 1)?.squeeze(0)?; // [H*W]
-            let channel_vec = channel_data.to_vec()?;
-
-            // Compute mean
-            let sum: f32 = channel_vec.iter().sum();
-            let mean_val = sum / (h * w) as f32;
-            means.push(mean_val);
-
-            // Compute variance
-            let var_sum: f32 = channel_vec.iter().map(|&x| (x - mean_val).powi(2)).sum();
-            let var_val = var_sum / (h * w) as f32;
-            variances.push(var_val);
-        }
-
-        // Create mean and variance tensors
-        let mean_tensor = Tensor::from_vec(means, &[n * c, 1])?;
-        let var_tensor = Tensor::from_vec(variances, &[n * c, 1])?;
+        // Tensor-level reductions keep the autograd graph intact: pulling the
+        // data out with to_vec()/from_vec() would detach the mean and variance
+        // from the input and silently produce wrong gradients.
+        let mean_tensor = x_reshaped.mean(Some(&[1]), true)?; // [N*C, 1]
+        let centered = x_reshaped.sub(&mean_tensor)?;
+        let var_tensor = centered.mul(&centered)?.mean(Some(&[1]), true)?; // [N*C, 1]
 
         // Normalize
-        let normalized = x_reshaped
-            .sub(&mean_tensor)?
-            .div(&var_tensor.add_scalar(self.eps)?.sqrt()?)?;
+        let normalized = centered.div(&var_tensor.add_scalar(self.eps)?.sqrt()?)?;
 
         // Reshape back to [N, C, H, W]
         let normalized = normalized.view(&[n as i32, c as i32, h as i32, w as i32])?;
@@ -1137,7 +1144,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "KNOWN ISSUE: LayerNorm2d fails with empty spatial dimensions (h*w=0). Edge case from aggressive pooling. Requires minimum input size validation (32x32+). Deferred to v0.2.0. See: TODO.md"]
     fn test_convnext_forward() {
         let model = ConvNeXt::convnext_tiny().expect("Conv Ne Xt should succeed");
         let input = randn::<f32>(&[1, 3, 224, 224]).expect("operation should succeed");
@@ -1154,7 +1160,7 @@ mod tests {
 
     #[test]
     fn test_layer_norm_2d() {
-        let norm = LayerNorm2d::new(64);
+        let norm = LayerNorm2d::new(64).expect("LayerNorm2d creation should succeed");
         let input = randn::<f32>(&[2, 64, 32, 32]).expect("operation should succeed");
         let output = norm.forward(&input).expect("forward pass should succeed");
         assert_eq!(output.shape().dims(), &[2, 64, 32, 32]);

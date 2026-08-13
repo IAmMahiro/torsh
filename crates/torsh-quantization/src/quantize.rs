@@ -15,169 +15,190 @@ fn calculate_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
-/// SIMD-optimized quantization for large arrays (when AVX2 is available)
-#[cfg(target_feature = "avx2")]
+/// Integer range of a quantization dtype.
+fn dtype_range(dtype: DType) -> TorshResult<(i32, i32)> {
+    match dtype {
+        DType::I8 => Ok((-128, 127)),
+        DType::U8 => Ok((0, 255)),
+        DType::I16 => Ok((-32768, 32767)),
+        _ => Err(TorshError::InvalidArgument(format!(
+            "Unsupported quantization dtype: {dtype:?}"
+        ))),
+    }
+}
+
+/// Fallback scalar quantization kernel clamped to an explicit `[qmin, qmax]` range.
 #[inline]
-fn quantize_simd_f32_to_i8(data: &[f32], scale: f32, zero_point: i32, output: &mut [i8]) {
+fn quantize_scalar_f32(
+    data: &[f32],
+    scale: f32,
+    zero_point: i32,
+    qmin: i32,
+    qmax: i32,
+    output: &mut [f32],
+) {
+    let inv_scale = 1.0 / scale;
+    let zero_point_f32 = zero_point as f32;
+    let (lo, hi) = (qmin as f32, qmax as f32);
+
+    for (out, &val) in output.iter_mut().zip(data.iter()) {
+        *out = ((val * inv_scale).round() + zero_point_f32).clamp(lo, hi);
+    }
+}
+
+/// AVX2 + FMA quantization kernel.
+///
+/// Ties are rounded to even (the hardware rounding mode), which may differ from
+/// the scalar kernel's round-half-away-from-zero for values exactly on `.5`.
+///
+/// # Safety
+///
+/// The caller must ensure the `avx2` and `fma` CPU features are available and
+/// that `output.len() == data.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn quantize_avx2_f32(
+    data: &[f32],
+    scale: f32,
+    zero_point: i32,
+    qmin: i32,
+    qmax: i32,
+    output: &mut [f32],
+) {
     use std::arch::x86_64::*;
 
-    let inv_scale = 1.0 / scale;
-    let zero_point_f32 = zero_point as f32;
+    let inv_scale_vec = _mm256_set1_ps(1.0 / scale);
+    let zero_point_vec = _mm256_set1_ps(zero_point as f32);
+    let min_vec = _mm256_set1_ps(qmin as f32);
+    let max_vec = _mm256_set1_ps(qmax as f32);
 
-    let chunks = data.chunks_exact(8);
-    let remainder = chunks.remainder();
-
-    unsafe {
-        let inv_scale_vec = _mm256_set1_ps(inv_scale);
-        let zero_point_vec = _mm256_set1_ps(zero_point_f32);
-        let min_val = _mm256_set1_ps(-128.0);
-        let max_val = _mm256_set1_ps(127.0);
-
-        for (i, chunk) in chunks.enumerate() {
-            let input = _mm256_loadu_ps(chunk.as_ptr());
-            let scaled = _mm256_fmadd_ps(input, inv_scale_vec, zero_point_vec);
-            let rounded = _mm256_round_ps(scaled, _MM_FROUND_TO_NEAREST_INT);
-            let clamped = _mm256_max_ps(_mm256_min_ps(rounded, max_val), min_val);
-
-            let as_i32 = _mm256_cvtps_epi32(clamped);
-            let as_i16_lo = _mm256_extracti128_si256(as_i32, 0);
-            let as_i16_hi = _mm256_extracti128_si256(as_i32, 1);
-            let as_i16 = _mm_packs_epi32(as_i16_lo, as_i16_hi);
-            let as_i8 = _mm_packs_epi16(as_i16, as_i16);
-
-            _mm_storel_epi64(output[i * 8..].as_mut_ptr() as *mut __m128i, as_i8);
-        }
+    let n_chunks = data.len() / 8;
+    for i in 0..n_chunks {
+        let base = i * 8;
+        let input = _mm256_loadu_ps(data.as_ptr().add(base));
+        let scaled = _mm256_fmadd_ps(input, inv_scale_vec, zero_point_vec);
+        let rounded = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(scaled);
+        let clamped = _mm256_max_ps(_mm256_min_ps(rounded, max_vec), min_vec);
+        _mm256_storeu_ps(output.as_mut_ptr().add(base), clamped);
     }
 
-    // Process remainder
-    for (i, &val) in remainder.iter().enumerate() {
-        let quantized = (val * inv_scale + zero_point_f32).round();
-        output[chunks.len() * 8 + i] = quantized.max(-128.0).min(127.0) as i8;
+    // Process the tail with the scalar kernel
+    let processed = n_chunks * 8;
+    if processed < data.len() {
+        quantize_scalar_f32(
+            &data[processed..],
+            scale,
+            zero_point,
+            qmin,
+            qmax,
+            &mut output[processed..],
+        );
     }
 }
 
-/// Ultra-high-performance AVX-512 VNNI quantization for latest Intel processors
-#[cfg(all(
-    target_feature = "avx512f",
-    target_feature = "avx512vnni",
-    target_feature = "avx512bw"
-))]
-#[inline]
-fn quantize_avx512_vnni_f32_to_i8(data: &[f32], scale: f32, zero_point: i32, output: &mut [i8]) {
+/// AVX-512F quantization kernel processing 16 lanes per iteration.
+///
+/// # Safety
+///
+/// The caller must ensure the `avx512f` CPU feature is available and that
+/// `output.len() == data.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn quantize_avx512_f32(
+    data: &[f32],
+    scale: f32,
+    zero_point: i32,
+    qmin: i32,
+    qmax: i32,
+    output: &mut [f32],
+) {
     use std::arch::x86_64::*;
 
-    let inv_scale = 1.0 / scale;
-    let zero_point_f32 = zero_point as f32;
+    let inv_scale_vec = _mm512_set1_ps(1.0 / scale);
+    let zero_point_vec = _mm512_set1_ps(zero_point as f32);
+    let min_vec = _mm512_set1_ps(qmin as f32);
+    let max_vec = _mm512_set1_ps(qmax as f32);
 
-    let chunks = data.chunks_exact(16); // AVX-512 processes 16 f32 at once
-    let remainder = chunks.remainder();
-
-    unsafe {
-        let inv_scale_vec = _mm512_set1_ps(inv_scale);
-        let zero_point_vec = _mm512_set1_ps(zero_point_f32);
-        let min_val = _mm512_set1_ps(-128.0);
-        let max_val = _mm512_set1_ps(127.0);
-
-        for (i, chunk) in chunks.enumerate() {
-            // Load 16 f32 values
-            let input = _mm512_loadu_ps(chunk.as_ptr());
-
-            // Scale and add zero point with FMA
-            let scaled = _mm512_fmadd_ps(input, inv_scale_vec, zero_point_vec);
-
-            // Round to nearest integer
-            let rounded = _mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT);
-
-            // Clamp to quantization range
-            let clamped = _mm512_max_ps(_mm512_min_ps(rounded, max_val), min_val);
-
-            // Convert to i32 then pack to i8
-            let as_i32 = _mm512_cvtps_epi32(clamped);
-
-            // Pack i32 -> i16 -> i8 with saturation (AVX-512BW)
-            let as_i16 = _mm512_packs_epi32(as_i32, as_i32);
-            let as_i8_512 = _mm512_packs_epi16(as_i16, as_i16);
-
-            // Extract lower 128 bits containing our 16 i8 values
-            let as_i8_128 = _mm512_extracti32x4_epi32(as_i8_512, 0);
-            _mm_storeu_si128(output[i * 16..].as_mut_ptr() as *mut __m128i, as_i8_128);
-        }
+    let n_chunks = data.len() / 16;
+    for i in 0..n_chunks {
+        let base = i * 16;
+        let input = _mm512_loadu_ps(data.as_ptr().add(base));
+        let scaled = _mm512_fmadd_ps(input, inv_scale_vec, zero_point_vec);
+        // imm8 = 0x00: round to nearest (even), no scaling, suppress exceptions
+        let rounded = _mm512_roundscale_ps::<0x00>(scaled);
+        let clamped = _mm512_max_ps(_mm512_min_ps(rounded, max_vec), min_vec);
+        _mm512_storeu_ps(output.as_mut_ptr().add(base), clamped);
     }
 
-    // Process remainder with scalar code
-    for (i, &val) in remainder.iter().enumerate() {
-        let quantized = (val * inv_scale + zero_point_f32).round();
-        output[chunks.len() * 16 + i] = quantized.clamp(-128.0, 127.0) as i8;
+    // Process the tail with the scalar kernel
+    let processed = n_chunks * 16;
+    if processed < data.len() {
+        quantize_scalar_f32(
+            &data[processed..],
+            scale,
+            zero_point,
+            qmin,
+            qmax,
+            &mut output[processed..],
+        );
     }
 }
 
-/// Fallback scalar quantization
+/// Optimized quantization with runtime SIMD feature detection.
+///
+/// The SIMD kernels are compiled unconditionally on `x86_64` (they use
+/// `#[target_feature]` rather than compile-time `#[cfg(target_feature)]` gates),
+/// so they are always type-checked and are actually selected on default builds
+/// whenever the running CPU supports them.
 #[inline]
-fn quantize_scalar_f32_to_i8(data: &[f32], scale: f32, zero_point: i32, output: &mut [i8]) {
-    let inv_scale = 1.0 / scale;
-    let zero_point_f32 = zero_point as f32;
+fn quantize_optimized(data: &[f32], scale: f32, zero_point: i32, qmin: i32, qmax: i32) -> Vec<f32> {
+    let mut output = vec![0.0f32; data.len()];
 
-    for (i, &val) in data.iter().enumerate() {
-        let quantized = (val * inv_scale + zero_point_f32).round();
-        output[i] = quantized.clamp(-128.0, 127.0) as i8;
-    }
-}
-
-/// Optimized quantization with automatic SIMD detection and runtime feature detection
-#[inline]
-fn quantize_optimized(data: &[f32], scale: f32, zero_point: i32) -> Vec<f32> {
-    let mut output_i8 = vec![0i8; data.len()];
-
-    // Use the most advanced SIMD available at runtime
-    #[cfg(all(
-        target_feature = "avx512f",
-        target_feature = "avx512vnni",
-        target_feature = "avx512bw"
-    ))]
+    #[cfg(target_arch = "x86_64")]
     {
-        if data.len() >= 16
-            && is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512bw")
+        if data.len() >= 16 && std::arch::is_x86_feature_detected!("avx512f") {
+            // SAFETY: the avx512f feature was just verified at runtime and the
+            // output buffer has exactly the same length as the input.
+            unsafe { quantize_avx512_f32(data, scale, zero_point, qmin, qmax, &mut output) };
+            return output;
+        }
+        if data.len() >= 8
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
         {
-            quantize_avx512_vnni_f32_to_i8(data, scale, zero_point, &mut output_i8);
-        } else if data.len() >= 8 && is_x86_feature_detected!("avx2") {
-            quantize_simd_f32_to_i8(data, scale, zero_point, &mut output_i8);
-        } else {
-            quantize_scalar_f32_to_i8(data, scale, zero_point, &mut output_i8);
+            // SAFETY: the avx2/fma features were just verified at runtime and
+            // the output buffer has exactly the same length as the input.
+            unsafe { quantize_avx2_f32(data, scale, zero_point, qmin, qmax, &mut output) };
+            return output;
         }
     }
 
-    #[cfg(all(
-        target_feature = "avx2",
-        not(all(
-            target_feature = "avx512f",
-            target_feature = "avx512vnni",
-            target_feature = "avx512bw"
-        ))
-    ))]
-    {
-        if data.len() >= 8 && is_x86_feature_detected!("avx2") {
-            quantize_simd_f32_to_i8(data, scale, zero_point, &mut output_i8);
-        } else {
-            quantize_scalar_f32_to_i8(data, scale, zero_point, &mut output_i8);
-        }
-    }
-
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        quantize_scalar_f32_to_i8(data, scale, zero_point, &mut output_i8);
-    }
-
-    // Convert back to f32 for compatibility
-    output_i8.into_iter().map(|x| x as f32).collect()
+    quantize_scalar_f32(data, scale, zero_point, qmin, qmax, &mut output);
+    output
 }
 
 /// Quantize a tensor to INT8 using per-tensor affine quantization
+///
+/// This is the `DType::I8` specialisation of
+/// [`quantize_per_tensor_affine_dtype`].
 pub fn quantize_per_tensor_affine(
     tensor: &Tensor,
     scale: f32,
     zero_point: i32,
+) -> TorshResult<(Tensor, f32, i32)> {
+    quantize_per_tensor_affine_dtype(tensor, scale, zero_point, DType::I8)
+}
+
+/// Quantize a tensor using per-tensor affine quantization for a target dtype
+///
+/// The integer codes are clamped to the dtype's own range (`[0, 255]` for `U8`,
+/// `[-128, 127]` for `I8`, `[-32768, 32767]` for `I16`) and `zero_point` is
+/// validated against that same range.
+pub fn quantize_per_tensor_affine_dtype(
+    tensor: &Tensor,
+    scale: f32,
+    zero_point: i32,
+    dtype: DType,
 ) -> TorshResult<(Tensor, f32, i32)> {
     let data = tensor.data()?;
 
@@ -188,20 +209,21 @@ pub fn quantize_per_tensor_affine(
         ));
     }
 
-    if !(-128..=127).contains(&zero_point) {
-        return Err(TorshError::InvalidArgument(
-            "Zero point must be in range [-128, 127]".to_string(),
-        ));
+    let (qmin, qmax) = dtype_range(dtype)?;
+    if !(qmin..=qmax).contains(&zero_point) {
+        return Err(TorshError::InvalidArgument(format!(
+            "Zero point {zero_point} must be in range [{qmin}, {qmax}] for {dtype:?}"
+        )));
     }
 
     // Use optimized quantization with SIMD when available
     let quantized_f32: Vec<f32> = if data.len() > 1000 {
         // Use parallel processing for large tensors
         data.par_chunks(4096) // Process in cache-friendly chunks
-            .flat_map(|chunk| quantize_optimized(chunk, scale, zero_point))
+            .flat_map(|chunk| quantize_optimized(chunk, scale, zero_point, qmin, qmax))
             .collect()
     } else {
-        quantize_optimized(&data, scale, zero_point)
+        quantize_optimized(&data, scale, zero_point, qmin, qmax)
     };
 
     let quantized_tensor = Tensor::from_data(
@@ -213,10 +235,81 @@ pub fn quantize_per_tensor_affine(
     Ok((quantized_tensor?, scale, zero_point))
 }
 
-/// Quantize a tensor using symmetric quantization (zero_point = 0)
+/// Quantize a tensor using symmetric quantization (INT8, zero_point = 0)
 pub fn quantize_per_tensor_symmetric(tensor: &Tensor, scale: f32) -> TorshResult<(Tensor, f32)> {
     let (quantized_tensor, computed_scale, _) = quantize_per_tensor_affine(tensor, scale, 0)?;
     Ok((quantized_tensor, computed_scale))
+}
+
+/// Quantize a tensor using symmetric quantization for a target dtype
+///
+/// `zero_point` is the symmetric zero of `dtype` (`0` for signed types, the
+/// midpoint of the range for unsigned ones), as produced by
+/// [`calculate_symmetric_qparams`].
+pub fn quantize_per_tensor_symmetric_dtype(
+    tensor: &Tensor,
+    scale: f32,
+    zero_point: i32,
+    dtype: DType,
+) -> TorshResult<(Tensor, f32, i32)> {
+    quantize_per_tensor_affine_dtype(tensor, scale, zero_point, dtype)
+}
+
+/// Calculate symmetric quantization parameters from tensor statistics
+///
+/// Unlike [`calculate_qparams`] (affine), the scale is derived from the maximum
+/// absolute value: `scale = max_abs / (qmax - zero_point)`. Using the affine
+/// scale for a symmetric quantizer clips every value above half the range —
+/// for an input spanning `[-1, 3]` the tensor maximum would be reduced by a
+/// third.
+///
+/// The zero point is `0` for signed ranges and the midpoint of the range for
+/// unsigned ones (`128` for `U8`), because a `U8` quantizer with zero point `0`
+/// cannot represent negative values at all.
+pub fn calculate_symmetric_qparams(
+    tensor: &Tensor,
+    qmin: i32,
+    qmax: i32,
+) -> TorshResult<(f32, i32)> {
+    let data = tensor.data()?;
+
+    if data.is_empty() {
+        return Err(TorshError::InvalidArgument(
+            "Cannot calculate quantization parameters for empty tensor".to_string(),
+        ));
+    }
+
+    if qmin >= qmax {
+        return Err(TorshError::InvalidArgument(
+            "qmin must be less than qmax".to_string(),
+        ));
+    }
+
+    // `f32::max` ignores NaN, so a fold alone would silently accept NaN inputs
+    // and emit NaN codes; check every element explicitly, as the affine
+    // `calculate_qparams` does.
+    if data.iter().any(|val| !val.is_finite()) {
+        return Err(TorshError::InvalidArgument(
+            "Tensor contains non-finite values (NaN or infinity)".to_string(),
+        ));
+    }
+
+    let max_abs = data.iter().fold(0.0f32, |acc, &val| acc.max(val.abs()));
+
+    let zero_point = if qmin >= 0 {
+        (((qmin as i64) + (qmax as i64) + 1) / 2) as i32
+    } else {
+        0
+    };
+
+    let headroom = (qmax - zero_point).max(1) as f32;
+    let scale = if max_abs < 1e-7 {
+        1e-7 / headroom
+    } else {
+        max_abs / headroom
+    };
+
+    Ok((scale, zero_point))
 }
 
 /// Calculate quantization parameters (scale and zero_point) from tensor statistics
@@ -283,12 +376,25 @@ pub fn calculate_qparams(
     Ok((scale, zero_point))
 }
 
-/// Quantize using per-channel affine quantization
+/// Quantize using per-channel affine quantization into the INT8 range
 pub fn quantize_per_channel_affine(
     tensor: &Tensor,
     scales: &[f32],
     zero_points: &[i32],
     axis: usize,
+) -> TorshResult<(Tensor, Vec<f32>, Vec<i32>)> {
+    quantize_per_channel_affine_dtype(tensor, scales, zero_points, axis, DType::I8)
+}
+
+/// Quantize using per-channel affine quantization for a target dtype
+///
+/// Codes are clamped to the dtype's range rather than always to the INT8 range.
+pub fn quantize_per_channel_affine_dtype(
+    tensor: &Tensor,
+    scales: &[f32],
+    zero_points: &[i32],
+    axis: usize,
+    dtype: DType,
 ) -> TorshResult<(Tensor, Vec<f32>, Vec<i32>)> {
     let data = tensor.data()?;
     let binding = tensor.shape();
@@ -307,27 +413,100 @@ pub fn quantize_per_channel_affine(
         ));
     }
 
+    let (qmin, qmax) = dtype_range(dtype)?;
+    let (qmin_f, qmax_f) = (qmin as f32, qmax as f32);
+
+    for (channel, (&scale, &zero_point)) in scales.iter().zip(zero_points.iter()).enumerate() {
+        if scale <= 0.0 {
+            return Err(TorshError::InvalidArgument(format!(
+                "Scale for channel {channel} must be positive"
+            )));
+        }
+        if !(qmin..=qmax).contains(&zero_point) {
+            return Err(TorshError::InvalidArgument(format!(
+                "Zero point {zero_point} for channel {channel} must be in range \
+                 [{qmin}, {qmax}] for {dtype:?}"
+            )));
+        }
+    }
+
     // Calculate strides for the given axis (using optimized helper)
     let strides = calculate_strides(shape);
 
-    let mut quantized_data = vec![0i8; data.len()];
+    let quantized_f32: Vec<f32> = data
+        .iter()
+        .enumerate()
+        .map(|(idx, &x)| {
+            // Calculate which channel this element belongs to
+            let channel_idx = (idx / strides[axis]) % shape[axis];
+            let scale = scales[channel_idx];
+            let zero_point = zero_points[channel_idx];
 
-    for (idx, &x) in data.iter().enumerate() {
-        // Calculate which channel this element belongs to
-        let channel_idx = (idx / strides[axis]) % shape[axis];
-        let scale = scales[channel_idx];
-        let zero_point = zero_points[channel_idx];
+            // Quantize: q = round(x / scale) + zero_point
+            ((x / scale).round() + zero_point as f32).clamp(qmin_f, qmax_f)
+        })
+        .collect();
 
-        // Quantize: q = round(x / scale) + zero_point
-        let quantized = (x / scale).round() + zero_point as f32;
-        quantized_data[idx] = quantized.clamp(-128.0, 127.0) as i8;
-    }
-
-    // Convert to f32 tensor for compatibility
-    let quantized_f32: Vec<f32> = quantized_data.iter().map(|&x| x as f32).collect();
     let quantized_tensor = Tensor::from_data(quantized_f32, shape.to_vec(), tensor.device());
 
     Ok((quantized_tensor?, scales.to_vec(), zero_points.to_vec()))
+}
+
+/// Calculate per-channel symmetric quantization parameters
+///
+/// Returns `scales[c] = max_abs(channel c) / (qmax - zero_point)` and the
+/// symmetric zero point of `dtype` for every channel. See
+/// [`calculate_symmetric_qparams`] for why the affine scale must not be reused.
+pub fn calculate_per_channel_symmetric_qparams(
+    tensor: &Tensor,
+    axis: usize,
+    dtype: DType,
+) -> TorshResult<(Vec<f32>, Vec<i32>)> {
+    let data = tensor.data()?;
+    let binding = tensor.shape();
+    let shape = binding.dims();
+
+    if axis >= shape.len() {
+        return Err(TorshError::InvalidArgument(
+            "Axis out of bounds".to_string(),
+        ));
+    }
+
+    let (qmin, qmax) = dtype_range(dtype)?;
+    let zero_point = if qmin >= 0 {
+        (((qmin as i64) + (qmax as i64) + 1) / 2) as i32
+    } else {
+        0
+    };
+    let headroom = (qmax - zero_point).max(1) as f32;
+
+    if data.iter().any(|val| !val.is_finite()) {
+        return Err(TorshError::InvalidArgument(
+            "Tensor contains non-finite values (NaN or infinity)".to_string(),
+        ));
+    }
+
+    let channel_size = shape[axis];
+    let strides = calculate_strides(shape);
+    let mut channel_abs_max = vec![0.0f32; channel_size];
+
+    for (idx, &val) in data.iter().enumerate() {
+        let channel_idx = (idx / strides[axis]) % shape[axis];
+        channel_abs_max[channel_idx] = channel_abs_max[channel_idx].max(val.abs());
+    }
+
+    let scales = channel_abs_max
+        .iter()
+        .map(|&max_abs| {
+            if max_abs < 1e-7 {
+                1e-7 / headroom
+            } else {
+                max_abs / headroom
+            }
+        })
+        .collect();
+
+    Ok((scales, vec![zero_point; channel_size]))
 }
 
 /// Calculate per-channel quantization parameters
@@ -346,15 +525,7 @@ pub fn calculate_per_channel_qparams(
         ));
     }
 
-    let (qmin, qmax) = match dtype {
-        DType::I8 => (-128, 127),
-        DType::U8 => (0, 255),
-        _ => {
-            return Err(TorshError::InvalidArgument(
-                "Unsupported quantization dtype".to_string(),
-            ))
-        }
-    };
+    let (qmin, qmax) = dtype_range(dtype)?;
 
     let channel_size = shape[axis];
     let mut channel_mins = vec![f32::INFINITY; channel_size];
@@ -396,45 +567,32 @@ pub fn calculate_per_channel_qparams(
 }
 
 /// Quantize tensor with automatic parameter calculation
+///
+/// Per-channel schemes are rejected here because the scalar `(scale,
+/// zero_point)` return type cannot carry their parameters; use
+/// [`quantize_per_channel_auto`], which returns the full vectors.
 pub fn quantize_tensor_auto(
     tensor: &Tensor,
     dtype: DType,
     scheme: QScheme,
 ) -> TorshResult<(Tensor, f32, i32)> {
-    let (qmin, qmax) = match dtype {
-        DType::I8 => (-128, 127),
-        DType::U8 => (0, 255),
-        _ => {
-            return Err(TorshError::InvalidArgument(
-                "Unsupported quantization dtype".to_string(),
-            ))
-        }
-    };
-
-    let (scale, zero_point) = calculate_qparams(tensor, qmin, qmax, dtype)?;
+    let (qmin, qmax) = dtype_range(dtype)?;
 
     match scheme {
-        QScheme::PerTensorAffine => quantize_per_tensor_affine(tensor, scale, zero_point),
+        QScheme::PerTensorAffine => {
+            let (scale, zero_point) = calculate_qparams(tensor, qmin, qmax, dtype)?;
+            quantize_per_tensor_affine_dtype(tensor, scale, zero_point, dtype)
+        }
         QScheme::PerTensorSymmetric => {
-            let (quantized, computed_scale) = quantize_per_tensor_symmetric(tensor, scale)?;
-            Ok((quantized, computed_scale, 0))
+            let (scale, zero_point) = calculate_symmetric_qparams(tensor, qmin, qmax)?;
+            quantize_per_tensor_symmetric_dtype(tensor, scale, zero_point, dtype)
         }
-        QScheme::PerChannelAffine => {
-            // For per-channel, we need to specify the axis (default to 0 for weights)
-            let axis = 0;
-            let (scales, zero_points) = calculate_per_channel_qparams(tensor, axis, dtype)?;
-            let (quantized, _, _) =
-                quantize_per_channel_affine(tensor, &scales, &zero_points, axis)?;
-            // Return the first channel's parameters for compatibility
-            Ok((quantized, scales[0], zero_points[0]))
-        }
-        QScheme::PerChannelSymmetric => {
-            let axis = 0;
-            let (scales, _) = calculate_per_channel_qparams(tensor, axis, dtype)?;
-            let zero_points = vec![0; scales.len()];
-            let (quantized, _, _) =
-                quantize_per_channel_affine(tensor, &scales, &zero_points, axis)?;
-            Ok((quantized, scales[0], 0))
+        QScheme::PerChannelAffine | QScheme::PerChannelSymmetric => {
+            Err(TorshError::InvalidArgument(format!(
+                "{scheme:?} produces one scale/zero-point pair per channel which \
+                 cannot be returned through this scalar API; call \
+                 quantize_per_channel_auto instead"
+            )))
         }
         QScheme::Int4PerTensor => {
             // Use the quantize_int4_per_tensor function from lib.rs
@@ -483,12 +641,12 @@ pub fn quantize_per_channel_auto(
     match scheme {
         QScheme::PerChannelAffine => {
             let (scales, zero_points) = calculate_per_channel_qparams(tensor, axis, dtype)?;
-            quantize_per_channel_affine(tensor, &scales, &zero_points, axis)
+            quantize_per_channel_affine_dtype(tensor, &scales, &zero_points, axis, dtype)
         }
         QScheme::PerChannelSymmetric => {
-            let (scales, _) = calculate_per_channel_qparams(tensor, axis, dtype)?;
-            let zero_points = vec![0; scales.len()];
-            quantize_per_channel_affine(tensor, &scales, &zero_points, axis)
+            let (scales, zero_points) =
+                calculate_per_channel_symmetric_qparams(tensor, axis, dtype)?;
+            quantize_per_channel_affine_dtype(tensor, &scales, &zero_points, axis, dtype)
         }
         _ => Err(TorshError::InvalidArgument(
             "Scheme not supported for per-channel quantization".to_string(),
@@ -566,6 +724,59 @@ pub fn prepare_qat(module: &mut dyn crate::qat::Module) -> TorshResult<()> {
 mod tests {
     use super::*;
     use torsh_tensor::creation::{tensor_1d, tensor_2d};
+
+    /// F249: the runtime-dispatched kernel must agree with the scalar
+    /// reference for both the signed and the unsigned code range.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_simd_dispatch_matches_scalar_kernel() {
+        let data: Vec<f32> = (0..133).map(|i| (i as f32 - 66.0) * 0.37).collect();
+        let scale = 0.05;
+
+        for (qmin, qmax, zero_point) in [(-128, 127, -3), (0, 255, 170)] {
+            let mut expected = vec![0.0f32; data.len()];
+            quantize_scalar_f32(&data, scale, zero_point, qmin, qmax, &mut expected);
+            let actual = quantize_optimized(&data, scale, zero_point, qmin, qmax);
+
+            for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                // SIMD rounds ties to even, the scalar kernel rounds ties away
+                // from zero, so a one-code difference is admissible.
+                assert!(
+                    (a - e).abs() <= 1.0,
+                    "lane {i}: simd {a} vs scalar {e} (range [{qmin}, {qmax}])"
+                );
+                assert!((qmin as f32..=qmax as f32).contains(a));
+            }
+        }
+    }
+
+    /// F249: the AVX2 kernel itself must compile and produce correct codes.
+    /// Skipped at runtime on CPUs without AVX2/FMA, but always type-checked.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx2_kernel_matches_scalar_kernel() {
+        if !std::arch::is_x86_feature_detected!("avx2")
+            || !std::arch::is_x86_feature_detected!("fma")
+        {
+            return;
+        }
+
+        let data: Vec<f32> = (0..37).map(|i| (i as f32 - 18.0) * 0.31).collect();
+        let (scale, zero_point, qmin, qmax) = (0.05f32, 12, -128, 127);
+
+        let mut expected = vec![0.0f32; data.len()];
+        quantize_scalar_f32(&data, scale, zero_point, qmin, qmax, &mut expected);
+
+        let mut actual = vec![0.0f32; data.len()];
+        // SAFETY: avx2 and fma were verified above; buffers have equal length.
+        unsafe {
+            quantize_avx2_f32(&data, scale, zero_point, qmin, qmax, &mut actual);
+        }
+
+        for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!((a - e).abs() <= 1.0, "lane {i}: avx2 {a} vs scalar {e}");
+        }
+    }
 
     #[test]
     fn test_calculate_qparams() {

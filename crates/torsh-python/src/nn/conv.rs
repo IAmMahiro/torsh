@@ -26,6 +26,7 @@ pub struct PyConv2d {
 #[pymethods]
 impl PyConv2d {
     #[new]
+    #[pyo3(signature = (in_channels, out_channels, kernel_size, stride=None, padding=None, dilation=None, groups=None, bias=None))]
     fn new(
         in_channels: usize,
         out_channels: usize,
@@ -35,7 +36,7 @@ impl PyConv2d {
         dilation: Option<Py<PyAny>>,
         groups: Option<usize>,
         bias: Option<bool>,
-    ) -> PyResult<(Self, PyModule)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let has_bias = bias.unwrap_or(true);
         let groups = groups.unwrap_or(1);
 
@@ -135,7 +136,8 @@ impl PyConv2d {
                 training: true,
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through the convolutional layer
@@ -243,6 +245,7 @@ pub struct PyConv1d {
 #[pymethods]
 impl PyConv1d {
     #[new]
+    #[pyo3(signature = (in_channels, out_channels, kernel_size, stride=None, padding=None, dilation=None, groups=None, bias=None))]
     fn new(
         in_channels: usize,
         out_channels: usize,
@@ -252,7 +255,7 @@ impl PyConv1d {
         dilation: Option<usize>,
         groups: Option<usize>,
         bias: Option<bool>,
-    ) -> PyResult<(Self, PyModule)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let has_bias = bias.unwrap_or(true);
         let stride = stride.unwrap_or(1);
         let padding = padding.unwrap_or(0);
@@ -286,7 +289,8 @@ impl PyConv1d {
                 training: true,
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through the 1D convolutional layer

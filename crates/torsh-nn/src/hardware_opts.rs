@@ -1,18 +1,19 @@
-//! Hardware-Specific Layer Optimizations
+//! Hardware detection and hardware-aware layers
 //!
-//! This module provides hardware-aware layer implementations that automatically
-//! select the best implementation based on available hardware features:
-//! - SIMD optimizations (AVX2, AVX-512, NEON)
-//! - GPU tensor core utilization
-//! - Cache-optimized memory layouts
-//! - Quantized inference kernels
+//! This module detects the running machine's capabilities (AVX2/AVX-512/NEON,
+//! GPU availability, cache sizes, core count) and exposes them as a
+//! [`HardwareContext`] that layers can consult — for tile sizes, for CPU/GPU
+//! selection, and for reporting.
 //!
-//! # SciRS2 Policy Compliance
+//! # What is and is not accelerated here
 //!
-//! All hardware-specific operations use scirs2-core abstractions:
-//! - SIMD: `scirs2_core::simd_ops::SimdUnifiedOps`
-//! - GPU: `scirs2_core::gpu` (when available)
-//! - Parallel: `scirs2_core::parallel_ops`
+//! The layers in this module do **not** contain hand-written per-ISA kernels.
+//! Their matrix products go through `Tensor::matmul`, which dispatches to a
+//! blocked SIMD GEMM (`scirs2_core::ndarray`'s `general_mat_mul` for `f32`/`f64`)
+//! and therefore already uses the widest instruction set the CPU supports.
+//! Paths that would claim more than that — a "GPU" path silently running on the
+//! CPU, or an "AVX-512" branch identical to the generic one — return an error
+//! instead.
 //!
 //! # Examples
 //!
@@ -22,18 +23,16 @@
 //! // Auto-detect hardware capabilities
 //! let ctx = HardwareContext::auto_detect();
 //!
-//! // Create hardware-optimized linear layer
+//! // Create a linear layer bound to that context
 //! let layer = HardwareLinear::new(784, 128, true, &ctx)?;
 //!
-//! // Forward pass automatically uses best available implementation
+//! // Forward pass runs through the blocked SIMD GEMM
 //! let output = layer.forward(&input)?;
 //! ```
 
 use crate::{Module, ModuleBase, Parameter};
 use std::collections::HashMap;
-use torsh_core::error::Result;
-#[cfg(not(feature = "cuda"))]
-use torsh_core::error::TorshError;
+use torsh_core::error::{Result, TorshError};
 use torsh_tensor::{creation::*, Tensor};
 
 // ================================================================================================
@@ -273,12 +272,14 @@ impl Default for HardwareContext {
 // Hardware-Optimized Linear Layer
 // ================================================================================================
 
-/// Hardware-optimized linear layer
+/// Linear layer that carries a [`HardwareContext`].
 ///
-/// Automatically selects the best implementation based on:
-/// - Available SIMD instructions (AVX2, AVX-512, NEON)
-/// - GPU availability and tensor core support
-/// - Cache sizes for tiling strategies
+/// The matrix product runs through `Tensor::matmul`, whose GEMM already selects
+/// a SIMD kernel for the running CPU; this type does not add per-ISA branches of
+/// its own. What it does add is an explicit hardware context — detected
+/// capabilities, cache-derived tile size, CPU/GPU preference — that callers can
+/// inspect and that governs whether a GPU path is requested (and, until a GPU
+/// kernel exists, honestly refused).
 ///
 /// # Examples
 ///
@@ -324,144 +325,43 @@ impl HardwareLinear {
         })
     }
 
-    /// Forward pass with hardware-specific optimizations
+    /// Forward pass.
+    ///
+    /// # Dispatch
+    ///
+    /// The CPU path goes straight to `Self::forward_generic`, which routes to
+    /// `Tensor::matmul` — a blocked, SIMD GEMM (`scirs2_core::ndarray`'s
+    /// `general_mat_mul` for `f32`/`f64`, a cache-blocked `i-k-j` kernel
+    /// otherwise). There are deliberately no separate AVX-512/AVX2/NEON
+    /// branches here: hand-written per-ISA branches that merely call the same
+    /// GEMM advertise an acceleration that does not exist, and the GEMM already
+    /// dispatches on the ISA internally. The detected
+    /// [`HardwareCapabilities`] still drive tiling decisions through
+    /// [`HardwareContext::tile_size`].
+    ///
+    /// A GPU-preferring context returns an error rather than silently running
+    /// on the CPU, so "GPU" never means "CPU with a different label".
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        // Select implementation based on hardware
         if self.context.use_gpu() {
             self.forward_gpu(input)
-        } else if self.context.capabilities().has_avx512 {
-            self.forward_avx512(input)
-        } else if self.context.capabilities().has_avx2 {
-            self.forward_avx2(input)
-        } else if self.context.capabilities().has_neon {
-            self.forward_neon(input)
         } else {
             self.forward_generic(input)
         }
     }
 
-    /// GPU-accelerated forward pass
-    #[cfg(feature = "cuda")]
-    fn forward_gpu(&self, input: &Tensor) -> Result<Tensor> {
-        // Use GPU backend if available
-        let weight = self.base.parameters["weight"].tensor().read().clone();
-        let bias_opt = if self.use_bias {
-            Some(self.base.parameters["bias"].tensor().read().clone())
-        } else {
-            None
-        };
-
-        // TODO: Use actual GPU kernel through scirs2_core::gpu
-        // For now, fall back to generic
-        crate::functional::linear(input, &weight, bias_opt.as_ref())
-    }
-
-    #[cfg(not(feature = "cuda"))]
+    /// GPU forward pass.
+    ///
+    /// No GPU kernel is wired into this layer yet. Returning an error keeps the
+    /// contract honest: a caller that asked for GPU execution is told it is not
+    /// available instead of being handed a CPU result that it believes ran on
+    /// the device.
     fn forward_gpu(&self, _input: &Tensor) -> Result<Tensor> {
-        Err(TorshError::Other(
-            "GPU support not enabled (cuda feature required)".to_string(),
+        Err(TorshError::Unimplemented(
+            "HardwareLinear has no GPU kernel: build a CPU context with \
+             HardwareContext::cpu_only(), or run the layer through a GPU-enabled \
+             backend once one is wired up"
+                .to_string(),
         ))
-    }
-
-    /// AVX-512 optimized forward pass
-    #[cfg(target_arch = "x86_64")]
-    fn forward_avx512(&self, input: &Tensor) -> Result<Tensor> {
-        // Use SIMD operations through scirs2_core
-        #[cfg(feature = "simd")]
-        {
-            // TODO: Use scirs2_core::simd_ops::SimdUnifiedOps for AVX-512 intrinsics
-            let weight = self.base.parameters["weight"].tensor().read().clone();
-
-            // For AVX-512, process 16 floats at a time
-            // TODO: Implement tiled matmul with AVX-512 intrinsics through scirs2
-            // For now, use generic with hint that SIMD is available
-
-            let result = input.matmul(&weight)?;
-
-            if self.use_bias {
-                let bias = self.base.parameters["bias"].tensor().read().clone();
-                result.add(&bias)
-            } else {
-                Ok(result)
-            }
-        }
-
-        #[cfg(not(feature = "simd"))]
-        {
-            self.forward_generic(input)
-        }
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    fn forward_avx512(&self, input: &Tensor) -> Result<Tensor> {
-        self.forward_generic(input)
-    }
-
-    /// AVX2 optimized forward pass
-    #[cfg(target_arch = "x86_64")]
-    fn forward_avx2(&self, input: &Tensor) -> Result<Tensor> {
-        // Use SIMD operations through scirs2_core
-        #[cfg(feature = "simd")]
-        {
-            // TODO: Use scirs2_core::simd_ops::SimdUnifiedOps for AVX2 intrinsics
-            let weight = self.base.parameters["weight"].tensor().read().clone();
-
-            // For AVX2, process 8 floats at a time
-            // TODO: Implement tiled matmul with AVX2 intrinsics through scirs2
-            // For now, use generic with hint that SIMD is available
-
-            let result = input.matmul(&weight)?;
-
-            if self.use_bias {
-                let bias = self.base.parameters["bias"].tensor().read().clone();
-                result.add(&bias)
-            } else {
-                Ok(result)
-            }
-        }
-
-        #[cfg(not(feature = "simd"))]
-        {
-            self.forward_generic(input)
-        }
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    fn forward_avx2(&self, input: &Tensor) -> Result<Tensor> {
-        self.forward_generic(input)
-    }
-
-    /// NEON optimized forward pass (ARM)
-    #[cfg(target_arch = "aarch64")]
-    fn forward_neon(&self, input: &Tensor) -> Result<Tensor> {
-        // Use SIMD operations through scirs2_core
-        #[cfg(feature = "simd")]
-        {
-            // TODO: Use scirs2_core::simd_ops::SimdUnifiedOps for NEON intrinsics
-            let weight = self.base.parameters["weight"].tensor().read().clone();
-
-            // For NEON, process 4 floats at a time
-            // TODO: Implement tiled matmul with NEON intrinsics through scirs2
-
-            let result = input.matmul(&weight)?;
-
-            if self.use_bias {
-                let bias = self.base.parameters["bias"].tensor().read().clone();
-                result.add(&bias)
-            } else {
-                Ok(result)
-            }
-        }
-
-        #[cfg(not(feature = "simd"))]
-        {
-            self.forward_generic(input)
-        }
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    fn forward_neon(&self, _input: &Tensor) -> Result<Tensor> {
-        self.forward_generic(_input)
     }
 
     /// Generic (portable) forward pass

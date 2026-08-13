@@ -180,6 +180,10 @@ pub mod utils {
     use super::*;
 
     /// Generate random indices without replacement
+    ///
+    /// # Panics
+    ///
+    /// Panics if `k > n`. See [`try_random_indices`] for a non-panicking variant.
     pub fn random_indices(n: usize, k: usize, seed: Option<u64>) -> Vec<usize> {
         assert!(k <= n, "Cannot sample more items than available");
 
@@ -189,6 +193,38 @@ pub mod utils {
             None => Random::seed(42),
         };
 
+        random_indices_from_rng(n, k, &mut rng)
+    }
+
+    /// Fallible variant of [`random_indices`] that returns an error instead of
+    /// panicking when `k > n`.
+    pub fn try_random_indices(
+        n: usize,
+        k: usize,
+        seed: Option<u64>,
+    ) -> torsh_core::error::Result<Vec<usize>> {
+        if k > n {
+            return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                "Cannot sample {k} items without replacement from {n} available"
+            )));
+        }
+
+        // ✅ SciRS2 Policy Compliant - Using scirs2_core for random operations
+        let mut rng = match seed {
+            Some(s) => Random::seed(s),
+            None => Random::seed(42),
+        };
+
+        Ok(random_indices_from_rng(n, k, &mut rng))
+    }
+
+    /// Shared sampling core for [`random_indices`]/[`try_random_indices`], run
+    /// once `k <= n` is already known to hold.
+    fn random_indices_from_rng(
+        n: usize,
+        k: usize,
+        rng: &mut Random<scirs2_core::rngs::StdRng>,
+    ) -> Vec<usize> {
         if k == n {
             // Return all indices shuffled
             let mut indices: Vec<usize> = (0..n).collect();
@@ -198,24 +234,37 @@ pub mod utils {
             }
             indices
         } else if k <= n / 2 {
-            // Use rejection sampling for small k
+            // Use rejection sampling for small k, then shuffle the result: the
+            // HashSet-derived order is canonicalized via sort_unstable() first
+            // (HashSet iteration order is randomized per-process by RandomState
+            // and must not leak into the sampled order), and only then is it
+            // Fisher-Yates shuffled with the seeded RNG so the returned subset
+            // comes back in random order rather than ascending order.
             let mut selected = std::collections::HashSet::new();
             while selected.len() < k {
                 let idx = rng.gen_range(0..n);
                 selected.insert(idx);
             }
             let mut result: Vec<usize> = selected.into_iter().collect();
-            result.sort_unstable(); // Ensure deterministic ordering
+            result.sort_unstable(); // Canonicalize HashSet iteration order first
+            for i in (1..result.len()).rev() {
+                let j = rng.gen_range(0..=i);
+                result.swap(i, j);
+            }
             result
         } else {
-            // Use exclusion method for large k
+            // Use exclusion method for large k, then shuffle (same reasoning as above).
             let mut excluded = std::collections::HashSet::new();
             while excluded.len() < n - k {
                 let idx = rng.gen_range(0..n);
                 excluded.insert(idx);
             }
             let mut result: Vec<usize> = (0..n).filter(|&i| !excluded.contains(&i)).collect();
-            result.sort_unstable(); // Ensure deterministic ordering
+            result.sort_unstable(); // Canonicalize before shuffling
+            for i in (1..result.len()).rev() {
+                let j = rng.gen_range(0..=i);
+                result.swap(i, j);
+            }
             result
         }
     }
@@ -340,6 +389,11 @@ pub mod utils {
     }
 
     /// Generate k-fold cross-validation splits
+    ///
+    /// # Panics
+    ///
+    /// Panics if `k <= 1` or `k > dataset_size`. See [`try_kfold_splits`] for a
+    /// non-panicking variant.
     pub fn kfold_splits(
         dataset_size: usize,
         k: usize,
@@ -347,7 +401,36 @@ pub mod utils {
     ) -> Vec<(Vec<usize>, Vec<usize>)> {
         assert!(k > 1, "K must be greater than 1");
         assert!(k <= dataset_size, "K cannot be larger than dataset size");
+        kfold_splits_unchecked(dataset_size, k, seed)
+    }
 
+    /// Fallible variant of [`kfold_splits`] that returns an error instead of
+    /// panicking on an invalid `k`.
+    pub fn try_kfold_splits(
+        dataset_size: usize,
+        k: usize,
+        seed: Option<u64>,
+    ) -> torsh_core::error::Result<Vec<(Vec<usize>, Vec<usize>)>> {
+        if k <= 1 {
+            return Err(torsh_core::error::TorshError::InvalidArgument(
+                "K must be greater than 1".to_string(),
+            ));
+        }
+        if k > dataset_size {
+            return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                "K ({k}) cannot be larger than dataset size ({dataset_size})"
+            )));
+        }
+        Ok(kfold_splits_unchecked(dataset_size, k, seed))
+    }
+
+    /// Shared fold-building core for [`kfold_splits`]/[`try_kfold_splits`], run
+    /// once `1 < k <= dataset_size` is already known to hold.
+    fn kfold_splits_unchecked(
+        dataset_size: usize,
+        k: usize,
+        seed: Option<u64>,
+    ) -> Vec<(Vec<usize>, Vec<usize>)> {
         let indices = random_indices(dataset_size, dataset_size, seed);
         let fold_size = dataset_size / k;
         let mut splits = Vec::new();
@@ -369,6 +452,11 @@ pub mod utils {
     }
 
     /// Three-way split: train, validation, test
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ratios are invalid. See [`try_train_val_test_split`] for a
+    /// non-panicking variant.
     pub fn train_val_test_split(
         dataset_size: usize,
         train_ratio: f32,
@@ -383,7 +471,43 @@ pub mod utils {
             train_ratio > 0.0 && val_ratio > 0.0,
             "Ratios must be positive"
         );
+        train_val_test_split_unchecked(dataset_size, train_ratio, val_ratio, seed)
+    }
 
+    /// Fallible variant of [`train_val_test_split`] that returns an error instead
+    /// of panicking on invalid ratios.
+    pub fn try_train_val_test_split(
+        dataset_size: usize,
+        train_ratio: f32,
+        val_ratio: f32,
+        seed: Option<u64>,
+    ) -> torsh_core::error::Result<(Vec<usize>, Vec<usize>, Vec<usize>)> {
+        if !(train_ratio + val_ratio < 1.0) {
+            return Err(torsh_core::error::TorshError::InvalidArgument(
+                "Train and val ratios must sum to less than 1.0".to_string(),
+            ));
+        }
+        if !(train_ratio > 0.0 && val_ratio > 0.0) {
+            return Err(torsh_core::error::TorshError::InvalidArgument(
+                "Ratios must be positive".to_string(),
+            ));
+        }
+        Ok(train_val_test_split_unchecked(
+            dataset_size,
+            train_ratio,
+            val_ratio,
+            seed,
+        ))
+    }
+
+    /// Shared split core for [`train_val_test_split`]/[`try_train_val_test_split`],
+    /// run once the ratios are already known to be valid.
+    fn train_val_test_split_unchecked(
+        dataset_size: usize,
+        train_ratio: f32,
+        val_ratio: f32,
+        seed: Option<u64>,
+    ) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
         let train_size = (dataset_size as f32 * train_ratio).round() as usize;
         let val_size = (dataset_size as f32 * val_ratio).round() as usize;
         let _test_size = dataset_size - train_size - val_size;

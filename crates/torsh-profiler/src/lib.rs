@@ -166,6 +166,8 @@ pub use core::{
     MetricsScope,
     // Core profiler implementation
     Profiler,
+    // Aggregated event statistics returned by get_stats()/get_global_stats()
+    ProfilerEventStats,
     // Scope-based profiling
     ScopeGuard,
 };

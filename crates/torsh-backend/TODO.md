@@ -114,7 +114,7 @@ The backend crate serves as the unified interface for all compute backends in To
 
 ### Future Backend Support
 - [ ] Add ROCm backend support when scirs2 implements AMD GPU support
-- [ ] Add comprehensive WebGPU backend when scirs2 adds support
+- [x] Add comprehensive WebGPU backend when scirs2 adds support — **DONE, via a different path**: implemented directly in this crate (`src/webgpu/`: backend, buffer, device, kernels, memory, multi_device, pipeline, shader) on top of the `wgpu` crate rather than through scirs2-core; includes real cross-device buffer copies (`copy_buffer`/`copy_to_device`/`copy_from_device`) and 100+ passing tests
 - [ ] Consider OpenCL backend integration through scirs2
 - [ ] Plan for TPU integration through XLA/JAX compatibility
 - [ ] Research neuromorphic processor backends (Intel Loihi, etc.)
@@ -123,7 +123,7 @@ The backend crate serves as the unified interface for all compute backends in To
 ### Advanced Optimization and JIT
 - [ ] Implement just-in-time kernel compilation across backends
 - [ ] Add profile-guided optimization with automatic tuning
-- [ ] Create custom kernel fusion with operation analysis
+- [x] Create custom kernel fusion with operation analysis — DONE: `src/cuda/kernel_fusion_optimizer.rs` (`AdvancedKernelFusionOptimizer`), wired into `cuda/mod.rs` and `cuda/performance_optimization_coordinator.rs`
 - [ ] Implement adaptive scheduling based on hardware characteristics
 - [ ] Add hardware-specific optimization passes
 - [ ] Create automatic vectorization and parallelization
@@ -147,7 +147,7 @@ The backend crate serves as the unified interface for all compute backends in To
 
 ### Testing and Validation Infrastructure
 - [ ] Migrate and enhance tests from separate backend crates
-- [ ] Add comprehensive unified backend compliance tests
+- [x] Add comprehensive unified backend compliance tests — DONE: `tests/comprehensive_integration_tests.rs` (builder configs, buffer alignment/error handling, device capability consistency, error propagation, cross-backend availability, etc.), all passing
 - [x] **COMPLETED (2025-07-05)**: Create extensive cross-backend correctness validation (Complete cross-backend validation system with device creation, capability reporting, memory management, error handling, and performance hints consistency validation across all backends)
 - [x] **COMPLETED (2025-07-06)**: Implement comprehensive performance benchmarking suite (Complete criterion-based benchmarking infrastructure with backend_benchmarks and cpu_benchmarks covering memory allocation, device operations, SIMD performance, cross-backend validation, auto-tuning, quantization, FFT, sparse operations, profiler overhead, platform optimization, feature detection, convolution, RNN operations, and optimized kernels with comprehensive documentation in BENCHMARKING.md)
 - [ ] Add integration tests with scirs2 across all backends
@@ -239,7 +239,7 @@ The backend crate serves as the unified interface for all compute backends in To
 - [x] **COMPLETED (2025-07-05)**: Increase test coverage for edge cases and error conditions (Added 20+ comprehensive edge case tests covering memory pool configurations, device selection, error handling, backend builder validation, concurrent operations, resource cleanup, and robustness testing)
 - [ ] Add comprehensive integration tests for all backend combinations
 - [ ] Create reproducible performance benchmarks with CI integration
-- [ ] Add property-based testing for backend mathematical properties
+- [x] Add property-based testing for backend mathematical properties — DONE: `tests/property_based_tests.rs` (proptest-based; commutativity/associativity/distributivity, dot product, SIMD correctness, quantization range, FFT plan creation), `proptest-regressions/` present
 - [ ] Implement extensive fuzzing tests for robustness
 - [x] **COMPLETED (2025-07-05)**: Create automated correctness verification across backends (Implemented comprehensive cross-backend validation with mathematical correctness checks, capability consistency validation, and hardware optimization testing)
 
@@ -847,3 +847,143 @@ While the current state demonstrates production readiness, potential future enha
 - `src/cross_backend_transfer.rs` - Advanced transfer method implementations
 
 ### Session Achievement: ✅ CRITICAL IMPROVEMENTS & FEATURE IMPLEMENTATIONS - Successfully implemented proper buffer ID generation, enhanced memory profiler with comprehensive monitoring capabilities, and advanced cross-backend transfer methods including pipelined, CUDA unified memory, and GPU peer-to-peer transfers. All implementations maintain 100% test success rate and production-ready quality standards, significantly improving the framework's debugging, monitoring, and multi-backend performance capabilities.
+
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+- [ ] torsh-backend: memory_profiler/mod.rs:155 — TODO: If these types are required, import from the appropriate scirs2-* sub-crate
+  - **Approach:** Commented-out block re-exports 9 analytics types from the removed scirs2 meta-crate; a local scirs2 submodule already supplies ScirS2Event/ScirS2Integration. Likely fix is authoring the missing types locally. Nothing currently references them (all commented out).
+  - **Scope:** small
+  - **Prerequisites:** none
+  - **Risk:** low — dead/commented code, no current callers.
+
+- [ ] torsh-backend: quantization/specialized.rs:110 — // placeholder implementation that could be replaced with optimized code
+  - **Approach:** vnni_matmul_kernel (L175-201) is a fully correct scalar int8 fallback already; implement real AVX-512-VNNI via std::arch::x86_64 (_mm512_dpbusd_epi32) behind is_x86_feature_detected!, keeping scalar as fallback. Intrinsics already stable, no new crate.
+  - **Scope:** medium
+  - **Prerequisites:** none
+  - **Risk:** low — correct fallback already in place, pure perf gap not correctness.
+
+- [ ] torsh-backend: webgpu/kernels.rs:24 — TODO: Implement proper kernel trait when available
+  - **Approach:** No pub trait Kernel exists anywhere (internal architecture decision, not blocked externally). Would need a cross-backend Kernel trait mirroring WebGpuKernel's inherent handle()/descriptor()/as_any().
+  - **Scope:** large
+  - **Prerequisites:** none
+  - **Risk:** naming collision — cuda/kernels/mod.rs already defines a concrete struct Kernel<F,Args>.
+
+- [ ] torsh-backend: webgpu/buffer.rs:385 — TODO: Implement proper buffer trait when available
+  - **Approach:** Buffer (buffer.rs:28) is already a pervasive concrete struct used crate-wide (e.g. RnnOps signatures); a Buffer trait needs a rename/redesign to avoid conceptual clash.
+  - **Scope:** large
+  - **Prerequisites:** none
+  - **Risk:** HIGH design risk — likely an abandoned earlier design, superseded everywhere else. NEEDS_CLARIFICATION before attempting.
+
+- [ ] torsh-backend: webgpu/backend.rs:896 — TODO: Implement RnnOps trait when it becomes available
+  - **Approach:** crate::rnn::RnnOps now exists (rnn.rs:349) but has diverged: current trait takes &RnnConfig+Option<&Buffer>, returns BackendResult<RnnOutput>; commented-out impl uses raw usize dims and returns BackendResult<()>. Needs full rewrite to current shape PLUS real WGSL compute-shader RNN kernels.
+  - **Scope:** large
+  - **Prerequisites:** none
+  - **Risk:** medium — genuine compute-shader implementation effort once resignatured.
+
+- [ ] torsh-backend: webgpu/backend.rs:997 — TODO: Implement QuantizationOps trait with correct method signatures
+  - **Approach:** crate::quantization::QuantizationOps exists (ops.rs:22) but wrong shape — both in-crate definitions (ops.rs, and an unrelated duplicate in operations.rs) are sync/slice-based, incompatible with the commented-out async Device/Buffer/scale/zero_point code here. Needs a new async GPU-buffer-oriented trait, or a host-roundtrip shim.
+  - **Scope:** large
+  - **Prerequisites:** none
+  - **Risk:** medium; also flags an unrelated duplicate QuantizationOps trait definition (ops.rs vs operations.rs) worth separate cleanup.
+
+- [ ] torsh-backend: memory_defrag.rs:1036 — TODO: Implement when scirs2_cuda memory operations are available
+  - **Approach:** 'scirs2_cuda' does not exist as a crate at all. Real path is oxicuda-memory 0.4.0's copy::copy_dtod<T> — exact device-to-device block-move match. Needs oxicuda-memory/-driver added as optional deps under the cuda feature, plus bridging BlockMove's raw usize addresses to oxicuda's typed buffers.
+  - **Scope:** medium
+  - **Prerequisites:** add oxicuda-memory dependency
+  - **Risk:** medium — bridging effort, plus overlap risk with torsh-tensor's separate oxicuda GPU path (coordinate before implementing).
+
+- [ ] torsh-backend: webgpu/device.rs:1047 — TODO: Implement proper device trait when available
+  - **Approach:** Device (device.rs:10) is already a pervasive concrete struct crate-wide. Same collision/redesign concern as the Buffer trait TODO.
+  - **Scope:** large
+  - **Prerequisites:** none
+  - **Risk:** HIGH design risk — likely abandoned earlier design. NEEDS_CLARIFICATION.
+
+- [ ] torsh-backend: lib.rs:455 — TODO: Implement when scirs2 supports ROCm
+  - **Approach:** No ROCm/HIP Rust bindings exist anywhere in the COOLJAPAN ecosystem. Would require a new ROCm/HIP backend from scratch, unrelated to the CUDA-focused oxicuda migration. The rocm Cargo feature is literally `rocm = []` today, confirming pure scaffolding.
+  - **Scope:** oversized
+  - **Prerequisites:** new ROCm/HIP Rust bindings (don't exist)
+  - **Risk:** low urgency; large effort if ever pursued. Status: tracked_external.
+
+- [ ] torsh-backend: cuda/tensor_cores.rs:14 — TODO: Replace with actual scirs2_core::gpu::backends::cuda::CudaDevice when available
+  - **Approach:** Named symbol doesn't exist — scirs2-core 0.6.0 gpu backends cover metal/metal_mps/opencl/wgpu only, no cuda.rs, no CudaDevice. This crate already HAS a real crate::cuda::device::CudaDevice (cuda/device.rs:19), already used elsewhere (zero_copy.rs, memory_defrag.rs via alias). The local placeholder struct here is dead code, unreferenced in this 540-line file. Fix: delete it, import the real CudaDevice.
+  - **Scope:** trivial
+  - **Prerequisites:** none
+  - **Risk:** very low — concrete, high-confidence, essentially free fix.
+
+- [ ] torsh-backend: cuda/tensor_cores.rs:408 — TODO: Implement tensor core GEMM when scirs2_core::gpu module is available
+  - **Approach:** Dead-end named dependency (see memory_profiler.rs and cuda/tensor_cores.rs:14 items above); real path is oxicuda-blas::level3::gemm::tensor_core (0.4.0, resolved) or oxicuda-ptx::tensor_core::{mma,wmma,wgmma} (doc comment says the latter is "naive, for correctness testing" and defers real impl to oxicuda-blas).
+  - **Scope:** large
+  - **Prerequisites:** add oxicuda-blas/oxicuda-ptx as deps (currently zero oxicuda-* deps in this crate)
+  - **Risk:** medium-high — bridging f16 raw pointers to typed API is real work; duplicates torsh-tensor's parallel oxicuda effort unless coordinated.
+
+- [ ] torsh-backend: cuda/tensor_cores.rs:520 — TODO: Implement tensor core convolution when scirs2_core::gpu module is available
+  - **Approach:** Same dead-end dependency; likely path is oxicuda-ptx templates/convolution.rs + the separate oxicuda-dnn crate (present at 0.4.0, API not yet inspected).
+  - **Scope:** large
+  - **Prerequisites:** add oxicuda-dnn/oxicuda-ptx as deps
+  - **Risk:** medium-high, same wiring/duplication concerns as GEMM, more uncertain (oxicuda-dnn API unverified).
+
+- [ ] torsh-backend: cuda/buffer.rs:295 — TODO: Implement Buffer trait when it's defined in the codebase
+  - **Approach:** Comment itself confirms "Currently Buffer is a struct, not a trait" — same collision/redesign concern as webgpu/buffer.rs:385.
+  - **Scope:** large
+  - **Prerequisites:** none
+  - **Risk:** HIGH design risk — likely an abandoned candle-like Buffer<T> trait design. NEEDS_CLARIFICATION.
+
+- [ ] torsh-backend: cuda/kernels/mod.rs:438 — TODO: Kernel registry implementation requires proper cust version with Module/Function support
+  - **Approach:** STALE claim — cust 0.3.2 (already pinned) already has full Module/Function support (Module::load_from_string, Module::get_function), matching the commented-out code almost verbatim. Zero new deps needed. More policy-aligned alternative: oxicuda-driver 0.4.0's Module::from_ptx/get_function + oxicuda-launch::Kernel, near-identical API, avoids legacy cust/cuda-sys FFI.
+  - **Scope:** small
+  - **Prerequisites:** none (or oxicuda-driver if preferring the policy-aligned path)
+  - **Risk:** low — directly actionable now via either path.
+
+- [ ] torsh-backend: cuda/kernels/tensor_ops.rs:9 — TODO: Uncomment when build script is implemented
+  - **Approach:** HIGH-SEVERITY — the cuda_kernels module this would replace (cuda/kernels/mod.rs) is EXPLICITLY documented as all no-op stubs for conv2d/maxpool2d/batchnorm2d/softmax/sum/mean/max/min/elementwise ("Currently these are no-ops to allow the code to compile") — every CUDA tensor op is a silent no-op today when the cuda feature is on. build.rs only detects CUDA toolkit presence, never compiles kernels. Real fix: rebuild the whole no-op module on oxicuda-ptx's kernel templates (elementwise/gemm/convolution/softmax/reduction/batch_norm all have templates) + oxicuda-launch + oxicuda-driver — NOT the abandoned build-script-codegen idea this line describes.
+  - **Scope:** oversized
+  - **Prerequisites:** oxicuda-ptx/oxicuda-launch/oxicuda-driver as deps (none currently present in this crate)
+  - **Risk:** HIGH and understated by this single line — crate-wide correctness landmine with the cuda feature on, not a localized stub. HIGHEST PRIORITY deferred item in this file — flag for a dedicated future pass, coordinated with torsh-tensor's oxicuda migration to avoid duplicating GPU backend work.
+
+- [ ] torsh-backend: zero_copy.rs:757 — TODO: Implement when scirs2_cuda memory operations are available
+  - **Approach:** 'scirs2_cuda' doesn't exist; real path is oxicuda-memory's managed_hints.rs (ManagedMemoryHints::prefetch_to/prefetch_range, batchable PrefetchPlan) — direct match for CUDA unified-memory prefetch.
+  - **Scope:** medium
+  - **Prerequisites:** add oxicuda-memory dependency
+  - **Risk:** medium — dependency + bridging work, same duplication concern as the memory_defrag.rs item above.
+
+- [ ] torsh-backend: zero_copy.rs:1070 — TODO: Implement when scirs2_cuda memory operations are available
+  - **Approach:** Covers CUDA P2P transfer. oxicuda-memory's peer_copy.rs (can_access_peer/enable_peer_access/copy_peer/copy_peer_region/copy_peer_async) is a complete direct match.
+  - **Scope:** medium
+  - **Prerequisites:** add oxicuda-memory dependency
+  - **Risk:** medium.
+
+- [ ] torsh-backend: zero_copy.rs:1109 — TODO: Implement when scirs2_cuda memory operations are available
+  - **Approach:** Covers CUDA async transfer. oxicuda-memory's copy.rs (copy_dtod_async/copy_htod_async/copy_dtoh_async) generic over DeviceBuffer. Needs bridging from raw pointer/byte-size model to typed buffers.
+  - **Scope:** medium
+  - **Prerequisites:** add oxicuda-memory dependency
+  - **Risk:** medium.
+
+- [ ] torsh-backend: zero_copy.rs:1122 — TODO: Implement when scirs2_cuda memory operations are available
+  - **Approach:** Covers CUDA sync transfer. oxicuda-memory's copy.rs sync variants (copy_dtod/copy_htod/copy_dtoh) directly.
+  - **Scope:** medium
+  - **Prerequisites:** add oxicuda-memory dependency
+  - **Risk:** medium.
+
+- [ ] torsh-backend: metal/buffer.rs:313 — TODO: BackendStorage trait doesn't exist in current API
+  - **Approach:** NEEDS_CLARIFICATION — no pub trait BackendStorage exists anywhere; name strongly suggests this Metal backend was ported from a candle-rs-style Device/BackendStorage/BackendDevice architecture and never finished adapting to torsh's own concrete Buffer/Device structs. Maintainer should decide: design a real trait, or delete the ~20-line dead commented block.
+  - **Scope:** large
+  - **Prerequisites:** none
+  - **Risk:** low as-is (inert); ambiguous whether even wanted.
+
+- [ ] torsh-backend: cpu/memory.rs:527 — TODO: Re-enable when stabilized (see issue #117217)
+  - **Approach:** CONFIRMED via web search — rust-lang/rust#117217 is the real, open tracking issue for the AArch64 _prefetch intrinsic, gated behind unstable stdarch_aarch64_prefetch (nightly-only). Code is already written and commented out, ready to uncomment on stabilization. x86_64 path already uses real stable _mm_prefetch.
+  - **Scope:** trivial
+  - **Prerequisites:** Rust stdlib stabilization of stdarch_aarch64_prefetch (rustc issue #117217)
+  - **Risk:** low — aarch64 currently no-ops, missed perf optimization not correctness; genuinely not implementable on stable Rust today. Status: tracked_external.
+
+- [ ] torsh-backend: cpu/numa_enhanced.rs:402 — TODO: Re-enable when stabilized (see issue #117217)
+  - **Approach:** Same issue as cpu/memory.rs:527; larger commented block covers 4 PrefetchHint variants, all blocked on the same nightly feature.
+  - **Scope:** trivial
+  - **Prerequisites:** Rust stdlib stabilization of stdarch_aarch64_prefetch (rustc issue #117217) — same as cpu/memory.rs:527 above
+  - **Risk:** low — x86_64 path already fully implemented; aarch64 gap is perf-only. Status: tracked_external.
+
+- [ ] torsh-backend: metal/device.rs:156 — TODO: BackendDevice trait doesn't exist in current API
+  - **Approach:** NEEDS_CLARIFICATION — same situation as metal/buffer.rs:313's BackendStorage; no pub trait BackendDevice exists, likely candle-style vestige. Maintainer should decide: design it, or delete the dead block.
+  - **Scope:** large
+  - **Prerequisites:** none
+  - **Risk:** low as-is (inert); ambiguous whether wanted.

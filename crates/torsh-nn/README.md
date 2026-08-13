@@ -182,24 +182,26 @@ if let Some(encoder) = blocks.get("encoder") {
 ### Parameter Management
 
 ```rust
-use torsh_nn::parameter::utils;
+use torsh_nn::utils::analysis;
+use torsh_nn::core::ModuleExt;
 
-// Count parameters
-let total = utils::count_parameters(&model.parameters());
-let trainable = utils::count_trainable_parameters(&model.parameters());
+// Count parameters (analysis functions take the module itself, not a Vec of params)
+let total = analysis::count_parameters(&model);
+let trainable = analysis::count_trainable_parameters(&model);
 
-// Freeze/unfreeze parameters
-utils::freeze_parameters(&encoder.parameters());
-utils::unfreeze_parameters(&decoder.parameters());
+// Freeze/unfreeze parameters matching a name pattern (ModuleExt trait methods)
+model.freeze_matching("encoder");
+model.unfreeze_matching("decoder");
 
 // Get parameter statistics
-let stats = utils::parameter_stats(&model.parameters());
-println!("{}", stats);
-
-// Gradient clipping
-utils::clip_grad_norm_(&mut model.parameters(), 1.0, 2.0);
-utils::clip_grad_value_(&mut model.parameters(), 0.5);
+let stats = analysis::parameter_statistics(&model);
+println!("Trainable: {:.1}%", stats.trainable_percentage());
 ```
+
+Note: `torsh_autograd::grad_mode::clip` is dead code (commented out in source). There is a
+`torsh_autograd::clip::clip_grad_norm` function, but it takes `&[&dyn AutogradTensor<T>]`, not
+the `Vec<Arc<RwLock<Tensor>>>` collections returned by `model.parameters()` — there is currently
+no drop-in gradient-clipping helper for torsh-nn `Parameter` collections.
 
 ## Integration with SciRS2
 

@@ -16,27 +16,42 @@ This crate provides comprehensive profiling capabilities for deep learning workl
 
 ### Basic Profiling
 
+The easiest way to profile a block of code is with the `profile_block!` (or
+`profile_current_function!`) macro, which records a scoped event automatically:
+
 ```rust
-use torsh_profiler::prelude::*;
+use torsh_profiler::profile_block;
 
-// Profile a model
-let profiler = Profiler::new()
-    .record_shapes(true)
-    .with_stack(true);
-
-with_profiler(&profiler, || {
-    for _ in 0..100 {
-        let output = model.forward(&input)?;
-        loss = criterion(&output, &target)?;
-        loss.backward()?;
-        optimizer.step()?;
-    }
-})?;
-
-// Get results
-let report = profiler.report();
-println!("{}", report);
+fn train_step() {
+    let output = profile_block!("forward", {
+        model.forward(&input)?
+    });
+    // ...
+}
 ```
+
+For lower-level control, use the core `Profiler` directly:
+
+```rust
+use torsh_profiler::{Profiler, ProfileEvent};
+
+let mut profiler = Profiler::new();
+profiler.start();
+
+// ... record events, e.g. via ProfileScope/macros that call profiler.add_event(...)
+
+profiler.stop();
+let (count, total_duration_us, _, min_us, max_us) = profiler.get_stats();
+println!("{count} events, {total_duration_us}us total (min {min_us}us, max {max_us}us)");
+```
+
+> **Note.** The three sections below (**Detailed Operation Profiling**, **Memory
+> Profiling**, **FLOPS Counting**) illustrate a *planned* builder-style API and
+> do **not** compile against this release — the fluent methods
+> (`activities`/`step`/`export_chrome_trace`, `MemoryProfiler::track_allocations`/
+> `snapshot`/`find_leaks`, `FlopCounter`) are not yet implemented. The working
+> API today is the **Basic Profiling** section above (`profile_block!`, the core
+> `Profiler`, `profile_memory()`, and `export_chrome_trace_format(...)`).
 
 ### Detailed Operation Profiling
 
@@ -125,21 +140,19 @@ for (module_name, flops) in breakdown {
 ### Custom Profiling Regions
 
 ```rust
-use torsh_profiler::profile;
+use torsh_profiler::profile_block;
 
-// Profile specific code regions
-profile!("data_preprocessing", {
+// Profile specific code regions - the guard automatically records
+// the event's duration when it goes out of scope
+let (normalized, augmented) = profile_block!("data_preprocessing", {
     let normalized = normalize(&data)?;
     let augmented = augment(&normalized)?;
-    augmented
+    (normalized, augmented)
 });
-
-// Or with explicit profiler
-let profiler = Profiler::current();
-let _guard = profiler.record("critical_section");
-// Critical code here
-// _guard automatically stops profiling when dropped
 ```
+
+Other macros cover more specific cases: `profile_current_function!()`, `profile_closure!`,
+`profile_async!`, `profile_loop!`, `profile_with_metadata!`, and more (see `src/macros.rs`).
 
 ### TensorBoard Integration
 
@@ -268,6 +281,10 @@ The profiler can export data in various formats:
 3. Profile both training and inference
 4. Look for memory allocation patterns
 5. Check for unnecessary synchronizations
+
+## Testing
+
+This crate has 292 passing tests, 3 skipped (`cargo nextest run -p torsh-profiler --all-features`).
 
 ## License
 

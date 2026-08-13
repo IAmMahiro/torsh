@@ -237,7 +237,12 @@ pub trait ConvolutionOps: Send + Sync {
         config: &ConvolutionConfig,
     ) -> BackendResult<()>;
 
-    /// Execute a 2D convolution
+    /// Execute a 2D convolution.
+    ///
+    /// Shapes are given explicitly in NCHW layout — buffer byte-lengths alone
+    /// cannot recover a tensor's shape, so callers must supply them:
+    /// `input_shape = [N, C_in, H, W]`, `kernel_shape = [C_out, C_in, kH, kW]`.
+    #[allow(clippy::too_many_arguments)]
     async fn conv2d(
         &self,
         device: &Device,
@@ -245,12 +250,18 @@ pub trait ConvolutionOps: Send + Sync {
         kernel: &Buffer,
         bias: Option<&Buffer>,
         output: &Buffer,
+        input_shape: [usize; 4],
+        kernel_shape: [usize; 4],
         stride: (usize, usize),
         padding: (usize, usize),
         dilation: (usize, usize),
     ) -> BackendResult<()>;
 
-    /// Execute a depthwise convolution
+    /// Execute a depthwise convolution.
+    ///
+    /// `input_shape = [N, C, H, W]`, `kernel_shape = [C_out, 1, kH, kW]` where
+    /// `C_out = C * channel_multiplier` (groups are implicitly `C`).
+    #[allow(clippy::too_many_arguments)]
     async fn depthwise_conv2d(
         &self,
         device: &Device,
@@ -258,8 +269,11 @@ pub trait ConvolutionOps: Send + Sync {
         kernel: &Buffer,
         bias: Option<&Buffer>,
         output: &Buffer,
+        input_shape: [usize; 4],
+        kernel_shape: [usize; 4],
         stride: (usize, usize),
         padding: (usize, usize),
+        dilation: (usize, usize),
     ) -> BackendResult<()>;
 
     /// Execute a transposed convolution
@@ -275,7 +289,10 @@ pub trait ConvolutionOps: Send + Sync {
         output_padding: (usize, usize),
     ) -> BackendResult<()>;
 
-    /// Execute a grouped convolution
+    /// Execute a grouped convolution.
+    ///
+    /// `input_shape = [N, C_in, H, W]`, `kernel_shape = [C_out, C_in/groups, kH, kW]`.
+    #[allow(clippy::too_many_arguments)]
     async fn grouped_conv2d(
         &self,
         device: &Device,
@@ -283,9 +300,12 @@ pub trait ConvolutionOps: Send + Sync {
         kernel: &Buffer,
         bias: Option<&Buffer>,
         output: &Buffer,
+        input_shape: [usize; 4],
+        kernel_shape: [usize; 4],
         groups: usize,
         stride: (usize, usize),
         padding: (usize, usize),
+        dilation: (usize, usize),
     ) -> BackendResult<()>;
 
     /// Get the best algorithm for given configuration
@@ -368,6 +388,7 @@ impl ConvolutionOps for DefaultConvolutionOps {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn conv2d(
         &self,
         _device: &Device,
@@ -375,6 +396,8 @@ impl ConvolutionOps for DefaultConvolutionOps {
         _kernel: &Buffer,
         _bias: Option<&Buffer>,
         _output: &Buffer,
+        _input_shape: [usize; 4],
+        _kernel_shape: [usize; 4],
         _stride: (usize, usize),
         _padding: (usize, usize),
         _dilation: (usize, usize),
@@ -384,6 +407,7 @@ impl ConvolutionOps for DefaultConvolutionOps {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn depthwise_conv2d(
         &self,
         _device: &Device,
@@ -391,8 +415,11 @@ impl ConvolutionOps for DefaultConvolutionOps {
         _kernel: &Buffer,
         _bias: Option<&Buffer>,
         _output: &Buffer,
+        _input_shape: [usize; 4],
+        _kernel_shape: [usize; 4],
         _stride: (usize, usize),
         _padding: (usize, usize),
+        _dilation: (usize, usize),
     ) -> BackendResult<()> {
         Err(torsh_core::error::TorshError::BackendError(
             "Depthwise convolution not implemented for this backend".to_string(),
@@ -415,6 +442,7 @@ impl ConvolutionOps for DefaultConvolutionOps {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn grouped_conv2d(
         &self,
         _device: &Device,
@@ -422,9 +450,12 @@ impl ConvolutionOps for DefaultConvolutionOps {
         _kernel: &Buffer,
         _bias: Option<&Buffer>,
         _output: &Buffer,
+        _input_shape: [usize; 4],
+        _kernel_shape: [usize; 4],
         _groups: usize,
         _stride: (usize, usize),
         _padding: (usize, usize),
+        _dilation: (usize, usize),
     ) -> BackendResult<()> {
         Err(torsh_core::error::TorshError::BackendError(
             "Grouped convolution not implemented for this backend".to_string(),
@@ -488,7 +519,16 @@ pub mod algorithms {
     pub struct DirectConvolution;
 
     impl DirectConvolution {
-        /// Perform 2D convolution using direct approach
+        /// Perform 2D convolution using a direct approach.
+        ///
+        /// Supports dilation and grouped convolution (which also subsumes
+        /// depthwise convolution, expressed as `groups == in_channels`).
+        ///
+        /// Layout conventions (NCHW): `input_dims = [N, C_in, H, W]`,
+        /// `kernel_dims = [C_out, C_in / groups, kH, kW]`,
+        /// `output_dims = [N, C_out, out_H, out_W]`. The output spatial size
+        /// must satisfy `out = (in + 2*pad - dilation*(k-1) - 1) / stride + 1`.
+        #[allow(clippy::too_many_arguments)]
         pub fn conv2d_direct(
             input: &[f32],
             kernel: &[f32],
@@ -498,10 +538,12 @@ pub mod algorithms {
             output_dims: &[usize],
             stride: (usize, usize),
             padding: (usize, usize),
+            dilation: (usize, usize),
+            groups: usize,
         ) -> BackendResult<()> {
             let (batch, in_channels, in_h, in_w) =
                 (input_dims[0], input_dims[1], input_dims[2], input_dims[3]);
-            let (out_channels, _, k_h, k_w) = (
+            let (out_channels, kernel_in_per_group, k_h, k_w) = (
                 kernel_dims[0],
                 kernel_dims[1],
                 kernel_dims[2],
@@ -515,18 +557,81 @@ pub mod algorithms {
             );
             let (s_h, s_w) = stride;
             let (p_h, p_w) = padding;
+            let (d_h, d_w) = dilation;
+
+            if groups == 0 || in_channels % groups != 0 || out_channels % groups != 0 {
+                return Err(torsh_core::error::TorshError::BackendError(format!(
+                    "grouped convolution requires groups ({}) to divide both in_channels ({}) and out_channels ({})",
+                    groups, in_channels, out_channels
+                )));
+            }
+            if d_h == 0 || d_w == 0 || s_h == 0 || s_w == 0 {
+                return Err(torsh_core::error::TorshError::BackendError(
+                    "convolution stride and dilation must be non-zero".to_string(),
+                ));
+            }
+
+            let in_per_group = in_channels / groups;
+            let out_per_group = out_channels / groups;
+
+            if kernel_in_per_group != in_per_group {
+                return Err(torsh_core::error::TorshError::BackendError(format!(
+                    "kernel in-channels per group ({}) does not match in_channels/groups ({})",
+                    kernel_in_per_group, in_per_group
+                )));
+            }
+
+            // Validate slice lengths up front so the indexed inner loop can never
+            // go out of bounds (a bounds violation must be a returned error, not a
+            // panic from deep inside the kernel).
+            if input.len() < batch * in_channels * in_h * in_w {
+                return Err(torsh_core::error::TorshError::BackendError(format!(
+                    "input buffer ({} elems) too small for [{}, {}, {}, {}]",
+                    input.len(),
+                    batch,
+                    in_channels,
+                    in_h,
+                    in_w
+                )));
+            }
+            if kernel.len() < out_channels * in_per_group * k_h * k_w {
+                return Err(torsh_core::error::TorshError::BackendError(format!(
+                    "kernel buffer ({} elems) too small for [{}, {}, {}, {}]",
+                    kernel.len(),
+                    out_channels,
+                    in_per_group,
+                    k_h,
+                    k_w
+                )));
+            }
+            if output.len() < batch * out_channels * out_h * out_w {
+                return Err(torsh_core::error::TorshError::BackendError(format!(
+                    "output buffer ({} elems) too small for [{}, {}, {}, {}]",
+                    output.len(),
+                    batch,
+                    out_channels,
+                    out_h,
+                    out_w
+                )));
+            }
 
             for b in 0..batch {
                 for oc in 0..out_channels {
+                    // Each output channel only sees the input channels of its group.
+                    let group = oc / out_per_group;
+                    let ic_base = group * in_per_group;
+
                     for oh in 0..out_h {
                         for ow in 0..out_w {
                             let mut sum = 0.0;
 
-                            for ic in 0..in_channels {
+                            for icg in 0..in_per_group {
+                                let ic = ic_base + icg;
                                 for kh in 0..k_h {
                                     for kw in 0..k_w {
-                                        let ih = oh * s_h + kh;
-                                        let iw = ow * s_w + kw;
+                                        // Dilated tap position in the padded input.
+                                        let ih = oh * s_h + kh * d_h;
+                                        let iw = ow * s_w + kw * d_w;
 
                                         if ih >= p_h
                                             && iw >= p_w
@@ -541,8 +646,10 @@ pub mod algorithms {
                                                     + ic * in_h * in_w
                                                     + input_h * in_w
                                                     + input_w;
-                                                let kernel_idx = oc * in_channels * k_h * k_w
-                                                    + ic * k_h * k_w
+                                                // Kernel is indexed by the in-group channel
+                                                // offset, not the absolute input channel.
+                                                let kernel_idx = oc * in_per_group * k_h * k_w
+                                                    + icg * k_h * k_w
                                                     + kh * k_w
                                                     + kw;
 
@@ -673,6 +780,8 @@ pub mod algorithms {
                 output_dims,
                 (1, 1),
                 (1, 1),
+                (1, 1),
+                1,
             )
         }
     }

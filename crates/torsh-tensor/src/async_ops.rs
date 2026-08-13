@@ -9,6 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use torsh_core::sync::MutexExt;
 
 use torsh_core::error::Result;
 
@@ -89,7 +90,7 @@ impl AsyncOperationScheduler {
             // Wait for available slot
             loop {
                 {
-                    let mut active = active_ops.lock().expect("lock should not be poisoned");
+                    let mut active = active_ops.lock_or_recover();
                     if *active < 8 {
                         // Simple rate limiting
                         *active += 1;
@@ -105,7 +106,7 @@ impl AsyncOperationScheduler {
 
             // Decrement active operations count
             {
-                let mut active = active_ops.lock().expect("lock should not be poisoned");
+                let mut active = active_ops.lock_or_recover();
                 *active -= 1;
             }
 
@@ -117,10 +118,7 @@ impl AsyncOperationScheduler {
 
     /// Get current active operations count
     pub fn active_operations(&self) -> usize {
-        *self
-            .active_operations
-            .lock()
-            .expect("lock should not be poisoned")
+        *self.active_operations.lock_or_recover()
     }
 }
 

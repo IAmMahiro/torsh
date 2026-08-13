@@ -97,20 +97,39 @@ impl MFCCProcessor {
         }
     }
 
-    /// Compute mel-scale spectrogram (simplified implementation)
+    /// Compute the mel-scale power spectrogram of `signal`.
+    ///
+    /// Equivalent to `mel_filterbank @ |STFT(signal)|^2`, returning a
+    /// `[n_mels, n_frames]` tensor.
     pub fn compute_mel_spectrogram(&self, signal: &Tensor<f32>) -> Result<Tensor<f32>> {
-        let signal_len = signal.shape().dims()[0];
-        let n_frames = (signal_len - self.n_fft) / self.hop_length + 1;
+        use crate::spectral::{mel_spectrogram, spectrogram};
+        use crate::windows::Window;
 
-        let mel_spec = zeros(&[self.n_mels, n_frames])?;
-        Ok(mel_spec)
+        let spec = spectrogram(
+            signal,
+            self.n_fft,
+            Some(self.hop_length),
+            Some(self.n_fft),
+            Some(Window::Hann),
+            true,
+            "reflect",
+            false,
+            true,
+            Some(2.0),
+        )?;
+
+        mel_spectrogram(&spec, self.f_min, self.f_max, self.n_mels, self.sample_rate)
     }
 
-    /// Compute mel-scale filterbank (simplified implementation)
+    /// Compute the mel-scale filterbank matrix `[n_mels, n_fft / 2 + 1]`.
     pub fn compute_mel_filterbank(&self) -> Result<Tensor<f32>> {
-        let n_freqs = self.n_fft / 2 + 1;
-        let filterbank = zeros(&[self.n_mels, n_freqs])?;
-        Ok(filterbank)
+        crate::spectral::mel_filterbank(
+            self.n_mels,
+            self.n_fft,
+            self.sample_rate,
+            self.f_min,
+            self.f_max,
+        )
     }
 }
 

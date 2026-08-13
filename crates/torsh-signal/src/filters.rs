@@ -341,8 +341,29 @@ pub fn gaussian_filter(signal: &Tensor, sigma: f32) -> Result<Tensor> {
     convolve1d(signal, &kernel, "same", "auto")
 }
 
-/// Savitzky-Golay filter for smoothing (real implementation with least-squares polynomial fitting)
+/// Savitzky-Golay smoothing filter.
+///
+/// Fits a polynomial of degree `polyorder` to every `window_length`-sample
+/// neighbourhood in the least-squares sense and evaluates it at the centre
+/// sample. Polynomials of degree up to `polyorder` therefore pass through
+/// unchanged. Edges use scipy's `mode="interp"`: a single polynomial is fitted
+/// to the first (last) `window_length` samples and evaluated at the boundary
+/// positions, so the filter gain stays exactly one everywhere.
 pub fn savgol_filter(signal: &Tensor, window_length: usize, polyorder: usize) -> Result<Tensor> {
+    savgol_filter_with_deriv(signal, window_length, polyorder, 0, 1.0)
+}
+
+/// Savitzky-Golay filter with derivative support.
+///
+/// `deriv` selects the order of the derivative to compute (0 = smoothing) and
+/// `delta` is the sample spacing used to scale that derivative.
+pub fn savgol_filter_with_deriv(
+    signal: &Tensor,
+    window_length: usize,
+    polyorder: usize,
+    deriv: usize,
+    delta: f32,
+) -> Result<Tensor> {
     let shape = signal.shape();
     if shape.ndim() != 1 {
         return Err(TorshError::InvalidArgument(
@@ -362,60 +383,167 @@ pub fn savgol_filter(signal: &Tensor, window_length: usize, polyorder: usize) ->
         ));
     }
 
+    if deriv > polyorder {
+        return Err(TorshError::InvalidArgument(
+            "Derivative order must not exceed the polynomial order".to_string(),
+        ));
+    }
+
+    if delta == 0.0 || !delta.is_finite() {
+        return Err(TorshError::InvalidArgument(
+            "Sample spacing `delta` must be finite and non-zero".to_string(),
+        ));
+    }
+
     let signal_len = shape.dims()[0];
+    if signal_len < window_length {
+        return Err(TorshError::InvalidArgument(format!(
+            "Signal length {} is shorter than the Savitzky-Golay window {}",
+            signal_len, window_length
+        )));
+    }
+
     let half_window = window_length / 2;
+    let data = signal.to_vec()?;
     let mut output = zeros(&[signal_len])?;
 
-    // Compute Savitzky-Golay coefficients using least-squares
-    let coeffs = compute_savgol_coefficients(window_length, polyorder, half_window)?;
+    let scale = 1.0 / (delta as f64).powi(deriv as i32);
 
-    // Apply the filter
-    for i in 0..signal_len {
-        let mut sum = 0.0f32;
-
-        for j in 0..window_length {
-            let idx = (i as i32) + (j as i32) - (half_window as i32);
-            if idx >= 0 && idx < signal_len as i32 {
-                let val: f32 = signal.get_1d(idx as usize)?;
-                sum += val * coeffs[j];
-            }
+    // Interior samples: one shared coefficient set centred on the window.
+    let centre_coeffs = savgol_coeffs(window_length, polyorder, deriv, half_window as f64)?;
+    for i in half_window..signal_len - half_window {
+        let mut acc = 0.0f64;
+        for (j, coeff) in centre_coeffs.iter().enumerate() {
+            acc += coeff * data[i + j - half_window] as f64;
         }
+        output.set_1d(i, (acc * scale) as f32)?;
+    }
 
-        output.set_1d(i, sum)?;
+    // Leading edge: evaluate the polynomial fitted to the first window.
+    for i in 0..half_window {
+        let coeffs = savgol_coeffs(window_length, polyorder, deriv, i as f64)?;
+        let mut acc = 0.0f64;
+        for (j, coeff) in coeffs.iter().enumerate() {
+            acc += coeff * data[j] as f64;
+        }
+        output.set_1d(i, (acc * scale) as f32)?;
+    }
+
+    // Trailing edge: evaluate the polynomial fitted to the last window.
+    for i in signal_len - half_window..signal_len {
+        let position = (window_length - (signal_len - i)) as f64;
+        let coeffs = savgol_coeffs(window_length, polyorder, deriv, position)?;
+        let mut acc = 0.0f64;
+        for (j, coeff) in coeffs.iter().enumerate() {
+            acc += coeff * data[signal_len - window_length + j] as f64;
+        }
+        output.set_1d(i, (acc * scale) as f32)?;
     }
 
     Ok(output)
 }
 
-/// Compute Savitzky-Golay filter coefficients
-fn compute_savgol_coefficients(
+/// Least-squares Savitzky-Golay coefficients.
+///
+/// Returns the weights `c` such that `sum_i c_i * x_i` is the `deriv`-th
+/// derivative at offset `position` (in samples from the window start) of the
+/// degree-`polyorder` polynomial fitted to the `window_length` samples `x`.
+fn savgol_coeffs(
     window_length: usize,
     polyorder: usize,
-    _deriv: usize,
-) -> Result<Vec<f32>> {
-    let half_window = window_length / 2;
+    deriv: usize,
+    position: f64,
+) -> Result<Vec<f64>> {
+    let order = polyorder + 1;
 
-    // Simplified Savitzky-Golay coefficients for smoothing (derivative = 0)
-    // Using a simple weighted moving average approximation for now
-    // In production, would compute proper least-squares polynomial fit
-
-    let mut coeffs = vec![0.0f32; window_length];
-    let mut sum = 0.0f32;
-
-    // Simple weighting scheme based on distance from center
+    // Vandermonde matrix A[i][j] = (i - position)^j.
+    let mut a = vec![0.0f64; window_length * order];
     for i in 0..window_length {
-        let dist = ((i as i32) - (half_window as i32)).abs() as f32;
-        let weight = 1.0 / (1.0 + dist / (polyorder as f32));
-        coeffs[i] = weight;
-        sum += weight;
+        let x = i as f64 - position;
+        let mut power = 1.0f64;
+        for j in 0..order {
+            a[i * order + j] = power;
+            power *= x;
+        }
     }
 
-    // Normalize
-    for coeff in coeffs.iter_mut() {
-        *coeff /= sum;
+    // Normal equations: (A^T A) z = e_deriv.
+    let mut ata = vec![0.0f64; order * order];
+    for r in 0..order {
+        for c in 0..order {
+            let mut acc = 0.0f64;
+            for i in 0..window_length {
+                acc += a[i * order + r] * a[i * order + c];
+            }
+            ata[r * order + c] = acc;
+        }
     }
+    let mut rhs = vec![0.0f64; order];
+    rhs[deriv] = 1.0;
 
+    let z = solve_linear_system(&mut ata, &mut rhs, order)?;
+
+    // c_i = sum_j z_j * A[i][j], scaled by deriv! to turn the polynomial
+    // coefficient into the derivative value.
+    let factorial: f64 = (1..=deriv).map(|k| k as f64).product::<f64>().max(1.0);
+    let mut coeffs = vec![0.0f64; window_length];
+    for (i, coeff) in coeffs.iter_mut().enumerate() {
+        let mut acc = 0.0f64;
+        for (j, zj) in z.iter().enumerate() {
+            acc += zj * a[i * order + j];
+        }
+        *coeff = acc * factorial;
+    }
     Ok(coeffs)
+}
+
+/// Gaussian elimination with partial pivoting for a small dense system.
+fn solve_linear_system(matrix: &mut [f64], rhs: &mut [f64], n: usize) -> Result<Vec<f64>> {
+    for col in 0..n {
+        // Partial pivot.
+        let mut pivot_row = col;
+        let mut pivot_value = matrix[col * n + col].abs();
+        for row in col + 1..n {
+            let value = matrix[row * n + col].abs();
+            if value > pivot_value {
+                pivot_value = value;
+                pivot_row = row;
+            }
+        }
+        if pivot_value < 1e-300 {
+            return Err(TorshError::ComputeError(
+                "Singular matrix in Savitzky-Golay least-squares solve".to_string(),
+            ));
+        }
+        if pivot_row != col {
+            for k in 0..n {
+                matrix.swap(col * n + k, pivot_row * n + k);
+            }
+            rhs.swap(col, pivot_row);
+        }
+
+        let pivot = matrix[col * n + col];
+        for row in col + 1..n {
+            let factor = matrix[row * n + col] / pivot;
+            if factor == 0.0 {
+                continue;
+            }
+            for k in col..n {
+                matrix[row * n + k] -= factor * matrix[col * n + k];
+            }
+            rhs[row] -= factor * rhs[col];
+        }
+    }
+
+    let mut solution = vec![0.0f64; n];
+    for row in (0..n).rev() {
+        let mut acc = rhs[row];
+        for k in row + 1..n {
+            acc -= matrix[row * n + k] * solution[k];
+        }
+        solution[row] = acc / matrix[row * n + row];
+    }
+    Ok(solution)
 }
 
 /// Filter response analysis

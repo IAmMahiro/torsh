@@ -26,8 +26,14 @@ pub struct VGG {
 }
 
 impl VGG {
-    fn get_config(variant: &str) -> VGGConfig {
-        match variant {
+    /// Look up the layer configuration for a VGG variant name
+    ///
+    /// # Errors
+    ///
+    /// Returns [`torsh_core::error::TorshError::InvalidArgument`] when `variant`
+    /// is not one of the supported names.
+    fn get_config(variant: &str) -> Result<VGGConfig> {
+        let config: VGGConfig = match variant {
             "vgg11" => &[
                 VGGLayer::Conv(64),
                 VGGLayer::MaxPool,
@@ -103,8 +109,14 @@ impl VGG {
                 VGGLayer::Conv(512),
                 VGGLayer::MaxPool,
             ],
-            _ => panic!("Unknown VGG variant: {}", variant),
-        }
+            other => {
+                return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                    "Unknown VGG variant '{}'; supported variants are: vgg11, vgg13, vgg16, vgg19",
+                    other
+                )))
+            }
+        };
+        Ok(config)
     }
 
     fn make_features(config: VGGConfig, batch_norm: bool) -> Result<Sequential> {
@@ -154,7 +166,7 @@ impl VGG {
     }
 
     fn new(variant: &str, config: ModelConfig, batch_norm: bool) -> Result<Self> {
-        let vgg_config = Self::get_config(variant);
+        let vgg_config = Self::get_config(variant)?;
         let features = Self::make_features(vgg_config, batch_norm)?;
         let avgpool = AdaptiveAvgPool2d::new((Some(7), Some(7)));
         let classifier = Self::make_classifier(config.num_classes, config.dropout);
@@ -267,5 +279,30 @@ impl VisionModel for VGG {
 
     fn name(&self) -> &str {
         "VGG"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_config_known_variants() {
+        for variant in ["vgg11", "vgg13", "vgg16", "vgg19"] {
+            assert!(
+                VGG::get_config(variant).is_ok(),
+                "{variant} should be supported"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_config_unknown_variant_errors() {
+        let err = VGG::get_config("vgg17").expect_err("unknown variant must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("vgg17") && message.contains("vgg16"),
+            "error should name the offending variant and the supported ones, got: {message}"
+        );
     }
 }

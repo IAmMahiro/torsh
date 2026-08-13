@@ -34,23 +34,29 @@ impl Reduction {
         }
     }
 
+    /// Reduce a per-element loss to the configured shape.
+    ///
+    /// `Mean` divides by `batch_size` — the *number of samples*, not the number
+    /// of elements — which is what this framework has always done and what the
+    /// callers of [`CustomLoss::compute_loss`] expect.
+    ///
+    /// Both reduced arms used to read the sum out with `to_vec()` and rebuild it
+    /// with `Tensor::from_data`, which returns a detached leaf: every loss in
+    /// this module was non-differentiable the moment it was reduced, however
+    /// carefully its `forward` had been written. `sum()` and `div_scalar` record,
+    /// and `view(&[1])` restores the historical `[1]` output shape from the
+    /// rank-0 tensor `sum()` returns.
     pub fn apply(&self, loss: &Tensor, batch_size: usize) -> Result<Tensor> {
         match self {
             Self::None => Ok(loss.clone()),
             Self::Mean => {
                 // Compute mean over batch dimension
                 let total_sum = loss.sum()?;
-                let mean_val = total_sum.to_vec()?[0] / batch_size as f32;
-                Ok(Tensor::from_data(vec![mean_val], vec![1], loss.device())?)
+                total_sum.div_scalar(batch_size as f32)?.view(&[1])
             }
             Self::Sum => {
                 // Compute sum over batch dimension
-                let total_sum = loss.sum()?;
-                Ok(Tensor::from_data(
-                    vec![total_sum.to_vec()?[0]],
-                    vec![1],
-                    loss.device(),
-                )?)
+                loss.sum()?.view(&[1])
             }
         }
     }
@@ -111,32 +117,11 @@ impl SmoothL1Loss {
 }
 
 impl CustomLoss for SmoothL1Loss {
+    /// Delegates to the functional kernel, which computes the same two arms as
+    /// the `to_vec()`/`from_vec` loop this used to run — but as a composition of
+    /// recording ops, so the result stays on the autograd graph.
     fn forward(&self, predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
-        // Smooth L1 loss:
-        // loss = 0.5 * (pred - target)^2 / beta  if |pred - target| < beta
-        // loss = |pred - target| - 0.5 * beta    otherwise
-
-        let diff = predictions.sub(&targets)?;
-        let abs_diff = diff.abs()?;
-        let abs_diff_data = abs_diff.to_vec()?;
-        let diff_data = diff.to_vec()?;
-
-        let mut loss_data = Vec::new();
-
-        for i in 0..abs_diff_data.len() {
-            let abs_val = abs_diff_data[i];
-            let diff_val = diff_data[i];
-
-            let loss_val = if abs_val < self.beta {
-                0.5 * diff_val * diff_val / self.beta
-            } else {
-                abs_val - 0.5 * self.beta
-            };
-
-            loss_data.push(loss_val);
-        }
-
-        Ok(Tensor::from_vec(loss_data, predictions.shape().dims())?)
+        crate::functional::loss::smooth_l1_loss(predictions, targets, self.beta, "none")
     }
 
     fn reduction(&self) -> &Reduction {
@@ -159,37 +144,13 @@ impl DiceLoss {
 }
 
 impl CustomLoss for DiceLoss {
+    /// Applies `sigmoid` (these predictions are raw logits) and delegates to the
+    /// functional kernel, which computes the same coefficient with recording
+    /// tensor ops instead of a `to_vec()` accumulation loop.
     fn forward(&self, predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
         // Dice loss: 1 - (2 * |intersection| + smooth) / (|pred| + |target| + smooth)
-
-        // Apply sigmoid to predictions if needed (assuming raw logits)
         let probs = predictions.sigmoid()?;
-
-        // Flatten tensors for easier computation
-        let pred_data = probs.to_vec()?;
-        let target_data = targets.to_vec()?;
-
-        let mut intersection = 0.0f32;
-        let mut pred_sum = 0.0f32;
-        let mut target_sum = 0.0f32;
-
-        for i in 0..pred_data.len() {
-            let pred_val = pred_data[i];
-            let target_val = target_data[i];
-
-            intersection += pred_val * target_val;
-            pred_sum += pred_val;
-            target_sum += target_val;
-        }
-
-        let dice_coeff = (2.0 * intersection + self.smooth) / (pred_sum + target_sum + self.smooth);
-        let dice_loss = 1.0 - dice_coeff;
-
-        Ok(Tensor::from_data(
-            vec![dice_loss],
-            vec![1],
-            predictions.device(),
-        )?)
+        crate::functional::loss::dice_loss(&probs, targets, self.smooth, "none")
     }
 
     fn reduction(&self) -> &Reduction {
@@ -212,32 +173,22 @@ impl IoULoss {
 }
 
 impl CustomLoss for IoULoss {
+    /// The same soft-IoU the `to_vec()` loop computed, expressed with recording
+    /// ops so the loss stays differentiable:
+    /// `1 - (sum(p*t) + smooth) / (sum(p + t - p*t) + smooth)`.
     fn forward(&self, predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
         // IoU loss: 1 - |intersection| / |union|
-
         let probs = predictions.sigmoid()?;
-        let pred_data = probs.to_vec()?;
-        let target_data = targets.to_vec()?;
+        let overlap = probs.mul_op(targets)?;
 
-        let mut intersection = 0.0f32;
-        let mut union = 0.0f32;
+        let intersection = overlap.sum()?;
+        let union = probs.add(targets)?.sub(&overlap)?.sum()?;
 
-        for i in 0..pred_data.len() {
-            let pred_val = pred_data[i];
-            let target_val = target_data[i];
+        let iou = intersection
+            .add_scalar(self.smooth)?
+            .div(&union.add_scalar(self.smooth)?)?;
 
-            intersection += pred_val * target_val;
-            union += pred_val + target_val - pred_val * target_val;
-        }
-
-        let iou = (intersection + self.smooth) / (union + self.smooth);
-        let iou_loss = 1.0 - iou;
-
-        Ok(Tensor::from_data(
-            vec![iou_loss],
-            vec![1],
-            predictions.device(),
-        )?)
+        iou.neg()?.add_scalar(1.0)?.view(&[1])
     }
 
     fn reduction(&self) -> &Reduction {
@@ -268,17 +219,26 @@ impl<L: CustomLoss> CustomLoss for WeightedLoss<L> {
     fn forward(&self, predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
         let base_loss = self.base_loss.forward(predictions, targets)?;
 
-        // Apply class weights (simplified implementation)
-        // In practice, this would need proper indexing based on target classes
-        let loss_data = base_loss.to_vec()?;
-        let mut weighted_data = Vec::new();
-
-        for (i, &loss_val) in loss_data.iter().enumerate() {
-            let weight_idx = i % self.weights.len();
-            weighted_data.push(loss_val * self.weights[weight_idx]);
+        if self.weights.is_empty() {
+            return Err(TorshError::InvalidArgument(
+                "WeightedLoss needs at least one weight".to_string(),
+            ));
         }
 
-        Ok(Tensor::from_vec(weighted_data, base_loss.shape().dims())?)
+        // Apply class weights (simplified implementation)
+        // In practice, this would need proper indexing based on target classes.
+        // The weights cycle over the flattened loss, so they are a *constant*
+        // tensor of the same shape and the scaling is a recording multiply --
+        // reading the loss out with `to_vec()` and rebuilding it, as this used
+        // to do, detached whatever `base_loss` had recorded.
+        let shape_binding = base_loss.shape();
+        let dims = shape_binding.dims();
+        let weight_data: Vec<f32> = (0..shape_binding.numel())
+            .map(|i| self.weights[i % self.weights.len()])
+            .collect();
+        let weight_tensor = Tensor::from_data(weight_data, dims.to_vec(), base_loss.device())?;
+
+        base_loss.mul_op(&weight_tensor)
     }
 
     fn reduction(&self) -> &Reduction {
@@ -525,27 +485,13 @@ impl HuberLoss {
 }
 
 impl CustomLoss for HuberLoss {
+    /// Delegates to the functional kernel. The arms are the same function —
+    /// `delta * |d| - 0.5 * delta^2` is `delta * (|d| - 0.5 * delta)`, and at the
+    /// switch-over point `|d| == delta` both arms evaluate to `0.5 * delta^2`, so
+    /// the strict-versus-inclusive comparison the loop used makes no difference
+    /// to the value.
     fn forward(&self, predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
-        let diff = predictions.sub(targets)?;
-        let abs_diff = diff.abs()?;
-        let abs_diff_data = abs_diff.to_vec()?;
-        let diff_data = diff.to_vec()?;
-
-        let mut loss_data = Vec::new();
-        for i in 0..abs_diff_data.len() {
-            let abs_val = abs_diff_data[i];
-            let diff_val = diff_data[i];
-
-            let loss_val = if abs_val < self.delta {
-                0.5 * diff_val * diff_val
-            } else {
-                self.delta * abs_val - 0.5 * self.delta * self.delta
-            };
-
-            loss_data.push(loss_val);
-        }
-
-        Ok(Tensor::from_vec(loss_data, predictions.shape().dims())?)
+        crate::functional::loss::huber_loss(predictions, targets, self.delta, "none")
     }
 
     fn reduction(&self) -> &Reduction {
@@ -794,42 +740,65 @@ impl LossFactory {
         }
 
         impl CustomLoss for LabelSmoothingCE {
+            /// The smoothed target distribution is a *constant* matrix derived
+            /// from `targets`, so the whole loss is one recording multiply and a
+            /// row sum. The predecessor read `log_softmax`'s output back with
+            /// `to_vec()` and rebuilt the per-sample losses with
+            /// `Tensor::from_vec`, detaching a numerically careful forward pass
+            /// from the graph it was computed on.
             fn forward(&self, predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
                 // Label smoothing: mix true labels with uniform distribution
                 // smoothed_target = (1 - smoothing) * target + smoothing / num_classes
 
-                let num_classes = predictions.shape().dims()[1];
+                let shape_binding = predictions.shape();
+                let dims = shape_binding.dims();
+                let (batch_size, num_classes) = match dims {
+                    [batch, classes] => (*batch, *classes),
+                    _ => {
+                        return Err(TorshError::InvalidShape(format!(
+                            "label_smoothing_ce expects 2-D predictions [N, C], got {dims:?}"
+                        )))
+                    }
+                };
+
                 let uniform_prob = self.smoothing / num_classes as f32;
                 let true_prob = 1.0 - self.smoothing;
 
                 // Apply log softmax to predictions
                 let log_probs = predictions.log_softmax(-1)?;
 
-                // Create smoothed targets (simplified implementation)
                 let target_data = targets.to_vec()?;
-                let log_prob_data = log_probs.to_vec()?;
-                let batch_size = predictions.shape().dims()[0];
-
-                let mut loss_data = Vec::new();
-
-                for b in 0..batch_size {
-                    let true_class = target_data[b] as usize;
-                    let mut sample_loss = 0.0f32;
-
-                    for c in 0..num_classes {
-                        let log_prob = log_prob_data[b * num_classes + c];
-                        let smooth_target = if c == true_class {
-                            true_prob + uniform_prob
-                        } else {
-                            uniform_prob
-                        };
-                        sample_loss -= smooth_target * log_prob;
-                    }
-
-                    loss_data.push(sample_loss);
+                if target_data.len() < batch_size {
+                    return Err(TorshError::InvalidShape(format!(
+                        "label_smoothing_ce expects one target per sample: predictions \
+                         have {batch_size} rows but targets have {} entries",
+                        target_data.len()
+                    )));
                 }
 
-                Ok(Tensor::from_vec(loss_data, &[batch_size])?)
+                // Constant smoothed-target matrix. An out-of-range class simply
+                // never matches, leaving that row uniformly smoothed -- exactly
+                // what the element-wise predecessor did.
+                let mut smoothed = vec![uniform_prob; batch_size * num_classes];
+                for (b, &target_value) in target_data.iter().take(batch_size).enumerate() {
+                    let true_class = target_value as usize;
+                    if true_class >= num_classes {
+                        continue;
+                    }
+                    if let Some(slot) = smoothed.get_mut(b * num_classes + true_class) {
+                        *slot = true_prob + uniform_prob;
+                    }
+                }
+                let smoothed_tensor = Tensor::from_data(
+                    smoothed,
+                    vec![batch_size, num_classes],
+                    predictions.device(),
+                )?;
+
+                log_probs
+                    .mul_op(&smoothed_tensor)?
+                    .sum_dim(&[-1], false)?
+                    .neg()
             }
 
             fn reduction(&self) -> &Reduction {
@@ -860,33 +829,76 @@ impl LossFactory {
         }
 
         impl CustomLoss for CenterLoss {
+            /// The class centres are plain host data owned by this loss, so the
+            /// per-sample centre is a *constant* tensor and the whole loss is
+            /// `0.5 * sum((features - centres)^2)` in recording ops. The
+            /// predecessor accumulated the same sum over `to_vec()` output and
+            /// rebuilt it with `Tensor::from_vec`, i.e. a detached leaf.
             fn forward(&self, predictions: &Tensor, targets: &Tensor) -> Result<Tensor> {
                 // Center loss: 0.5 * ||features - centers[class]||^2
 
-                let batch_size = predictions.shape().dims()[0];
-                let feature_data = predictions.to_vec()?;
-                let target_data = targets.to_vec()?;
-
-                let mut loss_data = Vec::new();
-
-                for b in 0..batch_size {
-                    let class_id = target_data[b] as usize;
-                    if class_id >= self.num_classes {
-                        continue;
+                let shape_binding = predictions.shape();
+                let dims = shape_binding.dims();
+                let (batch_size, feature_dim) = match dims {
+                    [batch, features] => (*batch, *features),
+                    _ => {
+                        return Err(TorshError::InvalidShape(format!(
+                            "center_loss expects 2-D features [N, D], got {dims:?}"
+                        )))
                     }
-
-                    let mut squared_distance = 0.0f32;
-                    for f in 0..self.feature_dim {
-                        let feature_val = feature_data[b * self.feature_dim + f];
-                        let center_val = self.centers[class_id][f];
-                        let diff = feature_val - center_val;
-                        squared_distance += diff * diff;
-                    }
-
-                    loss_data.push(0.5 * squared_distance);
+                };
+                if feature_dim != self.feature_dim {
+                    return Err(TorshError::ShapeMismatch {
+                        expected: vec![batch_size, self.feature_dim],
+                        got: dims.to_vec(),
+                    });
                 }
 
-                Ok(Tensor::from_vec(loss_data, &[batch_size])?)
+                let target_data = targets.to_vec()?;
+                if target_data.len() < batch_size {
+                    return Err(TorshError::InvalidShape(format!(
+                        "center_loss expects one label per sample: features have \
+                         {batch_size} rows but labels have {} entries",
+                        target_data.len()
+                    )));
+                }
+
+                // Gather the per-sample centre into a constant tensor. The
+                // predecessor skipped out-of-range classes and then handed a
+                // short vector to `Tensor::from_vec`, which failed the length
+                // check; this reports the real problem instead.
+                let mut centers = vec![0.0f32; batch_size * feature_dim];
+                for (b, &target_value) in target_data.iter().take(batch_size).enumerate() {
+                    let class_id = target_value as usize;
+                    let row = match self.centers.get(class_id) {
+                        Some(row) if class_id < self.num_classes => row,
+                        _ => {
+                            return Err(TorshError::InvalidArgument(format!(
+                                "Label {target_value} out of range for {} classes",
+                                self.num_classes
+                            )))
+                        }
+                    };
+                    for (f, slot) in centers
+                        .iter_mut()
+                        .skip(b * feature_dim)
+                        .take(feature_dim)
+                        .enumerate()
+                    {
+                        *slot = row.get(f).copied().unwrap_or(0.0);
+                    }
+                }
+                let centers_tensor = Tensor::from_data(
+                    centers,
+                    vec![batch_size, feature_dim],
+                    predictions.device(),
+                )?;
+
+                predictions
+                    .sub(&centers_tensor)?
+                    .square()?
+                    .sum_dim(&[-1], false)?
+                    .mul_scalar(0.5)
             }
 
             fn reduction(&self) -> &Reduction {

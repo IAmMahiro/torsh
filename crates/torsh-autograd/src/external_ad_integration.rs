@@ -5,6 +5,7 @@
 //! utilities that enable seamless interoperability with various AD frameworks.
 
 use crate::context::AutogradContext;
+use torsh_core::sync::MutexExt;
 // AutogradTensor trait is available through crate root - it's generic
 use crate::AutogradTensor;
 use std::any::Any;
@@ -252,7 +253,7 @@ impl AutogradBridge {
         &self,
         library: T,
     ) -> Result<(), TorshError> {
-        let mut registry = self.registry.lock().expect("lock should not be poisoned");
+        let mut registry = self.registry.lock_or_recover();
         registry.register(library)
     }
 
@@ -262,7 +263,7 @@ impl AutogradBridge {
         graph: ComputationGraph,
         inputs: Vec<&dyn AutogradTensor<T>>,
     ) -> Result<Vec<Box<dyn AutogradTensor<T>>>, TorshError> {
-        let registry = self.registry.lock().expect("lock should not be poisoned");
+        let registry = self.registry.lock_or_recover();
 
         let library = registry
             .get_active_library()
@@ -301,7 +302,7 @@ impl AutogradBridge {
 
     /// Get summary of available external libraries
     pub fn library_summary(&self) -> String {
-        let registry = self.registry.lock().expect("lock should not be poisoned");
+        let registry = self.registry.lock_or_recover();
         let libraries = registry.list_libraries();
         let capabilities = registry.get_all_capabilities();
 

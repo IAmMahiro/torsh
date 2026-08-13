@@ -11,6 +11,7 @@ use std::sync::RwLock;
 
 use crate::dtype::core::DType;
 use crate::dtype::traits::TensorElement;
+use crate::sync::RwLockExt;
 
 /// Information about a custom data type
 ///
@@ -124,7 +125,7 @@ impl CustomDTypeRegistry {
 
         // Check if already registered
         {
-            let types = instance.types.read().expect("lock should not be poisoned");
+            let types = instance.types.read_or_recover();
             if types.contains_key(&type_id) {
                 return Err(crate::error::TorshError::InvalidArgument(format!(
                     "Type {:?} is already registered",
@@ -135,7 +136,7 @@ impl CustomDTypeRegistry {
 
         // Check for name conflicts
         {
-            let names = instance.names.read().expect("lock should not be poisoned");
+            let names = instance.names.read_or_recover();
             if names.contains_key(&type_info.name) {
                 return Err(crate::error::TorshError::InvalidArgument(format!(
                     "Type name '{}' is already in use",
@@ -146,8 +147,8 @@ impl CustomDTypeRegistry {
 
         // Register the type
         {
-            let mut types = instance.types.write().expect("lock should not be poisoned");
-            let mut names = instance.names.write().expect("lock should not be poisoned");
+            let mut types = instance.types.write_or_recover();
+            let mut names = instance.names.write_or_recover();
 
             types.insert(type_id, type_info.clone());
             names.insert(type_info.name.clone(), type_id);
@@ -159,28 +160,28 @@ impl CustomDTypeRegistry {
     /// Get type information by TypeId
     pub fn get_info(type_id: TypeId) -> Option<CustomDTypeInfo> {
         let instance = Self::instance();
-        let types = instance.types.read().expect("lock should not be poisoned");
+        let types = instance.types.read_or_recover();
         types.get(&type_id).cloned()
     }
 
     /// Get TypeId by name
     pub fn get_type_id(name: &str) -> Option<TypeId> {
         let instance = Self::instance();
-        let names = instance.names.read().expect("lock should not be poisoned");
+        let names = instance.names.read_or_recover();
         names.get(name).copied()
     }
 
     /// Check if a type is registered
     pub fn is_registered(type_id: TypeId) -> bool {
         let instance = Self::instance();
-        let types = instance.types.read().expect("lock should not be poisoned");
+        let types = instance.types.read_or_recover();
         types.contains_key(&type_id)
     }
 
     /// List all registered types
     pub fn list_types() -> Vec<CustomDTypeInfo> {
         let instance = Self::instance();
-        let types = instance.types.read().expect("lock should not be poisoned");
+        let types = instance.types.read_or_recover();
         types.values().cloned().collect()
     }
 
@@ -190,13 +191,13 @@ impl CustomDTypeRegistry {
         let instance = Self::instance();
 
         let type_info = {
-            let types = instance.types.read().expect("lock should not be poisoned");
+            let types = instance.types.read_or_recover();
             types.get(&type_id).cloned()
         };
 
         if let Some(info) = type_info {
-            let mut types = instance.types.write().expect("lock should not be poisoned");
-            let mut names = instance.names.write().expect("lock should not be poisoned");
+            let mut types = instance.types.write_or_recover();
+            let mut names = instance.names.write_or_recover();
 
             types.remove(&type_id);
             names.remove(&info.name);

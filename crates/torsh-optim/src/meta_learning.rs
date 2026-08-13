@@ -217,7 +217,7 @@ impl MetaOptimizer {
                     // Update adapted parameters
                     for (param_name, gradient) in support_gradients {
                         if let Some(param) = adapted_params.get_mut(&param_name) {
-                            *param = param.sub(&gradient.mul_scalar(inner_lr)?)?;
+                            crate::param_update::sub_assign(&mut param, &gradient.mul_scalar(inner_lr)?)?;
                         }
                     }
                 }
@@ -241,7 +241,7 @@ impl MetaOptimizer {
             // Update meta-parameters
             for (param_name, meta_gradient) in meta_gradients {
                 if let Some(param) = self.meta_parameters.get_mut(&param_name) {
-                    *param = param.sub(&meta_gradient.mul_scalar(outer_lr)?)?;
+                    crate::param_update::sub_assign(&mut param, &meta_gradient.mul_scalar(outer_lr)?)?;
                 }
             }
             
@@ -319,7 +319,7 @@ impl MetaOptimizer {
                 // Update meta-parameters
                 for (param_name, gradient) in meta_gradients {
                     if let Some(param) = self.meta_parameters.get_mut(&param_name) {
-                        *param = param.sub(&gradient.mul_scalar(meta_step_size)?)?;
+                        crate::param_update::sub_assign(&mut param, &gradient.mul_scalar(meta_step_size)?)?;
                     }
                 }
             }

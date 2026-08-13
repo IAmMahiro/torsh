@@ -118,6 +118,109 @@ pub fn is_safe_path(path: &Path) -> bool {
     true
 }
 
+/// Resolve an archive entry name to a safe destination path beneath `dest_root`.
+///
+/// This is the "tar-slip"/"zip-slip" guard used when extracting archives that
+/// may come from an untrusted source (a downloaded GitHub repository tarball,
+/// a shared package, etc.). A malicious entry name such as `"../../etc/passwd"`
+/// or an absolute path like `"/etc/passwd"` must never be allowed to write
+/// outside `dest_root`.
+///
+/// The check is component-wise (via [`Path::components`]) rather than a
+/// simple substring search, so every `..`/absolute/rooted form is rejected
+/// regardless of platform path conventions. `.` (current-dir) components are
+/// dropped as no-ops. The resolved path is additionally verified to still be
+/// nested under `dest_root` before being returned, as defense in depth.
+///
+/// This function only performs a *lexical* check on `entry_name` itself: it
+/// does not (and, for a not-yet-created destination, cannot) canonicalize the
+/// result, since the file/directory being extracted does not exist yet.
+/// Callers should not create symlink entries while extracting (skip them
+/// instead), since a symlink written earlier in an archive could otherwise
+/// let an innocuous-looking later entry escape through it.
+///
+/// # Errors
+/// Returns [`TorshError::InvalidArgument`] when `entry_name` is absolute,
+/// empty, or contains a parent-directory (`..`) component.
+///
+/// # Examples
+///
+/// ```
+/// use torsh_hub::utils::sanitize_archive_entry_path;
+/// use std::path::Path;
+///
+/// let root = Path::new("/safe/extract/root");
+/// assert!(sanitize_archive_entry_path(root, "models/net.bin").is_ok());
+/// assert!(sanitize_archive_entry_path(root, "../../etc/passwd").is_err());
+/// assert!(sanitize_archive_entry_path(root, "/etc/passwd").is_err());
+/// ```
+pub fn sanitize_archive_entry_path(dest_root: &Path, entry_name: &str) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let entry_path = Path::new(entry_name);
+
+    if entry_path.is_absolute() {
+        return Err(TorshError::InvalidArgument(format!(
+            "Refusing to extract archive entry with an absolute path: {:?}",
+            entry_name
+        )));
+    }
+
+    let mut saw_any_component = false;
+    let mut safe_relative = PathBuf::new();
+    for component in entry_path.components() {
+        saw_any_component = true;
+        match component {
+            Component::Normal(part) => safe_relative.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(TorshError::InvalidArgument(format!(
+                    "Refusing to extract archive entry that escapes the destination directory (contains '..'): {:?}",
+                    entry_name
+                )));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(TorshError::InvalidArgument(format!(
+                    "Refusing to extract archive entry with a rooted/absolute path: {:?}",
+                    entry_name
+                )));
+            }
+        }
+    }
+
+    if safe_relative.as_os_str().is_empty() {
+        // A genuinely empty name (`entry_name == ""`, zero components) is
+        // rejected as malformed. A pure "current directory" name (".", "./")
+        // — which e.g. GNU tar emits as the archive's own leading entry for
+        // `tar czf x.tgz .` — has a component (`CurDir`) but resolves to no
+        // path segments; treat that as "the destination root itself" rather
+        // than an error, or a legitimate real-world archive would otherwise
+        // always be rejected outright by this guard.
+        if saw_any_component {
+            return Ok(dest_root.to_path_buf());
+        }
+        return Err(TorshError::InvalidArgument(format!(
+            "Archive entry name resolves to an empty path: {:?}",
+            entry_name
+        )));
+    }
+
+    let dest = dest_root.join(&safe_relative);
+
+    // Defense in depth: by construction `safe_relative` contains no
+    // '..'/root/prefix components, so this should always hold. Treat a
+    // violation as a hard error rather than silently extracting outside
+    // `dest_root`.
+    if !dest.starts_with(dest_root) {
+        return Err(TorshError::InvalidArgument(format!(
+            "Archive entry escapes the destination directory: {:?}",
+            entry_name
+        )));
+    }
+
+    Ok(dest)
+}
+
 /// Get the cache directory for a specific model
 ///
 /// Creates the directory if it doesn't exist.
@@ -458,6 +561,58 @@ mod tests {
         assert!(!is_safe_path(Path::new("../etc/passwd")));
         assert!(!is_safe_path(Path::new("/absolute/path")));
         assert!(!is_safe_path(Path::new("models/../../etc/passwd")));
+    }
+
+    #[test]
+    fn test_sanitize_archive_entry_path_rejects_parent_dir_traversal() {
+        let root = Path::new("/safe/extract/root");
+        let err = sanitize_archive_entry_path(root, "../../../../etc/cron.d/pwn")
+            .expect_err("parent-dir traversal must be rejected");
+        assert!(matches!(err, TorshError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn test_sanitize_archive_entry_path_rejects_absolute_path() {
+        let root = Path::new("/safe/extract/root");
+        let err = sanitize_archive_entry_path(root, "/Users/x/.ssh/authorized_keys")
+            .expect_err("absolute entry path must be rejected");
+        assert!(matches!(err, TorshError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn test_sanitize_archive_entry_path_rejects_embedded_parent_dir() {
+        let root = Path::new("/safe/extract/root");
+        assert!(sanitize_archive_entry_path(root, "models/../../escape.bin").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_archive_entry_path_accepts_normal_relative_paths() {
+        let root = Path::new("/safe/extract/root");
+        let dest = sanitize_archive_entry_path(root, "models/sub/net.bin")
+            .expect("ordinary relative path should be accepted");
+        assert_eq!(dest, root.join("models").join("sub").join("net.bin"));
+        assert!(dest.starts_with(root));
+    }
+
+    #[test]
+    fn test_sanitize_archive_entry_path_rejects_empty_name() {
+        let root = Path::new("/safe/extract/root");
+        assert!(sanitize_archive_entry_path(root, "").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_archive_entry_path_treats_current_dir_as_the_root_itself() {
+        // GNU tar's `tar czf x.tgz .` emits a leading "./" entry; this must
+        // resolve to dest_root itself rather than being rejected outright.
+        let root = Path::new("/safe/extract/root");
+        assert_eq!(
+            sanitize_archive_entry_path(root, ".").expect("'.' should resolve to dest_root"),
+            root
+        );
+        assert_eq!(
+            sanitize_archive_entry_path(root, "./").expect("'./' should resolve to dest_root"),
+            root
+        );
     }
 
     #[test]

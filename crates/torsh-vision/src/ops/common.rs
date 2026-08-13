@@ -91,8 +91,10 @@ pub mod utils {
         _x2: usize,
         _y2: usize,
     ) -> (f32, f32, f32, f32) {
-        let dx = src_x - x1 as f32;
-        let dy = src_y - y1 as f32;
+        // Clamp into [0, 1]: a fractional part outside that range turns the
+        // interpolation into an extrapolation with negative weights.
+        let dx = (src_x - x1 as f32).clamp(0.0, 1.0);
+        let dy = (src_y - y1 as f32).clamp(0.0, 1.0);
 
         let w11 = (1.0 - dx) * (1.0 - dy);
         let w21 = dx * (1.0 - dy);
@@ -100,6 +102,132 @@ pub mod utils {
         let w22 = dx * dy;
 
         (w11, w21, w12, w22)
+    }
+
+    /// Sample a single image plane with clamped bilinear interpolation
+    ///
+    /// Coordinates outside the plane are clamped to the border (the behaviour of
+    /// PyTorch's `grid_sample` with `padding_mode="border"`), never extrapolated.
+    pub fn sample_plane_bilinear(
+        plane: &[f32],
+        height: usize,
+        width: usize,
+        x: f32,
+        y: f32,
+    ) -> f32 {
+        if height == 0 || width == 0 || plane.len() < height * width {
+            return 0.0;
+        }
+
+        let xc = if x.is_finite() {
+            x.clamp(0.0, (width - 1) as f32)
+        } else {
+            0.0
+        };
+        let yc = if y.is_finite() {
+            y.clamp(0.0, (height - 1) as f32)
+        } else {
+            0.0
+        };
+
+        let x1 = xc.floor() as usize;
+        let y1 = yc.floor() as usize;
+        let x2 = (x1 + 1).min(width - 1);
+        let y2 = (y1 + 1).min(height - 1);
+
+        let dx = xc - x1 as f32;
+        let dy = yc - y1 as f32;
+
+        let v11 = plane[y1 * width + x1];
+        let v21 = plane[y1 * width + x2];
+        let v12 = plane[y2 * width + x1];
+        let v22 = plane[y2 * width + x2];
+
+        v11 * (1.0 - dx) * (1.0 - dy)
+            + v21 * dx * (1.0 - dy)
+            + v12 * (1.0 - dx) * dy
+            + v22 * dx * dy
+    }
+
+    /// Inverse-warp an image tensor through a caller-supplied coordinate map
+    ///
+    /// Accepts a 2D `(H, W)` or 3D `(C, H, W)` tensor. For every destination
+    /// pixel `(x, y)` the closure returns the source coordinate to read, which is
+    /// sampled with clamped bilinear interpolation. The output keeps the input's
+    /// shape.
+    pub fn inverse_warp_chw<F>(image: &Tensor<f32>, map: F) -> Result<Tensor<f32>>
+    where
+        F: Fn(f32, f32) -> (f32, f32),
+    {
+        let dims = image.shape().dims().to_vec();
+        let (channels, height, width) = match dims.len() {
+            2 => (1usize, dims[0], dims[1]),
+            3 => (dims[0], dims[1], dims[2]),
+            other => {
+                return Err(VisionError::InvalidShape(format!(
+                    "Warping expects a 2D (H, W) or 3D (C, H, W) tensor, got {}D",
+                    other
+                )))
+            }
+        };
+
+        if height == 0 || width == 0 {
+            return Err(VisionError::InvalidArgument(
+                "Cannot warp an image with an empty spatial extent".to_string(),
+            ));
+        }
+
+        let data = image.to_vec()?;
+        let plane_len = height * width;
+        let mut output = vec![0.0f32; data.len()];
+
+        for c in 0..channels {
+            let base = c * plane_len;
+            let plane = &data[base..base + plane_len];
+            for y in 0..height {
+                for x in 0..width {
+                    let (src_x, src_y) = map(x as f32, y as f32);
+                    output[base + y * width + x] =
+                        sample_plane_bilinear(plane, height, width, src_x, src_y);
+                }
+            }
+        }
+
+        Tensor::from_vec(output, &dims).map_err(VisionError::TensorError)
+    }
+
+    /// Invert a 3x3 homogeneous transformation matrix
+    ///
+    /// Returns an error when the matrix is singular (determinant ~ 0), which
+    /// would make the inverse warp undefined.
+    pub fn invert_3x3(matrix: &[[f64; 3]; 3]) -> Result<[[f64; 3]; 3]> {
+        let m = matrix;
+        let cofactor = |a: f64, b: f64, c: f64, d: f64| a * d - b * c;
+
+        let c00 = cofactor(m[1][1], m[1][2], m[2][1], m[2][2]);
+        let c01 = -cofactor(m[1][0], m[1][2], m[2][0], m[2][2]);
+        let c02 = cofactor(m[1][0], m[1][1], m[2][0], m[2][1]);
+
+        let det = m[0][0] * c00 + m[0][1] * c01 + m[0][2] * c02;
+        if det.abs() < 1e-12 {
+            return Err(VisionError::InvalidArgument(
+                "Transformation matrix is singular and cannot be inverted".to_string(),
+            ));
+        }
+
+        let c10 = -cofactor(m[0][1], m[0][2], m[2][1], m[2][2]);
+        let c11 = cofactor(m[0][0], m[0][2], m[2][0], m[2][2]);
+        let c12 = -cofactor(m[0][0], m[0][1], m[2][0], m[2][1]);
+        let c20 = cofactor(m[0][1], m[0][2], m[1][1], m[1][2]);
+        let c21 = -cofactor(m[0][0], m[0][2], m[1][0], m[1][2]);
+        let c22 = cofactor(m[0][0], m[0][1], m[1][0], m[1][1]);
+
+        // Adjugate (transposed cofactor matrix) divided by the determinant.
+        Ok([
+            [c00 / det, c10 / det, c20 / det],
+            [c01 / det, c11 / det, c21 / det],
+            [c02 / det, c12 / det, c22 / det],
+        ])
     }
 
     /// Calculate the intersection over union (IoU) between two bounding boxes

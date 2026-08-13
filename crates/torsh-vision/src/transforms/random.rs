@@ -42,6 +42,12 @@ impl RandomHorizontalFlip {
         Self { p }
     }
 
+    /// Fallible variant of [`Self::new`]
+    pub fn try_new(p: f32) -> Result<Self> {
+        super::augmentation::validate_probability(p, "p")?;
+        Ok(Self { p })
+    }
+
     /// Get the flip probability
     pub fn probability(&self) -> f32 {
         self.p
@@ -107,6 +113,12 @@ impl RandomVerticalFlip {
             "Probability must be between 0.0 and 1.0"
         );
         Self { p }
+    }
+
+    /// Fallible variant of [`Self::new`]
+    pub fn try_new(p: f32) -> Result<Self> {
+        super::augmentation::validate_probability(p, "p")?;
+        Ok(Self { p })
     }
 
     /// Get the flip probability
@@ -235,6 +247,10 @@ impl RandomResizedCrop {
     /// # Arguments
     ///
     /// * `scale` - Range of area to sample relative to input area (min, max)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is invalid. Use [`Self::try_with_scale`] instead.
     pub fn with_scale(mut self, scale: (f32, f32)) -> Self {
         assert!(scale.0 <= scale.1, "Scale min must be <= scale max");
         assert!(scale.0 > 0.0, "Scale min must be > 0");
@@ -243,16 +259,34 @@ impl RandomResizedCrop {
         self
     }
 
+    /// Fallible variant of [`Self::with_scale`]
+    pub fn try_with_scale(mut self, scale: (f32, f32)) -> Result<Self> {
+        super::augmentation::validate_range(scale, f32::MIN_POSITIVE, 1.0, "scale")?;
+        self.scale = scale;
+        Ok(self)
+    }
+
     /// Set the aspect ratio range for random sampling
     ///
     /// # Arguments
     ///
     /// * `ratio` - Range of aspect ratios to sample (min, max)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is invalid. Use [`Self::try_with_ratio`] instead.
     pub fn with_ratio(mut self, ratio: (f32, f32)) -> Self {
         assert!(ratio.0 <= ratio.1, "Ratio min must be <= ratio max");
         assert!(ratio.0 > 0.0, "Ratio min must be > 0");
         self.ratio = ratio;
         self
+    }
+
+    /// Fallible variant of [`Self::with_ratio`]
+    pub fn try_with_ratio(mut self, ratio: (f32, f32)) -> Result<Self> {
+        super::augmentation::validate_range(ratio, f32::MIN_POSITIVE, f32::MAX, "ratio")?;
+        self.ratio = ratio;
+        Ok(self)
     }
 
     /// Get the target size
@@ -356,12 +390,22 @@ impl RandomRotation {
     /// # Arguments
     ///
     /// * `degrees` - Range of rotation angles in degrees (min, max)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `degrees.0 > degrees.1`. Use [`Self::try_new`] instead.
     pub fn new(degrees: (f32, f32)) -> Self {
         assert!(
             degrees.0 <= degrees.1,
             "Minimum degree must be <= maximum degree"
         );
         Self { degrees }
+    }
+
+    /// Fallible variant of [`Self::new`]
+    pub fn try_new(degrees: (f32, f32)) -> Result<Self> {
+        super::augmentation::validate_range(degrees, f32::MIN, f32::MAX, "degrees")?;
+        Ok(Self { degrees })
     }
 
     /// Create a symmetric rotation range around 0

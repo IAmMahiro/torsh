@@ -242,6 +242,7 @@ impl FaultInjector {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_network_failure_recovery() -> Result<()> {
     let config = FaultInjectionConfig {
         fault_type: FaultType::NetworkFailure,
@@ -273,6 +274,7 @@ async fn test_network_failure_recovery() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_circuit_breaker_fault_tolerance() -> Result<()> {
     let circuit_breaker_config = CircuitBreakerConfig {
         failure_threshold: 3,
@@ -338,6 +340,7 @@ async fn test_circuit_breaker_fault_tolerance() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_retry_mechanism_with_faults() -> Result<()> {
     let retry_config = RetryConfig {
         max_attempts: 3,
@@ -394,6 +397,7 @@ async fn test_retry_mechanism_with_faults() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_data_corruption_detection() -> Result<()> {
     let pg = init_process_group(BackendType::Gloo, 0, 2, "127.0.0.1", 29603).await?;
 
@@ -424,6 +428,7 @@ async fn test_data_corruption_detection() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_partial_process_failure() -> Result<()> {
     let world_size = 4;
     let mut process_groups: Vec<Option<ProcessGroup>> = Vec::new();
@@ -456,6 +461,7 @@ async fn test_partial_process_failure() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_checkpoint_recovery_after_failure() -> Result<()> {
     let checkpoint_config = CheckpointConfig {
         checkpoint_dir: std::env::temp_dir()
@@ -525,6 +531,7 @@ async fn test_checkpoint_recovery_after_failure() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_elastic_training_with_node_failure() -> Result<()> {
     let elastic_config = torsh_distributed::fault_tolerance::ElasticConfig {
         min_workers: 2,
@@ -573,6 +580,7 @@ async fn test_elastic_training_with_node_failure() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_cascading_failure_handling() -> Result<()> {
     let world_size = 6;
     let mut process_groups: Vec<Option<ProcessGroup>> = Vec::new();
@@ -616,6 +624,7 @@ async fn test_cascading_failure_handling() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires a real multi-process launch; the single-process mock backend was removed so honest collectives error without live peers. Real multi-rank coverage: tests/hardening_distributed.rs"]
 async fn test_memory_pressure_handling() -> Result<()> {
     let injector = FaultInjector::new(FaultInjectionConfig {
         fault_type: FaultType::MemoryFailure,

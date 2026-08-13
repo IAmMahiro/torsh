@@ -374,7 +374,7 @@ pub fn pinv(tensor: &Tensor, rcond: Option<f32>) -> TorshResult<Tensor> {
     let (m, n) = (tensor.shape().dims()[0], tensor.shape().dims()[1]);
 
     // Compute SVD: A = U * S * V^T
-    let (u, s, vt) = svd(tensor, true)?;
+    let (u, s, vt) = svd(tensor, false)?;
 
     // Set tolerance for small singular values
     let rcond = rcond.unwrap_or(1e-15);
@@ -484,7 +484,7 @@ pub fn lstsq(
     }
 
     // Compute SVD of A
-    let (_u, s, _vt) = svd(a, true)?;
+    let (_u, s, _vt) = svd(a, false)?;
 
     // s is already a 1D tensor from SVD, just return it
     let s_tensor = s;

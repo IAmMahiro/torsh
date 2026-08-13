@@ -22,59 +22,43 @@ Note: This crate integrates with scirs2-text for optimized text processing opera
 ```rust
 use torsh_text::prelude::*;
 
-// Basic tokenizer
-let tokenizer = BasicTokenizer::new()
-    .do_lower_case(true)
-    .strip_accents(true);
-
+// All tokenizers implement the same `Tokenizer` trait:
+// tokenize(&str) -> Vec<String>, encode(&str) -> Vec<u32>, decode(&[u32]) -> String
+let tokenizer = WhitespaceTokenizer::new();
 let text = "Hello, World! This is a test.";
 let tokens = tokenizer.tokenize(text)?;
 
-// WordPiece tokenizer
-let vocab = load_vocab("bert-base-uncased.txt")?;
-let wordpiece = WordPieceTokenizer::new(vocab)
-    .unk_token("[UNK]")
-    .max_input_chars_per_word(100);
-
-let tokens = wordpiece.tokenize("unaffable")?;
-// ["un", "##aff", "##able"]
-
-// Sentence Piece tokenizer
-let sp_model = SentencePieceTokenizer::from_file("model.model")?;
-let tokens = sp_model.encode("Hello world")?;
-let decoded = sp_model.decode(&tokens)?;
-
-// BPE tokenizer
-let bpe = BPETokenizer::from_file("vocab.json", "merges.txt")?;
-let encoding = bpe.encode("Hello, world!")?;
+// BPE tokenizer (trained from texts, not loaded from a vocab.json/merges.txt pair)
+let bpe = BPETokenizer::from_texts(&training_texts, 8000)?;
+let ids = bpe.encode("Hello, world!")?;
+let decoded = bpe.decode(&ids)?;
 ```
+
+Note: there is no `BasicTokenizer`, `WordPieceTokenizer`, or `SentencePieceTokenizer` in
+this crate today — real tokenizer types are `WhitespaceTokenizer`, `CharTokenizer`,
+`SubwordTokenizer`, `BPETokenizer`, `ByteLevelBPETokenizer`, and `UnigramTokenizer`.
 
 ### Vocabulary Management
 
 ```rust
 use torsh_text::vocab::*;
 
-// Build vocabulary from corpus
-let corpus = vec![
-    "This is a sentence",
-    "This is another sentence",
-    "And one more",
+// Build vocabulary from corpus texts (the real type is `Vocabulary`, not `Vocab`)
+let corpus: Vec<String> = vec![
+    "This is a sentence".to_string(),
+    "This is another sentence".to_string(),
+    "And one more".to_string(),
 ];
 
-let vocab = Vocab::build_from_iterator(
-    corpus.iter().flat_map(|s| s.split_whitespace()),
-    min_freq=1,
-    max_size=Some(10000),
-    special_tokens=vec!["<pad>", "<unk>", "<sos>", "<eos>"],
-)?;
+let vocab = Vocabulary::from_texts(&corpus, /* min_freq */ 1, /* max_size */ Some(10000));
 
-// Convert between tokens and indices
-let indices = vocab.tokens_to_indices(&["This", "is", "a", "test"])?;
-let tokens = vocab.indices_to_tokens(&indices)?;
+// Convert between tokens and ids (method names are tokens_to_ids / ids_to_tokens)
+let ids = vocab.tokens_to_ids(&["This".to_string(), "is".to_string(), "a".to_string()]);
+let tokens = vocab.ids_to_tokens(&ids);
 
-// Save and load vocabulary
-vocab.save("vocab.txt")?;
-let loaded = Vocab::from_file("vocab.txt")?;
+// Save and load vocabulary (plain-text format)
+vocab.save_txt("vocab.txt")?;
+let loaded = Vocabulary::load_txt("vocab.txt")?;
 ```
 
 ### Text Datasets
@@ -82,34 +66,22 @@ let loaded = Vocab::from_file("vocab.txt")?;
 ```rust
 use torsh_text::datasets::*;
 
-// IMDB sentiment dataset
-let imdb = IMDB::new("./data", split="train", download=true)?;
-for (text, label) in imdb.iter() {
-    println!("Text: {}, Sentiment: {}", text, label);
-}
+// IMDB sentiment dataset (real type is `ImdbDataset`; no built-in download)
+let imdb = ImdbDataset::from_directory("./data", DatasetSplit::Train)?;
+println!("{} positive, {} negative", imdb.num_positive(), imdb.num_negative());
 
-// Custom text classification dataset
-let dataset = TextClassificationDataset::from_csv(
-    "data.csv",
-    text_column="review",
-    label_column="sentiment",
-    tokenizer=tokenizer,
-    max_length=512,
-)?;
+// Text classification dataset (real type is `ClassificationDataset`; its
+// `from_csv` expects a specific "class_idx,title,description" CSV layout,
+// not arbitrary text/label columns)
+let dataset = ClassificationDataset::from_csv("data.csv", DatasetSplit::Train)?;
 
-// Language modeling dataset
-let lm_dataset = LanguageModelingDataset::from_file(
-    "corpus.txt",
-    tokenizer=tokenizer,
-    block_size=128,
-)?;
+// Language modeling dataset — plain text, split into fixed-length windows
+// (there is no tokenizer/block_size keyword API; tokenization is a separate step)
+let lm_dataset = LanguageModelingDataset::from_file("corpus.txt", 128, None)?;
 
-// Translation dataset
-let translation = TranslationDataset::new(
-    source_files=vec!["train.en"],
-    target_files=vec!["train.de"],
-    source_tokenizer=en_tokenizer,
-    target_tokenizer=de_tokenizer,
+// Translation dataset — parallel text files, one sentence per line
+let translation = TranslationDataset::from_files(
+    "train.en", "train.de", "en".to_string(), "de".to_string(),
 )?;
 ```
 
@@ -137,13 +109,8 @@ let augmenter = TextAugmenter::new()
 
 let augmented = augmenter.augment("The quick brown fox")?;
 
-// Padding and truncation
-let padded = pad_sequence(
-    &sequences,
-    batch_first=true,
-    padding_value=0,
-    max_length=Some(100),
-)?;
+// Padding and truncation (operates on one token-id sequence at a time)
+let padded = pad_sequence(&tokens, 100, 0, PaddingStrategy::Right);
 ```
 
 ### Embeddings
@@ -151,30 +118,14 @@ let padded = pad_sequence(
 ```rust
 use torsh_text::embeddings::*;
 
-// Pre-trained embeddings
-let glove = GloVe::from_file("glove.6B.300d.txt")?;
-let word_vector = glove.get_vector("hello")?;
+// There is no GloVe / pre-trained-vector loader in this crate today.
+// Embedding is torsh-nn's layer type: Embedding::new(vocab_size, embedding_dim)
+// (no padding_idx / from_pretrained here).
+let embedding = torsh_nn::Embedding::new(vocab.len(), 300);
 
-// Embedding layer
-let embedding = Embedding::new(
-    num_embeddings=vocab.size(),
-    embedding_dim=300,
-    padding_idx=Some(0),
-)?;
-
-// Initialize with pre-trained
-embedding.from_pretrained(&glove, &vocab, freeze=false)?;
-
-// Contextual embeddings
-let bert_embeddings = BertEmbeddings::new(
-    vocab_size=30522,
-    hidden_size=768,
-    pad_token_id=0,
-    max_position_embeddings=512,
-    type_vocab_size=2,
-    layer_norm_eps=1e-12,
-    dropout=0.1,
-)?;
+// Contextual embeddings — BertEmbeddings takes a config struct + device
+let config = TextModelConfig::new(30522, 768, 12, 12)?; // vocab, hidden, layers, heads
+let bert_embeddings = BertEmbeddings::new(&config, DeviceType::Cpu)?;
 ```
 
 ### Text Generation
@@ -217,28 +168,19 @@ let sampled = generator.sample(
 ```rust
 use torsh_text::metrics::*;
 
-// BLEU score
-let bleu = calculate_bleu(
-    &references,
-    &hypotheses,
-    max_n=4,
-    smooth=true,
-)?;
+// BLEU score (scorer object, not a calculate_bleu() free function)
+let bleu = BleuScore::new().with_smoothing(true);
+let score = bleu.calculate(&hypothesis, &references)?;
 
-// ROUGE scores
-let rouge = calculate_rouge(
-    &references,
-    &hypotheses,
-    rouge_types=vec!["rouge1", "rouge2", "rougeL"],
-)?;
+// ROUGE score
+let rouge = RougeScore::new(RougeType::RougeL);
+let rouge_result = rouge.calculate(&hypothesis, &reference)?;
 
-// Perplexity
-let perplexity = calculate_perplexity(&model, &test_data)?;
+// Perplexity (metrics::perplexity module, from probabilities or logits)
+let ppl = metrics::perplexity::calculate(&probabilities)?;
 
-// Text statistics
-let stats = TextStatistics::from_corpus(&corpus)?;
-println!("Vocabulary size: {}", stats.vocab_size);
-println!("Average sentence length: {:.2}", stats.avg_sentence_length);
+// Text statistics (built from sentences, not a raw corpus)
+let stats = TextStatistics::from_sentences(&sentences);
 ```
 
 ### Integration with Models
@@ -286,8 +228,8 @@ let transformer = TransformerModel::new(
 ### Utilities
 
 ```rust
-// N-gram extraction
-let ngrams = extract_ngrams(&tokens, n=3)?;
+// N-gram extraction (returns frequency counts, not a plain list)
+let ngrams = scirs2_ops::ngram_frequency(text, 3)?;
 
 // TF-IDF
 let tfidf = TfIdf::fit(&documents)?;

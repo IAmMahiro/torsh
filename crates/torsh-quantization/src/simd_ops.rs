@@ -14,11 +14,26 @@
 use scirs2_core::parallel_ops::*;
 use torsh_core::error::{Result as TorshResult, TorshError};
 
-/// SIMD-accelerated per-tensor quantization
+/// SIMD-accelerated per-tensor quantization into the `I8` range.
+///
+/// Use [`quantize_per_tensor_affine_simd_range`] to target a different integer
+/// width (for example `U8`'s `[0, 255]`).
 pub fn quantize_per_tensor_affine_simd(
     input: &[f32],
     scale: f32,
     zero_point: i32,
+    output: &mut [f32],
+) -> TorshResult<()> {
+    quantize_per_tensor_affine_simd_range(input, scale, zero_point, -128, 127, output)
+}
+
+/// SIMD-accelerated per-tensor quantization clamped to an explicit `[qmin, qmax]` range.
+pub fn quantize_per_tensor_affine_simd_range(
+    input: &[f32],
+    scale: f32,
+    zero_point: i32,
+    qmin: i32,
+    qmax: i32,
     output: &mut [f32],
 ) -> TorshResult<()> {
     if input.len() != output.len() {
@@ -33,8 +48,15 @@ pub fn quantize_per_tensor_affine_simd(
         ));
     }
 
+    if qmin >= qmax {
+        return Err(TorshError::InvalidArgument(
+            "qmin must be less than qmax".to_string(),
+        ));
+    }
+
     let inv_scale = 1.0 / scale;
     let zero_point_f32 = zero_point as f32;
+    let (qmin_f, qmax_f) = (qmin as f32, qmax as f32);
 
     // Use optimized parallel processing for quantization operation
     input
@@ -42,7 +64,7 @@ pub fn quantize_per_tensor_affine_simd(
         .zip(output.par_iter_mut())
         .for_each(|(&x, out)| {
             let quantized = (x * inv_scale).round() + zero_point_f32;
-            *out = quantized.clamp(-128.0, 127.0);
+            *out = quantized.clamp(qmin_f, qmax_f);
         });
 
     Ok(())

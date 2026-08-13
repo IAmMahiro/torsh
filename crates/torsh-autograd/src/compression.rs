@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use torsh_core::dtype::FloatElement;
 use torsh_core::error::{Result, TorshError};
+use torsh_core::sync::RwLockExt;
 
 /// Gradient compression configuration
 #[derive(Debug, Clone)]
@@ -129,16 +130,9 @@ impl<T: FloatElement> std::fmt::Debug for GradientCompressor<T> {
             .field("config", &self.config)
             .field(
                 "error_feedback_size",
-                &self
-                    .error_feedback
-                    .read()
-                    .expect("lock should not be poisoned")
-                    .len(),
+                &self.error_feedback.read_or_recover().len(),
             )
-            .field(
-                "stats",
-                &self.stats.read().expect("lock should not be poisoned"),
-            )
+            .field("stats", &self.stats.read_or_recover())
             .finish()
     }
 }
@@ -215,7 +209,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> GradientCompressor<T> {
 
         // Update statistics
         let compression_time = start_time.elapsed().as_millis() as u64;
-        let mut stats = self.stats.write().expect("lock should not be poisoned");
+        let mut stats = self.stats.write_or_recover();
         stats.total_compressions += 1;
         stats.total_bytes_original += std::mem::size_of_val(gradients);
         stats.total_bytes_compressed += compressed.data.len();
@@ -269,10 +263,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> GradientCompressor<T> {
 
         // Update decompression statistics
         let decompression_time = start_time.elapsed().as_millis() as u64;
-        self.stats
-            .write()
-            .expect("lock should not be poisoned")
-            .total_decompression_time_ms += decompression_time;
+        self.stats.write_or_recover().total_decompression_time_ms += decompression_time;
 
         Ok(decompressed)
     }
@@ -694,10 +685,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> GradientCompressor<T> {
         parameter_name: &str,
     ) -> Result<CompressedGradient> {
         // Get or create error feedback buffer
-        let mut error_feedback = self
-            .error_feedback
-            .write()
-            .expect("lock should not be poisoned");
+        let mut error_feedback = self.error_feedback.write_or_recover();
         let error_buffer = error_feedback
             .entry(parameter_name.to_string())
             .or_insert_with(|| {
@@ -937,15 +925,12 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> GradientCompressor<T> {
 
     /// Get compression statistics
     pub fn get_stats(&self) -> CompressionStats {
-        self.stats
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.stats.read_or_recover().clone()
     }
 
     /// Reset compression statistics
     pub fn reset_stats(&mut self) {
-        *self.stats.write().expect("lock should not be poisoned") = CompressionStats::default();
+        *self.stats.write_or_recover() = CompressionStats::default();
     }
 
     /// Update configuration

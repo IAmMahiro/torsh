@@ -125,6 +125,21 @@ impl KFold {
             random_seed,
         }
     }
+
+    /// Fallible variant of [`Self::new`] that returns an error instead of
+    /// panicking when `n_splits < 2`.
+    pub fn try_new(n_splits: usize, shuffle: bool, random_seed: Option<u64>) -> Result<Self> {
+        if n_splits < 2 {
+            return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                "n_splits must be at least 2, got {n_splits}"
+            )));
+        }
+        Ok(Self {
+            n_splits,
+            shuffle,
+            random_seed,
+        })
+    }
     /// Generate fold indices for a dataset
     ///
     /// Returns a vector of (train_indices, val_indices) tuples, one for each fold.

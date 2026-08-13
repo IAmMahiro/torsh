@@ -122,11 +122,28 @@ pub struct KMeansResult {
     pub converged: bool,
     /// Final centroids change
     pub final_change: f64,
+    /// Number of times an empty cluster's centroid was reseeded to the
+    /// data point farthest from its assigned centroid during the run
+    /// (0 for a run where every cluster always received at least one
+    /// point). A persistently high count across runs suggests `n_clusters`
+    /// is too large for the data.
+    pub n_empty_cluster_reseeds: usize,
+}
+
+impl KMeansResult {
+    /// Get cluster labels for each data point.
+    ///
+    /// K-Means always produces labels, so this concrete accessor is
+    /// infallible; see [`ClusteringResult::labels`] for the fallible,
+    /// trait-object-safe equivalent.
+    pub fn labels(&self) -> &Tensor {
+        &self.labels
+    }
 }
 
 impl ClusteringResult for KMeansResult {
-    fn labels(&self) -> &Tensor {
-        &self.labels
+    fn labels(&self) -> Option<&Tensor> {
+        Some(&self.labels)
     }
 
     fn n_clusters(&self) -> usize {
@@ -148,6 +165,59 @@ impl ClusteringResult for KMeansResult {
     fn converged(&self) -> bool {
         self.converged
     }
+}
+
+/// Relocate empty-cluster centroids to the data points currently farthest
+/// from their assigned centroid, matching scikit-learn's empty-cluster
+/// relocation strategy (`_relocate_empty_clusters_dense`) instead of
+/// silently leaving the centroid at the origin.
+///
+/// `centroids_data` is the flat `n_clusters * n_features` centroid buffer,
+/// already averaged for non-empty clusters (i.e. `cluster_counts[k] > 0`
+/// entries hold a valid mean; `cluster_counts[k] == 0` entries are still at
+/// their pre-update value, typically zero). `assigned_dist` gives, for each
+/// point, a distance (or squared distance -- only relative order matters)
+/// to the centroid it was assigned to this iteration; it is used purely to
+/// rank candidates, so an upper bound (as Elkan's algorithm produces) is
+/// fine too. Each empty cluster is seeded from a distinct farthest point,
+/// with `cluster_counts` updated to `1` for reseeded clusters so a later
+/// caller can distinguish "genuinely empty" from "just reseeded". Returns
+/// the number of clusters that were reseeded.
+fn reseed_empty_clusters(
+    n_clusters: usize,
+    n_features: usize,
+    data_vec: &[f32],
+    cluster_counts: &mut [usize],
+    centroids_data: &mut [f32],
+    assigned_dist: &[f32],
+) -> usize {
+    let empty_clusters: Vec<usize> = (0..n_clusters)
+        .filter(|&k| cluster_counts[k] == 0)
+        .collect();
+    if empty_clusters.is_empty() {
+        return 0;
+    }
+
+    // Rank points by distance to their assigned centroid, descending.
+    let mut order: Vec<usize> = (0..assigned_dist.len()).collect();
+    order.sort_by(|&a, &b| {
+        assigned_dist[b]
+            .partial_cmp(&assigned_dist[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut n_reseeded = 0;
+    for (slot, &k) in empty_clusters.iter().enumerate() {
+        if let Some(&point_idx) = order.get(slot) {
+            let src_start = point_idx * n_features;
+            let dst_start = k * n_features;
+            centroids_data[dst_start..dst_start + n_features]
+                .copy_from_slice(&data_vec[src_start..src_start + n_features]);
+            cluster_counts[k] = 1;
+            n_reseeded += 1;
+        }
+    }
+    n_reseeded
 }
 
 /// K-Means clustering algorithm
@@ -388,6 +458,33 @@ impl KMeans {
             }
         }
 
+        // A random partition can leave some clusters empty (especially with
+        // many clusters relative to samples); reseed them instead of
+        // leaving the centroid at the origin. Every point's own assigned
+        // cluster is non-empty by construction, so its distance to that
+        // cluster's (now-averaged) centroid is a valid ranking key for
+        // "farthest point" reseeding.
+        let assigned_dist: Vec<f32> = (0..n_samples)
+            .map(|i| {
+                let cluster = cluster_assignments[i];
+                let mut dist = 0.0f32;
+                for j in 0..n_features {
+                    let diff =
+                        data_vec[i * n_features + j] - centroids_data[cluster * n_features + j];
+                    dist += diff * diff;
+                }
+                dist
+            })
+            .collect();
+        reseed_empty_clusters(
+            self.config.n_clusters,
+            n_features,
+            &data_vec,
+            &mut cluster_counts,
+            &mut centroids_data,
+            &assigned_dist,
+        );
+
         Tensor::from_vec(centroids_data, &[self.config.n_clusters, n_features])
             .map_err(ClusterError::TensorError)
     }
@@ -411,6 +508,7 @@ impl KMeans {
         let mut converged = false;
         let mut n_iter = 0;
         let mut final_change = f64::INFINITY;
+        let mut n_empty_cluster_reseeds = 0usize;
 
         for iter in 0..self.config.max_iters {
             n_iter = iter + 1;
@@ -418,6 +516,7 @@ impl KMeans {
             // Assignment step: assign each point to nearest centroid
             let centroids_vec = centroids.to_vec().map_err(ClusterError::TensorError)?;
             let mut labels_vec = vec![0.0; n_samples];
+            let mut assigned_dist_sq = vec![0.0f32; n_samples];
 
             for i in 0..n_samples {
                 let mut min_dist = f32::INFINITY;
@@ -437,6 +536,7 @@ impl KMeans {
                 }
 
                 labels_vec[i] = best_cluster as f32;
+                assigned_dist_sq[i] = min_dist;
             }
 
             labels = Tensor::from_vec(labels_vec.clone(), &[n_samples])
@@ -464,6 +564,18 @@ impl KMeans {
                 }
             }
 
+            // Reseed any cluster that received no points this iteration to
+            // the farthest point from its assigned centroid, rather than
+            // leaving it at the origin (see `reseed_empty_clusters`).
+            n_empty_cluster_reseeds += reseed_empty_clusters(
+                self.config.n_clusters,
+                n_features,
+                &data_vec,
+                &mut cluster_counts,
+                &mut new_centroids_data,
+                &assigned_dist_sq,
+            );
+
             centroids = Tensor::from_vec(new_centroids_data, &[self.config.n_clusters, n_features])
                 .map_err(ClusterError::TensorError)?;
 
@@ -487,6 +599,7 @@ impl KMeans {
             n_iter,
             converged,
             final_change,
+            n_empty_cluster_reseeds,
         })
     }
 
@@ -506,6 +619,7 @@ impl KMeans {
         let mut converged = false;
         let mut n_iter = 0;
         let mut final_change = f64::INFINITY;
+        let mut n_empty_cluster_reseeds = 0usize;
 
         for iter in 0..self.config.max_iters {
             n_iter = iter + 1;
@@ -514,8 +628,9 @@ impl KMeans {
             let centroids_array = tensor_to_array2(&centroids)?;
 
             // Parallel K-means iteration using optimized parallel utilities
-            let (new_centroids_array, _labels_array, _inertia_f32) =
+            let (new_centroids_array, _labels_array, _inertia_f32, n_reseeds) =
                 parallel::parallel_kmeans_iteration_f32(&data_array, &centroids_array)?;
+            n_empty_cluster_reseeds += n_reseeds;
 
             // Convert back to tensors
             let new_centroids = array2_to_tensor(&new_centroids_array)?;
@@ -534,8 +649,9 @@ impl KMeans {
 
         // Final assignment and inertia computation
         let centroids_array = tensor_to_array2(&centroids)?;
-        let (_, labels_array, inertia_f32) =
+        let (_, labels_array, inertia_f32, n_reseeds) =
             parallel::parallel_kmeans_iteration_f32(&data_array, &centroids_array)?;
+        n_empty_cluster_reseeds += n_reseeds;
 
         let labels_usize = labels_array.to_vec();
         let labels = Tensor::from_vec(
@@ -551,6 +667,7 @@ impl KMeans {
             n_iter,
             converged,
             final_change,
+            n_empty_cluster_reseeds,
         })
     }
 
@@ -612,6 +729,7 @@ impl KMeans {
         let mut converged = false;
         let mut n_iter = 0;
         let mut final_change = f64::INFINITY;
+        let mut n_empty_cluster_reseeds = 0usize;
 
         // Elkan's algorithm specific data structures
         let mut upper_bounds = vec![f32::INFINITY; n_samples]; // Upper bound on distance to assigned centroid
@@ -689,6 +807,24 @@ impl KMeans {
                 }
             }
 
+            // Reseed any cluster that received no points this iteration to
+            // the farthest point from its assigned centroid (see
+            // `reseed_empty_clusters`), *before* computing centroid
+            // movement below -- this makes the movement loop naturally
+            // compute the correct (large) jump distance for reseeded
+            // clusters too, which keeps Elkan's triangle-inequality bounds
+            // (`upper_bounds`/`lower_bounds`) valid in later iterations.
+            // `upper_bounds` currently holds each point's distance to its
+            // just-assigned centroid, the ranking key reseeding needs.
+            n_empty_cluster_reseeds += reseed_empty_clusters(
+                self.config.n_clusters,
+                n_features,
+                &data_vec,
+                &mut cluster_counts,
+                &mut new_centroids_data,
+                &upper_bounds,
+            );
+
             // Average to get new centroids and compute movement
             let mut centroid_movements = vec![0.0; self.config.n_clusters];
             #[allow(clippy::needless_range_loop)]
@@ -741,6 +877,7 @@ impl KMeans {
             n_iter,
             converged,
             final_change,
+            n_empty_cluster_reseeds,
         })
     }
 
@@ -863,6 +1000,11 @@ impl KMeans {
             n_iter,
             converged,
             final_change,
+            // Mini-batch centroids are nudged incrementally from their
+            // (data-derived) initial positions and are never reset to a
+            // zero-sum accumulator, so they cannot be teleported to the
+            // origin the way Lloyd/Elkan's per-iteration averaging can.
+            n_empty_cluster_reseeds: 0,
         })
     }
 }

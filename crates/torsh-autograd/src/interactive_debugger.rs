@@ -333,7 +333,7 @@ enum Operand {
 /// * `total_operations` (number) -- total operation count
 /// * `input_count` / `output_count` (number) -- tensor arity of the event
 /// * `gradient_norm` (number) -- L2 norm of the event gradient (see
-///   [`extract_gradient_norm`]); comparisons are false when unavailable
+///   `extract_gradient_norm`); comparisons are false when unavailable
 /// * `duration_micros` (number) -- event duration in microseconds
 ///
 /// Text fields support only `==` / `!=`. Numeric fields support all operators.

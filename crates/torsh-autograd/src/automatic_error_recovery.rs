@@ -12,6 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use torsh_core::sync::{MutexExt, RwLockExt};
 
 /// Types of transient failures that can be recovered from
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -668,10 +669,7 @@ impl AutomaticErrorRecovery {
 
     /// Get current recovery statistics
     pub fn get_statistics(&self) -> RecoveryStatistics {
-        self.statistics
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.statistics.read_or_recover().clone()
     }
 
     /// Update recovery strategy for a failure type (learning)
@@ -696,10 +694,7 @@ impl AutomaticErrorRecovery {
 
     /// Get list of active recoveries
     pub fn get_active_recoveries(&self) -> HashMap<String, RecoveryContext> {
-        self.active_recoveries
-            .lock()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.active_recoveries.lock_or_recover().clone()
     }
 
     /// Clear recovery history and statistics

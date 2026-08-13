@@ -14,7 +14,6 @@ pub use registry::*;
 // pub use transformer::*;
 
 use torsh_core::{device::DeviceType, Result};
-use torsh_tensor::creation::randn;
 use torsh_tensor::Tensor;
 
 /// Base trait for text models (temporarily simplified)
@@ -736,13 +735,20 @@ pub mod integration {
             result.to_dtype(torsh_core::DType::I64)
         }
 
-        fn forward_model(&self, input: &Tensor) -> Result<Tensor> {
-            // Placeholder implementation - would call actual model
-            let batch_size = input.size(0)?;
-            let seq_len = input.size(1)?;
-            let vocab_size = self.model.vocab_size();
-
-            Ok(randn::<f32>(&[batch_size, seq_len, vocab_size])?)
+        fn forward_model(&self, _input: &Tensor) -> Result<Tensor> {
+            // The TextModel trait carries only shape metadata and has no
+            // forward() method, so there is no way to produce real logits here.
+            // Returning random (or zero) logits would make every downstream
+            // sampling strategy emit noise while looking like a successful
+            // generation, so we return an honest error instead — mirroring
+            // UniversalTextEncoder::forward_model.
+            Err(crate::TextError::ModelError(
+                "AdvancedTextDecoder::forward_model: TextModel trait does not expose a \
+                 forward() method. Wrap the model in a Module-backed decoder to obtain \
+                 real logits."
+                    .to_string(),
+            )
+            .into())
         }
 
         fn sample_nucleus(&self, probs: &Tensor, top_p: f32) -> Result<Tensor> {
@@ -818,15 +824,17 @@ pub mod integration {
             _hidden_states: &Tensor,
             _past_key_values: Option<&Tensor>,
         ) -> Result<(Tensor, Option<Tensor>)> {
-            // Convert hidden states to logits over vocabulary
-            let vocab_size = self.model.vocab_size();
-            let batch_size = _hidden_states.size(0)?;
-            let seq_len = _hidden_states.size(1)?;
-
-            // Placeholder: create random logits
-            let logits = randn::<f32>(&[batch_size, seq_len, vocab_size])?;
-
-            Ok((logits, None))
+            // Projecting hidden states onto the vocabulary requires the model's
+            // output head, which the TextModel trait does not expose. Fabricated
+            // logits would silently corrupt every downstream sampling strategy,
+            // so this reports the missing forward path instead.
+            Err(crate::TextError::ModelError(
+                "AdvancedTextDecoder::decode: no language-model head available. \
+                 forward_model requires a Module-backed decoder to project hidden \
+                 states onto the vocabulary."
+                    .to_string(),
+            )
+            .into())
         }
 
         fn generate(
@@ -914,25 +922,59 @@ pub mod integration {
             }
         }
 
-        /// Similarity search between texts
-        pub fn text_similarity(&self, text1: &str, text2: &str) -> Result<f32> {
-            if let Some(_encoder) = &self.encoder {
-                let _emb1 = self.encode(text1)?;
-                let _emb2 = self.encode(text2)?;
+        /// Cosine similarity between two embedding tensors.
+        ///
+        /// Returns an error when the embeddings have different lengths, are
+        /// empty, or when either has (near) zero norm — cosine similarity is
+        /// undefined in those cases and returning a number would be a guess.
+        fn cosine_similarity(left: &Tensor, right: &Tensor) -> Result<f32> {
+            let left_values = left.to_vec()?;
+            let right_values = right.to_vec()?;
 
-                // Compute cosine similarity
-                // let dot_product = emb1.mul(&emb2)?.sum(None, false)?;
-                // let norm1 = emb1.norm(None, false, false)?.unwrap();
-                // let norm2 = emb2.norm(None, false, false)?.unwrap();
-                // let similarity = dot_product.div(&norm1.mul(&norm2)?)?;
-
-                // Extract scalar value (simplified)
-                Ok(0.5) // Placeholder
-            } else {
-                Err(torsh_core::error::TorshError::InvalidArgument(
-                    "No encoder available for similarity computation".to_string(),
-                ))
+            if left_values.len() != right_values.len() {
+                return Err(torsh_core::error::TorshError::InvalidArgument(format!(
+                    "embedding dimension mismatch: {} vs {}",
+                    left_values.len(),
+                    right_values.len()
+                )));
             }
+            if left_values.is_empty() {
+                return Err(torsh_core::error::TorshError::InvalidArgument(
+                    "cannot compute similarity of empty embeddings".to_string(),
+                ));
+            }
+
+            let mut dot = 0.0f32;
+            let mut left_sq = 0.0f32;
+            let mut right_sq = 0.0f32;
+            for (a, b) in left_values.iter().zip(right_values.iter()) {
+                dot += a * b;
+                left_sq += a * a;
+                right_sq += b * b;
+            }
+
+            let denominator = left_sq.sqrt() * right_sq.sqrt();
+            if !denominator.is_finite() || denominator <= f32::EPSILON {
+                return Err(torsh_core::error::TorshError::InvalidArgument(
+                    "cosine similarity is undefined for a zero-norm embedding".to_string(),
+                ));
+            }
+
+            Ok((dot / denominator).clamp(-1.0, 1.0))
+        }
+
+        /// Cosine similarity between the embeddings of two texts
+        pub fn text_similarity(&self, text1: &str, text2: &str) -> Result<f32> {
+            if self.encoder.is_none() {
+                return Err(torsh_core::error::TorshError::InvalidArgument(
+                    "No encoder available for similarity computation".to_string(),
+                ));
+            }
+
+            let embedding1 = self.encode(text1)?;
+            let embedding2 = self.encode(text2)?;
+
+            Self::cosine_similarity(&embedding1, &embedding2)
         }
 
         /// Question answering functionality
@@ -954,33 +996,39 @@ pub mod integration {
             }
         }
 
-        /// Text classification
+        /// Zero-shot text classification by embedding similarity
+        ///
+        /// Embeds `text` and every candidate label with the configured encoder
+        /// and returns the label whose embedding has the highest cosine
+        /// similarity, together with that similarity.
         pub fn classify(&self, text: &str, labels: &[String]) -> Result<(String, f32)> {
-            if let Some(_encoder) = &self.encoder {
-                let _text_embedding = self.encode(text)?;
-
-                // For each label, compute similarity (simplified approach)
-                let mut best_label = String::new();
-                let mut best_score = 0.0f32;
-
-                for label in labels {
-                    let _label_embedding = self.encode(label)?;
-
-                    // Compute similarity (placeholder)
-                    let score = 1.0 / (1.0 + labels.len() as f32); // Dummy score
-
-                    if score > best_score {
-                        best_score = score;
-                        best_label = label.clone();
-                    }
-                }
-
-                Ok((best_label, best_score))
-            } else {
-                Err(torsh_core::error::TorshError::InvalidArgument(
+            if self.encoder.is_none() {
+                return Err(torsh_core::error::TorshError::InvalidArgument(
                     "No encoder available for classification".to_string(),
-                ))
+                ));
             }
+            if labels.is_empty() {
+                return Err(torsh_core::error::TorshError::InvalidArgument(
+                    "classify requires at least one candidate label".to_string(),
+                ));
+            }
+
+            let text_embedding = self.encode(text)?;
+
+            let mut best_label = String::new();
+            let mut best_score = f32::NEG_INFINITY;
+
+            for label in labels {
+                let label_embedding = self.encode(label)?;
+                let score = Self::cosine_similarity(&text_embedding, &label_embedding)?;
+
+                if score > best_score {
+                    best_score = score;
+                    best_label = label.clone();
+                }
+            }
+
+            Ok((best_label, best_score))
         }
     }
 
@@ -1606,5 +1654,54 @@ mod integration_honesty_tests {
             }
             Ok(_) => panic!("forward_model returned Ok — fabricated zero tensor still active"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Decoder half: decode() must return Err, not fabricated random logits
+    // -----------------------------------------------------------------------
+    fn make_decoder() -> super::integration::AdvancedTextDecoder {
+        let model = Box::new(StubModel {
+            hidden: 8,
+            vocab: 32,
+        });
+        let tokenizer = Arc::new(WhitespaceTokenizer::new());
+        super::integration::AdvancedTextDecoder::new(model, tokenizer, DeviceType::Cpu)
+    }
+
+    #[test]
+    fn decoder_decode_returns_error_not_random_logits() {
+        use super::TextDecoder;
+
+        let decoder = make_decoder();
+        let hidden = Tensor::from_vec(vec![0.0_f32; 8], &[1, 1, 8]).expect("hidden states");
+        let result = decoder.decode(&hidden, None);
+        assert!(
+            result.is_err(),
+            "decode returned Ok — fabricated random logits still active"
+        );
+    }
+
+    #[test]
+    fn decoder_generate_returns_error_not_random_tokens() {
+        use super::{GenerationConfig, TextDecoder};
+
+        let decoder = make_decoder();
+        let input = Tensor::from_vec(vec![1.0_f32, 2.0], &[1, 2]).expect("input tensor");
+
+        assert!(
+            decoder
+                .generate(&input, 4, &GenerationConfig::default())
+                .is_err(),
+            "sampling generate returned Ok — it would be sampling from noise"
+        );
+
+        let beam = GenerationConfig {
+            num_beams: 2,
+            ..Default::default()
+        };
+        assert!(
+            decoder.generate(&input, 4, &beam).is_err(),
+            "beam-search generate returned Ok — it would be sampling from noise"
+        );
     }
 }

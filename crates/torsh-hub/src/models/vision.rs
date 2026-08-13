@@ -757,11 +757,9 @@ pub mod pretrained {
         let model = ResNet::resnet18(1000);
 
         if pretrained {
-            // In a real implementation, this would download and load pretrained weights
-            // For now, we just initialize with random weights
-            println!(
-                "Loading ResNet-18 with random weights (pretrained weights not implemented yet)"
-            );
+            return Err(torsh_core::error::TorshError::NotImplemented(
+                "ResNet-18 pretrained weights are not available; call with pretrained=false for a randomly-initialized model".to_string(),
+            ));
         }
 
         Ok(Box::new(model))
@@ -772,9 +770,9 @@ pub mod pretrained {
         let model = ResNet::resnet50(1000);
 
         if pretrained {
-            println!(
-                "Loading ResNet-50 with random weights (pretrained weights not implemented yet)"
-            );
+            return Err(torsh_core::error::TorshError::NotImplemented(
+                "ResNet-50 pretrained weights are not available; call with pretrained=false for a randomly-initialized model".to_string(),
+            ));
         }
 
         Ok(Box::new(model))
@@ -785,7 +783,9 @@ pub mod pretrained {
         let model = EfficientNet::efficientnet_b0(1000);
 
         if pretrained {
-            println!("Loading EfficientNet-B0 with random weights (pretrained weights not implemented yet)");
+            return Err(torsh_core::error::TorshError::NotImplemented(
+                "EfficientNet-B0 pretrained weights are not available; call with pretrained=false for a randomly-initialized model".to_string(),
+            ));
         }
 
         Ok(Box::new(model))
@@ -796,9 +796,9 @@ pub mod pretrained {
         let model = VisionTransformer::vit_base_patch16_224(1000)?;
 
         if pretrained {
-            println!(
-                "Loading ViT-Base with random weights (pretrained weights not implemented yet)"
-            );
+            return Err(torsh_core::error::TorshError::NotImplemented(
+                "ViT-Base pretrained weights are not available; call with pretrained=false for a randomly-initialized model".to_string(),
+            ));
         }
 
         Ok(Box::new(model))

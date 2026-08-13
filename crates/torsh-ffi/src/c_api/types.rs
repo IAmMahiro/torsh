@@ -502,6 +502,9 @@ impl OptimizerImpl {
 /// # Examples
 ///
 /// ```rust
+/// use rstorch::c_api::types::TorshDType;
+/// use torsh_core::DType;
+///
 /// let rust_type = DType::F32;
 /// let c_type: TorshDType = rust_type.into();
 /// assert_eq!(c_type, TorshDType::F32);
@@ -527,6 +530,9 @@ impl From<DType> for TorshDType {
 /// # Examples
 ///
 /// ```rust
+/// use rstorch::c_api::types::TorshDType;
+/// use torsh_core::DType;
+///
 /// let c_type = TorshDType::F32;
 /// let rust_type: DType = c_type.into();
 /// assert_eq!(rust_type, DType::F32);
@@ -553,6 +559,8 @@ impl TorshDType {
     /// # Examples
     ///
     /// ```rust
+    /// use rstorch::c_api::types::TorshDType;
+    ///
     /// assert_eq!(TorshDType::F32.size_in_bytes(), 4);
     /// assert_eq!(TorshDType::F64.size_in_bytes(), 8);
     /// assert_eq!(TorshDType::U8.size_in_bytes(), 1);

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use torsh_core::sync::MutexExt;
 
 use super::{
     config::{IntegrationStatus, ScirS2IntegrationConfig},
@@ -237,10 +238,7 @@ impl ScirS2Integration {
         self.event_callbacks.push(Box::new(callback.clone()));
 
         // Also add to event processor with signature conversion
-        let mut processor = self
-            .event_processor
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut processor = self.event_processor.lock_or_recover();
         let callback_ref = move |event: &ScirS2Event| {
             callback(event.clone());
         };
@@ -254,10 +252,7 @@ impl ScirS2Integration {
 
         // Process through event processor
         {
-            let mut processor = self
-                .event_processor
-                .lock()
-                .expect("lock should not be poisoned");
+            let mut processor = self.event_processor.lock_or_recover();
             processor.process_event(event.clone());
         }
 
@@ -453,10 +448,7 @@ impl ScirS2Integration {
     pub fn flush_all(&mut self) {
         // Flush event processor buffer
         {
-            let mut processor = self
-                .event_processor
-                .lock()
-                .expect("lock should not be poisoned");
+            let mut processor = self.event_processor.lock_or_recover();
             processor.flush_buffer();
         }
 
@@ -536,29 +528,20 @@ impl ScirS2Integration {
     }
 
     fn enable_predictive_modeling(&self) -> Result<(), String> {
-        let mut features = self
-            .advanced_features
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut features = self.advanced_features.lock_or_recover();
         features.predictive_engine.enable();
         features.initialize_ml_models();
         Ok(())
     }
 
     fn enable_auto_optimization(&self) -> Result<(), String> {
-        let mut features = self
-            .advanced_features
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut features = self.advanced_features.lock_or_recover();
         features.auto_optimization.enable();
         Ok(())
     }
 
     fn initialize_event_processing(&self) {
-        let mut processor = self
-            .event_processor
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut processor = self.event_processor.lock_or_recover();
 
         // Add high-severity event filter
         processor.add_filter(super::event_system::EventFilter::high_severity_only());
@@ -576,10 +559,7 @@ impl ScirS2Integration {
 
         // Clean up event processor
         {
-            let mut processor = self
-                .event_processor
-                .lock()
-                .expect("lock should not be poisoned");
+            let mut processor = self.event_processor.lock_or_recover();
             processor.clear_statistics();
         }
     }

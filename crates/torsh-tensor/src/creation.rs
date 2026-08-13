@@ -2,13 +2,147 @@
 
 use crate::{FloatElement, Tensor, TensorElement};
 // ✅ SciRS2 Policy Compliant - Using scirs2_core::random instead of direct rand
-use scirs2_core::random::Random;
+use scirs2_core::random::{Random, StdRng as SeededRng};
 use scirs2_core::RngExt;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use torsh_core::{
     device::DeviceType,
     dtype::{Complex32, Complex64, ComplexElement},
     error::{Result, TorshError},
 };
+
+// ============================================================================
+// Process-global random number generation (PyTorch-compatible semantics)
+// ============================================================================
+//
+// Every random constructor draws from a *thread-local* generator that is seeded
+// from OS entropy the first time it is used, so two calls never return the same
+// data by accident. [`manual_seed`] installs a process-wide seed (mirroring
+// `torch.manual_seed`) and bumps a generation counter; each thread notices the
+// new generation on its next draw and re-seeds its generator deterministically
+// from `(manual seed, thread stream index)`. That keeps single-threaded programs
+// bit-reproducible after `manual_seed` while never handing two threads the same
+// stream.
+
+/// Generation counter, bumped by [`manual_seed`]. `0` means "no manual seed yet".
+static SEED_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Seed installed by the most recent [`manual_seed`] call.
+static MANUAL_SEED: AtomicU64 = AtomicU64::new(0);
+
+/// Hands out a distinct stream index to every thread that draws random numbers.
+static NEXT_STREAM: AtomicU64 = AtomicU64::new(0);
+
+/// Per-thread generator state.
+struct ThreadRngState {
+    /// Seed generation this RNG was created for.
+    generation: u64,
+    /// Stable per-thread stream index (survives re-seeding).
+    stream: u64,
+    /// The generator itself.
+    rng: SeededRng,
+}
+
+thread_local! {
+    static THREAD_RNG: RefCell<Option<ThreadRngState>> = const { RefCell::new(None) };
+}
+
+/// SplitMix64 finaliser — mixes a counter/seed pair into a well-distributed seed.
+fn splitmix64(value: u64) -> u64 {
+    let mut z = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Sets the seed of the ToRSh random number generator for the whole process.
+///
+/// This mirrors `torch.manual_seed`: after calling it, the sequence of values
+/// produced by [`rand`], [`randn`], [`randint`] and the complex variants is
+/// reproducible for a single-threaded program. Threads that draw random numbers
+/// get distinct (but deterministically derived) streams, so results are
+/// reproducible per thread rather than dependent on scheduling.
+///
+/// Without a call to `manual_seed`, every thread seeds itself from OS entropy,
+/// so each process — and each tensor — gets genuinely different random data.
+///
+/// # Examples
+///
+/// ```
+/// use torsh_tensor::creation::{manual_seed, randn};
+///
+/// manual_seed(42);
+/// let a = randn::<f32>(&[4]).expect("operation should succeed");
+/// manual_seed(42);
+/// let b = randn::<f32>(&[4]).expect("operation should succeed");
+/// assert_eq!(a.to_vec().expect("to_vec"), b.to_vec().expect("to_vec"));
+/// ```
+pub fn manual_seed(seed: u64) {
+    MANUAL_SEED.store(seed, Ordering::SeqCst);
+    // Bump last so that a thread observing the new generation also observes the
+    // new seed value.
+    SEED_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Run `f` with exclusive access to the calling thread's generator.
+fn with_rng<R>(f: impl FnOnce(&mut SeededRng) -> R) -> R {
+    THREAD_RNG.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let generation = SEED_GENERATION.load(Ordering::SeqCst);
+        let stale = slot
+            .as_ref()
+            .map(|state| state.generation != generation)
+            .unwrap_or(true);
+
+        if stale {
+            let stream = match slot.as_ref() {
+                Some(state) => state.stream,
+                None => NEXT_STREAM.fetch_add(1, Ordering::Relaxed),
+            };
+            let seed = if generation == 0 {
+                // No manual seed installed: draw a fresh seed from OS entropy.
+                scirs2_core::random::random::<u64>()
+            } else {
+                splitmix64(MANUAL_SEED.load(Ordering::SeqCst) ^ splitmix64(stream))
+            };
+            *slot = Some(ThreadRngState {
+                generation,
+                stream,
+                rng: Random::seed(seed),
+            });
+        }
+
+        // `slot` is `Some` at this point; the fallback never runs.
+        let state = slot.get_or_insert_with(|| ThreadRngState {
+            generation,
+            stream: 0,
+            rng: Random::seed(0),
+        });
+        f(&mut state.rng)
+    })
+}
+
+/// Draw a single standard-normal sample pair using the Box-Muller transform.
+fn box_muller(rng: &mut SeededRng) -> (f64, f64) {
+    // `u1` must be strictly positive: `ln(0)` is `-inf`, which would poison the
+    // sample with NaN.
+    let u1: f64 = rng.gen_range(f64::MIN_POSITIVE..1.0);
+    let u2: f64 = rng.gen_range(0.0..1.0);
+    let radius = (-2.0_f64 * u1.ln()).sqrt();
+    let angle = 2.0_f64 * std::f64::consts::PI * u2;
+    (radius * angle.cos(), radius * angle.sin())
+}
+
+/// Convert an `f64` sample into the tensor element type.
+fn sample_to_element<T: TensorElement>(value: f64) -> Result<T> {
+    T::from_f64(value).ok_or_else(|| {
+        TorshError::InvalidArgument(format!(
+            "cannot represent random sample {value} as {:?}",
+            T::dtype()
+        ))
+    })
+}
 
 /// Create a tensor from a scalar value
 pub fn tensor_scalar<T: TensorElement>(value: T) -> Result<Tensor<T>> {
@@ -92,10 +226,12 @@ pub fn zeros<T: TensorElement>(shape: &[usize]) -> Result<Tensor<T>> {
     Tensor::from_data(data, shape.to_vec(), DeviceType::Cpu)
 }
 
-/// Create a mutable tensor of zeros (uses InMemory storage for mutability)
+/// Create a tensor of zeros backed by plain in-memory storage
 ///
-/// This is useful for operations that need to write to the tensor element-by-element,
-/// as it bypasses SimdOptimized storage which is immutable.
+/// `SimdOptimized` storage now supports mutation too (through a copy-on-write
+/// buffer), so this is no longer required for correctness — it just skips the
+/// SIMD alignment copy for tensors that are going to be written element by
+/// element anyway.
 pub fn zeros_mut<T: TensorElement>(shape: &[usize]) -> Tensor<T> {
     let size = shape.iter().product();
     let data = vec![T::zero(); size];
@@ -289,9 +425,21 @@ pub fn eye<T: TensorElement>(n: usize) -> Result<Tensor<T>> {
 /// let floats = arange(0.0f32, 1.0, 0.25).expect("operation should succeed");
 /// assert_eq!(floats.shape().dims(), &[4]);
 ///
+/// // Descending ranges use a negative step, like `torch.arange`
+/// let down = arange(5, 0, -1).expect("operation should succeed");
+/// assert_eq!(down.to_vec().expect("to_vec should succeed"), vec![5, 4, 3, 2, 1]);
+///
+/// // A zero step is rejected instead of looping forever
+/// assert!(arange(0.0f32, 1.0, 0.0).is_err());
+///
 /// // Use for indexing or creating coordinate grids
 /// let indices = arange(0, 100, 1).expect("operation should succeed");
 /// ```
+///
+/// # Errors
+///
+/// Returns [`TorshError::InvalidArgument`] if `step` is zero (or NaN), since no
+/// such sequence can terminate.
 ///
 /// # See Also
 ///
@@ -302,12 +450,39 @@ pub fn arange<T: TensorElement + std::cmp::PartialOrd + std::ops::Add<Output = T
     end: T,
     step: T,
 ) -> Result<Tensor<T>> {
+    let zero = <T as TensorElement>::zero();
+    let ascending = step > zero;
+    let descending = step < zero;
+
+    // Catches both `step == 0` and a NaN step: neither comparison holds, and
+    // neither can ever reach `end`.
+    if !ascending && !descending {
+        return Err(TorshError::InvalidArgument(
+            "arange requires a non-zero, non-NaN step".to_string(),
+        ));
+    }
+
     let mut values = Vec::new();
     let mut current = start;
 
-    while current < end {
+    loop {
+        let in_range = if ascending {
+            current < end
+        } else {
+            current > end
+        };
+        if !in_range {
+            break;
+        }
         values.push(current);
-        current = current + step;
+        let next = current + step;
+        // Guard against a floating-point step too small to advance `current`
+        // (e.g. a subnormal step next to a large start), which would otherwise
+        // spin forever.
+        if next == current {
+            break;
+        }
+        current = next;
     }
 
     let len = values.len();
@@ -340,8 +515,9 @@ pub fn linspace<T: FloatElement>(start: T, end: T, steps: usize) -> Result<Tenso
 /// Useful for generating random data, initialization schemes that require uniform
 /// distribution, or Monte Carlo simulations.
 ///
-/// **Note**: Uses a deterministic seed (42) for reproducibility in tests and examples.
-/// For production use with true randomness, consider using a time-based seed.
+/// **Randomness**: draws from the process-global generator, which seeds itself
+/// from OS entropy on first use. Call [`manual_seed`] first when you need a
+/// reproducible sequence.
 ///
 /// # Arguments
 ///
@@ -376,12 +552,31 @@ pub fn linspace<T: FloatElement>(start: T, end: T, steps: usize) -> Result<Tenso
 /// * [`randn`] - Create tensor with normal distribution
 /// * [`randint`] - Create tensor with random integers
 /// * [`rand_like`] - Create random tensor matching another's shape
+/// * [`manual_seed`] - Make the sequence reproducible
 pub fn rand<T: FloatElement>(shape: &[usize]) -> Result<Tensor<T>>
 where
     T: From<f32>,
 {
     let size = shape.iter().product();
-    let mut rng = Random::seed(42); // Deterministic seed for reproducibility
+    let values: Vec<T> = with_rng(|rng| {
+        (0..size)
+            .map(|_| <T as From<f32>>::from(rng.random::<f32>()))
+            .collect()
+    });
+
+    Tensor::from_data(values, shape.to_vec(), DeviceType::Cpu)
+}
+
+/// Create a uniform-random tensor from an explicit seed (reproducible).
+///
+/// Unlike [`rand`], this does not touch the process-global generator, so it is
+/// safe to use in tests that must not perturb other threads' sequences.
+pub fn rand_with_seed<T: FloatElement>(shape: &[usize], seed: u64) -> Result<Tensor<T>>
+where
+    T: From<f32>,
+{
+    let size = shape.iter().product();
+    let mut rng = Random::seed(seed);
     let values: Vec<T> = (0..size)
         .map(|_| <T as From<f32>>::from(rng.random::<f32>()))
         .collect();
@@ -395,8 +590,9 @@ where
 /// as it provides a good starting point for gradient-based optimization.
 /// Uses the Box-Muller transform to generate normally distributed values.
 ///
-/// **Note**: Uses a deterministic seed (42) for reproducibility in tests and examples.
-/// For production use with true randomness, consider using a time-based seed.
+/// **Randomness**: draws from the process-global generator, which seeds itself
+/// from OS entropy on first use. Call [`manual_seed`] first when you need a
+/// reproducible sequence.
 ///
 /// # Arguments
 ///
@@ -409,7 +605,9 @@ where
 /// # Examples
 ///
 /// ```
-/// use torsh_tensor::creation::randn;
+/// use torsh_tensor::creation::{manual_seed, randn};
+///
+/// manual_seed(0);
 ///
 /// // Create random normal tensor
 /// let t = randn::<f32>(&[1000]).expect("operation should succeed");
@@ -428,51 +626,298 @@ where
 /// # Implementation Details
 ///
 /// Uses the Box-Muller transform to convert uniform random numbers into
-/// normally distributed values. Optimized separately for f32 and f64.
+/// normally distributed values. Sampling happens in `f64` and the result is
+/// converted through [`TensorElement::from_f64`], so narrow float types such as
+/// `f16`/`bf16` get a correctly rounded sample rather than a reinterpreted bit
+/// pattern.
 ///
 /// # See Also
 ///
 /// * [`rand`] - Create tensor with uniform distribution
 /// * [`randn_like`] - Create normal random tensor matching another's shape
 /// * [`zeros`] - Create tensor filled with zeros
+/// * [`manual_seed`] - Make the sequence reproducible
 pub fn randn<T: FloatElement>(shape: &[usize]) -> Result<Tensor<T>> {
     let size = shape.iter().product();
-    let mut rng = Random::seed(42); // Deterministic seed for reproducibility
-
-    let values: Vec<T> = if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-        // Box-Muller for f32
-        (0..size)
-            .map(|_| {
-                let u1: f32 = rng.gen_range(0.0..1.0);
-                let u2: f32 = rng.gen_range(0.0..1.0);
-                let normal =
-                    (-2.0_f32 * u1.ln()).sqrt() * (2.0_f32 * std::f32::consts::PI * u2).cos();
-                unsafe { std::mem::transmute_copy(&normal) }
-            })
-            .collect()
-    } else {
-        // Box-Muller for f64
-        (0..size)
-            .map(|_| {
-                let u1: f64 = rng.gen_range(0.0..1.0);
-                let u2: f64 = rng.gen_range(0.0..1.0);
-                let normal =
-                    (-2.0_f64 * u1.ln()).sqrt() * (2.0_f64 * std::f64::consts::PI * u2).cos();
-                unsafe { std::mem::transmute_copy(&normal) }
-            })
-            .collect()
-    };
+    let samples = with_rng(|rng| normal_samples(rng, size));
+    let values = samples
+        .into_iter()
+        .map(sample_to_element::<T>)
+        .collect::<Result<Vec<T>>>()?;
 
     Tensor::from_data(values, shape.to_vec(), DeviceType::Cpu)
 }
 
-/// Create a tensor with random integers
+/// Create a standard-normal tensor from an explicit seed (reproducible).
+///
+/// Unlike [`randn`], this does not touch the process-global generator.
+pub fn randn_with_seed<T: FloatElement>(shape: &[usize], seed: u64) -> Result<Tensor<T>> {
+    let size = shape.iter().product();
+    let mut rng = Random::seed(seed);
+    let values = normal_samples(&mut rng, size)
+        .into_iter()
+        .map(sample_to_element::<T>)
+        .collect::<Result<Vec<T>>>()?;
+
+    Tensor::from_data(values, shape.to_vec(), DeviceType::Cpu)
+}
+
+/// Draw `size` independent N(0, 1) samples (two per Box-Muller evaluation).
+fn normal_samples(rng: &mut SeededRng, size: usize) -> Vec<f64> {
+    let mut samples = Vec::with_capacity(size);
+    while samples.len() < size {
+        let (first, second) = box_muller(rng);
+        samples.push(first);
+        if samples.len() < size {
+            samples.push(second);
+        }
+    }
+    samples
+}
+
+impl<T: FloatElement> Tensor<T> {
+    /// Fills this tensor in-place with samples from a normal (Gaussian)
+    /// distribution `N(mean, std^2)`.
+    ///
+    /// # PyTorch Compatibility
+    ///
+    /// Equivalent to `Tensor.normal_(mean, std)`. Like every other in-place
+    /// mutator on this type, it refuses to run on a tensor that
+    /// `requires_grad`, since autograd cannot track through a buffer
+    /// mutation.
+    ///
+    /// **Randomness**: draws from the process-global generator, which seeds
+    /// itself from OS entropy on first use. Call [`manual_seed`] first when
+    /// you need a reproducible sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TorshError::InvalidArgument`] if:
+    /// - `self.requires_grad()` is `true`,
+    /// - `std` is negative or not finite,
+    /// - `mean` is not finite.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use torsh_tensor::creation::{manual_seed, zeros};
+    ///
+    /// manual_seed(0);
+    /// let mut t = zeros::<f32>(&[10, 10]).expect("operation should succeed");
+    /// t.normal_(0.0, 1.0).expect("operation should succeed");
+    ///
+    /// let data = t.to_vec().expect("to_vec should succeed");
+    /// assert!(
+    ///     data.iter().any(|&x| x != 0.0),
+    ///     "normal_ should fill the tensor with non-zero values"
+    /// );
+    /// ```
+    ///
+    /// # See Also
+    ///
+    /// * [`randn`] - Create a new standard-normal tensor
+    /// * [`manual_seed`] - Make the sequence reproducible
+    pub fn normal_(&mut self, mean: f64, std: f64) -> Result<()> {
+        if self.requires_grad {
+            return Err(TorshError::InvalidArgument(
+                "In-place operation `normal_` on tensor that requires grad is not allowed"
+                    .to_string(),
+            ));
+        }
+        if !std.is_finite() || std < 0.0 {
+            return Err(TorshError::InvalidArgument(format!(
+                "normal_ expects a finite std >= 0.0, got {std}"
+            )));
+        }
+        if !mean.is_finite() {
+            return Err(TorshError::InvalidArgument(format!(
+                "normal_ expects a finite mean, got {mean}"
+            )));
+        }
+
+        let numel = self.numel();
+        let raw = with_rng(|rng| normal_samples(rng, numel));
+        let values = raw
+            .into_iter()
+            .map(|z| sample_to_element::<T>(mean + std * z))
+            .collect::<Result<Vec<T>>>()?;
+
+        // `data_mut_apply` takes an infallible `FnMut(&mut T)`, so the
+        // fallible `f64 -> T` conversion happens eagerly above; this closure
+        // only ever assigns already-converted values. `written` is checked
+        // against `numel` afterwards so a mismatch surfaces as an honest
+        // error instead of silently leaving some elements at their old
+        // value.
+        let mut written = 0usize;
+        self.data_mut_apply(|item| {
+            if let Some(&value) = values.get(written) {
+                *item = value;
+            }
+            written += 1;
+        })?;
+
+        if written != numel {
+            return Err(TorshError::InvalidArgument(format!(
+                "normal_ wrote {written} elements but the tensor has {numel}"
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+impl Tensor<f32> {
+    /// Draws samples from a multinomial (categorical) distribution defined by
+    /// `weights`.
+    ///
+    /// Each entry of `weights` is the unnormalized probability of drawing its
+    /// index; `weights` does not need to sum to 1. Returns a 1-D `i64` tensor
+    /// of `num_samples` category indices, on the same device as `weights`.
+    ///
+    /// # PyTorch Compatibility
+    ///
+    /// Equivalent to `weights.multinomial(num_samples, replacement)` for a
+    /// 1-D `weights` tensor. Batched (2-D) `weights` is not yet supported and
+    /// returns [`TorshError::InvalidArgument`] rather than silently
+    /// misinterpreting the input.
+    ///
+    /// **Randomness**: draws from the process-global generator; see
+    /// [`manual_seed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TorshError::InvalidArgument`] if:
+    /// - `weights` is not 1-dimensional,
+    /// - any weight is negative or not finite,
+    /// - every weight is zero (there is nothing to sample),
+    /// - `replacement` is `false` and `num_samples` exceeds the number of
+    ///   strictly-positive weights.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use torsh_tensor::creation::{manual_seed, tensor_1d};
+    /// use torsh_tensor::Tensor;
+    ///
+    /// manual_seed(0);
+    /// let weights = tensor_1d(&[0.1f32, 0.2, 0.3, 0.4]).expect("operation should succeed");
+    /// let samples = Tensor::multinomial(&weights, 10, true).expect("operation should succeed");
+    /// assert_eq!(samples.shape().dims(), &[10]);
+    /// ```
+    pub fn multinomial(
+        weights: &Self,
+        num_samples: usize,
+        replacement: bool,
+    ) -> Result<Tensor<i64>> {
+        if weights.ndim() != 1 {
+            return Err(TorshError::InvalidArgument(format!(
+                "multinomial expects a 1-D weights tensor, got {} dimensions",
+                weights.ndim()
+            )));
+        }
+
+        let mut pool = weights.to_vec()?;
+        for &w in &pool {
+            if !w.is_finite() || w < 0.0 {
+                return Err(TorshError::InvalidArgument(format!(
+                    "multinomial: weights must be finite and non-negative, found {w}"
+                )));
+            }
+        }
+
+        let num_positive = pool.iter().filter(|&&w| w > 0.0).count();
+        if num_positive == 0 {
+            return Err(TorshError::InvalidArgument(
+                "multinomial: weights sum must be positive".to_string(),
+            ));
+        }
+        if !replacement && num_samples > num_positive {
+            return Err(TorshError::InvalidArgument(format!(
+                "multinomial: cannot sample {num_samples} indices without replacement \
+                 from {num_positive} categories with positive weight"
+            )));
+        }
+
+        let mut samples = Vec::with_capacity(num_samples);
+        with_rng(|rng| -> Result<()> {
+            for _ in 0..num_samples {
+                let total: f32 = pool.iter().sum();
+                if total <= 0.0 {
+                    return Err(TorshError::InvalidArgument(
+                        "multinomial: ran out of positive-weight categories while \
+                         sampling without replacement"
+                            .to_string(),
+                    ));
+                }
+                let draw: f32 = rng.gen_range(0.0..total);
+
+                // Find the first category whose cumulative weight passes `draw`.
+                let mut cumulative = 0.0f32;
+                let mut chosen = None;
+                for (i, &w) in pool.iter().enumerate() {
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    cumulative += w;
+                    if draw < cumulative {
+                        chosen = Some(i);
+                        break;
+                    }
+                }
+                // Floating-point rounding can (rarely) leave `draw` just past
+                // the last positive category's cumulative weight; fall back
+                // to that last positive category rather than risk selecting
+                // a zero-weight one.
+                let chosen = match chosen {
+                    Some(i) => i,
+                    None => pool
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|&(_, &w)| w > 0.0)
+                        .map(|(i, _)| i)
+                        .ok_or_else(|| {
+                            TorshError::InvalidArgument(
+                                "multinomial: no positive-weight category available \
+                                 to sample"
+                                    .to_string(),
+                            )
+                        })?,
+                };
+
+                samples.push(chosen as i64);
+                if !replacement {
+                    pool[chosen] = 0.0;
+                }
+            }
+            Ok(())
+        })?;
+
+        let len = samples.len();
+        Tensor::from_data(samples, vec![len], weights.device())
+    }
+}
+
+/// Create a tensor with random integers in `[low, high)`
+///
+/// **Randomness**: draws from the process-global generator; see [`manual_seed`].
 pub fn randint(low: i32, high: i32, shape: &[usize]) -> Result<Tensor<i32>> {
     let size = shape.iter().product();
-    let mut rng = Random::seed(42); // Deterministic seed for reproducibility
     use scirs2_core::random::Uniform;
     let dist = Uniform::new(low, high)
         .map_err(|e| TorshError::InvalidArgument(format!("Invalid range for randint: {}", e)))?;
+    let values: Vec<i32> = with_rng(|rng| (0..size).map(|_| rng.sample(&dist)).collect());
+
+    Tensor::from_data(values, shape.to_vec(), DeviceType::Cpu)
+}
+
+/// Create a tensor with random integers in `[low, high)` from an explicit seed.
+pub fn randint_with_seed(low: i32, high: i32, shape: &[usize], seed: u64) -> Result<Tensor<i32>> {
+    let size = shape.iter().product();
+    use scirs2_core::random::Uniform;
+    let dist = Uniform::new(low, high)
+        .map_err(|e| TorshError::InvalidArgument(format!("Invalid range for randint: {}", e)))?;
+    let mut rng = Random::seed(seed);
     let values: Vec<i32> = (0..size).map(|_| rng.sample(&dist)).collect();
 
     Tensor::from_data(values, shape.to_vec(), DeviceType::Cpu)
@@ -572,15 +1017,16 @@ where
     C: ComplexElement<Real = T> + TensorElement,
 {
     let size = shape.iter().product();
-    let mut rng = Random::seed(42); // Deterministic seed for reproducibility
-    let values: Vec<C> = (0..size)
-        .map(|_| {
-            C::new(
-                <T as From<f32>>::from(rng.random::<f32>()),
-                <T as From<f32>>::from(rng.random::<f32>()),
-            )
-        })
-        .collect();
+    let values: Vec<C> = with_rng(|rng| {
+        (0..size)
+            .map(|_| {
+                C::new(
+                    <T as From<f32>>::from(rng.random::<f32>()),
+                    <T as From<f32>>::from(rng.random::<f32>()),
+                )
+            })
+            .collect()
+    });
 
     Tensor::from_data(values, shape.to_vec(), DeviceType::Cpu)
 }
@@ -593,39 +1039,19 @@ where
     C: ComplexElement<Real = T> + TensorElement,
 {
     let size = shape.iter().product();
-    let mut rng = Random::seed(42); // Deterministic seed for reproducibility
+    let pairs = with_rng(|rng| {
+        (0..size)
+            .map(|_| box_muller(rng))
+            .collect::<Vec<(f64, f64)>>()
+    });
 
-    let values: Vec<C> = if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-        // Box-Muller for f32
-        (0..size)
-            .map(|_| {
-                let u1: f32 = rng.gen_range(0.0..1.0);
-                let u2: f32 = rng.gen_range(0.0..1.0);
-                let normal1 =
-                    (-2.0_f32 * u1.ln()).sqrt() * (2.0_f32 * std::f32::consts::PI * u2).cos();
-                let normal2 =
-                    (-2.0_f32 * u1.ln()).sqrt() * (2.0_f32 * std::f32::consts::PI * u2).sin();
-                let real: T = unsafe { std::mem::transmute_copy(&normal1) };
-                let imag: T = unsafe { std::mem::transmute_copy(&normal2) };
-                C::new(real, imag)
-            })
-            .collect()
-    } else {
-        // Box-Muller for f64
-        (0..size)
-            .map(|_| {
-                let u1: f64 = rng.gen_range(0.0..1.0);
-                let u2: f64 = rng.gen_range(0.0..1.0);
-                let normal1 =
-                    (-2.0_f64 * u1.ln()).sqrt() * (2.0_f64 * std::f64::consts::PI * u2).cos();
-                let normal2 =
-                    (-2.0_f64 * u1.ln()).sqrt() * (2.0_f64 * std::f64::consts::PI * u2).sin();
-                let real: T = unsafe { std::mem::transmute_copy(&normal1) };
-                let imag: T = unsafe { std::mem::transmute_copy(&normal2) };
-                C::new(real, imag)
-            })
-            .collect()
-    };
+    let mut values = Vec::with_capacity(size);
+    for (real, imag) in pairs {
+        values.push(C::new(
+            sample_to_element::<T>(real)?,
+            sample_to_element::<T>(imag)?,
+        ));
+    }
 
     Tensor::from_data(values, shape.to_vec(), DeviceType::Cpu)
 }
@@ -813,11 +1239,24 @@ mod complex_tests {
     }
 }
 
-/// Create a tensor from a vector and shape
+/// Create a tensor from a vector and shape.
+///
+/// Rejects a `data` length that does not equal `shape`'s element count, so a
+/// mismatch surfaces here instead of as a confusing out-of-bounds error deep in
+/// a later operation.
 pub fn from_vec<T: TensorElement>(
     data: Vec<T>,
     shape: &[usize],
     device: DeviceType,
 ) -> Result<Tensor<T>> {
+    let numel: usize = shape.iter().product();
+    if data.len() != numel {
+        return Err(TorshError::InvalidArgument(format!(
+            "from_vec: data has {} elements but shape {:?} requires {}",
+            data.len(),
+            shape,
+            numel
+        )));
+    }
     Tensor::from_data(data, shape.to_vec(), device)
 }

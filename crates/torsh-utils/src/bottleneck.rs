@@ -6,13 +6,23 @@
 //!
 //! ## Features
 //!
-//! - **Flame Graph Generation**: Visual representation of call stacks and time distribution
-//! - **Memory Profiling**: Detailed memory allocation tracking with leak detection
-//! - **GPU Profiling**: CUDA kernel analysis, occupancy, and memory transfer tracking
-//! - **Hotspot Detection**: Automatic identification of performance-critical code paths
-//! - **Call Stack Analysis**: Recursive call detection and call frequency analysis
-//! - **Regression Detection**: Compare against baseline performance metrics
-//! - **Cache Performance**: L1/L2/L3 cache hit rates and memory stall analysis
+//! - **Flame Graph Generation**: built from real per-iteration forward/backward
+//!   timings (coarse-grained: whole-pass, not per-layer, since `Module::forward`
+//!   is opaque to this crate)
+//! - **Memory Profiling**: real peak/current process memory via `sysinfo`.
+//!   Leak detection and cache/fragmentation metrics are not implemented (they
+//!   would require allocator instrumentation or hardware performance
+//!   counters) and are reported as `None`, never a fabricated number
+//! - **GPU Profiling**: reports zeros with an explicit "not measured" doc note
+//!   unless a real GPU backend is wired up (no NVML/CUDA linkage here)
+//! - **Hotspot Detection**: real CPU time-share per timed operation. Memory/
+//!   I/O/synchronization hotspots require instrumentation this crate does not
+//!   have and are always empty
+//! - **Call Stack Analysis**: real stack captures (`std::backtrace`) paired
+//!   with each iteration's real duration
+//! - **Regression Detection**: compare against baseline performance metrics
+//! - **Cache Performance**: not measured (requires hardware performance
+//!   counters); always reported as `None`, not a plausible-looking number
 //!
 //! ## Quick Start
 //!
@@ -126,26 +136,29 @@
 //!
 //! let report = profile_bottlenecks_advanced(&model, &[1, 3, 224, 224], 1000, true, config)?;
 //!
-//! // Check for memory leaks
-//! if !report.memory_profile.memory_leaks.is_empty() {
-//!     println!("⚠️  WARNING: {} memory leaks detected!", report.memory_profile.memory_leaks.len());
-//!
-//!     for leak in &report.memory_profile.memory_leaks {
-//!         println!("  - {} bytes at {} (age: {:.1}s)",
-//!             (leak.size_mb * 1024.0 * 1024.0) as usize,
-//!             leak.allocation_site,
-//!             leak.age_ms / 1000.0
-//!         );
+//! // Check for memory leaks. `None` means leak detection could not run
+//! // (no allocator instrumentation is wired up) -- distinct from
+//! // `Some(vec![])`, which would mean detection ran and found nothing.
+//! match &report.memory_profile.memory_leaks {
+//!     Some(leaks) if !leaks.is_empty() => {
+//!         println!("⚠️  WARNING: {} memory leaks detected!", leaks.len());
+//!         for leak in leaks {
+//!             println!("  - {} bytes at {} (age: {:.1}s)",
+//!                 (leak.size_mb * 1024.0 * 1024.0) as usize,
+//!                 leak.allocation_site,
+//!                 leak.age_ms / 1000.0
+//!             );
+//!         }
 //!     }
-//! } else {
-//!     println!("✓ No memory leaks detected");
+//!     Some(_) => println!("✓ No memory leaks detected"),
+//!     None => println!("Memory leak detection not available"),
 //! }
 //!
-//! // Check memory fragmentation
-//! if report.memory_profile.fragmentation_ratio > 0.2 {
-//!     println!("⚠️  High memory fragmentation: {:.1}%",
-//!         report.memory_profile.fragmentation_ratio * 100.0
-//!     );
+//! // Check memory fragmentation, when it was measured.
+//! if let Some(fragmentation_ratio) = report.memory_profile.fragmentation_ratio {
+//!     if fragmentation_ratio > 0.2 {
+//!         println!("⚠️  High memory fragmentation: {:.1}%", fragmentation_ratio * 100.0);
+//!     }
 //! }
 //! # Ok(())
 //! # }
@@ -325,13 +338,23 @@ pub struct FlameFrame {
 /// Comprehensive memory profiling data
 #[derive(Debug, Clone)]
 pub struct MemoryProfileData {
+    /// Real peak resident memory observed during profiling (MB).
     pub peak_usage_mb: f32,
+    /// Real resident memory at the time metrics were read (MB).
     pub current_usage_mb: f32,
     pub allocation_timeline: Vec<MemorySnapshot>,
-    pub memory_leaks: Vec<MemoryLeak>,
-    pub fragmentation_ratio: f32,
+    /// Detected memory leaks, when leak detection is actually implemented.
+    /// `None` means "not measured" (no allocator instrumentation is wired
+    /// up here) -- distinct from `Some(vec![])`, which would claim leak
+    /// detection ran and found nothing.
+    pub memory_leaks: Option<Vec<MemoryLeak>>,
+    /// Fragmentation ratio, when it can be measured from allocator
+    /// introspection. `None` if unmeasured.
+    pub fragmentation_ratio: Option<f32>,
     pub gc_pressure: Option<f32>,
-    pub memory_bandwidth_utilization: f32,
+    /// Memory bandwidth utilization, when it can be measured from hardware
+    /// performance counters. `None` if unmeasured.
+    pub memory_bandwidth_utilization: Option<f32>,
     pub cache_performance: CachePerformance,
 }
 
@@ -354,14 +377,20 @@ pub struct MemoryLeak {
     pub stack_trace: Vec<String>,
 }
 
-/// Cache performance metrics
+/// Cache performance metrics.
+///
+/// L1/L2/L3 hit rates, cache misses per instruction, and memory stall
+/// percentage all require reading hardware performance counters (e.g. via
+/// `perf_event_open` on Linux, typically permission-gated), which this
+/// crate does not do. Every field is `None` ("not measured") rather than a
+/// plausible-looking invented number -- see [`MemoryMetricsCollector`].
 #[derive(Debug, Clone)]
 pub struct CachePerformance {
-    pub l1_hit_rate: f32,
-    pub l2_hit_rate: f32,
+    pub l1_hit_rate: Option<f32>,
+    pub l2_hit_rate: Option<f32>,
     pub l3_hit_rate: Option<f32>,
-    pub cache_misses_per_instruction: f32,
-    pub memory_stalls_percentage: f32,
+    pub cache_misses_per_instruction: Option<f32>,
+    pub memory_stalls_percentage: Option<f32>,
 }
 
 /// GPU profiling data
@@ -595,13 +624,11 @@ pub fn profile_bottlenecks_advanced<M: Module>(
 ) -> Result<BottleneckReport> {
     // Initialize profilers
     let mut profiler = Profiler::new();
-    let mut scirs2_profiler = SciRS2Profiler::new();
     let mut memory_collector = MemoryMetricsCollector::new();
     let mut leak_detector = LeakDetector::new();
 
     // Start profiling
     profiler.start();
-    scirs2_profiler.start();
 
     if config.enable_memory_profiling {
         memory_collector.start_collection();
@@ -613,7 +640,10 @@ pub fn profile_bottlenecks_advanced<M: Module>(
     let mut operation_times: HashMap<String, Vec<Duration>> = HashMap::new();
     let mut memory_peaks = Vec::new();
     let mut memory_snapshots = Vec::new();
-    let mut call_stacks = Vec::new();
+    // Each entry pairs a real captured call stack with the real duration of
+    // the iteration it was captured in, so `analyze_call_stacks` can report
+    // genuine per-path timing instead of a fabricated constant.
+    let mut call_stacks: Vec<(Vec<String>, Duration)> = Vec::new();
 
     // GPU profiling setup
     let gpu_profiler = if config.enable_gpu_profiling {
@@ -635,12 +665,16 @@ pub fn profile_bottlenecks_advanced<M: Module>(
 
     for i in 0..num_iterations {
         let input = torsh_tensor::creation::randn(input_shape)?;
+        let iteration_start = Instant::now();
 
-        // Collect call stack if enabled
-        if config.enable_call_stack_analysis {
-            let call_stack = capture_call_stack();
-            call_stacks.push(call_stack);
-        }
+        // Capture the real call stack at the point this iteration's
+        // compute begins; paired with the iteration's real duration once
+        // that's known below.
+        let call_stack = if config.enable_call_stack_analysis {
+            Some(capture_call_stack())
+        } else {
+            None
+        };
 
         // Profile forward pass
         let forward_start = Instant::now();
@@ -664,6 +698,10 @@ pub fn profile_bottlenecks_advanced<M: Module>(
                 .push(backward_time);
         }
 
+        if let Some(call_stack) = call_stack {
+            call_stacks.push((call_stack, iteration_start.elapsed()));
+        }
+
         // Memory snapshots
         if config.enable_memory_profiling && last_snapshot.elapsed() >= snapshot_interval {
             if let Ok(memory_info) = get_detailed_memory_info() {
@@ -675,6 +713,9 @@ pub fn profile_bottlenecks_advanced<M: Module>(
                     largest_free_block_mb: memory_info.3,
                 });
             }
+            // Update the real peak-memory reading alongside the existing
+            // snapshot cadence (see MemoryMetricsCollector).
+            memory_collector.sample();
             last_snapshot = Instant::now();
         }
 
@@ -694,15 +735,16 @@ pub fn profile_bottlenecks_advanced<M: Module>(
 
     // Stop all profilers
     profiler.stop();
-    scirs2_profiler.stop();
 
     if config.enable_memory_profiling {
         memory_collector.stop_collection();
     }
 
-    // Collect profiling results
+    // Collect profiling results. The flame graph and hotspot analysis are
+    // built from the real per-iteration forward/backward `Duration`s
+    // collected in the loop above, not from a fabricated sample set.
     let flame_graph = if config.enable_flame_graph {
-        Some(generate_flame_graph(&scirs2_profiler, total_time)?)
+        Some(generate_flame_graph(&operation_times, total_time))
     } else {
         None
     };
@@ -726,7 +768,7 @@ pub fn profile_bottlenecks_advanced<M: Module>(
     };
 
     let hotspot_analysis = if config.enable_hotspot_analysis {
-        analyze_hotspots(&scirs2_profiler, &memory_profile)?
+        analyze_hotspots(&operation_times, total_time)
     } else {
         HotspotAnalysis::default()
     };
@@ -758,29 +800,60 @@ pub fn profile_bottlenecks_advanced<M: Module>(
     })
 }
 
-/// Generate flame graph from profiling data
-fn generate_flame_graph(profiler: &SciRS2Profiler, total_time: Duration) -> Result<FlameGraphData> {
-    // Extract profiling samples and build flame graph tree
-    let samples = profiler.get_samples();
-    let sample_rate = profiler.get_sample_rate();
+/// Generate a flame graph from the real per-iteration operation timings
+/// collected during profiling (`operation_times`: e.g. "forward"/"backward"
+/// -> one real `Duration` per iteration), instead of a fixed, fabricated
+/// sample set describing functions that were never actually executed.
+///
+/// This is coarser than a true sampling profiler (it can only see the
+/// operations this crate explicitly times -- forward/backward passes as a
+/// whole, not individual layers inside them, since `Module::forward` is
+/// opaque here), but every number in it was genuinely measured.
+fn generate_flame_graph(
+    operation_times: &HashMap<String, Vec<Duration>>,
+    total_time: Duration,
+) -> FlameGraphData {
+    let samples = real_profile_samples(operation_times);
     let total_samples = samples.len();
+    // Real average sampling rate: how many real per-operation
+    // measurements were taken per second of wall-clock profiling time.
+    let sample_rate_hz = if total_time.as_secs_f32() > 0.0 {
+        total_samples as f32 / total_time.as_secs_f32()
+    } else {
+        0.0
+    };
 
-    // Build flame graph tree from samples
-    let root_frame = build_flame_graph_tree(samples)?;
+    let root_frame = build_flame_graph_tree(samples);
 
-    Ok(FlameGraphData {
+    FlameGraphData {
         root_frame,
         total_samples,
-        sample_rate_hz: sample_rate,
+        sample_rate_hz,
         duration_ms: total_time.as_millis() as f32,
-    })
+    }
 }
 
-/// Build flame graph tree structure
-fn build_flame_graph_tree(samples: Vec<ProfileSample>) -> Result<FlameFrame> {
-    // Simplified flame graph construction
-    // In practice, this would analyze call stacks and build a proper tree
+/// Turn real per-iteration operation `Duration`s into one [`ProfileSample`]
+/// per iteration per operation, each carrying that operation's own name as
+/// its (single-frame) stack trace -- the only call-site information
+/// available without deeper instrumentation into the profiled model.
+fn real_profile_samples(operation_times: &HashMap<String, Vec<Duration>>) -> Vec<ProfileSample> {
+    let mut samples = Vec::new();
+    for (name, durations) in operation_times {
+        for duration in durations {
+            samples.push(ProfileSample {
+                function_name: name.clone(),
+                duration_ms: duration.as_secs_f32() * 1000.0,
+                stack_trace: vec![name.clone()],
+            });
+        }
+    }
+    samples
+}
 
+/// Build flame graph tree structure from real samples (see
+/// [`real_profile_samples`]).
+fn build_flame_graph_tree(samples: Vec<ProfileSample>) -> FlameFrame {
     let mut root = FlameFrame {
         name: "root".to_string(),
         file: None,
@@ -791,31 +864,34 @@ fn build_flame_graph_tree(samples: Vec<ProfileSample>) -> Result<FlameFrame> {
         children: Vec::new(),
     };
 
-    // Aggregate samples by function name
-    let mut function_times: HashMap<String, f32> = HashMap::new();
-
+    // Aggregate samples by function name, also tracking real sample counts
+    // (previously hardcoded to 1 regardless of how many samples an
+    // operation actually had).
+    let mut function_stats: HashMap<String, (f32, usize)> = HashMap::new();
     for sample in &samples {
-        let function_name = sample.function_name.clone();
-        let time_ms = sample.duration_ms;
-        *function_times.entry(function_name).or_insert(0.0) += time_ms;
+        let entry = function_stats
+            .entry(sample.function_name.clone())
+            .or_insert((0.0, 0));
+        entry.0 += sample.duration_ms;
+        entry.1 += 1;
     }
 
     // Create child frames
-    for (function_name, total_time) in function_times {
+    for (function_name, (total_time, sample_count)) in function_stats {
         let child_frame = FlameFrame {
             name: function_name,
             file: None,
             line: None,
             self_time_ms: total_time,
             total_time_ms: total_time,
-            sample_count: 1, // Simplified
+            sample_count,
             children: Vec::new(),
         };
         root.children.push(child_frame);
         root.total_time_ms += total_time;
     }
 
-    Ok(root)
+    root
 }
 
 /// Profile sample structure
@@ -833,17 +909,21 @@ fn generate_memory_profile(
     snapshots: Vec<MemorySnapshot>,
 ) -> Result<MemoryProfileData> {
     let metrics = collector.get_metrics();
-    let leaks = leak_detector.get_detected_leaks();
 
-    let memory_leaks = leaks
-        .into_iter()
-        .map(|leak| MemoryLeak {
-            allocation_site: leak.location,
-            size_mb: leak.size_bytes as f32 / 1024.0 / 1024.0,
-            age_ms: leak.age_ms,
-            stack_trace: leak.stack_trace,
-        })
-        .collect();
+    // `None` means leak detection is not implemented (no allocator
+    // instrumentation is wired up); `Some(vec)` (even if empty) would
+    // falsely claim detection ran and found nothing.
+    let memory_leaks = leak_detector.get_detected_leaks().map(|leaks| {
+        leaks
+            .into_iter()
+            .map(|leak| MemoryLeak {
+                allocation_site: leak.location,
+                size_mb: leak.size_bytes as f32 / 1024.0 / 1024.0,
+                age_ms: leak.age_ms,
+                stack_trace: leak.stack_trace,
+            })
+            .collect()
+    });
 
     Ok(MemoryProfileData {
         peak_usage_mb: metrics.peak_usage_mb,
@@ -863,21 +943,23 @@ fn generate_memory_profile(
     })
 }
 
-/// Placeholder memory metrics structure
+/// Memory metrics: real process memory readings plus (unmeasured) cache
+/// counters. See [`MemoryMetricsCollector`].
 #[derive(Debug)]
 struct MemoryMetrics {
     peak_usage_mb: f32,
     current_usage_mb: f32,
-    fragmentation_ratio: f32,
-    bandwidth_utilization: f32,
-    l1_hit_rate: f32,
-    l2_hit_rate: f32,
+    fragmentation_ratio: Option<f32>,
+    bandwidth_utilization: Option<f32>,
+    l1_hit_rate: Option<f32>,
+    l2_hit_rate: Option<f32>,
     l3_hit_rate: Option<f32>,
-    cache_misses_per_instruction: f32,
-    memory_stalls_percentage: f32,
+    cache_misses_per_instruction: Option<f32>,
+    memory_stalls_percentage: Option<f32>,
 }
 
-/// Placeholder leak structure
+/// A leak detected by [`LeakDetector`] (currently never constructed --
+/// see that type's doc comment).
 #[derive(Debug)]
 struct DetectedLeak {
     location: String,
@@ -1034,24 +1116,39 @@ fn collect_gpu_profile_data(_profiler: GpuProfiler) -> Result<GpuProfileData> {
     })
 }
 
-/// Capture call stack for analysis
+/// Capture the real current call stack via `std::backtrace` (stable since
+/// Rust 1.65; no extra dependency needed).
+///
+/// `force_capture` resolves symbols unconditionally, so behavior does not
+/// depend on the `RUST_BACKTRACE` environment variable. The standard
+/// library's `Backtrace` exposes only a formatted `Display`/`Debug`
+/// rendering (no structured per-frame API), so individual frames are
+/// recovered by splitting that rendering into non-empty lines -- real,
+/// call-site-specific data, replacing the previous fixed 3-entry
+/// placeholder that was returned for every call regardless of where it was
+/// actually made from.
 fn capture_call_stack() -> Vec<String> {
-    // Capture current call stack
-    // This would use platform-specific APIs
-    vec![
-        "model.forward".to_string(),
-        "conv_layer.forward".to_string(),
-        "tensor.conv2d".to_string(),
-    ]
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    format!("{backtrace}")
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect()
 }
 
-/// Analyze call stacks for patterns
-fn analyze_call_stacks(call_stacks: Vec<Vec<String>>) -> Result<CallStackAnalysis> {
+/// Analyze call stacks for patterns.
+///
+/// `call_stacks` pairs each real captured stack with the real duration of
+/// the iteration it was captured in (see `profile_bottlenecks_advanced`),
+/// so per-path timing below is computed from genuine measurements instead
+/// of a fixed placeholder.
+fn analyze_call_stacks(call_stacks: Vec<(Vec<String>, Duration)>) -> Result<CallStackAnalysis> {
     let mut call_frequency = HashMap::new();
     let mut total_depth = 0;
     let mut max_depth = 0;
 
-    for stack in &call_stacks {
+    for (stack, _duration) in &call_stacks {
         total_depth += stack.len();
         max_depth = max_depth.max(stack.len());
 
@@ -1066,17 +1163,37 @@ fn analyze_call_stacks(call_stacks: Vec<Vec<String>>) -> Result<CallStackAnalysi
         0.0
     };
 
-    // Find hottest call paths (simplified)
-    let hottest_paths = call_stacks
+    // Group identical stacks together and compute each group's real
+    // aggregate timing, rather than stamping every path with a fixed
+    // 100.0ms placeholder.
+    let mut path_groups: HashMap<Vec<String>, Vec<f32>> = HashMap::new();
+    for (stack, duration) in call_stacks {
+        path_groups
+            .entry(stack)
+            .or_default()
+            .push(duration.as_secs_f32() * 1000.0);
+    }
+
+    let mut hottest_paths: Vec<CallPath> = path_groups
         .into_iter()
-        .take(5)
-        .map(|path| CallPath {
-            path,
-            total_time_ms: 100.0, // Placeholder
-            call_count: 1,
-            average_time_ms: 100.0,
+        .map(|(path, times_ms)| {
+            let call_count = times_ms.len();
+            let total_time_ms: f32 = times_ms.iter().sum();
+            let average_time_ms = total_time_ms / call_count as f32;
+            CallPath {
+                path,
+                total_time_ms,
+                call_count,
+                average_time_ms,
+            }
         })
         .collect();
+    hottest_paths.sort_by(|a, b| {
+        b.total_time_ms
+            .partial_cmp(&a.total_time_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hottest_paths.truncate(5);
 
     Ok(CallStackAnalysis {
         hottest_paths,
@@ -1087,67 +1204,57 @@ fn analyze_call_stacks(call_stacks: Vec<Vec<String>>) -> Result<CallStackAnalysi
     })
 }
 
-/// Analyze performance hotspots
+/// Analyze performance hotspots from the real per-iteration operation
+/// timings collected during profiling.
+///
+/// CPU hotspots are derived from genuinely measured operation durations
+/// (coarse-grained: "forward"/"backward" as a whole, since `Module` does
+/// not expose per-layer timing here). `instruction_count`/`cache_misses`/
+/// `branch_mispredictions` require hardware performance counters this
+/// crate does not read, so they are `None` rather than invented numbers.
+///
+/// Memory/I/O/synchronization hotspots require access-pattern, I/O, and
+/// lock-contention instrumentation that does not exist in this crate;
+/// rather than fabricate plausible-looking entries, these are honestly
+/// empty until such instrumentation is implemented.
 fn analyze_hotspots(
-    _profiler: &SciRS2Profiler,
-    memory_profile: &MemoryProfileData,
-) -> Result<HotspotAnalysis> {
-    // CPU hotspots
-    let cpu_hotspots = vec![
-        Hotspot {
-            function_name: "conv2d_forward".to_string(),
-            time_percentage: 35.0,
-            instruction_count: Some(1_000_000),
-            cache_misses: Some(50_000),
-            branch_mispredictions: Some(5_000),
-        },
-        Hotspot {
-            function_name: "matrix_multiply".to_string(),
-            time_percentage: 25.0,
-            instruction_count: Some(800_000),
-            cache_misses: Some(30_000),
-            branch_mispredictions: Some(2_000),
-        },
-    ];
+    operation_times: &HashMap<String, Vec<Duration>>,
+    total_time: Duration,
+) -> HotspotAnalysis {
+    let total_secs = total_time.as_secs_f32();
+    let mut cpu_hotspots: Vec<Hotspot> = operation_times
+        .iter()
+        .map(|(name, durations)| {
+            let op_total_secs: f32 = durations.iter().map(|d| d.as_secs_f32()).sum();
+            let time_percentage = if total_secs > 0.0 {
+                (op_total_secs / total_secs) * 100.0
+            } else {
+                0.0
+            };
+            Hotspot {
+                function_name: name.clone(),
+                time_percentage,
+                instruction_count: None,
+                cache_misses: None,
+                branch_mispredictions: None,
+            }
+        })
+        .collect();
+    cpu_hotspots.sort_by(|a, b| {
+        b.time_percentage
+            .partial_cmp(&a.time_percentage)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    // Memory hotspots based on access patterns
-    let memory_hotspots = vec![
-        MemoryHotspot {
-            operation: "large_tensor_copy".to_string(),
-            access_pattern: MemoryAccessPattern::Sequential,
-            bandwidth_utilization: memory_profile.memory_bandwidth_utilization,
-            latency_ms: 2.5,
-        },
-        MemoryHotspot {
-            operation: "sparse_access".to_string(),
-            access_pattern: MemoryAccessPattern::Random,
-            bandwidth_utilization: 30.0,
-            latency_ms: 8.0,
-        },
-    ];
-
-    // I/O hotspots
-    let io_hotspots = vec![IoHotspot {
-        operation_type: "data_loading".to_string(),
-        wait_time_ms: 15.0,
-        throughput_mb_s: 500.0,
-        queue_depth: 4,
-    }];
-
-    // Synchronization hotspots
-    let synchronization_hotspots = vec![SyncHotspot {
-        synchronization_type: "mutex_contention".to_string(),
-        wait_time_ms: 5.0,
-        contention_count: 50,
-        affected_threads: 4,
-    }];
-
-    Ok(HotspotAnalysis {
+    HotspotAnalysis {
         cpu_hotspots,
-        memory_hotspots,
-        io_hotspots,
-        synchronization_hotspots,
-    })
+        // Would require memory access-pattern instrumentation.
+        memory_hotspots: vec![],
+        // Would require I/O instrumentation.
+        io_hotspots: vec![],
+        // Would require lock/synchronization instrumentation.
+        synchronization_hotspots: vec![],
+    }
 }
 
 /// Generate advanced recommendations with comprehensive analysis
@@ -1167,33 +1274,39 @@ fn generate_advanced_recommendations(
         memory_peaks,
     ));
 
-    // Memory-specific recommendations
-    if memory_profile.fragmentation_ratio > 0.3 {
-        recommendations.push(format!(
-            "High memory fragmentation ({:.1}%). Consider using memory pools or reducing allocation frequency.",
-            memory_profile.fragmentation_ratio * 100.0
-        ));
+    // Memory-specific recommendations -- only fire when the underlying
+    // metric was actually measured.
+    if let Some(fragmentation_ratio) = memory_profile.fragmentation_ratio {
+        if fragmentation_ratio > 0.3 {
+            recommendations.push(format!(
+                "High memory fragmentation ({:.1}%). Consider using memory pools or reducing allocation frequency.",
+                fragmentation_ratio * 100.0
+            ));
+        }
     }
 
-    if !memory_profile.memory_leaks.is_empty() {
-        recommendations.push(format!(
-            "Detected {} memory leaks. Review allocation sites: {}",
-            memory_profile.memory_leaks.len(),
-            memory_profile
-                .memory_leaks
-                .iter()
-                .take(3)
-                .map(|leak| leak.allocation_site.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+    if let Some(leaks) = &memory_profile.memory_leaks {
+        if !leaks.is_empty() {
+            recommendations.push(format!(
+                "Detected {} memory leaks. Review allocation sites: {}",
+                leaks.len(),
+                leaks
+                    .iter()
+                    .take(3)
+                    .map(|leak| leak.allocation_site.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
 
-    if memory_profile.cache_performance.l1_hit_rate < 0.9 {
-        recommendations.push(format!(
-            "Low L1 cache hit rate ({:.1}%). Consider improving data locality and access patterns.",
-            memory_profile.cache_performance.l1_hit_rate * 100.0
-        ));
+    if let Some(l1_hit_rate) = memory_profile.cache_performance.l1_hit_rate {
+        if l1_hit_rate < 0.9 {
+            recommendations.push(format!(
+                "Low L1 cache hit rate ({:.1}%). Consider improving data locality and access patterns.",
+                l1_hit_rate * 100.0
+            ));
+        }
     }
 
     // CPU hotspot recommendations
@@ -1268,21 +1381,27 @@ fn generate_advanced_recommendations(
 
 // Add default implementations for complex structures
 impl Default for MemoryProfileData {
+    /// Used when memory profiling was not enabled at all
+    /// (`enable_memory_profiling: false`). Every field is a genuine zero/
+    /// `None` for "not collected", not a fabricated "everything is
+    /// perfect" reading (the previous implementation reported 100% cache
+    /// hit rates here, which claimed cache performance had been checked
+    /// and was flawless -- when in fact nothing had been measured at all).
     fn default() -> Self {
         Self {
             peak_usage_mb: 0.0,
             current_usage_mb: 0.0,
             allocation_timeline: vec![],
-            memory_leaks: vec![],
-            fragmentation_ratio: 0.0,
+            memory_leaks: None,
+            fragmentation_ratio: None,
             gc_pressure: None,
-            memory_bandwidth_utilization: 0.0,
+            memory_bandwidth_utilization: None,
             cache_performance: CachePerformance {
-                l1_hit_rate: 1.0,
-                l2_hit_rate: 1.0,
-                l3_hit_rate: Some(1.0),
-                cache_misses_per_instruction: 0.0,
-                memory_stalls_percentage: 0.0,
+                l1_hit_rate: None,
+                l2_hit_rate: None,
+                l3_hit_rate: None,
+                cache_misses_per_instruction: None,
+                memory_stalls_percentage: None,
             },
         }
     }
@@ -1311,63 +1430,6 @@ impl Default for HotspotAnalysis {
     }
 }
 
-// Add trait implementations for SciRS2 placeholders to avoid compilation errors
-trait SciRS2ProfilerTrait {
-    fn new() -> Self;
-    fn start(&mut self);
-    fn stop(&mut self);
-    fn get_samples(&self) -> Vec<ProfileSample>;
-    fn get_sample_rate(&self) -> f32;
-}
-
-impl SciRS2ProfilerTrait for SciRS2Profiler {
-    fn new() -> Self {
-        SciRS2Profiler { _placeholder: () }
-    }
-
-    fn start(&mut self) {
-        // Start profiling
-    }
-
-    fn stop(&mut self) {
-        // Stop profiling
-    }
-
-    fn get_samples(&self) -> Vec<ProfileSample> {
-        // Return collected samples
-        vec![
-            ProfileSample {
-                function_name: "conv2d_forward".to_string(),
-                duration_ms: 10.0,
-                stack_trace: vec![
-                    "model.forward".to_string(),
-                    "conv_layer.forward".to_string(),
-                ],
-            },
-            ProfileSample {
-                function_name: "matrix_multiply".to_string(),
-                duration_ms: 8.0,
-                stack_trace: vec!["linear_layer.forward".to_string(), "tensor.mm".to_string()],
-            },
-        ]
-    }
-
-    fn get_sample_rate(&self) -> f32 {
-        1000.0 // 1000 Hz
-    }
-}
-
-// Add placeholder implementations for SciRS2 types
-impl SciRS2Profiler {
-    fn new() -> Self {
-        Self { _placeholder: () }
-    }
-}
-
-struct SciRS2Profiler {
-    _placeholder: (),
-}
-
 trait MemoryCollectorTrait {
     fn new() -> Self;
     fn start_collection(&mut self);
@@ -1377,46 +1439,114 @@ trait MemoryCollectorTrait {
 
 impl MemoryCollectorTrait for MemoryMetricsCollector {
     fn new() -> Self {
-        MemoryMetricsCollector { _placeholder: () }
+        MemoryMetricsCollector {
+            #[cfg(feature = "collect_env")]
+            peak_bytes: 0,
+        }
     }
 
     fn start_collection(&mut self) {
-        // Start memory tracking
+        #[cfg(feature = "collect_env")]
+        {
+            self.peak_bytes = current_process_memory_bytes().unwrap_or(0);
+        }
     }
 
     fn stop_collection(&mut self) {
-        // Stop memory tracking
+        // Take one final real sample so the peak reflects memory right up
+        // to the end of the profiled run.
+        self.sample();
     }
 
     fn get_metrics(&self) -> MemoryMetrics {
-        MemoryMetrics {
-            peak_usage_mb: 256.0,
-            current_usage_mb: 180.0,
-            fragmentation_ratio: 0.15,
-            bandwidth_utilization: 75.0,
-            l1_hit_rate: 0.95,
-            l2_hit_rate: 0.88,
-            l3_hit_rate: Some(0.82),
-            cache_misses_per_instruction: 0.05,
-            memory_stalls_percentage: 12.0,
+        #[cfg(feature = "collect_env")]
+        {
+            let current_bytes = current_process_memory_bytes().unwrap_or(0);
+            let peak_bytes = self.peak_bytes.max(current_bytes);
+            MemoryMetrics {
+                peak_usage_mb: bytes_to_mb(peak_bytes),
+                current_usage_mb: bytes_to_mb(current_bytes),
+                // None of these require hardware performance counters or
+                // allocator introspection this crate does not have.
+                fragmentation_ratio: None,
+                bandwidth_utilization: None,
+                l1_hit_rate: None,
+                l2_hit_rate: None,
+                l3_hit_rate: None,
+                cache_misses_per_instruction: None,
+                memory_stalls_percentage: None,
+            }
+        }
+        #[cfg(not(feature = "collect_env"))]
+        {
+            MemoryMetrics {
+                peak_usage_mb: 0.0,
+                current_usage_mb: 0.0,
+                fragmentation_ratio: None,
+                bandwidth_utilization: None,
+                l1_hit_rate: None,
+                l2_hit_rate: None,
+                l3_hit_rate: None,
+                cache_misses_per_instruction: None,
+                memory_stalls_percentage: None,
+            }
         }
     }
 }
 
 impl MemoryMetricsCollector {
-    fn new() -> Self {
-        Self { _placeholder: () }
+    /// Take a real process-memory reading now and fold it into the
+    /// running peak. A no-op when the `collect_env` feature (which brings
+    /// in `sysinfo`) is disabled.
+    fn sample(&mut self) {
+        #[cfg(feature = "collect_env")]
+        {
+            if let Some(bytes) = current_process_memory_bytes() {
+                self.peak_bytes = self.peak_bytes.max(bytes);
+            }
+        }
     }
 }
 
+/// Real process memory metrics collector.
+///
+/// Uses `sysinfo` (available via this crate's default-enabled
+/// `collect_env` feature) to sample this process's actual resident
+/// memory. Cache-level counters (L1/L2/L3 hit rate, cache misses per
+/// instruction, memory bandwidth utilization, fragmentation ratio)
+/// require hardware performance counters or allocator introspection this
+/// crate does not have -- see [`MemoryMetrics`] / [`CachePerformance`],
+/// which report those as `None` rather than plausible-looking invented
+/// numbers.
 struct MemoryMetricsCollector {
-    _placeholder: (),
+    /// Peak resident memory (bytes) observed via [`Self::sample`] /
+    /// `start_collection` / `stop_collection` so far.
+    #[cfg(feature = "collect_env")]
+    peak_bytes: u64,
+}
+
+/// Real resident memory (RSS) of the current process, in bytes, via
+/// `sysinfo`. Returns `None` if the current process could not be looked up
+/// (e.g. an unsupported platform).
+#[cfg(feature = "collect_env")]
+fn current_process_memory_bytes() -> Option<u64> {
+    use sysinfo::{ProcessesToUpdate, System};
+
+    let pid = sysinfo::get_current_pid().ok()?;
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    sys.process(pid).map(|process| process.memory())
+}
+
+#[cfg(feature = "collect_env")]
+fn bytes_to_mb(bytes: u64) -> f32 {
+    bytes as f32 / (1024.0 * 1024.0)
 }
 
 trait LeakDetectorTrait {
     fn new() -> Self;
     fn enable(&mut self);
-    fn get_detected_leaks(&self) -> Vec<DetectedLeak>;
+    fn get_detected_leaks(&self) -> Option<Vec<DetectedLeak>>;
 }
 
 impl LeakDetectorTrait for LeakDetector {
@@ -1428,8 +1558,13 @@ impl LeakDetectorTrait for LeakDetector {
         // Enable leak detection
     }
 
-    fn get_detected_leaks(&self) -> Vec<DetectedLeak> {
-        vec![] // No leaks detected in this example
+    /// Real leak detection requires instrumenting the global allocator to
+    /// record allocation call sites and ages (or an external tool such as
+    /// Valgrind/heaptrack); neither is wired into this crate. Returns
+    /// `None` ("not measured") rather than `Some(vec![])`, which would
+    /// falsely claim detection ran and cleanly found zero leaks.
+    fn get_detected_leaks(&self) -> Option<Vec<DetectedLeak>> {
+        None
     }
 }
 
@@ -1549,12 +1684,46 @@ pub fn print_bottleneck_report(report: &BottleneckReport) {
     }
     println!();
 
+    println!("Memory Profile:");
+    println!(
+        "  Peak usage: {:.1} MB, current usage: {:.1} MB",
+        report.memory_profile.peak_usage_mb, report.memory_profile.current_usage_mb
+    );
+    println!(
+        "  Fragmentation ratio: {}",
+        format_optional_percent(report.memory_profile.fragmentation_ratio)
+    );
+    println!(
+        "  Memory leaks: {}",
+        match &report.memory_profile.memory_leaks {
+            Some(leaks) => format!("{}", leaks.len()),
+            None => "not measured".to_string(),
+        }
+    );
+    let cache = &report.memory_profile.cache_performance;
+    println!(
+        "  Cache hit rate: L1 {}, L2 {}, L3 {}",
+        format_optional_percent(cache.l1_hit_rate),
+        format_optional_percent(cache.l2_hit_rate),
+        format_optional_percent(cache.l3_hit_rate)
+    );
+    println!();
+
     if !report.recommendations.is_empty() {
         println!("Optimization Recommendations:");
         for (i, rec) in report.recommendations.iter().enumerate() {
             println!("{}. {}", i + 1, rec);
         }
     }
+}
+
+/// Render an optional 0.0-1.0 ratio as a percentage, or "not measured"
+/// when the underlying metric was never read (rather than silently
+/// printing a `0.0%` that would look like a real, if bad, measurement).
+fn format_optional_percent(value: Option<f32>) -> String {
+    value
+        .map(|v| format!("{:.1}%", v * 100.0))
+        .unwrap_or_else(|| "not measured".to_string())
 }
 
 #[cfg(test)]

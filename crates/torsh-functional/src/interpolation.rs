@@ -6,19 +6,47 @@
 use torsh_core::{Result as TorshResult, TorshError};
 use torsh_tensor::Tensor;
 
-/// Interpolation methods supported
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Interpolation methods supported.
+///
+/// This is the single interpolation mode of the crate: image resizing
+/// ([`crate::image::resize`]), grid sampling and the numeric interpolators all
+/// take these variants, so a mode chosen for one of them means the same thing in
+/// the others. Not every mode is meaningful everywhere — a function that cannot
+/// honour a mode returns an error naming it instead of silently degrading to a
+/// cheaper kernel.
+///
+/// `Bilinear`/`Bicubic` are the 2-D spellings of `Linear`/`Cubic` and are treated
+/// as their synonyms; both spellings are accepted for PyTorch familiarity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterpolationMode {
     /// Linear interpolation
     Linear,
+    /// Bilinear interpolation (2-D spelling of [`InterpolationMode::Linear`])
+    Bilinear,
     /// Nearest neighbor interpolation
     Nearest,
     /// Cubic interpolation
     Cubic,
+    /// Bicubic interpolation (2-D spelling of [`InterpolationMode::Cubic`])
+    Bicubic,
+    /// Area (box) averaging, as used for image downsampling
+    Area,
     /// Spline interpolation
     Spline,
     /// Lanczos interpolation
     Lanczos,
+}
+
+impl InterpolationMode {
+    /// Whether this mode is a linear kernel (`Linear` or its 2-D spelling).
+    pub fn is_linear(self) -> bool {
+        matches!(self, Self::Linear | Self::Bilinear)
+    }
+
+    /// Whether this mode is a cubic kernel (`Cubic` or its 2-D spelling).
+    pub fn is_cubic(self) -> bool {
+        matches!(self, Self::Cubic | Self::Bicubic)
+    }
 }
 
 /// 1D linear interpolation
@@ -116,10 +144,14 @@ pub fn interp2d(
 
     for (_i, (&x, &y)) in x_coords_data.iter().zip(y_coords_data.iter()).enumerate() {
         let val = match mode {
-            InterpolationMode::Linear => bilinear_sample(&input_data, width, height, x, y),
+            InterpolationMode::Linear | InterpolationMode::Bilinear => {
+                bilinear_sample(&input_data, width, height, x, y)
+            }
             InterpolationMode::Nearest => nearest_sample(&input_data, width, height, x, y),
-            InterpolationMode::Cubic => bicubic_sample(&input_data, width, height, x, y),
-            _ => {
+            InterpolationMode::Cubic | InterpolationMode::Bicubic => {
+                bicubic_sample(&input_data, width, height, x, y)
+            }
+            InterpolationMode::Area | InterpolationMode::Spline | InterpolationMode::Lanczos => {
                 return Err(TorshError::UnsupportedOperation {
                     op: format!("{:?}", mode),
                     dtype: "2D interpolation".to_string(),
@@ -193,13 +225,25 @@ pub fn grid_sample(
                         &input_data[channel_offset..channel_offset + in_height * in_width];
 
                     let sampled_value = match mode {
-                        InterpolationMode::Linear => {
+                        InterpolationMode::Linear | InterpolationMode::Bilinear => {
                             bilinear_sample(input_slice, in_width, in_height, pixel_x, pixel_y)
                         }
                         InterpolationMode::Nearest => {
                             nearest_sample(input_slice, in_width, in_height, pixel_x, pixel_y)
                         }
-                        _ => 0.0,
+                        InterpolationMode::Cubic | InterpolationMode::Bicubic => {
+                            bicubic_sample(input_slice, in_width, in_height, pixel_x, pixel_y)
+                        }
+                        InterpolationMode::Area
+                        | InterpolationMode::Spline
+                        | InterpolationMode::Lanczos => {
+                            // Silently returning zeros would look like a black image;
+                            // report the unsupported mode instead.
+                            return Err(TorshError::UnsupportedOperation {
+                                op: format!("{:?}", mode),
+                                dtype: "grid_sample".to_string(),
+                            });
+                        }
                     };
 
                     let out_idx = ((n * channels + c) * out_height + h) * out_width + w;
@@ -387,9 +431,54 @@ fn nearest_sample(data: &[f32], width: usize, height: usize, x: f32, y: f32) -> 
     }
 }
 
+/// Bicubic sample of a `[height, width]` plane, for use by other modules of the crate.
+pub(crate) fn sample_bicubic(data: &[f32], width: usize, height: usize, x: f32, y: f32) -> f32 {
+    bicubic_sample(data, width, height, x, y)
+}
+
+/// Cubic convolution kernel with `a = -0.75`, the coefficient PyTorch and OpenCV use.
+///
+/// `w(t) = (a+2)|t|³ - (a+3)|t|² + 1` for `|t| <= 1` and
+/// `w(t) = a|t|³ - 5a|t|² + 8a|t| - 4a` for `1 < |t| < 2`.
+fn cubic_weight(t: f32) -> f32 {
+    const A: f32 = -0.75;
+    let t = t.abs();
+    if t <= 1.0 {
+        ((A + 2.0) * t - (A + 3.0)) * t * t + 1.0
+    } else if t < 2.0 {
+        (((t - 5.0) * t + 8.0) * t - 4.0) * A
+    } else {
+        0.0
+    }
+}
+
+/// Bicubic sample of a `[height, width]` plane at fractional coordinates.
+///
+/// Uses the separable 4x4 cubic convolution kernel; samples outside the plane are
+/// clamped to the border, which is the convention of `torch.nn.functional.interpolate`.
 fn bicubic_sample(data: &[f32], width: usize, height: usize, x: f32, y: f32) -> f32 {
-    // Simplified bicubic - in practice would use proper cubic kernel
-    bilinear_sample(data, width, height, x, y)
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    let x_floor = x.floor();
+    let y_floor = y.floor();
+    let dx = x - x_floor;
+    let dy = y - y_floor;
+
+    let clamp = |value: i64, limit: usize| -> usize { value.clamp(0, limit as i64 - 1) as usize };
+
+    let mut result = 0.0f32;
+    for m in -1i64..=2 {
+        let sample_y = clamp(y_floor as i64 + m, height);
+        let weight_y = cubic_weight(m as f32 - dy);
+        let mut row = 0.0f32;
+        for n in -1i64..=2 {
+            let sample_x = clamp(x_floor as i64 + n, width);
+            row += cubic_weight(n as f32 - dx) * data[sample_y * width + sample_x];
+        }
+        result += weight_y * row;
+    }
+    result
 }
 
 fn lanczos_kernel(x: f32, a: usize) -> f32 {

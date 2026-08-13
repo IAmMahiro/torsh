@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use torsh_core::error::TorshError;
 
 /// Scikit-learn compatible metric interface
 pub trait SklearnMetric {
@@ -37,13 +38,23 @@ impl SklearnAccuracy {
         self
     }
 
-    /// Compute accuracy
+    /// Compute accuracy, or `f64::NAN` if `y_true`/`y_pred` have different
+    /// lengths. See [`Self::try_compute`] for a version that reports the
+    /// mismatch as an `Err` instead.
     pub fn compute(&self, y_true: &[usize], y_pred: &[usize]) -> f64 {
-        assert_eq!(
-            y_true.len(),
-            y_pred.len(),
-            "y_true and y_pred must have same length"
-        );
+        self.try_compute(y_true, y_pred).unwrap_or(f64::NAN)
+    }
+
+    /// Compute accuracy, returning an error instead of panicking when
+    /// `y_true` and `y_pred` have different lengths.
+    pub fn try_compute(&self, y_true: &[usize], y_pred: &[usize]) -> Result<f64, TorshError> {
+        if y_true.len() != y_pred.len() {
+            return Err(TorshError::InvalidArgument(format!(
+                "y_true and y_pred must have same length: {} vs {}",
+                y_true.len(),
+                y_pred.len()
+            )));
+        }
 
         let correct = y_true
             .iter()
@@ -51,11 +62,11 @@ impl SklearnAccuracy {
             .filter(|(t, p)| t == p)
             .count();
 
-        if self.normalize {
+        Ok(if self.normalize {
             correct as f64 / y_true.len() as f64
         } else {
             correct as f64
-        }
+        })
     }
 }
 
@@ -104,20 +115,33 @@ impl SklearnPrecision {
         self
     }
 
-    /// Compute precision
+    /// Compute precision, or `f64::NAN` if `y_true`/`y_pred` have different
+    /// lengths or `average` is not one of "binary"/"micro"/"macro"/
+    /// "weighted". See [`Self::try_compute`] for a version that reports
+    /// either problem as an `Err` instead.
     pub fn compute(&self, y_true: &[usize], y_pred: &[usize]) -> f64 {
-        assert_eq!(
-            y_true.len(),
-            y_pred.len(),
-            "y_true and y_pred must have same length"
-        );
+        self.try_compute(y_true, y_pred).unwrap_or(f64::NAN)
+    }
+
+    /// Compute precision, returning an error instead of panicking on a
+    /// length mismatch or an unrecognized `average` string.
+    pub fn try_compute(&self, y_true: &[usize], y_pred: &[usize]) -> Result<f64, TorshError> {
+        if y_true.len() != y_pred.len() {
+            return Err(TorshError::InvalidArgument(format!(
+                "y_true and y_pred must have same length: {} vs {}",
+                y_true.len(),
+                y_pred.len()
+            )));
+        }
 
         match self.average.as_str() {
-            "binary" => self.compute_binary_precision(y_true, y_pred),
-            "micro" => self.compute_micro_precision(y_true, y_pred),
-            "macro" => self.compute_macro_precision(y_true, y_pred),
-            "weighted" => self.compute_weighted_precision(y_true, y_pred),
-            _ => panic!("Unknown average type: {}", self.average),
+            "binary" => Ok(self.compute_binary_precision(y_true, y_pred)),
+            "micro" => Ok(self.compute_micro_precision(y_true, y_pred)),
+            "macro" => Ok(self.compute_macro_precision(y_true, y_pred)),
+            "weighted" => Ok(self.compute_weighted_precision(y_true, y_pred)),
+            other => Err(TorshError::InvalidArgument(format!(
+                "Unknown average type: {other}"
+            ))),
         }
     }
 
@@ -253,20 +277,33 @@ impl SklearnRecall {
         self
     }
 
-    /// Compute recall
+    /// Compute recall, or `f64::NAN` if `y_true`/`y_pred` have different
+    /// lengths or `average` is not one of "binary"/"micro"/"macro"/
+    /// "weighted". See [`Self::try_compute`] for a version that reports
+    /// either problem as an `Err` instead.
     pub fn compute(&self, y_true: &[usize], y_pred: &[usize]) -> f64 {
-        assert_eq!(
-            y_true.len(),
-            y_pred.len(),
-            "y_true and y_pred must have same length"
-        );
+        self.try_compute(y_true, y_pred).unwrap_or(f64::NAN)
+    }
+
+    /// Compute recall, returning an error instead of panicking on a length
+    /// mismatch or an unrecognized `average` string.
+    pub fn try_compute(&self, y_true: &[usize], y_pred: &[usize]) -> Result<f64, TorshError> {
+        if y_true.len() != y_pred.len() {
+            return Err(TorshError::InvalidArgument(format!(
+                "y_true and y_pred must have same length: {} vs {}",
+                y_true.len(),
+                y_pred.len()
+            )));
+        }
 
         match self.average.as_str() {
-            "binary" => self.compute_binary_recall(y_true, y_pred),
-            "micro" => self.compute_micro_recall(y_true, y_pred),
-            "macro" => self.compute_macro_recall(y_true, y_pred),
-            "weighted" => self.compute_weighted_recall(y_true, y_pred),
-            _ => panic!("Unknown average type: {}", self.average),
+            "binary" => Ok(self.compute_binary_recall(y_true, y_pred)),
+            "micro" => Ok(self.compute_micro_recall(y_true, y_pred)),
+            "macro" => Ok(self.compute_macro_recall(y_true, y_pred)),
+            "weighted" => Ok(self.compute_weighted_recall(y_true, y_pred)),
+            other => Err(TorshError::InvalidArgument(format!(
+                "Unknown average type: {other}"
+            ))),
         }
     }
 
@@ -402,25 +439,34 @@ impl SklearnF1Score {
         self
     }
 
-    /// Compute F1 score
+    /// Compute F1 score, or `f64::NAN` if `y_true`/`y_pred` have different
+    /// lengths or `average` is not one of "binary"/"micro"/"macro"/
+    /// "weighted". See [`Self::try_compute`] for a version that reports
+    /// either problem as an `Err` instead.
     pub fn compute(&self, y_true: &[usize], y_pred: &[usize]) -> f64 {
+        self.try_compute(y_true, y_pred).unwrap_or(f64::NAN)
+    }
+
+    /// Compute F1 score, returning an error instead of panicking on a
+    /// length mismatch or an unrecognized `average` string.
+    pub fn try_compute(&self, y_true: &[usize], y_pred: &[usize]) -> Result<f64, TorshError> {
         let precision = SklearnPrecision::new()
             .with_average(&self.average)
             .with_pos_label(self.pos_label)
             .with_zero_division(self.zero_division)
-            .compute(y_true, y_pred);
+            .try_compute(y_true, y_pred)?;
 
         let recall = SklearnRecall::new()
             .with_average(&self.average)
             .with_pos_label(self.pos_label)
             .with_zero_division(self.zero_division)
-            .compute(y_true, y_pred);
+            .try_compute(y_true, y_pred)?;
 
-        if precision + recall == 0.0 {
+        Ok(if precision + recall == 0.0 {
             self.zero_division
         } else {
             2.0 * precision * recall / (precision + recall)
-        }
+        })
     }
 }
 
@@ -449,13 +495,23 @@ impl SklearnMeanSquaredError {
         self
     }
 
-    /// Compute MSE or RMSE
+    /// Compute MSE or RMSE, or `f64::NAN` if `y_true`/`y_pred` have
+    /// different lengths. See [`Self::try_compute`] for a version that
+    /// reports the mismatch as an `Err` instead.
     pub fn compute(&self, y_true: &[f64], y_pred: &[f64]) -> f64 {
-        assert_eq!(
-            y_true.len(),
-            y_pred.len(),
-            "y_true and y_pred must have same length"
-        );
+        self.try_compute(y_true, y_pred).unwrap_or(f64::NAN)
+    }
+
+    /// Compute MSE or RMSE, returning an error instead of panicking when
+    /// `y_true` and `y_pred` have different lengths.
+    pub fn try_compute(&self, y_true: &[f64], y_pred: &[f64]) -> Result<f64, TorshError> {
+        if y_true.len() != y_pred.len() {
+            return Err(TorshError::InvalidArgument(format!(
+                "y_true and y_pred must have same length: {} vs {}",
+                y_true.len(),
+                y_pred.len()
+            )));
+        }
 
         let mse = y_true
             .iter()
@@ -464,11 +520,7 @@ impl SklearnMeanSquaredError {
             .sum::<f64>()
             / y_true.len() as f64;
 
-        if self.squared {
-            mse
-        } else {
-            mse.sqrt()
-        }
+        Ok(if self.squared { mse } else { mse.sqrt() })
     }
 }
 
@@ -488,20 +540,30 @@ impl SklearnMeanAbsoluteError {
         Self {}
     }
 
-    /// Compute MAE
+    /// Compute MAE, or `f64::NAN` if `y_true`/`y_pred` have different
+    /// lengths. See [`Self::try_compute`] for a version that reports the
+    /// mismatch as an `Err` instead.
     pub fn compute(&self, y_true: &[f64], y_pred: &[f64]) -> f64 {
-        assert_eq!(
-            y_true.len(),
-            y_pred.len(),
-            "y_true and y_pred must have same length"
-        );
+        self.try_compute(y_true, y_pred).unwrap_or(f64::NAN)
+    }
 
-        y_true
+    /// Compute MAE, returning an error instead of panicking when `y_true`
+    /// and `y_pred` have different lengths.
+    pub fn try_compute(&self, y_true: &[f64], y_pred: &[f64]) -> Result<f64, TorshError> {
+        if y_true.len() != y_pred.len() {
+            return Err(TorshError::InvalidArgument(format!(
+                "y_true and y_pred must have same length: {} vs {}",
+                y_true.len(),
+                y_pred.len()
+            )));
+        }
+
+        Ok(y_true
             .iter()
             .zip(y_pred.iter())
             .map(|(t, p)| (t - p).abs())
             .sum::<f64>()
-            / y_true.len() as f64
+            / y_true.len() as f64)
     }
 }
 
@@ -521,13 +583,29 @@ impl SklearnR2Score {
         Self {}
     }
 
-    /// Compute R² score
+    /// Compute R² score, or `f64::NAN` if `y_true`/`y_pred` have different
+    /// lengths. See [`Self::try_compute`] for a version that reports the
+    /// mismatch as an `Err` instead.
+    ///
+    /// Note: when `y_true` has zero variance this returns `0.0` regardless
+    /// of prediction quality (matches this type's established behavior,
+    /// validated against reference values in `tests/sklearn_reference_validation.rs`).
+    /// [`crate::regression::R2Score`] instead follows scikit-learn's
+    /// `force_finite` convention (`1.0` when residuals are also zero).
     pub fn compute(&self, y_true: &[f64], y_pred: &[f64]) -> f64 {
-        assert_eq!(
-            y_true.len(),
-            y_pred.len(),
-            "y_true and y_pred must have same length"
-        );
+        self.try_compute(y_true, y_pred).unwrap_or(f64::NAN)
+    }
+
+    /// Compute R² score, returning an error instead of panicking when
+    /// `y_true` and `y_pred` have different lengths.
+    pub fn try_compute(&self, y_true: &[f64], y_pred: &[f64]) -> Result<f64, TorshError> {
+        if y_true.len() != y_pred.len() {
+            return Err(TorshError::InvalidArgument(format!(
+                "y_true and y_pred must have same length: {} vs {}",
+                y_true.len(),
+                y_pred.len()
+            )));
+        }
 
         let mean = y_true.iter().sum::<f64>() / y_true.len() as f64;
 
@@ -538,11 +616,11 @@ impl SklearnR2Score {
             .map(|(t, p)| (t - p).powi(2))
             .sum::<f64>();
 
-        if ss_tot == 0.0 {
+        Ok(if ss_tot == 0.0 {
             0.0
         } else {
             1.0 - (ss_res / ss_tot)
-        }
+        })
     }
 }
 

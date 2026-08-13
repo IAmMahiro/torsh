@@ -22,20 +22,27 @@ torsh-tensor = { workspace = true }
 torsh-nn = { workspace = true }
 tokio = { workspace = true, features = ["fs", "net"] }
 reqwest = { workspace = true, features = ["json", "stream", "blocking"] }
+# Pure-Rust TLS provider (replaces reqwest's aws-lc-rs/BoringSSL default backend)
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+oxitls-rustcrypto-provider = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-dirs = "6.0.0"
+dirs = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
+tracing = { workspace = true }
 tempfile = { workspace = true }
-toml = "1.1.2"
+toml = { workspace = true }
 oxiarc-deflate = { workspace = true }
 oxiarc-archive = { workspace = true }
 oxiarc-core = { workspace = true }
-base64 = "0.22.1"
-oxionnx = { version = "0.1.4", features = ["ndarray"] }
+base64 = { workspace = true }
+oxionnx = { workspace = true }
 # SciRS2 compliance - replaces direct ndarray and rand usage
 scirs2-core.workspace = true
 scirs2-autograd.workspace = true
@@ -44,10 +51,10 @@ futures = { workspace = true }
 futures-util = { workspace = true }
 clap = { workspace = true }
 uuid = { workspace = true }
-indicatif = "0.18"
+indicatif = { workspace = true }
 
 [dev-dependencies]
-tokio-test = "0.4"
+tokio-test = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]

@@ -18,91 +18,24 @@ use alloc::vec::Vec;
 use scirs2_core::parallel_ops::*;
 
 /// Stack tensors along a new dimension (optimized version)
+///
+/// Delegates to [`TensorStacker`], which implements real dim-aware stacking
+/// (an `outer`/`inner` split so a batch axis inserted at any `dim` gets the
+/// correct interleaved memory layout, not just the correct output shape)
+/// without unsafe uninitialized-memory tricks. This function used to
+/// duplicate an earlier, independently-buggy copy of that logic: it wrote
+/// every source tensor into a contiguous `i * tensor_size` block regardless
+/// of `dim` (wrong element layout for any `dim != 0`, silently returning a
+/// mislabelled tensor), and pre-filled its output buffer via
+/// `Vec::with_capacity` + `unsafe { set_len(..) }` before every element was
+/// actually written. Delegating keeps a single, tested implementation
+/// instead of two copies that can drift out of sync (see the `TensorStacker`
+/// hardening fix in `collate::stacking` for the full reasoning).
 pub fn stack_tensors<T: TensorElement + Copy>(
     tensors: &[Tensor<T>],
     dim: usize,
 ) -> Result<Tensor<T>> {
-    if tensors.is_empty() {
-        return Err(TorshError::InvalidArgument(
-            "Cannot stack empty tensor list".to_string(),
-        ));
-    }
-
-    // Check that all tensors have the same shape
-    let first_shape = tensors[0].shape();
-    for tensor in &tensors[1..] {
-        if tensor.shape() != first_shape {
-            return Err(TorshError::ShapeMismatch {
-                expected: first_shape.dims().to_vec(),
-                got: tensor.shape().dims().to_vec(),
-            });
-        }
-    }
-
-    // Create new shape with additional dimension at the specified position
-    let original_dims = first_shape.dims();
-    let mut new_dims = Vec::with_capacity(original_dims.len() + 1);
-
-    // Insert batch dimension at the specified position
-    if dim == 0 {
-        new_dims.push(tensors.len());
-        new_dims.extend_from_slice(original_dims);
-    } else {
-        // Insert at position dim
-        new_dims.extend_from_slice(&original_dims[..dim.min(original_dims.len())]);
-        new_dims.push(tensors.len());
-        if dim < original_dims.len() {
-            new_dims.extend_from_slice(&original_dims[dim..]);
-        }
-    }
-
-    // Optimized stacking: pre-allocate without unnecessary initialization
-    // Use with_capacity + unsafe set_len for better performance when we know
-    // we'll immediately overwrite all values
-    let tensor_size = tensors[0].numel();
-    let total_elements = new_dims.iter().product::<usize>();
-    let mut new_data = Vec::with_capacity(total_elements);
-    // SAFETY: We immediately fill all elements below, so uninitialized memory is never read
-    unsafe { new_data.set_len(total_elements) };
-
-    // Use parallel processing for large batches when std feature is available
-    #[cfg(feature = "std")]
-    {
-        if tensors.len() > 4 && tensor_size > 1000 {
-            // Parallel data collection for large tensors
-            let parallel_data: std::result::Result<Vec<Vec<T>>, TorshError> =
-                tensors.par_iter().map(|tensor| tensor.to_vec()).collect();
-            let parallel_data = parallel_data?;
-            for (i, data) in parallel_data.into_iter().enumerate() {
-                let start_idx = i * tensor_size;
-                let end_idx = start_idx + tensor_size;
-                new_data[start_idx..end_idx].copy_from_slice(&data);
-            }
-        } else {
-            // Sequential copy for small tensors/batches
-            for (i, tensor) in tensors.iter().enumerate() {
-                let data = tensor.to_vec()?;
-                let start_idx = i * tensor_size;
-                let end_idx = start_idx + tensor_size;
-                new_data[start_idx..end_idx].copy_from_slice(&data);
-            }
-        }
-    }
-
-    #[cfg(not(feature = "std"))]
-    {
-        // Sequential copy for no_std
-        for (i, tensor) in tensors.iter().enumerate() {
-            let data = tensor.to_vec()?;
-            let start_idx = i * tensor_size;
-            let end_idx = start_idx + tensor_size;
-            new_data[start_idx..end_idx].copy_from_slice(&data);
-        }
-    }
-
-    let result = torsh_tensor::Tensor::from_data(new_data, new_dims, tensors[0].device())?;
-
-    Ok(result)
+    TensorStacker::new().stack(tensors, dim)
 }
 
 /// Fast stack tensors using memory mapping for very large batches

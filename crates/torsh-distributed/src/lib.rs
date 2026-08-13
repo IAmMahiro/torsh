@@ -340,6 +340,7 @@ pub mod ray_integration;
 pub mod rdma_support;
 pub mod rpc;
 pub mod store;
+pub mod tcp_backend;
 pub mod tensor_parallel;
 pub mod three_d_parallelism;
 pub mod training_analytics_dashboard;
@@ -499,6 +500,7 @@ pub use rpc::{
 pub use store::{
     create_store, FileStore, MemoryStore, Store, StoreBackend, StoreConfig, StoreValue,
 };
+pub use tcp_backend::{Payload, TcpBackend, TcpEngine};
 pub use tensor_parallel::{
     ShardInfo as TpShardInfo, TensorParallel, TensorParallelConfig, TensorParallelLayer,
     TensorParallelStats, TensorParallelStrategy,
@@ -548,9 +550,12 @@ pub async fn init_process_group(
 }
 
 /// Check if distributed training is available
+///
+/// Always `true`: the pure-Rust TCP collective backend ([`TcpBackend`]) is a
+/// real transport compiled unconditionally and used for the default `Gloo`
+/// backend type.
 #[allow(unexpected_cfgs)]
 pub fn is_available() -> bool {
-    // Always return true since we have MockBackend available
     true
 }
 
@@ -566,9 +571,11 @@ pub fn is_mpi_available() -> bool {
 }
 
 /// Check if Gloo backend is available
+///
+/// Always `true`: the `Gloo` backend type is served by the real pure-Rust
+/// [`TcpBackend`] (store-based TCP collectives), which is always compiled in.
 #[allow(unexpected_cfgs)]
 pub fn is_gloo_available() -> bool {
-    // Mock backend pretends to be Gloo
     true
 }
 

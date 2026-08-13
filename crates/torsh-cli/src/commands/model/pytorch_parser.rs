@@ -11,9 +11,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
-// ✅ SciRS2 POLICY COMPLIANT: Use scirs2-core unified access patterns
-use scirs2_core::random::{thread_rng, Distribution, Normal};
-
 // ToRSh integration
 use torsh::core::device::DeviceType;
 
@@ -137,7 +134,9 @@ pub async fn parse_pytorch_model(path: &Path) -> Result<PyTorchModelInfo> {
         if is_zip { "ZIP" } else { "Pickle" }
     );
 
-    // Parse model structure (simplified for now)
+    // Recover real state-dict parameter names and a real parameter count from
+    // the checkpoint bytes (see `parse_pytorch_structure`). For full tensor
+    // reconstruction (values, shapes, strides) use `pytorch_reader`.
     let (state_dict_keys, num_parameters, is_full_model) =
         parse_pytorch_structure(&file_data, is_zip)?;
 
@@ -556,8 +555,27 @@ pub async fn convert_pytorch_to_torsh(
 
     let pytorch_info = parse_pytorch_model(pytorch_path).await?;
 
-    // Build ToRSh model structure from PyTorch state dict
-    let (layers, weights) = build_torsh_structure(&pytorch_info, device)?;
+    // Prefer the real reader: reconstruct genuine tensor shapes/dtypes from the
+    // checkpoint. Fall back to name-based inference only when the file cannot be
+    // read (e.g. legacy pure-pickle format), and say so honestly.
+    let file_data = tokio::fs::read(pytorch_path).await?;
+    let (layers, weights) = match super::pytorch_reader::read_state_dict(&file_data) {
+        Ok(tensors) => {
+            let total_elements: usize = tensors.iter().map(|t| t.element_count()).sum();
+            info!(
+                "Reconstructed {} real tensors ({} elements) from the checkpoint",
+                tensors.len(),
+                total_elements
+            );
+            build_structure_from_tensors(&tensors)
+        }
+        Err(e) => {
+            warn!(
+                "could not fully deserialize tensors ({e}); falling back to name-based shape inference"
+            );
+            build_torsh_structure(&pytorch_info, device)?
+        }
+    };
 
     let mut metadata = ModelMetadata::default();
     metadata.format = "torsh".to_string();
@@ -586,6 +604,83 @@ pub async fn convert_pytorch_to_torsh(
         weights,
         metadata,
     })
+}
+
+/// Build a ToRSh structure from **real** reconstructed tensors (genuine shapes
+/// and dtypes), grouping parameters into layers by their dotted name prefix.
+fn build_structure_from_tensors(
+    tensors: &[super::pytorch_reader::PytorchTensor],
+) -> (Vec<LayerInfo>, HashMap<String, TensorInfo>) {
+    use super::pytorch_reader::TensorDType;
+
+    let mut weights = HashMap::new();
+    let mut layer_order: Vec<String> = Vec::new();
+    let mut layer_params: HashMap<String, Vec<Vec<usize>>> = HashMap::new();
+
+    for t in tensors {
+        let dtype = match t.dtype {
+            TensorDType::F32 => DType::F32,
+            TensorDType::F64 => DType::F64,
+            TensorDType::I64 => DType::I64,
+        };
+        weights.insert(
+            t.name.clone(),
+            TensorInfo {
+                name: t.name.clone(),
+                shape: t.shape.clone(),
+                dtype,
+                requires_grad: t.requires_grad
+                    && !t.name.contains("running")
+                    && !t.name.contains("num_batches_tracked"),
+                device: Device::Cpu,
+            },
+        );
+
+        let layer_name = match t.name.rfind('.') {
+            Some(pos) => t.name[..pos].to_string(),
+            None => t.name.clone(),
+        };
+        if !layer_params.contains_key(&layer_name) {
+            layer_order.push(layer_name.clone());
+        }
+        layer_params
+            .entry(layer_name)
+            .or_default()
+            .push(t.shape.clone());
+    }
+
+    let mut layers = Vec::with_capacity(layer_order.len());
+    for layer_name in layer_order {
+        let shapes = layer_params.get(&layer_name).cloned().unwrap_or_default();
+        let params: u64 = shapes
+            .iter()
+            .map(|s| s.iter().product::<usize>() as u64)
+            .sum();
+        // Use the largest-rank parameter (typically the weight) for I/O shapes.
+        let repr_shape = shapes
+            .iter()
+            .max_by_key(|s| s.len())
+            .cloned()
+            .unwrap_or_else(|| vec![params.max(1) as usize]);
+        let (input_shape, output_shape) = if repr_shape.len() >= 2 {
+            (vec![repr_shape[1]], vec![repr_shape[0]])
+        } else {
+            (repr_shape.clone(), repr_shape.clone())
+        };
+        let layer_type = PyTorchLayerType::from_param_name(&layer_name);
+
+        layers.push(LayerInfo {
+            name: layer_name,
+            layer_type: layer_type.to_torsh_type().to_string(),
+            input_shape,
+            output_shape,
+            parameters: params,
+            trainable: true,
+            config: create_layer_config(layer_type),
+        });
+    }
+
+    (layers, weights)
 }
 
 /// Build ToRSh model structure from PyTorch state dict
@@ -786,22 +881,33 @@ fn create_layer_config(layer_type: PyTorchLayerType) -> HashMap<String, serde_js
     config
 }
 
-/// Map PyTorch tensor to ToRSh tensor (simplified)
+/// Deserialize a real PyTorch tensor storage (little-endian `f32`) into a
+/// [`ModelTensor`] of the given shape.
+///
+/// This performs a genuine deserialization of the raw storage bytes — it never
+/// fabricates values. The buffer must contain exactly `shape.product()`
+/// little-endian `f32` elements; other dtypes are handled by the full
+/// [`super::pytorch_reader`] reader.
 pub fn map_pytorch_tensor_to_torsh(
-    _pytorch_tensor: &[u8],
+    pytorch_tensor: &[u8],
     shape: Vec<usize>,
     requires_grad: bool,
     device: DeviceType,
 ) -> Result<ModelTensor> {
-    // In real implementation, would deserialize PyTorch tensor format
-    // For now, create a random tensor with the correct shape
-
-    let mut rng = thread_rng();
-    let normal = Normal::new(0.0, 0.1)?;
-
     let num_elements: usize = shape.iter().product();
-    let data: Vec<f32> = (0..num_elements)
-        .map(|_| normal.sample(&mut rng) as f32)
+    let expected_bytes = num_elements * std::mem::size_of::<f32>();
+    if pytorch_tensor.len() != expected_bytes {
+        anyhow::bail!(
+            "raw tensor storage is {} bytes but shape {:?} needs {} f32 bytes",
+            pytorch_tensor.len(),
+            shape,
+            expected_bytes
+        );
+    }
+
+    let data: Vec<f32> = pytorch_tensor
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
     ModelTensor::from_data("converted".to_string(), data, shape, requires_grad, device)

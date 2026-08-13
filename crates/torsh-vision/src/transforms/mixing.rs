@@ -35,9 +35,20 @@ impl MixUp {
     ///
     /// * `alpha` - Parameter for Beta distribution. Higher values lead to stronger mixing.
     ///             Common values: 0.2, 1.0. Use 0.0 to disable mixing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `alpha` is negative. Use [`Self::try_new`] to get an error
+    /// instead.
     pub fn new(alpha: f32) -> Self {
         assert!(alpha >= 0.0, "Alpha must be non-negative");
         Self { alpha }
+    }
+
+    /// Fallible variant of [`Self::new`]
+    pub fn try_new(alpha: f32) -> Result<Self> {
+        crate::transforms::augmentation::validate_non_negative(alpha, "alpha")?;
+        Ok(Self { alpha })
     }
 
     /// Get the alpha parameter
@@ -120,10 +131,12 @@ impl MixUp {
         num_classes: usize,
         lambda: f32,
     ) -> Result<(Tensor<f32>, Tensor<f32>)> {
-        assert!(
-            (0.0..=1.0).contains(&lambda),
-            "Lambda must be between 0.0 and 1.0"
-        );
+        if !(0.0..=1.0).contains(&lambda) {
+            return Err(VisionError::InvalidArgument(format!(
+                "Lambda must be between 0.0 and 1.0, got {}",
+                lambda
+            )));
+        }
 
         if label1 >= num_classes || label2 >= num_classes {
             return Err(VisionError::InvalidArgument(format!(
@@ -203,9 +216,20 @@ impl CutMix {
     ///
     /// * `alpha` - Parameter for Beta distribution. Higher values lead to larger cut regions.
     ///             Common values: 1.0. Use 0.0 to disable cutting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `alpha` is negative. Use [`Self::try_new`] to get an error
+    /// instead.
     pub fn new(alpha: f32) -> Self {
         assert!(alpha >= 0.0, "Alpha must be non-negative");
         Self { alpha }
+    }
+
+    /// Fallible variant of [`Self::new`]
+    pub fn try_new(alpha: f32) -> Result<Self> {
+        crate::transforms::augmentation::validate_non_negative(alpha, "alpha")?;
+        Ok(Self { alpha })
     }
 
     /// Get the alpha parameter

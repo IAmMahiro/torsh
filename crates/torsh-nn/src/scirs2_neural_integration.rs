@@ -123,11 +123,13 @@ impl MultiHeadAttention {
         let head_dim = embed_dim / num_heads;
         let mut base = ModuleBase::new();
 
-        // Create projection layers
-        let q_proj = Parameter::new(zeros(&[embed_dim, embed_dim])?);
-        let k_proj = Parameter::new(zeros(&[embed_dim, embed_dim])?);
-        let v_proj = Parameter::new(zeros(&[embed_dim, embed_dim])?);
-        let out_proj = Parameter::new(zeros(&[embed_dim, embed_dim])?);
+        // Create projection layers. Xavier initialisation is required here: a
+        // zero-initialised projection makes the whole layer emit constant zeros
+        // and (with zero gradients through the product) never train.
+        let q_proj = Parameter::new(crate::init::xavier_uniform(&[embed_dim, embed_dim])?);
+        let k_proj = Parameter::new(crate::init::xavier_uniform(&[embed_dim, embed_dim])?);
+        let v_proj = Parameter::new(crate::init::xavier_uniform(&[embed_dim, embed_dim])?);
+        let out_proj = Parameter::new(crate::init::xavier_uniform(&[embed_dim, embed_dim])?);
 
         base.register_parameter("q_proj".to_string(), q_proj);
         base.register_parameter("k_proj".to_string(), k_proj);
@@ -153,14 +155,19 @@ impl MultiHeadAttention {
         value: &Tensor,
         attn_mask: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
-        // Simplified implementation using matrix operations
+        // Look the projections up fallibly: a state dict loaded with renamed or
+        // missing keys must surface as an error, never as a panic in the middle
+        // of a forward pass.
         let params = self.base.named_parameters();
-        let q_proj = params.get("q_proj").expect("q_proj parameter should exist");
-        let k_proj = params.get("k_proj").expect("k_proj parameter should exist");
-        let v_proj = params.get("v_proj").expect("v_proj parameter should exist");
-        let out_proj = params
-            .get("out_proj")
-            .expect("out_proj parameter should exist");
+        let missing = |name: &str| {
+            TorshError::InvalidArgument(format!(
+                "MultiHeadAttention is missing the '{name}' parameter"
+            ))
+        };
+        let q_proj = params.get("q_proj").ok_or_else(|| missing("q_proj"))?;
+        let k_proj = params.get("k_proj").ok_or_else(|| missing("k_proj"))?;
+        let v_proj = params.get("v_proj").ok_or_else(|| missing("v_proj"))?;
+        let out_proj = params.get("out_proj").ok_or_else(|| missing("out_proj"))?;
 
         let q = query.matmul(&*q_proj.tensor().read())?;
         let k = key.matmul(&*k_proj.tensor().read())?;
@@ -237,8 +244,10 @@ impl TransformerEncoderLayer {
         device: DeviceType,
     ) -> Result<Self> {
         let self_attn = MultiHeadAttention::new(d_model, nhead, dropout, true, device)?;
-        let linear1 = Parameter::new(zeros(&[d_model, dim_feedforward])?);
-        let linear2 = Parameter::new(zeros(&[dim_feedforward, d_model])?);
+        // Xavier, not zeros: a zero-initialised feed-forward block emits zeros
+        // for every input and its gradient never leaves zero either.
+        let linear1 = Parameter::new(crate::init::xavier_uniform(&[d_model, dim_feedforward])?);
+        let linear2 = Parameter::new(crate::init::xavier_uniform(&[dim_feedforward, d_model])?);
         let norm1 = LayerNorm::new(vec![d_model], 1e-5, true, device)?;
         let norm2 = LayerNorm::new(vec![d_model], 1e-5, true, device)?;
 
@@ -308,6 +317,147 @@ impl Module for TransformerEncoderLayer {
         self.self_attn.eval();
         self.norm1.eval();
         self.norm2.eval();
+    }
+}
+
+/// Transformer decoder layer
+///
+/// The standard post-norm decoder block of "Attention Is All You Need":
+/// masked self-attention over the target sequence, cross-attention over the
+/// encoder memory, then a position-wise feed-forward network — each sublayer
+/// wrapped in a residual connection followed by layer normalization, matching
+/// the conventions of [`TransformerEncoderLayer`] in this module.
+pub struct TransformerDecoderLayer {
+    self_attn: MultiHeadAttention,
+    cross_attn: MultiHeadAttention,
+    linear1: Parameter,
+    linear2: Parameter,
+    norm1: LayerNorm,
+    norm2: LayerNorm,
+    norm3: LayerNorm,
+    dropout: f32,
+    training: bool,
+}
+
+impl TransformerDecoderLayer {
+    /// Create a decoder layer.
+    ///
+    /// * `d_model` - model (embedding) dimension
+    /// * `nhead` - number of attention heads, must divide `d_model`
+    /// * `dim_feedforward` - hidden width of the position-wise network
+    /// * `dropout` - dropout probability applied to each sublayer output
+    pub fn new(
+        d_model: usize,
+        nhead: usize,
+        dim_feedforward: usize,
+        dropout: f32,
+        device: DeviceType,
+    ) -> Result<Self> {
+        let self_attn = MultiHeadAttention::new(d_model, nhead, dropout, true, device)?;
+        let cross_attn = MultiHeadAttention::new(d_model, nhead, dropout, true, device)?;
+        let linear1 = Parameter::new(crate::init::xavier_uniform(&[d_model, dim_feedforward])?);
+        let linear2 = Parameter::new(crate::init::xavier_uniform(&[dim_feedforward, d_model])?);
+        let norm1 = LayerNorm::new(vec![d_model], 1e-5, true, device)?;
+        let norm2 = LayerNorm::new(vec![d_model], 1e-5, true, device)?;
+        let norm3 = LayerNorm::new(vec![d_model], 1e-5, true, device)?;
+
+        Ok(Self {
+            self_attn,
+            cross_attn,
+            linear1,
+            linear2,
+            norm1,
+            norm2,
+            norm3,
+            dropout,
+            training: true,
+        })
+    }
+
+    /// Decode `tgt` while attending to the encoder output `memory`.
+    ///
+    /// * `tgt_mask` - additive mask for the self-attention scores (usually causal)
+    /// * `memory_mask` - additive mask for the cross-attention scores
+    pub fn forward(
+        &self,
+        tgt: &Tensor,
+        memory: &Tensor,
+        tgt_mask: Option<&Tensor>,
+        memory_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        // 1. Masked self-attention over the target sequence.
+        let (self_out, _) = self.self_attn.forward(tgt, tgt, tgt, tgt_mask)?;
+        let self_out = self.apply_dropout(&self_out)?;
+        let x = self.norm1.forward(&tgt.add(&self_out)?)?;
+
+        // 2. Cross-attention: queries from the decoder, keys/values from memory.
+        let (cross_out, _) = self.cross_attn.forward(&x, memory, memory, memory_mask)?;
+        let cross_out = self.apply_dropout(&cross_out)?;
+        let x = self.norm2.forward(&x.add(&cross_out)?)?;
+
+        // 3. Position-wise feed-forward network.
+        let hidden = x.matmul(&*self.linear1.tensor().read())?.relu()?;
+        let ff_out = hidden.matmul(&*self.linear2.tensor().read())?;
+        let ff_out = self.apply_dropout(&ff_out)?;
+        self.norm3.forward(&x.add(&ff_out)?)
+    }
+
+    /// Dropout on a sublayer output, honouring the module's training flag.
+    fn apply_dropout(&self, tensor: &Tensor) -> Result<Tensor> {
+        if self.dropout > 0.0 && self.training {
+            crate::functional::dropout(tensor, self.dropout, true)
+        } else {
+            Ok(tensor.clone())
+        }
+    }
+}
+
+impl Module for TransformerDecoderLayer {
+    /// Self-decoding shortcut: uses `input` as both target and memory.
+    ///
+    /// Real encoder-decoder use should call
+    /// [`TransformerDecoderLayer::forward`] with the encoder memory.
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.forward(input, input, None, None)
+    }
+
+    fn parameters(&self) -> HashMap<String, Parameter> {
+        self.named_parameters()
+    }
+
+    fn named_parameters(&self) -> HashMap<String, Parameter> {
+        let mut params = HashMap::new();
+        for (name, param) in self.self_attn.named_parameters() {
+            params.insert(format!("self_attn.{}", name), param);
+        }
+        for (name, param) in self.cross_attn.named_parameters() {
+            params.insert(format!("cross_attn.{}", name), param);
+        }
+        params.insert("linear1".to_string(), self.linear1.clone());
+        params.insert("linear2".to_string(), self.linear2.clone());
+        for (name, param) in self.norm1.named_parameters() {
+            params.insert(format!("norm1.{}", name), param);
+        }
+        for (name, param) in self.norm2.named_parameters() {
+            params.insert(format!("norm2.{}", name), param);
+        }
+        for (name, param) in self.norm3.named_parameters() {
+            params.insert(format!("norm3.{}", name), param);
+        }
+        params
+    }
+
+    fn training(&self) -> bool {
+        self.training
+    }
+
+    fn set_training(&mut self, training: bool) {
+        self.training = training;
+        self.self_attn.set_training(training);
+        self.cross_attn.set_training(training);
+        self.norm1.set_training(training);
+        self.norm2.set_training(training);
+        self.norm3.set_training(training);
     }
 }
 
@@ -421,12 +571,13 @@ impl LayerNorm {
 
         if self.elementwise_affine {
             let params = self.base.named_parameters();
-            let weight = params
-                .get("weight")
-                .expect("weight parameter should exist for elementwise_affine");
-            let bias = params
-                .get("bias")
-                .expect("bias parameter should exist for elementwise_affine");
+            let missing = |name: &str| {
+                TorshError::InvalidArgument(format!(
+                    "LayerNorm with elementwise_affine is missing the '{name}' parameter"
+                ))
+            };
+            let weight = params.get("weight").ok_or_else(|| missing("weight"))?;
+            let bias = params.get("bias").ok_or_else(|| missing("bias"))?;
 
             // Apply weight and bias using element-wise operations
             let weight_tensor = weight.tensor().read().clone();

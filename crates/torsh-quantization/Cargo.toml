@@ -24,7 +24,7 @@ thiserror = { workspace = true }
 scirs2-core = { workspace = true, features = ["random", "simd", "benchmarking", "parallel"] }
 serde_json = { workspace = true } # For JSON serialization
 serde = { workspace = true, features = ["derive"] } # For serialization
-num_cpus = "1.17" # For hardware info collection
+num_cpus = { workspace = true } # For hardware info collection
 
 [features]
 default = ["std"]

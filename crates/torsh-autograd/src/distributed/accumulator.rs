@@ -3,6 +3,7 @@
 //! This module provides the core gradient accumulation functionality with support for
 //! multiple communication patterns and compression strategies.
 
+use torsh_core::sync::RwLockExt;
 use crate::compression::{
     CompressedGradient, CompressionAlgorithm, CompressionConfig, CompressionMetadata,
     GradientCompressor,
@@ -16,9 +17,10 @@ use std::time::{Duration, Instant};
 use torsh_core::dtype::FloatElement;
 use torsh_core::error::{Result, TorshError};
 
-use super::config::{
-    CommunicationPattern, CompressionStrategy, DistributedConfig, DistributedStats, ReductionOp,
+use super::common::{
+    CommunicationPattern, CompressionStrategy, DistributedConfig, ReductionOp,
 };
+use super::metrics::DistributedStats;
 
 /// Distributed gradient accumulator with advanced features
 pub struct DistributedGradAccumulator<T: FloatElement> {
@@ -157,7 +159,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> DistributedGradAccumulator<T
 
     /// Initialize communication backend
     fn initialize_communication(&mut self) -> Result<()> {
-        use super::config::DistributedBackend;
+        use super::common::DistributedBackend;
 
         match self.config.backend {
             DistributedBackend::None => {
@@ -171,47 +173,52 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> DistributedGradAccumulator<T
         }
     }
 
+    /// Reject a transport that this accumulator cannot actually establish.
+    ///
+    /// Returning `Ok` from a backend initializer that creates no communicator,
+    /// socket or context is what lets a whole training run proceed on a channel
+    /// that does not exist: every subsequent all-reduce silently reduces one
+    /// rank's gradients with themselves. An error at setup time is the only
+    /// point where that is still recoverable.
+    fn reject_backend(&self, backend: &str, requirement: &str) -> Result<()> {
+        Err(TorshError::AutogradError(format!(
+            "distributed gradient accumulation over {backend} is not available: {requirement}. \
+             Use DistributedBackend::None for single-process accumulation, or drive \
+             multi-process training through torsh-distributed's process group."
+        )))
+    }
+
     /// Initialize NCCL backend
     fn initialize_nccl(&mut self) -> Result<()> {
-        // Placeholder for NCCL initialization
-        // In a real implementation, this would:
-        // 1. Initialize NCCL communicator
-        // 2. Set up CUDA streams
-        // 3. Configure NCCL topology
-
-        tracing::info!("Initializing NCCL backend (placeholder implementation)");
-        Ok(())
+        self.reject_backend(
+            "NCCL",
+            "no NCCL communicator or CUDA stream is created by this crate, which has no NCCL \
+             dependency",
+        )
     }
 
     /// Initialize Gloo backend
     fn initialize_gloo(&mut self) -> Result<()> {
-        // Placeholder for Gloo initialization
-        // In a real implementation, this would:
-        // 1. Set up TCP/InfiniBand connections
-        // 2. Create process group
-        // 3. Configure rendezvous
-
-        tracing::info!("Initializing Gloo backend (placeholder implementation)");
-        Ok(())
+        self.reject_backend(
+            "Gloo",
+            "no TCP/InfiniBand rendezvous or process group is created by this crate",
+        )
     }
 
     /// Initialize MPI backend
     fn initialize_mpi(&mut self) -> Result<()> {
-        // Placeholder for MPI initialization
-        // In a real implementation, this would:
-        // 1. Initialize MPI environment
-        // 2. Get rank and world size
-        // 3. Set up MPI communicators
-
-        tracing::info!("Initializing MPI backend (placeholder implementation)");
-        Ok(())
+        self.reject_backend(
+            "MPI",
+            "no MPI environment is initialized and no communicator is created by this crate",
+        )
     }
 
     /// Initialize custom backend
     fn initialize_custom(&mut self) -> Result<()> {
-        // Placeholder for custom backend initialization
-        tracing::info!("Initializing custom backend (placeholder implementation)");
-        Ok(())
+        self.reject_backend(
+            "a custom backend",
+            "no transport registration hook exists, so there is nothing to bind the backend to",
+        )
     }
 
     /// Register a parameter group for gradient accumulation
@@ -328,7 +335,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> DistributedGradAccumulator<T
 
         // Update statistics
         let sync_time = start_time.elapsed();
-        let mut stats = self.stats.write().expect("lock should not be poisoned");
+        let mut stats = self.stats.write_or_recover();
         stats.total_communications += 1;
         stats.total_comm_time += sync_time;
         stats.sync_overhead += sync_time;
@@ -344,14 +351,13 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> DistributedGradAccumulator<T
 
             for param_name in &bucket.parameter_names {
                 if let Some(accumulator) = self.local_accumulators.get(param_name) {
-                    let accumulated = accumulator.get_accumulated();
-
-                    // Convert to our element type (this is a simplified conversion)
-                    for &val in accumulated {
-                        // This is a placeholder - proper type conversion would be needed
-                        let converted_val = unsafe { std::mem::transmute_copy(&val) };
-                        bucket.data.push(converted_val);
-                    }
+                    // `SimdGradAccumulator<T>` already accumulates in the
+                    // bucket's own element type, so the values are appended
+                    // directly. (The previous `transmute_copy` here reinterpreted
+                    // `T` as `T` — a no-op dressed as a conversion, and an
+                    // `unsafe` block that would have silently become a
+                    // bit-reinterpretation the moment the two types diverged.)
+                    bucket.data.extend_from_slice(accumulator.get_accumulated());
                 }
             }
 
@@ -470,7 +476,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> DistributedGradAccumulator<T
                 let compression_ratio = compressed_size as f64 / original_size as f64;
 
                 // Update statistics
-                let mut stats = self.stats.write().expect("lock should not be poisoned");
+                let mut stats = self.stats.write_or_recover();
                 stats.total_communications += 1;
                 stats.total_data_communicated += compressed_size; // Use compressed size for bandwidth calculation
                 stats.total_comm_time += total_time;
@@ -565,7 +571,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> DistributedGradAccumulator<T
             bucket.data = gathered_data;
 
             // Update statistics
-            let mut stats = self.stats.write().expect("lock should not be poisoned");
+            let mut stats = self.stats.write_or_recover();
             stats.total_data_communicated += std::mem::size_of_val(&bucket.data);
         }
 
@@ -618,7 +624,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> DistributedGradAccumulator<T
             }
 
             // Update statistics
-            let mut stats = self.stats.write().expect("lock should not be poisoned");
+            let mut stats = self.stats.write_or_recover();
             stats.total_data_communicated += std::mem::size_of_val(&bucket.data);
         }
 
@@ -715,7 +721,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> DistributedGradAccumulator<T
             }
 
             // Update statistics
-            let mut stats = self.stats.write().expect("lock should not be poisoned");
+            let mut stats = self.stats.write_or_recover();
             stats.total_data_communicated += std::mem::size_of_val(&bucket.data) * 2;
             // Two phases
         }
@@ -832,7 +838,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> DistributedGradAccumulator<T
             }
 
             // Update statistics
-            let mut stats = self.stats.write().expect("lock should not be poisoned");
+            let mut stats = self.stats.write_or_recover();
             stats.total_data_communicated += std::mem::size_of_val(&bucket.data) * tree_height * 2;
             // Up and down
         }
@@ -857,7 +863,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> DistributedGradAccumulator<T
         let compression_ratio = compressed_size as f64 / original_size as f64;
 
         {
-            let mut stats = self.stats.write().expect("lock should not be poisoned");
+            let mut stats = self.stats.write_or_recover();
             stats.compression_ratio = (stats.compression_ratio + compression_ratio) / 2.0;
             // Running average
         }
@@ -992,7 +998,7 @@ impl<T: FloatElement + FromPrimitive + ToPrimitive> DistributedGradAccumulator<T
 
     /// Get distributed training statistics
     pub fn get_stats(&self) -> DistributedStats {
-        self.stats.read().expect("lock should not be poisoned").clone()
+        self.stats.read_or_recover().clone()
     }
 
     /// Check if this is the master rank

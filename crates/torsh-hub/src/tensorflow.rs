@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use torsh_core::error::{Result, TorshError};
 use torsh_tensor::Tensor;
 
@@ -126,6 +126,11 @@ impl TfModel {
 
         #[cfg(not(feature = "tensorflow"))]
         {
+            // The `tensorflow` feature binds the upstream `tensorflow` crate,
+            // which links the TensorFlow C++ runtime. ToRSh ships pure Rust by
+            // default, so without that feature there is no session to build and
+            // the honest answer is an explicit error rather than a fake model.
+            let _ = tags;
             Err(TorshError::Other(
                 "TensorFlow support not enabled. Enable the 'tensorflow' feature to use TensorFlow models".to_string(),
             ))
@@ -234,6 +239,7 @@ impl TfModel {
 
         #[cfg(not(feature = "tensorflow"))]
         {
+            let _ = inputs;
             Err(TorshError::Other(
                 "TensorFlow support not enabled".to_string(),
             ))
@@ -321,35 +327,6 @@ impl TfModel {
         // Create ToRSh tensor
         from_vec(data, &shape)
     }
-
-    #[cfg(not(feature = "tensorflow"))]
-    fn extract_input_names(_graph: ()) -> Result<Vec<String>> {
-        Ok(vec!["input".to_string()])
-    }
-
-    #[cfg(not(feature = "tensorflow"))]
-    fn extract_output_names(_graph: ()) -> Result<Vec<String>> {
-        Ok(vec!["output".to_string()])
-    }
-
-    #[cfg(not(feature = "tensorflow"))]
-    fn extract_metadata(_graph: (), model_path: &Path) -> Result<TfModelMetadata> {
-        let model_name = model_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("tf_model")
-            .to_string();
-
-        Ok(TfModelMetadata {
-            model_name,
-            version: "1.0".to_string(),
-            description: Some(format!("TensorFlow model loaded from {:?}", model_path)),
-            framework_version: "2.x".to_string(),
-            input_shapes: vec![],
-            output_shapes: vec![],
-            model_type: TfModelType::SavedModel,
-        })
-    }
 }
 
 /// TensorFlow model loader utility functions
@@ -367,9 +344,11 @@ impl TfLoader {
         let model_path = temp_dir.path().join("model");
         std::fs::create_dir_all(&model_path)?;
 
-        // Download the model (assuming it's a compressed archive)
+        // Download the model (assuming it's a compressed archive). No
+        // registry checksum is available for an arbitrary caller-supplied
+        // URL, so integrity verification is not requested here.
         let archive_path = temp_dir.path().join("model.tar.gz");
-        download_file(url, &archive_path, true)?;
+        download_file(url, &archive_path, true, None)?;
 
         // Extract the archive
         Self::extract_archive(&archive_path, &model_path)?;
@@ -465,7 +444,9 @@ impl TfLoader {
             .next_entry()
             .map_err(|e| TorshError::IoError(format!("Failed to read tar entry: {}", e)))?
         {
-            let dest = dest_path.join(&entry.header.name);
+            // Reject entries that would escape `dest_path` ("tar-slip"),
+            // matching the same guard used in `download::parallel::extract_tarball`.
+            let dest = crate::utils::sanitize_archive_entry_path(dest_path, &entry.header.name)?;
             match entry.header.entry_type() {
                 EntryType::Directory => {
                     std::fs::create_dir_all(&dest)
@@ -524,14 +505,14 @@ impl torsh_nn::Module for TfToTorshWrapper {
             .clone())
     }
 
-    fn parameters(&self) -> Vec<&Tensor<f32>> {
-        // TensorFlow models don't expose parameters directly in this wrapper
-        Vec::new()
+    fn parameters(&self) -> HashMap<String, torsh_nn::Parameter> {
+        // A loaded TensorFlow graph owns its own variables; none of them are
+        // exposed as ToRSh parameters, so this wrapper is inference-only.
+        HashMap::new()
     }
 
-    fn named_parameters(&self) -> std::collections::HashMap<String, &Tensor<f32>> {
-        // TensorFlow models don't expose parameters directly in this wrapper
-        std::collections::HashMap::new()
+    fn named_parameters(&self) -> HashMap<String, torsh_nn::Parameter> {
+        HashMap::new()
     }
 
     fn train(&mut self) {
@@ -548,23 +529,23 @@ impl torsh_nn::Module for TfToTorshWrapper {
 
     fn load_state_dict(
         &mut self,
-        _state_dict: &std::collections::HashMap<String, Tensor<f32>>,
+        _state_dict: &HashMap<String, Tensor<f32>>,
+        _strict: bool,
     ) -> Result<()> {
         Err(TorshError::Other(
             "TensorFlow models don't support state dict loading in this wrapper".to_string(),
         ))
     }
 
-    fn state_dict(&self) -> std::collections::HashMap<String, Tensor<f32>> {
+    fn state_dict(&self) -> HashMap<String, Tensor<f32>> {
         // TensorFlow models don't support state dict saving in this wrapper
-        std::collections::HashMap::new()
+        HashMap::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
 
     #[test]
     fn test_tf_config_default() {
@@ -614,5 +595,140 @@ mod tests {
         assert_eq!(metadata.version, "1.0");
         assert_eq!(metadata.framework_version, "2.8.0");
         assert!(matches!(metadata.model_type, TfModelType::SavedModel));
+    }
+
+    /// Build a `.tar.gz` byte stream containing a single entry named
+    /// `entry_name` with the given `data`, mirroring
+    /// `download::parallel`'s test helper of the same shape (kept local to
+    /// this file since it is test-only and the two extraction sites are
+    /// otherwise independent).
+    fn build_tar_gz(entry_name: &str, data: &[u8]) -> Vec<u8> {
+        use oxiarc_archive::TarWriter;
+
+        let mut tar_bytes = Vec::new();
+        {
+            let mut writer = TarWriter::new(&mut tar_bytes);
+            writer.add_file(entry_name, data).expect(
+                "crafting a tar entry must itself succeed (writer does not sanitise names)",
+            );
+            writer.finish().expect("tar finish should succeed");
+        }
+        oxiarc_deflate::gzip_compress(&tar_bytes, 6).expect("gzip compression should succeed")
+    }
+
+    /// F022 (tar-slip site 2): `TfLoader::extract_archive` must reject a
+    /// tar entry whose name contains a `..` component rather than writing
+    /// outside `dest_path`.
+    #[test]
+    fn f022_extract_archive_rejects_parent_dir_traversal() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let archive_path = temp_dir.path().join("evil.tar.gz");
+        let dest_path = temp_dir.path().join("extract_here");
+        std::fs::create_dir_all(&dest_path).expect("create dest dir");
+
+        let archive_bytes = build_tar_gz("../../evil_outside.txt", b"pwned-by-tar-slip");
+        std::fs::write(&archive_path, &archive_bytes).expect("write archive");
+
+        let result = TfLoader::extract_archive(&archive_path, &dest_path);
+        assert!(
+            result.is_err(),
+            "extract_archive must reject a '..'-escaping entry name"
+        );
+        assert!(!temp_dir.path().join("evil_outside.txt").exists());
+    }
+
+    /// F022 (tar-slip site 2): `TfLoader::extract_archive` must reject an
+    /// absolute tar entry path rather than extracting it verbatim.
+    #[test]
+    fn f022_extract_archive_rejects_absolute_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let archive_path = temp_dir.path().join("evil_abs.tar.gz");
+        let dest_path = temp_dir.path().join("extract_here");
+        std::fs::create_dir_all(&dest_path).expect("create dest dir");
+
+        let absolute_name = "/torsh_hardening_test_tf_absolute_evil.txt";
+        let archive_bytes = build_tar_gz(absolute_name, b"pwned-by-absolute-path");
+        std::fs::write(&archive_path, &archive_bytes).expect("write archive");
+
+        let result = TfLoader::extract_archive(&archive_path, &dest_path);
+        assert!(
+            result.is_err(),
+            "extract_archive must reject an absolute entry path"
+        );
+        assert!(!Path::new(absolute_name).exists());
+    }
+
+    /// Control case: a well-behaved relative entry must still extract
+    /// normally under `dest_path` after the sanitisation fix.
+    #[test]
+    fn f022_extract_archive_accepts_benign_relative_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let archive_path = temp_dir.path().join("benign.tar.gz");
+        let dest_path = temp_dir.path().join("extract_here");
+        std::fs::create_dir_all(&dest_path).expect("create dest dir");
+
+        let archive_bytes = build_tar_gz("variables/model.bin", b"legit-content");
+        std::fs::write(&archive_path, &archive_bytes).expect("write archive");
+
+        TfLoader::extract_archive(&archive_path, &dest_path)
+            .expect("benign entry should extract cleanly");
+
+        let extracted = dest_path.join("variables").join("model.bin");
+        assert!(extracted.exists());
+        assert_eq!(
+            std::fs::read(&extracted).expect("read extracted file"),
+            b"legit-content"
+        );
+    }
+
+    /// F022 (tar-slip site 2, symlink case): a `Symlink` tar entry must
+    /// never be materialised on disk, matching the guard proven for
+    /// `download::parallel::extract_tarball`. A lexically-clean entry
+    /// *name* combined with a malicious symlink *target* is exactly the
+    /// case a path-only guard would miss.
+    #[test]
+    fn f022_extract_archive_never_materialises_symlink_entries() {
+        use oxiarc_archive::TarWriter;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let archive_path = temp_dir.path().join("symlink_evil.tar.gz");
+        let dest_path = temp_dir.path().join("extract_here");
+        std::fs::create_dir_all(&dest_path).expect("create dest dir");
+
+        let mut tar_bytes = Vec::new();
+        {
+            let mut writer = TarWriter::new(&mut tar_bytes);
+            writer
+                .add_symlink("escape_link", "../../../../../../../../tmp")
+                .expect("writing a symlink entry must itself succeed");
+            writer
+                .add_file("escape_link/pwned.txt", b"pwned-via-symlink")
+                .expect("writing the follow-up file entry must itself succeed");
+            writer.finish().expect("tar finish should succeed");
+        }
+        let archive_bytes =
+            oxiarc_deflate::gzip_compress(&tar_bytes, 6).expect("gzip compression should succeed");
+        std::fs::write(&archive_path, &archive_bytes).expect("write archive");
+
+        TfLoader::extract_archive(&archive_path, &dest_path).expect(
+            "a Symlink entry must be silently skipped (not rejected), so extraction of the \
+             remaining benign entries still succeeds",
+        );
+
+        let escape_link_path = dest_path.join("escape_link");
+        if let Ok(meta) = std::fs::symlink_metadata(&escape_link_path) {
+            assert!(
+                !meta.file_type().is_symlink(),
+                "a tar Symlink entry must never be materialised as a real filesystem symlink"
+            );
+        }
+
+        let nested_file = escape_link_path.join("pwned.txt");
+        assert!(nested_file.exists());
+        assert_eq!(
+            std::fs::read(&nested_file).expect("read nested file"),
+            b"pwned-via-symlink"
+        );
+        assert!(nested_file.starts_with(&dest_path));
     }
 }

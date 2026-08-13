@@ -1,11 +1,23 @@
 //! Matrix decomposition algorithms
 
+use crate::dense_kernels;
 use crate::TorshResult;
 use torsh_core::{DeviceType, TorshError};
-use torsh_tensor::{
-    creation::{eye, zeros},
-    Tensor,
-};
+use torsh_tensor::{creation::eye, Tensor};
+
+/// Create an independent copy of a tensor.
+///
+/// [`Tensor::clone`] only clones the metadata: the underlying storage is shared
+/// through an `Arc`, so writing into a "cloned" tensor also writes into the
+/// original. Working matrices used by the in-place algorithms below must
+/// therefore be built from a real copy of the data.
+fn deep_copy(tensor: &Tensor) -> TorshResult<Tensor> {
+    Tensor::from_data(
+        tensor.to_vec()?,
+        tensor.shape().dims().to_vec(),
+        tensor.device(),
+    )
+}
 
 /// LU decomposition with partial pivoting
 /// Returns (P, L, U) where PA = LU
@@ -109,426 +121,228 @@ pub fn lu(tensor: &Tensor) -> TorshResult<(Tensor, Tensor, Tensor)> {
     Ok((p, l, u))
 }
 
-/// QR decomposition using Gram-Schmidt process
-/// Returns (Q, R) where A = QR
-#[allow(clippy::needless_range_loop)]
+/// QR decomposition using Householder reflections
+///
+/// Returns the thin (reduced) factorisation `(Q, R)` with `A = Q R`, where
+/// `Q` is `m x k` with orthonormal columns and `R` is `k x n` upper triangular
+/// for `k = min(m, n)`.
+///
+/// Householder reflections are backward stable: unlike classical Gram-Schmidt
+/// the orthogonality of `Q` does not degrade with the square of the condition
+/// number, and rank-deficient as well as wide (`m < n`) matrices are handled
+/// without failing.
 pub fn qr(tensor: &Tensor) -> TorshResult<(Tensor, Tensor)> {
-    if tensor.shape().ndim() != 2 {
+    let (a, m, n) = dense_kernels::tensor_to_f64(tensor).map_err(|_| {
+        TorshError::InvalidArgument("QR decomposition requires 2D tensor".to_string())
+    })?;
+
+    if m == 0 || n == 0 {
         return Err(TorshError::InvalidArgument(
-            "QR decomposition requires 2D tensor".to_string(),
+            "QR decomposition requires a non-empty matrix".to_string(),
         ));
     }
 
-    let (m, n) = (tensor.shape().dims()[0], tensor.shape().dims()[1]);
+    let k = m.min(n);
+    let (q_data, r_data) = dense_kernels::householder_qr(&a, m, n);
 
-    // Initialize Q and R data as mutable vectors (avoids SimdOptimized storage issues)
-    let mut q_data = vec![0.0f32; m * n];
-    let mut r_data = vec![0.0f32; n * n];
-
-    // Gram-Schmidt process
-    for j in 0..n {
-        // Get column j of A and store in working vector
-        let mut v = Vec::with_capacity(m);
-        for i in 0..m {
-            v.push(tensor.get(&[i, j])?);
-        }
-
-        // Orthogonalize against previous columns
-        for k in 0..j {
-            // Compute dot product <q_k, a_j> in a single pass
-            let mut dot_product = 0.0;
-            for i in 0..m {
-                dot_product += q_data[i * n + k] * v[i];
-            }
-
-            r_data[k * n + j] = dot_product;
-
-            // Subtract projection: v = v - r_kj * q_k
-            for i in 0..m {
-                let q_ki = q_data[i * n + k];
-                v[i] -= dot_product * q_ki;
-            }
-        }
-
-        // Compute norm of v
-        let mut norm_squared = 0.0;
-        for &val in &v {
-            norm_squared += val * val;
-        }
-        let norm = norm_squared.sqrt();
-
-        if norm < 1e-12 {
-            return Err(TorshError::InvalidArgument(format!(
-                "QR decomposition failed: column {j} is linearly dependent (norm = {norm})"
-            )));
-        }
-
-        r_data[j * n + j] = norm;
-
-        // Normalize and store in Q
-        let inv_norm = 1.0 / norm;
-        for (i, &v_item) in v.iter().enumerate().take(m) {
-            q_data[i * n + j] = v_item * inv_norm;
-        }
-    }
-
-    let q = Tensor::from_data(q_data, vec![m, n], DeviceType::Cpu)?;
-    let r = Tensor::from_data(r_data, vec![n, n], DeviceType::Cpu)?;
+    let q = dense_kernels::f64_to_tensor(&q_data, m, k, DeviceType::Cpu)?;
+    let r = dense_kernels::f64_to_tensor(&r_data, k, n, DeviceType::Cpu)?;
 
     Ok((q, r))
 }
 
-/// Singular Value Decomposition using QR iteration method
-/// Returns (U, S, V^T) where A = U * S * V^T
-/// Note: This is a simplified but more robust implementation
+/// Singular Value Decomposition
+///
+/// Returns `(U, S, V^T)` with `A = U * diag(S) * V^T`. The decomposition is
+/// computed by the LAPACK-backed dense solver of `scirs2-linalg` (OxiBLAS) in
+/// double precision, on `A` itself, and the singular values come back in
+/// descending order.
+///
+/// * `full_matrices == false` (thin/reduced): `U` is `m x k`, `S` has `k`
+///   entries and `V^T` is `k x n` for `k = min(m, n)`.
+/// * `full_matrices == true`: `U` is `m x m` and `V^T` is `n x n`; `S` still
+///   has `k` entries.
 pub fn svd(tensor: &Tensor, full_matrices: bool) -> TorshResult<(Tensor, Tensor, Tensor)> {
-    if tensor.shape().ndim() != 2 {
+    let (a, m, n) = dense_kernels::tensor_to_f64(tensor)
+        .map_err(|_| TorshError::InvalidArgument("SVD requires 2D tensor".to_string()))?;
+
+    if m == 0 || n == 0 {
         return Err(TorshError::InvalidArgument(
-            "SVD requires 2D tensor".to_string(),
+            "SVD requires a non-empty matrix".to_string(),
         ));
     }
 
-    let (m, n) = (tensor.shape().dims()[0], tensor.shape().dims()[1]);
-    let min_dim = m.min(n);
+    let result = dense_kernels::dense_svd(&a, m, n, full_matrices)?;
 
-    // For small matrices, use a more direct approach based on eigendecomposition
-    if min_dim <= 3 {
-        return svd_small_matrix(tensor, full_matrices);
-    }
+    let u = dense_kernels::f64_to_tensor(&result.u, m, result.u_cols, tensor.device())?;
+    let vt = dense_kernels::f64_to_tensor(&result.vt, result.vt_rows, n, tensor.device())?;
+    let s_values: Vec<f32> = result.s.iter().map(|&v| v as f32).collect();
+    let s = Tensor::from_data(s_values, vec![result.s.len()], tensor.device())?;
 
-    // For larger matrices, use the power iteration approach but with better deflation
-    let at = tensor.t()?;
-    let ata = at.matmul(tensor)?; // n x n matrix for right singular vectors
-
-    // Get eigenvalues and eigenvectors of A^T*A
-    let (eigenvalues, eigenvectors) = eig(&ata)?;
-
-    // Sort eigenvalues and corresponding eigenvectors in descending order
-    let mut eigen_pairs: Vec<(f32, usize)> = Vec::new();
-    for i in 0..n {
-        let eigenval = eigenvalues.get(&[i])?;
-        if eigenval >= 0.0 {
-            eigen_pairs.push((eigenval, i));
-        }
-    }
-    eigen_pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Build U, S, V^T matrices
-    let mut singular_values = Vec::new();
-    let u_matrix = zeros::<f32>(&[m, min_dim])?;
-    let vt_matrix = zeros::<f32>(&[min_dim, n])?;
-
-    for (idx, (eigenval, orig_idx)) in eigen_pairs.iter().take(min_dim).enumerate() {
-        let sigma = eigenval.sqrt();
-        singular_values.push(sigma);
-
-        // V^T row is the eigenvector (transposed)
-        for j in 0..n {
-            let v_val = eigenvectors.get(&[j, *orig_idx])?;
-            vt_matrix.set(&[idx, j], v_val)?;
-        }
-
-        // Compute U column: u_i = A * v_i / sigma_i
-        if sigma > 1e-10 {
-            for i in 0..m {
-                let mut u_val = 0.0;
-                for j in 0..n {
-                    u_val += tensor.get(&[i, j])? * eigenvectors.get(&[j, *orig_idx])?;
-                }
-                u_matrix.set(&[i, idx], u_val / sigma)?;
-            }
-        }
-    }
-
-    // Create singular values tensor
-    let s_tensor = Tensor::from_data(singular_values, vec![min_dim], tensor.device())?;
-
-    Ok((u_matrix, s_tensor, vt_matrix))
+    Ok((u, s, vt))
 }
 
-/// SVD for small matrices using direct computation
-fn svd_small_matrix(
-    tensor: &Tensor,
-    _full_matrices: bool,
-) -> TorshResult<(Tensor, Tensor, Tensor)> {
-    let (m, n) = (tensor.shape().dims()[0], tensor.shape().dims()[1]);
-    let min_dim = m.min(n);
+/// Relative tolerance used to decide whether a matrix is symmetric or whether
+/// an eigenvalue's imaginary part is numerically zero.
+const EIG_SYMMETRY_TOL: f64 = 1e-9;
 
-    // Simple case: 1x1 matrix
-    if m == 1 && n == 1 {
-        let val = tensor.get(&[0, 0])?.abs();
-        let u = Tensor::from_data(vec![1.0], vec![1, 1], tensor.device())?;
-        let s = Tensor::from_data(vec![val], vec![1], tensor.device())?;
-        let vt = Tensor::from_data(
-            vec![if tensor.get(&[0, 0])? >= 0.0 {
-                1.0
-            } else {
-                -1.0
-            }],
-            vec![1, 1],
-            tensor.device(),
-        )?;
-        return Ok((u, s, vt));
-    }
-
-    // For 2x2 matrices and similar, use the same eigendecomposition approach
-    let at = tensor.t()?;
-    let ata = at.matmul(tensor)?;
-
-    let (eigenvalues, eigenvectors) = eig(&ata)?;
-
-    let mut eigen_pairs: Vec<(f32, usize)> = Vec::new();
-    let num_eigenvals = eigenvalues.shape().dims()[0]; // Get actual number of eigenvalues returned
-    for i in 0..num_eigenvals.min(n) {
-        let eigenval = eigenvalues.get(&[i])?;
-        if eigenval >= 0.0 {
-            eigen_pairs.push((eigenval, i));
-        }
-    }
-    eigen_pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut singular_values = Vec::new();
-    let u_matrix = zeros::<f32>(&[m, min_dim])?;
-    let vt_matrix = zeros::<f32>(&[min_dim, n])?;
-
-    for (idx, (eigenval, orig_idx)) in eigen_pairs.iter().take(min_dim).enumerate() {
-        let sigma = eigenval.sqrt();
-        singular_values.push(sigma);
-
-        for j in 0..n {
-            let v_val = eigenvectors.get(&[j, *orig_idx])?;
-            vt_matrix.set(&[idx, j], v_val)?;
-        }
-
-        if sigma > 1e-10 {
-            for i in 0..m {
-                let mut u_val = 0.0;
-                for j in 0..n {
-                    u_val += tensor.get(&[i, j])? * eigenvectors.get(&[j, *orig_idx])?;
-                }
-                u_matrix.set(&[i, idx], u_val / sigma)?;
-            }
-        }
-    }
-
-    let s_tensor = Tensor::from_data(singular_values, vec![min_dim], tensor.device())?;
-    Ok((u_matrix, s_tensor, vt_matrix))
-}
-
-/// Eigenvalue decomposition using power iteration with deflation
-/// Returns (eigenvalues, eigenvectors) for multiple eigenvalues
-/// Note: This implementation finds the dominant eigenvalues using deflation
-pub fn eig(tensor: &Tensor) -> TorshResult<(Tensor, Tensor)> {
-    if tensor.shape().ndim() != 2 {
-        return Err(TorshError::InvalidArgument(
-            "Eigenvalue decomposition requires 2D tensor".to_string(),
-        ));
-    }
-
-    let (m, n) = (tensor.shape().dims()[0], tensor.shape().dims()[1]);
-
+/// Read a square matrix, rejecting non-square / non-2D input.
+fn square_matrix_f64(tensor: &Tensor, what: &str) -> TorshResult<(Vec<f64>, usize)> {
+    let (a, m, n) = dense_kernels::tensor_to_f64(tensor)
+        .map_err(|_| TorshError::InvalidArgument(format!("{what} requires 2D tensor")))?;
     if m != n {
-        return Err(TorshError::InvalidArgument(
-            "Eigenvalue decomposition requires square matrix".to_string(),
-        ));
+        return Err(TorshError::InvalidArgument(format!(
+            "{what} requires square matrix"
+        )));
     }
+    if n == 0 {
+        return Err(TorshError::InvalidArgument(format!(
+            "{what} requires a non-empty matrix"
+        )));
+    }
+    Ok((a, n))
+}
 
-    // Special case: diagonal matrices have exact eigendecomposition
-    // This provides numerically exact results for diagonal matrices
-    let tolerance = 1e-10;
-    let mut is_diagonal = true;
+fn is_symmetric(a: &[f64], n: usize) -> bool {
+    let scale = dense_kernels::matrix_inf_norm(a, n).max(1.0);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if (a[i * n + j] - a[j * n + i]).abs() > EIG_SYMMETRY_TOL * scale {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn is_diagonal_matrix(a: &[f64], n: usize) -> bool {
+    let scale = dense_kernels::matrix_inf_norm(a, n).max(1.0);
     for i in 0..n {
         for j in 0..n {
-            if i != j && tensor.get(&[i, j])?.abs() > tolerance {
-                is_diagonal = false;
-                break;
+            if i != j && a[i * n + j].abs() > EIG_SYMMETRY_TOL * scale {
+                return false;
             }
-        }
-        if !is_diagonal {
-            break;
         }
     }
+    true
+}
 
-    if is_diagonal {
-        // For diagonal matrices, eigenvalues are diagonal elements
-        // and eigenvectors are canonical basis vectors (identity matrix)
-        let mut eigenvalue_data = Vec::with_capacity(n);
-        for i in 0..n {
-            eigenvalue_data.push(tensor.get(&[i, i])?);
-        }
-        let eigenvalues = Tensor::from_data(eigenvalue_data, vec![n], tensor.device())?;
+/// Full complex eigendecomposition of a real square matrix.
+///
+/// Returns `(values_re, values_im, vectors_re, vectors_im)` where the value
+/// tensors have `n` entries and the vector matrices are `n x n` with the
+/// eigenvector for `lambda_k` stored in column `k`, i.e.
+/// `v_k = vectors_re[:, k] + i * vectors_im[:, k]`.
+///
+/// Eigenvalues come from the LAPACK-backed general eigensolver of
+/// `scirs2-linalg`; the eigenvectors are then recovered by shifted inverse
+/// iteration (a real `2n x 2n` embedding is used for complex conjugate pairs).
+/// If an eigenvector cannot be determined to working accuracy — a defective or
+/// severely clustered spectrum — an error is returned rather than a fabricated
+/// vector.
+pub fn eig_complex(tensor: &Tensor) -> TorshResult<(Tensor, Tensor, Tensor, Tensor)> {
+    let (a, n) = square_matrix_f64(tensor, "Eigenvalue decomposition")?;
+    let device = tensor.device();
 
-        // Eigenvectors are identity matrix for diagonal matrices
-        let eigenvectors = eye::<f32>(n)?;
-
-        return Ok((eigenvalues, eigenvectors));
-    }
-
-    let max_iterations = 100;
-    let tolerance = 1e-6;
-    let max_eigenvalues = n.min(5); // Find up to 5 dominant eigenvalues for efficiency
-
-    let mut eigenvalues = Vec::new();
-    let mut eigenvectors = Vec::new();
-
-    // Use deflation to find multiple eigenvalues
-    for k in 0..max_eigenvalues {
-        // Create working matrix by deflating previous eigenvalues
-        let working_matrix = tensor.clone();
-
-        for i in 0..k {
-            let lambda = eigenvalues[i];
-            let v_i: &Tensor = &eigenvectors[i];
-
-            // Deflate: A_k = A_{k-1} - λ_i * v_i * v_i^T
-            for row in 0..n {
-                for col in 0..n {
-                    let contribution = lambda * v_i.get(&[row])? * v_i.get(&[col])?;
-                    let old_val = working_matrix.get(&[row, col])?;
-                    working_matrix.set(&[row, col], old_val - contribution)?;
-                }
-            }
-        }
-
-        // Power iteration to find dominant eigenvalue of deflated matrix
-        let v = zeros::<f32>(&[n])?;
-
-        // Initialize with quasi-random vector that's orthogonal to previous eigenvectors
-        for i in 0..n {
-            v.set(&[i], (1.0 + i as f32 * 0.7 + k as f32 * 1.3).sin())?;
-        }
-
-        // Orthogonalize against previous eigenvectors (Gram-Schmidt)
-        for v_i in eigenvectors.iter().take(k) {
-            // Compute dot product
-            let mut dot_product = 0.0;
-            for j in 0..n {
-                dot_product += v.get(&[j])? * v_i.get(&[j])?;
-            }
-
-            // Subtract projection
-            for j in 0..n {
-                let old_val = v.get(&[j])?;
-                v.set(&[j], old_val - dot_product * v_i.get(&[j])?)?;
-            }
-        }
-
-        // Normalize initial vector
-        let mut norm = 0.0;
-        for i in 0..n {
-            let val = v.get(&[i])?;
-            norm += val * val;
-        }
-        norm = norm.sqrt();
-
-        if norm < tolerance {
-            break; // Can't find more orthogonal vectors
-        }
-
-        for i in 0..n {
-            v.set(&[i], v.get(&[i])? / norm)?;
-        }
-
-        let mut eigenvalue = 0.0;
-        let mut converged = false;
-
-        for iter in 0..max_iterations {
-            // v_new = A * v
-            let v_new = zeros::<f32>(&[n])?;
+    // Exact path for diagonal matrices.
+    if is_diagonal_matrix(&a, n) {
+        let values_re: Vec<f64> = (0..n).map(|i| a[i * n + i]).collect();
+        let vectors_re = {
+            let mut m = vec![0.0f64; n * n];
             for i in 0..n {
-                let mut sum = 0.0;
-                for j in 0..n {
-                    sum += working_matrix.get(&[i, j])? * v.get(&[j])?;
-                }
-                v_new.set(&[i], sum)?;
+                m[i * n + i] = 1.0;
             }
-
-            // Compute eigenvalue estimate: λ = (v^T * A * v) / (v^T * v)
-            // Optimize by computing both dot products in a single loop
-            let mut numerator = 0.0;
-            let mut denominator = 0.0;
-            for i in 0..n {
-                let v_i = v.get(&[i])?;
-                let v_new_i = v_new.get(&[i])?;
-                numerator += v_i * v_new_i;
-                denominator += v_i * v_i;
-            }
-
-            let new_eigenvalue = if denominator > tolerance {
-                numerator / denominator
-            } else {
-                0.0
-            };
-
-            // Check convergence
-            if iter > 0 && (new_eigenvalue - eigenvalue).abs() < tolerance {
-                eigenvalue = new_eigenvalue;
-                converged = true;
-                break;
-            }
-            eigenvalue = new_eigenvalue;
-
-            // Normalize v_new
-            let mut norm = 0.0;
-            for i in 0..n {
-                let val = v_new.get(&[i])?;
-                norm += val * val;
-            }
-            norm = norm.sqrt();
-
-            if norm < tolerance {
-                break;
-            }
-
-            for i in 0..n {
-                v.set(&[i], v_new.get(&[i])? / norm)?;
-            }
-        }
-
-        // Only add eigenvalue if it's significant and converged
-        if converged && eigenvalue.abs() > tolerance {
-            eigenvalues.push(eigenvalue);
-            eigenvectors.push(v);
-        } else {
-            break;
-        }
-    }
-
-    if eigenvalues.is_empty() {
-        return Err(TorshError::InvalidArgument(
-            "Failed to find any eigenvalues".to_string(),
+            m
+        };
+        return Ok((
+            dense_kernels::f64_to_vector(&values_re, device)?,
+            Tensor::from_data(vec![0.0f32; n], vec![n], device)?,
+            dense_kernels::f64_to_tensor(&vectors_re, n, n, device)?,
+            Tensor::from_data(vec![0.0f32; n * n], vec![n, n], device)?,
         ));
     }
 
-    // Construct result tensors - always return n eigenvalues and n x n eigenvector matrix
-    let num_found = eigenvalues.len();
+    let scale = dense_kernels::matrix_inf_norm(&a, n).max(1.0);
 
-    // Pad eigenvalues with zeros if needed
-    let mut full_eigenvalues = eigenvalues;
-    while full_eigenvalues.len() < n {
-        full_eigenvalues.push(0.0);
+    // Symmetric matrices: real spectrum with an orthonormal eigenbasis.
+    if is_symmetric(&a, n) {
+        let (values, vectors) = dense_kernels::dense_symmetric_eig(&a, n)?;
+        return Ok((
+            dense_kernels::f64_to_vector(&values, device)?,
+            Tensor::from_data(vec![0.0f32; n], vec![n], device)?,
+            dense_kernels::f64_to_tensor(&vectors, n, n, device)?,
+            Tensor::from_data(vec![0.0f32; n * n], vec![n, n], device)?,
+        ));
     }
 
-    // Create eigenvalues tensor
-    let eigenvals_tensor = Tensor::from_data(full_eigenvalues, vec![n], tensor.device())?;
+    let (values_re, values_im) = dense_kernels::dense_general_eigenvalues(&a, n)?;
 
-    // Create eigenvectors matrix (each column is an eigenvector) - n x n matrix
-    let mut eigenvecs_data = vec![0.0f32; n * n];
-    for col in 0..num_found {
-        for row in 0..n {
-            eigenvecs_data[row * n + col] = eigenvectors[col].get(&[row])?;
+    let mut vectors_re = vec![0.0f64; n * n];
+    let mut vectors_im = vec![0.0f64; n * n];
+
+    for k in 0..n {
+        let (re, im) = (values_re[k], values_im[k]);
+        if im.abs() <= EIG_SYMMETRY_TOL * scale {
+            let v = dense_kernels::eigenvector_real(&a, n, re).ok_or_else(|| {
+                TorshError::ComputeError(format!(
+                    "eigenvector for eigenvalue {re} could not be determined \
+                     (defective or severely clustered spectrum)"
+                ))
+            })?;
+            for i in 0..n {
+                vectors_re[i * n + k] = v[i];
+            }
+        } else {
+            let (x, y) = dense_kernels::eigenvector_complex(&a, n, re, im).ok_or_else(|| {
+                TorshError::ComputeError(format!(
+                    "eigenvector for eigenvalue {re}{im:+}i could not be determined \
+                     (defective or severely clustered spectrum)"
+                ))
+            })?;
+            for i in 0..n {
+                vectors_re[i * n + k] = x[i];
+                vectors_im[i * n + k] = y[i];
+            }
         }
     }
-    // Fill remaining columns with orthogonal unit vectors
-    for col in num_found..n {
-        // Simple: use standard basis vector
-        if col < n {
-            eigenvecs_data[col * n + col] = 1.0;
+
+    Ok((
+        dense_kernels::f64_to_vector(&values_re, device)?,
+        dense_kernels::f64_to_vector(&values_im, device)?,
+        dense_kernels::f64_to_tensor(&vectors_re, n, n, device)?,
+        dense_kernels::f64_to_tensor(&vectors_im, n, n, device)?,
+    ))
+}
+
+/// Eigenvalue decomposition of a real square matrix with a real spectrum
+///
+/// Returns `(eigenvalues, eigenvectors)`: an `n` element vector of eigenvalues
+/// and an `n x n` matrix whose column `k` is the (unit norm) eigenvector for
+/// `eigenvalues[k]`, so `A * V[:, k] = eigenvalues[k] * V[:, k]` holds for every
+/// `k`.
+///
+/// Symmetric input is solved with the LAPACK symmetric eigensolver; general
+/// input uses the LAPACK general eigensolver plus inverse iteration for the
+/// eigenvectors. Matrices with genuinely complex eigenvalues cannot be
+/// represented by this real-valued signature and return an error pointing at
+/// [`eig_complex`]; nothing is ever padded or invented.
+pub fn eig(tensor: &Tensor) -> TorshResult<(Tensor, Tensor)> {
+    let (values_re, values_im, vectors_re, vectors_im) = eig_complex(tensor)?;
+
+    let n = values_re.shape().dims()[0];
+    for i in 0..n {
+        if values_im.get(&[i])?.abs() > 0.0 {
+            return Err(TorshError::ComputeError(format!(
+                "matrix has complex eigenvalues (lambda_{i} = {}{:+}i); \
+                 use eig_complex() to obtain the full complex spectrum",
+                values_re.get(&[i])?,
+                values_im.get(&[i])?
+            )));
         }
     }
-    let eigenvecs_tensor = Tensor::from_data(eigenvecs_data, vec![n, n], tensor.device())?;
+    let _ = vectors_im;
 
-    Ok((eigenvals_tensor, eigenvecs_tensor))
+    Ok((values_re, vectors_re))
 }
 
 /// Cholesky decomposition
@@ -639,8 +453,10 @@ pub fn polar(tensor: &Tensor, side: Option<&str>) -> TorshResult<(Tensor, Tensor
     let (m, n) = (tensor.shape().dims()[0], tensor.shape().dims()[1]);
     let side = side.unwrap_or("right");
 
-    // Compute SVD: A = U_svd * Σ * V^T
-    let (u_svd, s, vt) = svd(tensor, true)?;
+    // Compute the thin SVD: A = U_svd * Σ * V^T with U_svd: m x k, V^T: k x n.
+    // The reduced form is what makes the products below dimensionally correct
+    // for rectangular input.
+    let (u_svd, s, vt) = svd(tensor, false)?;
 
     // Extract singular values (s is 1D vector)
     let min_dim = m.min(n);
@@ -710,7 +526,8 @@ pub fn schur(tensor: &Tensor) -> TorshResult<(Tensor, Tensor)> {
 
     // Initialize Q as identity and T as copy of input matrix
     let mut q = eye::<f32>(n)?;
-    let mut t = tensor.clone();
+    // Deep copy: the shift below writes into `t` in place.
+    let mut t = deep_copy(tensor)?;
 
     // Simplified QR iteration for Schur decomposition
     let max_iterations = 100;
@@ -813,170 +630,42 @@ pub fn schur(tensor: &Tensor) -> TorshResult<(Tensor, Tensor)> {
 
 /// Jordan canonical form decomposition
 ///
-/// Computes the Jordan form of a matrix A such that A = P * J * P^(-1)
-/// where J is the Jordan canonical form and P is the transformation matrix.
+/// Computes `(P, J)` such that `A = P * J * P^(-1)`, where `J` is the Jordan
+/// canonical form and `P` holds the corresponding basis in its columns.
 ///
-/// Note: This is a simplified implementation that works best for matrices
-/// with distinct eigenvalues or simple Jordan blocks.
+/// The eigenvalues and eigenvectors come from [`eig`], so the spectrum must be
+/// real. Repeated eigenvalues whose eigenvectors are still independent yield a
+/// diagonal `J` (Jordan blocks of size one). Genuinely defective matrices need
+/// generalised eigenvectors, which this routine does not compute: rather than
+/// returning a plausible-looking but wrong factorisation it reports an error.
 pub fn jordan_form(tensor: &Tensor) -> TorshResult<(Tensor, Tensor)> {
-    if tensor.shape().ndim() != 2 {
-        return Err(TorshError::InvalidArgument(
-            "Jordan form requires 2D tensor".to_string(),
+    let (_, n) = square_matrix_f64(tensor, "Jordan form")?;
+
+    // Real eigenpairs (errors out on a complex spectrum).
+    let (eigenvalues, eigenvectors) = eig(tensor)?;
+
+    // P is the eigenvector matrix; check that it is actually a basis, i.e. the
+    // matrix is diagonalisable. A defective matrix has a rank-deficient P.
+    let (_, p_singular_values, _) = svd(&eigenvectors, false)?;
+    let sigma_max = p_singular_values.get(&[0])?;
+    let sigma_min = p_singular_values.get(&[n - 1])?;
+    if sigma_max <= 0.0 || sigma_min <= 1e-6 * sigma_max {
+        return Err(TorshError::ComputeError(
+            "Jordan form: matrix is defective (eigenvectors do not form a basis); \
+             generalised eigenvectors are required and are not computed here"
+                .to_string(),
         ));
     }
 
-    let shape = tensor.shape();
-    let dims = shape.dims();
-    if dims[0] != dims[1] {
-        return Err(TorshError::InvalidArgument(
-            "Jordan form requires square matrix".to_string(),
-        ));
+    // J = diag(eigenvalues): every Jordan block has size one for a
+    // diagonalisable matrix.
+    let mut j_data = vec![0.0f32; n * n];
+    for i in 0..n {
+        j_data[i * n + i] = eigenvalues.get(&[i])?;
     }
+    let j = Tensor::from_data(j_data, vec![n, n], tensor.device())?;
 
-    let n = dims[0];
-
-    // For this simplified implementation, we'll compute eigenvalues using power iteration
-    // and construct Jordan blocks based on the multiplicities
-
-    // Start with the original matrix
-    let a = tensor.clone();
-
-    // Find eigenvalues using characteristic polynomial approach (simplified)
-    let mut eigenvalues = Vec::new();
-    let mut eigenvectors = Vec::new();
-
-    // Use power iteration to find dominant eigenvalues
-    for _k in 0..n.min(10) {
-        // Limit to prevent infinite loops
-        // Power iteration for current matrix
-        let max_iterations = 1000;
-        let tolerance = 1e-6;
-
-        // Random initial vector
-        let mut v = zeros::<f32>(&[n])?;
-        for i in 0..n {
-            v.set(&[i], (1.0 + i as f32 * 0.7).sin())?;
-        }
-
-        let mut eigenvalue = 0.0;
-        let mut prev_eigenvalue = 0.0;
-
-        for iter in 0..max_iterations {
-            // Normalize vector
-            let mut norm = 0.0;
-            for i in 0..n {
-                norm += v.get(&[i])?.powi(2);
-            }
-            norm = norm.sqrt();
-
-            if norm < 1e-12 {
-                break; // Avoid division by zero
-            }
-
-            for i in 0..n {
-                v.set(&[i], v.get(&[i])? / norm)?;
-            }
-
-            // v_new = A * v
-            let v_new = zeros::<f32>(&[n])?;
-            for i in 0..n {
-                let mut sum = 0.0;
-                for j in 0..n {
-                    sum += a.get(&[i, j])? * v.get(&[j])?;
-                }
-                v_new.set(&[i], sum)?;
-            }
-
-            // Compute Rayleigh quotient: eigenvalue = v^T * A * v / (v^T * v)
-            eigenvalue = 0.0;
-            for i in 0..n {
-                eigenvalue += v.get(&[i])? * v_new.get(&[i])?;
-            }
-
-            // Check convergence
-            if iter > 0 && (eigenvalue - prev_eigenvalue).abs() < tolerance {
-                break;
-            }
-
-            prev_eigenvalue = eigenvalue;
-            v = v_new;
-        }
-
-        // Store eigenvalue and eigenvector
-        if eigenvalue.abs() > tolerance {
-            eigenvalues.push(eigenvalue);
-            eigenvectors.push(v.clone());
-
-            // Deflate the matrix: A = A - λ * v * v^T / (v^T * v)
-            let mut vv_norm = 0.0;
-            for i in 0..n {
-                vv_norm += v.get(&[i])?.powi(2);
-            }
-
-            if vv_norm > tolerance {
-                for i in 0..n {
-                    for j in 0..n {
-                        let contribution = eigenvalue * v.get(&[i])? * v.get(&[j])? / vv_norm;
-                        let old_val = a.get(&[i, j])?;
-                        a.set(&[i, j], old_val - contribution)?;
-                    }
-                }
-            }
-        } else {
-            break; // No more significant eigenvalues
-        }
-    }
-
-    // Construct Jordan form matrix J
-    let j = zeros::<f32>(&[n, n])?;
-
-    // Simple case: put eigenvalues on diagonal (assuming distinct eigenvalues)
-    let num_eigenvals = eigenvalues.len().min(n);
-    for i in 0..num_eigenvals {
-        j.set(&[i, i], eigenvalues[i])?;
-
-        // Add superdiagonal 1s for Jordan blocks (simplified approach)
-        if i < num_eigenvals - 1 {
-            // Check if this eigenvalue should form a Jordan block
-            let eigenval_i = eigenvalues[i];
-            let mut has_repeated = false;
-            for eigenval_k in eigenvalues.iter().skip(i + 1).take(num_eigenvals - i - 1) {
-                if (eigenval_k - eigenval_i).abs() < 1e-6 {
-                    has_repeated = true;
-                    break;
-                }
-            }
-
-            // For repeated eigenvalues, add superdiagonal entries
-            if has_repeated && i < n - 1 {
-                j.set(&[i, i + 1], 1.0)?;
-            }
-        }
-    }
-
-    // Fill remaining diagonal with zeros or small eigenvalues
-    for i in num_eigenvals..n {
-        j.set(&[i, i], 0.0)?;
-    }
-
-    // Construct transformation matrix P from eigenvectors
-    let p = eye::<f32>(n)?;
-    for (i, eigenvector) in eigenvectors.iter().enumerate() {
-        if i < n {
-            for j in 0..n {
-                p.set(&[j, i], eigenvector.get(&[j])?)?;
-            }
-        }
-    }
-
-    // Fill remaining columns with identity vectors for stability
-    for i in eigenvalues.len()..n {
-        for j in 0..n {
-            p.set(&[j, i], if j == i { 1.0 } else { 0.0 })?;
-        }
-    }
-
-    Ok((p, j))
+    Ok((eigenvectors, j))
 }
 
 /// Compute the Hessenberg decomposition of a matrix
@@ -1031,8 +720,9 @@ pub fn hessenberg(tensor: &Tensor) -> TorshResult<(Tensor, Tensor)> {
         )));
     }
 
-    // Start with H = A and Q = I
-    let h = tensor.clone();
+    // Start with H = A (independent copy: the reflections update it in place)
+    // and Q = I.
+    let h = deep_copy(tensor)?;
     let q = eye::<f32>(n)?;
 
     // Householder reduction to Hessenberg form
@@ -1123,7 +813,7 @@ pub fn hessenberg(tensor: &Tensor) -> TorshResult<(Tensor, Tensor)> {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
-    use torsh_tensor::creation::eye;
+    use torsh_tensor::creation::{eye, zeros};
 
     fn create_test_matrix_2x2() -> TorshResult<Tensor> {
         // Create a 2x2 matrix [[1.0, 2.0], [3.0, 4.0]]

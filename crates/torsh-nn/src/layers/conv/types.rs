@@ -166,73 +166,115 @@ impl Conv2d {
             1,
         )
     }
-    /// Perform 2D convolution using direct implementation
+    /// 2D convolution through im2col + GEMM.
+    ///
+    /// The input is unfolded once into a `[groups, batch * out_h * out_w,
+    /// in_channels/groups * kh * kw]` patch tensor and multiplied by the
+    /// reshaped weight with `Tensor::matmul`, which dispatches to a blocked SIMD
+    /// GEMM. That is both far faster than a scalar loop nest and fully
+    /// differentiable: `im2col_2d` records a col2im backward, the reshape and
+    /// permute steps are views, so gradients reach **both** the input and the
+    /// weight (`dL/dW = patches^T @ grad`, `dL/dx = col2im(grad @ W)`).
     pub(crate) fn conv2d_im2col(&self, input: &Tensor, weight: &Tensor) -> Result<Tensor> {
         let input_shape_binding = input.shape();
         let input_shape = input_shape_binding.dims();
+        if input_shape.len() != 4 {
+            return Err(torsh_core::error::TorshError::InvalidShape(format!(
+                "Conv2d expects a 4-D input [batch, channels, height, width], got {}-D",
+                input_shape.len()
+            )));
+        }
         let batch_size = input_shape[0];
         let in_channels = input_shape[1];
+
+        if self.groups == 0 {
+            return Err(torsh_core::error::TorshError::InvalidArgument(
+                "Conv2d groups must be positive".to_string(),
+            ));
+        }
+        if in_channels != self.in_channels {
+            return Err(torsh_core::error::TorshError::InvalidShape(format!(
+                "Conv2d expects {} input channels, got {}",
+                self.in_channels, in_channels
+            )));
+        }
+        if in_channels % self.groups != 0 || self.out_channels % self.groups != 0 {
+            return Err(torsh_core::error::TorshError::InvalidShape(format!(
+                "in_channels ({}) and out_channels ({}) must be divisible by groups ({})",
+                in_channels, self.out_channels, self.groups
+            )));
+        }
+
+        let weight_shape_binding = weight.shape();
+        let weight_shape = weight_shape_binding.dims();
+        let expected_weight = [
+            self.out_channels,
+            in_channels / self.groups,
+            self.kernel_size.0,
+            self.kernel_size.1,
+        ];
+        if weight_shape != expected_weight {
+            return Err(torsh_core::error::TorshError::ShapeMismatch {
+                expected: expected_weight.to_vec(),
+                got: weight_shape.to_vec(),
+            });
+        }
+
         let in_height = input_shape[2];
         let in_width = input_shape[3];
-        let out_height =
-            (in_height + 2 * self.padding.0 - self.dilation.0 * (self.kernel_size.0 - 1) - 1)
-                / self.stride.0
-                + 1;
-        let out_width =
-            (in_width + 2 * self.padding.1 - self.dilation.1 * (self.kernel_size.1 - 1) - 1)
-                / self.stride.1
-                + 1;
-        let output_shape = [batch_size, self.out_channels, out_height, out_width];
-        let mut output_data = vec![0.0f32; output_shape.iter().product()];
-        let input_data = input.to_vec()?;
-        let weight_data = weight.to_vec()?;
-        for batch_idx in 0..batch_size {
-            for out_ch in 0..self.out_channels {
-                for out_y in 0..out_height {
-                    for out_x in 0..out_width {
-                        let mut sum = 0.0f32;
-                        for in_ch in 0..in_channels {
-                            for ky in 0..self.kernel_size.0 {
-                                for kx in 0..self.kernel_size.1 {
-                                    let in_y = out_y * self.stride.0 + ky * self.dilation.0;
-                                    let in_x = out_x * self.stride.1 + kx * self.dilation.1;
-                                    if in_y >= self.padding.0 && in_x >= self.padding.1 {
-                                        let actual_in_y = in_y - self.padding.0;
-                                        let actual_in_x = in_x - self.padding.1;
-                                        if actual_in_y < in_height && actual_in_x < in_width {
-                                            let input_idx = batch_idx
-                                                * (in_channels * in_height * in_width)
-                                                + in_ch * (in_height * in_width)
-                                                + actual_in_y * in_width
-                                                + actual_in_x;
-                                            let weight_idx = out_ch
-                                                * (in_channels
-                                                    * self.kernel_size.0
-                                                    * self.kernel_size.1)
-                                                + in_ch * (self.kernel_size.0 * self.kernel_size.1)
-                                                + ky * self.kernel_size.1
-                                                + kx;
-                                            if input_idx < input_data.len()
-                                                && weight_idx < weight_data.len()
-                                            {
-                                                sum +=
-                                                    input_data[input_idx] * weight_data[weight_idx];
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        let output_idx = batch_idx * (self.out_channels * out_height * out_width)
-                            + out_ch * (out_height * out_width)
-                            + out_y * out_width
-                            + out_x;
-                        output_data[output_idx] = sum;
-                    }
-                }
-            }
+        let span_y = self.dilation.0 * (self.kernel_size.0 - 1) + 1;
+        let span_x = self.dilation.1 * (self.kernel_size.1 - 1) + 1;
+        let padded_height = in_height + 2 * self.padding.0;
+        let padded_width = in_width + 2 * self.padding.1;
+        if padded_height < span_y || padded_width < span_x {
+            return Err(torsh_core::error::TorshError::InvalidShape(format!(
+                "Conv2d kernel span {span_y}x{span_x} does not fit the padded input \
+                 {padded_height}x{padded_width}"
+            )));
         }
-        Tensor::from_vec(output_data, &output_shape)
+        let out_height = (padded_height - span_y) / self.stride.0 + 1;
+        let out_width = (padded_width - span_x) / self.stride.1 + 1;
+
+        let out_per_group = self.out_channels / self.groups;
+        let patch_len = (in_channels / self.groups) * self.kernel_size.0 * self.kernel_size.1;
+        let spatial = out_height * out_width;
+
+        // im2col: [groups, batch * out_h * out_w, in/groups * kh * kw]
+        let patches = input.im2col_2d(
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )?;
+
+        // weight: [out_channels, in/groups, kh, kw] -> [groups, patch_len, out/groups].
+        // Both steps are views, so the product records a MatMul node that still
+        // leads back to the weight parameter.
+        let weight_matrix = weight
+            .reshape(&[self.groups as i32, out_per_group as i32, patch_len as i32])?
+            .transpose(1, 2)?;
+
+        // [groups, rows, patch_len] @ [groups, patch_len, out/groups]
+        let product = patches.matmul(&weight_matrix)?;
+
+        // [groups, batch, spatial, out/groups] -> [batch, groups, out/groups, spatial]
+        // -> [batch, out_channels, out_h, out_w]; reshape and permute are views,
+        // so the whole chain stays differentiable.
+        product
+            .reshape(&[
+                self.groups as i32,
+                batch_size as i32,
+                spatial as i32,
+                out_per_group as i32,
+            ])?
+            .permute(&[1, 0, 3, 2])?
+            .reshape(&[
+                batch_size as i32,
+                self.out_channels as i32,
+                out_height as i32,
+                out_width as i32,
+            ])
     }
 }
 /// Depthwise separable convolutional layer

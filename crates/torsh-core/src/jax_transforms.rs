@@ -23,6 +23,7 @@
 //! // vmap_fn will automatically vectorize over the first dimension
 //! ```
 
+use crate::sync::RwLockExt;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -216,14 +217,11 @@ where
 
         // Check cache
         {
-            let mut cache = self.cache.write().expect("lock should not be poisoned");
+            let mut cache = self.cache.write_or_recover();
             if let Some(entry) = cache.get_mut(&hash) {
                 entry.hit_count += 1;
                 entry.last_access = std::time::Instant::now();
-                self.metadata
-                    .write()
-                    .expect("lock should not be poisoned")
-                    .increment_count();
+                self.metadata.write_or_recover().increment_count();
                 return entry.output.clone();
             }
         }
@@ -233,7 +231,7 @@ where
 
         // Store in cache
         {
-            let mut cache = self.cache.write().expect("lock should not be poisoned");
+            let mut cache = self.cache.write_or_recover();
 
             // Evict oldest entry if cache is full
             if self.max_cache_size > 0 && cache.len() >= self.max_cache_size {
@@ -254,45 +252,31 @@ where
             );
         }
 
-        self.metadata
-            .write()
-            .expect("lock should not be poisoned")
-            .increment_count();
+        self.metadata.write_or_recover().increment_count();
         output
     }
 
     /// Get cache statistics
     pub fn cache_stats(&self) -> CacheStats {
-        let cache = self.cache.read().expect("lock should not be poisoned");
+        let cache = self.cache.read_or_recover();
         let total_hits: usize = cache.values().map(|entry| entry.hit_count).sum();
 
         CacheStats {
             size: cache.len(),
             total_hits,
-            total_misses: self
-                .metadata
-                .read()
-                .expect("lock should not be poisoned")
-                .application_count
-                - total_hits,
+            total_misses: self.metadata.read_or_recover().application_count - total_hits,
             max_size: self.max_cache_size,
         }
     }
 
     /// Clear the JIT cache
     pub fn clear_cache(&mut self) {
-        self.cache
-            .write()
-            .expect("lock should not be poisoned")
-            .clear();
+        self.cache.write_or_recover().clear();
     }
 
     /// Get transformation metadata
     pub fn metadata(&self) -> TransformMetadata {
-        self.metadata
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.metadata.read_or_recover().clone()
     }
 }
 
@@ -384,10 +368,7 @@ where
 
     /// Get transformation metadata
     pub fn metadata(&self) -> TransformMetadata {
-        self.metadata
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.metadata.read_or_recover().clone()
     }
 
     /// Apply the vectorization (must be implemented for specific types)
@@ -443,10 +424,7 @@ where
 
     /// Get transformation metadata
     pub fn metadata(&self) -> TransformMetadata {
-        self.metadata
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.metadata.read_or_recover().clone()
     }
 
     /// Get the function reference
@@ -498,10 +476,7 @@ where
 
     /// Get transformation metadata
     pub fn metadata(&self) -> TransformMetadata {
-        self.metadata
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.metadata.read_or_recover().clone()
     }
 
     /// Get the function reference
@@ -556,10 +531,7 @@ where
 
     /// Get transformation metadata
     pub fn metadata(&self) -> TransformMetadata {
-        self.metadata
-            .read()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.metadata.read_or_recover().clone()
     }
 }
 
@@ -580,25 +552,19 @@ impl TransformRegistry {
     /// Register a transformation
     pub fn register(&self, metadata: TransformMetadata) {
         self.transforms
-            .write()
-            .expect("transforms lock should not be poisoned")
+            .write_or_recover()
             .insert(metadata.id, metadata);
     }
 
     /// Get transformation metadata
     pub fn get(&self, id: TransformId) -> Option<TransformMetadata> {
-        self.transforms
-            .read()
-            .expect("lock should not be poisoned")
-            .get(&id)
-            .cloned()
+        self.transforms.read_or_recover().get(&id).cloned()
     }
 
     /// Get all transformations of a specific type
     pub fn get_by_type(&self, transform_type: TransformType) -> Vec<TransformMetadata> {
         self.transforms
-            .read()
-            .expect("transforms lock should not be poisoned")
+            .read_or_recover()
             .values()
             .filter(|m| m.transform_type == transform_type)
             .cloned()
@@ -607,26 +573,17 @@ impl TransformRegistry {
 
     /// Get total number of registered transformations
     pub fn len(&self) -> usize {
-        self.transforms
-            .read()
-            .expect("lock should not be poisoned")
-            .len()
+        self.transforms.read_or_recover().len()
     }
 
     /// Check if registry is empty
     pub fn is_empty(&self) -> bool {
-        self.transforms
-            .read()
-            .expect("lock should not be poisoned")
-            .is_empty()
+        self.transforms.read_or_recover().is_empty()
     }
 
     /// Clear all registered transformations
     pub fn clear(&self) {
-        self.transforms
-            .write()
-            .expect("lock should not be poisoned")
-            .clear();
+        self.transforms.write_or_recover().clear();
     }
 }
 

@@ -32,7 +32,10 @@ scirs2-datasets = { workspace = true }  # Direct access to dataset utilities
 
 # Image processing
 image = { workspace = true, optional = true }
-imageproc = { version = "0.27", optional = true }
+# default-features disabled to drop imageproc's `fft` feature, which pulls the
+# BANNED `rustfft` crate (via rustdct) into the default graph. The rotation path
+# used here (geometric_transformations) needs no imageproc feature flags.
+imageproc = { version = "0.27", default-features = false, optional = true }
 
 # Parallel processing
 rayon = { workspace = true }
@@ -66,9 +69,9 @@ serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 # WASM support
-wasm-bindgen = { version = "0.2", optional = true }
-js-sys = { version = "0.3", optional = true }
-web-sys = { version = "0.3", optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

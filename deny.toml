@@ -1,0 +1,81 @@
+# cargo-deny configuration — COOLJAPAN dependency-policy enforcement for ToRSh.
+#
+#   cargo deny check bans        # the gate this file is primarily written for
+#   cargo deny check licenses
+#   cargo deny check advisories
+#
+# Policy (see CLAUDE.md): the crates in [bans].deny below must never be DIRECT
+# dependencies. Pure-Rust replacements: oxiblas (openblas), oxicode (bincode),
+# oxifft (rustfft), oxisql-sqlite-compat (rusqlite), oxiarc-* (zip/flate2/zstd/
+# bzip2/lz4/tar/snap/brotli/miniz_oxide).
+
+[graph]
+# Match a default `cargo build` (optional codec/back-end deps such as parquet's
+# zstd/brotli/snap stack stay out of this graph, as they are off by default).
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses only (Apache-2.0 / MIT / BSD family), per policy.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[bans]
+# The brief only requires `check bans` to be green; duplicate-version hygiene is a
+# separate concern, so it is not gated here.
+multiple-versions = "allow"
+wildcards = "allow"
+allow-wildcard-paths = true
+
+# COOLJAPAN banned crates. flate2 + miniz_oxide are the only ones that actually
+# appear (transitively, and only via pure-Rust image/network decoders); they are
+# pure Rust in practice (flate2's default backend IS miniz_oxide — the C path needs
+# the `zlib`/`zlib-ng` features, which nothing here enables), so they are allowed
+# ONLY under their known transitive wrappers. Everything else is a regression guard
+# (absent from the default graph today).
+deny = [
+    { crate = "flate2", wrappers = ["png", "tiff", "ureq"] },
+    { crate = "miniz_oxide", wrappers = ["backtrace", "exr", "flate2", "png"] },
+    { crate = "openblas-src" },
+    { crate = "openblas" },
+    { crate = "bincode" },
+    { crate = "rustfft" },
+    { crate = "rusqlite" },
+    { crate = "libsqlite3-sys" },
+    { crate = "zip" },
+    { crate = "zstd" },
+    { crate = "zstd-sys" },
+    { crate = "bzip2" },
+    { crate = "bzip2-sys" },
+    { crate = "lz4" },
+    { crate = "lz4-sys" },
+    { crate = "tar" },
+    { crate = "snap" },
+    { crate = "brotli" },
+    # Replaced by oxiarc-lzma / removed in this wave — guard against regression.
+    { crate = "lzma-rs" },
+    { crate = "cust" },
+    { crate = "cuda-sys" },
+]
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

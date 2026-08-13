@@ -20,12 +20,43 @@ impl<T: TensorElement + Copy> Tensor<T> {
         Self::from_data(data, shape.to_vec(), device)
     }
     /// Fill tensor with a single value (in-place)
+    ///
+    /// A device-resident tensor is demoted to host storage first: device buffers
+    /// are immutable, so an in-place write has to happen on the host.
+    ///
+    /// # Aliasing
+    /// Follows the crate-wide in-place write contract (see
+    /// [`Tensor::set_item_flat`]): a base tensor is isolated copy-on-write, so a
+    /// `.clone()` snapshot keeps its old values, while a view writes *through*
+    /// to the tensor it aliases. The write is stride- and offset-aware, so
+    /// filling a row view touches that row and nothing else.
     pub fn fill_(&mut self, value: T) -> Result<()>
     where
         T: Copy,
     {
-        for i in 0..self.numel() {
-            self.storage.set(i, value)?;
+        #[cfg(feature = "gpu")]
+        if self.storage.is_device() {
+            self.make_unique()?;
+        }
+        if !self.is_view() {
+            self.make_unique()?;
+        }
+
+        let numel = self.numel();
+        if self.has_default_layout() {
+            // Contiguous (possibly offset) block: one straight run of stores.
+            // The offset is what a `slice_tensor` row view carries — writing
+            // `storage[0..numel]` here would clobber the base's *prefix*.
+            let offset = self.storage_offset;
+            for i in 0..numel {
+                self.storage.set(offset + i, value)?;
+            }
+            return Ok(());
+        }
+        // Strided view (a transpose, a stepped slice): every logical position
+        // has to be mapped through the strides individually.
+        for i in 0..numel {
+            self.set_item_flat(i, value)?;
         }
         Ok(())
     }
@@ -43,8 +74,25 @@ impl<T: TensorElement + Copy> Tensor<T> {
     {
         self.fill_(T::one())
     }
-    /// Copy data from another tensor (in-place)
+    /// Copy data from another tensor (in-place), copy-on-write safe.
+    ///
+    /// Delegates to [`Tensor::copy_from`], so a snapshot taken with `.clone()`
+    /// (which shares storage) is never clobbered by the write.
     pub fn copy_(&mut self, other: &Self) -> Result<()>
+    where
+        T: Copy,
+    {
+        self.copy_from(other)
+    }
+
+    /// Overwrite this tensor's contents with `other`'s, copy-on-write safe.
+    ///
+    /// The two tensors must have the same shape. Before writing, this makes the
+    /// storage uniquely owned (and contiguous), so any tensor that shares this
+    /// one's buffer — a `.clone()` snapshot, or a base tensor this is a view of —
+    /// keeps its old values. This is the primitive optimizers use to write an
+    /// updated parameter back without disturbing retained snapshots.
+    pub fn copy_from(&mut self, other: &Self) -> Result<()>
     where
         T: Copy,
     {
@@ -54,11 +102,51 @@ impl<T: TensorElement + Copy> Tensor<T> {
                 got: other.shape().dims().to_vec(),
             });
         }
+        // Read the source *before* isolating our storage: the source may alias
+        // it (e.g. a clone), and `make_unique` would otherwise leave `other`
+        // pointing at the pre-copy buffer.
         let other_data = other.to_vec()?;
-        for (i, &value) in other_data.iter().enumerate() {
-            self.storage.set(i, value)?;
+        // A strided/offset view aliases a sub-region of another tensor's buffer,
+        // and PyTorch's in-place-on-a-view semantics write *through* to that base
+        // (that is exactly how scatter-style aggregation into slices works).
+        // `set_slice` already performs a stride-aware store, mapping each logical
+        // element back to its physical slot in the base storage. Skipping the CoW
+        // step here is deliberate: `make_unique` would detach the view and the
+        // write would never reach the base. The contiguous-base path below keeps
+        // its copy-on-write behaviour so optimizer snapshots stay intact.
+        if self.is_view() {
+            return self.set_slice(0, &other_data);
         }
-        Ok(())
+        self.make_unique()?;
+        self.set_slice(0, &other_data)
+    }
+
+    /// Overwrite this tensor's contents from a flat, row-major slice,
+    /// copy-on-write safe.
+    ///
+    /// `data.len()` must equal this tensor's element count. Like
+    /// [`Tensor::copy_from`], the storage is made uniquely owned first, so
+    /// shared snapshots are preserved.
+    pub fn set_data(&mut self, data: &[T]) -> Result<()>
+    where
+        T: Copy,
+    {
+        let numel = self.numel();
+        if data.len() != numel {
+            return Err(TorshError::InvalidArgument(format!(
+                "set_data: slice has {} elements but the tensor holds {}",
+                data.len(),
+                numel
+            )));
+        }
+        // See `copy_from`: an in-place write into a view writes through to the
+        // base via the stride-aware `set_slice`; the contiguous path stays
+        // copy-on-write so shared snapshots are preserved.
+        if self.is_view() {
+            return self.set_slice(0, data);
+        }
+        self.make_unique()?;
+        self.set_slice(0, data)
     }
     /// Get an element by multi-dimensional index
     pub fn get_item(&self, indices: &[usize]) -> Result<T>
@@ -86,6 +174,10 @@ impl<T: TensorElement + Copy> Tensor<T> {
         self.get_item_flat(flat_index)
     }
     /// Set an element by multi-dimensional index
+    ///
+    /// # Aliasing
+    /// See [`Tensor::set_item_flat`]: a base tensor is isolated copy-on-write
+    /// before the write, a view writes through to the tensor it aliases.
     pub fn set_item(&mut self, indices: &[usize], value: T) -> Result<()>
     where
         T: Copy,
@@ -143,10 +235,41 @@ impl<T: TensorElement + Copy> Tensor<T> {
         self.storage.get(storage_idx)
     }
     /// Set element by flat index
+    ///
+    /// A device-resident tensor is demoted to host storage first (see
+    /// [`Tensor::fill_`]).
+    ///
+    /// # Aliasing
+    /// This is the reference implementation of the crate's in-place write
+    /// contract, which every `&mut self` writer follows:
+    ///
+    /// * A **base** tensor (default layout, zero storage offset) is made
+    ///   uniquely owned first, so `Tensor::clone()` — which shares storage
+    ///   rather than deep-copying — behaves as a value: writing through one
+    ///   handle never reaches the other. This is exactly what the in-place
+    ///   arithmetic ops do via
+    ///   [`prepare_for_inplace`](Tensor::make_unique), and what optimizer
+    ///   snapshots and checkpointing rely on.
+    /// * A **view** (custom strides or a non-zero storage offset) keeps
+    ///   PyTorch's write-*through* aliasing: the store is mapped back through
+    ///   the view's strides into the base tensor's buffer, which is how
+    ///   scatter-style aggregation into slices works.
+    ///
+    /// A `reshape`/`view` alias of a whole tensor keeps the default layout, so
+    /// it counts as a base tensor here and is isolated rather than written
+    /// through — the same classification [`Tensor::copy_from`] and
+    /// [`Tensor::set_data`] already use.
     pub fn set_item_flat(&mut self, index: usize, value: T) -> Result<()>
     where
         T: Copy,
     {
+        #[cfg(feature = "gpu")]
+        if self.storage.is_device() {
+            self.make_unique()?;
+        }
+        if !self.is_view() {
+            self.make_unique()?;
+        }
         if index >= self.numel() {
             return Err(TorshError::IndexOutOfBounds {
                 index,
@@ -194,6 +317,16 @@ impl<T: TensorElement + Copy> Tensor<T> {
         Ok(flat_index)
     }
     /// Gather values along an axis using indices
+    ///
+    /// The result joins the autograd graph as an
+    /// [`Operation::Gather`](crate::core_ops::Operation::Gather): every
+    /// output element records the *logical* index of the input element it was
+    /// copied from, so the backward pass scatters the output gradient back and
+    /// **accumulates** wherever an input element was read more than once.
+    ///
+    /// The index map is only built when gradients are actually being recorded —
+    /// inference keeps producing a plain leaf and pays no per-element
+    /// allocation.
     pub fn gather(&self, dim: usize, indices: &Tensor<i64>) -> Result<Self> {
         if dim >= self.ndim() {
             return Err(TorshError::InvalidArgument(format!(
@@ -202,9 +335,14 @@ impl<T: TensorElement + Copy> Tensor<T> {
                 self.ndim()
             )));
         }
+        let record = crate::should_record_grad(self.requires_grad);
         let self_data = self.to_vec()?;
         let indices_data = indices.to_vec()?;
         let mut result_data = Vec::new();
+        // `index_map[o]` is the input's logical (row-major) index that fed
+        // output position `o` — the negative-folded one, matching the element
+        // actually read below.
+        let mut index_map = Vec::with_capacity(if record { indices_data.len() } else { 0 });
         let result_shape = indices.shape().dims().to_vec();
         if self.ndim() == 1 {
             for &index in &indices_data {
@@ -221,6 +359,9 @@ impl<T: TensorElement + Copy> Tensor<T> {
                     )));
                 }
                 result_data.push(self_data[idx]);
+                if record {
+                    index_map.push(idx);
+                }
             }
         } else {
             let self_shape_ref = self.shape();
@@ -263,9 +404,22 @@ impl<T: TensorElement + Copy> Tensor<T> {
                     flat_idx += self_coords[j] * self_strides[j];
                 }
                 result_data.push(self_data[flat_idx]);
+                if record {
+                    // `self_strides` are `self`'s default row-major strides, so
+                    // `flat_idx` is already a logical index into `self`.
+                    index_map.push(flat_idx);
+                }
             }
         }
-        Self::from_data(result_data, result_shape, self.device)
+        let mut result = Self::from_data(result_data, result_shape, self.device)?;
+        // Guarded on the same `record` the map was built under: grad mode is a
+        // process-global flag, so without this a thread that turns it on between
+        // the two reads would record a node with an *empty* index map, and the
+        // backward pass would fail its length check instead of running.
+        if record {
+            self.record_gather(&mut result, index_map);
+        }
+        Ok(result)
     }
     /// Scatter values along an axis using indices
     pub fn scatter(&self, dim: usize, indices: &Tensor<i64>, src: &Tensor<T>) -> Result<Self> {

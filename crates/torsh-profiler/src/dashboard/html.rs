@@ -51,7 +51,7 @@ fn create_default_data() -> DashboardData {
             load_average: 0.0,
             available_memory_mb: 0.0,
             disk_usage_percent: 0.0,
-            network_io_mbps: 0.0,
+            network_io_mbps: None,
         },
         alerts: Vec::new(),
         top_operations: Vec::new(),
@@ -290,6 +290,10 @@ fn generate_memory_card(metrics: &MemoryMetrics) -> String {
 /// Generate system metrics card
 fn generate_system_card(metrics: &SystemMetrics) -> String {
     let uptime_formatted = format_duration(metrics.uptime_seconds);
+    let network_io_display = metrics
+        .network_io_mbps
+        .map(|mbps| format!("{mbps:.2} MB/s"))
+        .unwrap_or_else(|| "not measured".to_string());
 
     format!(
         r#"<div class="card system-card">
@@ -316,7 +320,7 @@ fn generate_system_card(metrics: &SystemMetrics) -> String {
                 </div>
                 <div class="metric">
                     <span class="metric-label">Network I/O</span>
-                    <span class="metric-value">{:.2} MB/s</span>
+                    <span class="metric-value">{network_io_display}</span>
                 </div>
             </div>
         </div>"#,
@@ -325,7 +329,6 @@ fn generate_system_card(metrics: &SystemMetrics) -> String {
         metrics.available_memory_mb,
         metrics.disk_usage_percent,
         metrics.disk_usage_percent.min(100.0),
-        metrics.network_io_mbps
     )
 }
 

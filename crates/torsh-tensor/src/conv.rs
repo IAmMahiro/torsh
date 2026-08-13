@@ -5,6 +5,143 @@ use torsh_core::error::{Result, TorshError};
 use torsh_core::TensorElement;
 
 impl<T: FloatElement> Tensor<T> {
+    /// im2col (unfold): gather the sliding windows of an `[N, C, H, W]` tensor
+    /// into per-group patch matrices.
+    ///
+    /// The result is shaped `[groups, N * out_h * out_w, (C / groups) * kh * kw]`:
+    /// one row per (batch item, output position), one column per kernel tap, so a
+    /// convolution is a single batched matrix product against the reshaped
+    /// weight. Positions that fall in the zero padding contribute zeros.
+    ///
+    /// # Autograd
+    ///
+    /// The gather is recorded, and its backward pass is col2im: every patch
+    /// element scatter-adds its gradient back onto the input element it was read
+    /// from, so overlapping windows accumulate. This is what lets a convolution
+    /// built as `im2col_2d(...).matmul(weight)` produce exact gradients for both
+    /// the input and the weight.
+    ///
+    /// # Arguments
+    /// * `kernel` - `(kh, kw)`
+    /// * `stride` - `(sh, sw)`
+    /// * `padding` - `(ph, pw)` zero padding applied on both sides of each axis
+    /// * `dilation` - `(dh, dw)` spacing between kernel taps
+    /// * `groups` - number of channel groups; `C` must be divisible by it
+    pub fn im2col_2d(
+        &self,
+        kernel: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+        groups: usize,
+    ) -> Result<Self> {
+        let shape_binding = self.shape();
+        let dims = shape_binding.dims();
+        if dims.len() != 4 {
+            return Err(TorshError::InvalidShape(format!(
+                "im2col_2d expects a 4-D [batch, channels, height, width] tensor, got {}-D",
+                dims.len()
+            )));
+        }
+        let (batch, channels, height, width) = (dims[0], dims[1], dims[2], dims[3]);
+
+        if groups == 0 || channels % groups != 0 {
+            return Err(TorshError::InvalidArgument(format!(
+                "im2col_2d: {channels} channels cannot be split into {groups} groups"
+            )));
+        }
+        if kernel.0 == 0 || kernel.1 == 0 || stride.0 == 0 || stride.1 == 0 {
+            return Err(TorshError::InvalidArgument(
+                "im2col_2d: kernel and stride must be positive".to_string(),
+            ));
+        }
+        if dilation.0 == 0 || dilation.1 == 0 {
+            return Err(TorshError::InvalidArgument(
+                "im2col_2d: dilation must be positive".to_string(),
+            ));
+        }
+
+        let span_h = dilation.0 * (kernel.0 - 1) + 1;
+        let span_w = dilation.1 * (kernel.1 - 1) + 1;
+        let padded_h = height + 2 * padding.0;
+        let padded_w = width + 2 * padding.1;
+        if padded_h < span_h || padded_w < span_w {
+            return Err(TorshError::InvalidShape(format!(
+                "im2col_2d: a {span_h}x{span_w} kernel span does not fit a \
+                 {padded_h}x{padded_w} padded input"
+            )));
+        }
+        let out_h = (padded_h - span_h) / stride.0 + 1;
+        let out_w = (padded_w - span_w) / stride.1 + 1;
+
+        let per_group = channels / groups;
+        let patch_len = per_group * kernel.0 * kernel.1;
+        let rows = batch * out_h * out_w;
+
+        let input_data = self.to_vec()?;
+        let mut patches = vec![<T as num_traits::Zero>::zero(); groups * rows * patch_len];
+
+        for batch_index in 0..batch {
+            for group in 0..groups {
+                let group_base = group * rows * patch_len;
+                for out_y in 0..out_h {
+                    for out_x in 0..out_w {
+                        let row = group_base
+                            + (batch_index * out_h * out_w + out_y * out_w + out_x) * patch_len;
+                        for channel in 0..per_group {
+                            let global_channel = group * per_group + channel;
+                            let channel_base =
+                                (batch_index * channels + global_channel) * height * width;
+                            for ky in 0..kernel.0 {
+                                let in_y = out_y * stride.0 + ky * dilation.0;
+                                if in_y < padding.0 {
+                                    continue;
+                                }
+                                let in_y = in_y - padding.0;
+                                if in_y >= height {
+                                    continue;
+                                }
+                                for kx in 0..kernel.1 {
+                                    let in_x = out_x * stride.1 + kx * dilation.1;
+                                    if in_x < padding.1 {
+                                        continue;
+                                    }
+                                    let in_x = in_x - padding.1;
+                                    if in_x >= width {
+                                        continue;
+                                    }
+                                    let column = (channel * kernel.0 + ky) * kernel.1 + kx;
+                                    patches[row + column] =
+                                        input_data[channel_base + in_y * width + in_x];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut result = Self::from_data(patches, vec![groups, rows, patch_len], self.device())?;
+
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = crate::core_ops::Operation::Im2Col {
+                input: std::sync::Arc::new(self.clone()),
+                config: crate::core_ops::Im2ColConfig {
+                    input_shape: [batch, channels, height, width],
+                    kernel,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                    output: (out_h, out_w),
+                },
+            };
+        }
+
+        Ok(result)
+    }
+
     /// Broadcast a per-output-channel bias across a contiguous convolution output.
     ///
     /// `output_data` is laid out row-major as `[batch, out_channels, spatial...]`,
@@ -102,44 +239,61 @@ impl<T: FloatElement> Tensor<T> {
         let mut output_data =
             vec![<T as TensorElement>::zero(); batch_size * out_channels * output_length];
 
-        // Perform convolution
-        for n in 0..batch_size {
-            for g in 0..groups {
-                let out_ch_start = g * (out_channels / groups);
-                let out_ch_end = (g + 1) * (out_channels / groups);
-                let in_ch_start = g * (in_channels / groups);
-                let in_ch_end = (g + 1) * (in_channels / groups);
+        // Perform convolution. Both operands are borrowed out of storage once
+        // for the whole op instead of taking a read guard per multiply-add.
+        self.with_operand_slices(weight, |input_data, weight_data| {
+            for n in 0..batch_size {
+                for g in 0..groups {
+                    let out_ch_start = g * (out_channels / groups);
+                    let out_ch_end = (g + 1) * (out_channels / groups);
+                    let in_ch_start = g * (in_channels / groups);
+                    let in_ch_end = (g + 1) * (in_channels / groups);
 
-                for oc in out_ch_start..out_ch_end {
-                    for ol in 0..output_length {
-                        let mut sum = <T as TensorElement>::zero();
+                    for oc in out_ch_start..out_ch_end {
+                        for ol in 0..output_length {
+                            let mut sum = <T as TensorElement>::zero();
 
-                        for ic in in_ch_start..in_ch_end {
-                            let ic_rel = ic - in_ch_start;
-                            for k in 0..kernel_size {
-                                let il = (ol * stride + k * dilation) as i32 - padding as i32;
+                            for ic in in_ch_start..in_ch_end {
+                                let ic_rel = ic - in_ch_start;
+                                for k in 0..kernel_size {
+                                    let il = (ol * stride + k * dilation) as i32 - padding as i32;
 
-                                if il >= 0 && (il as usize) < input_length {
-                                    let input_idx = n * in_channels * input_length
-                                        + ic * input_length
-                                        + il as usize;
-                                    let weight_idx = oc * (in_channels / groups) * kernel_size
-                                        + ic_rel * kernel_size
-                                        + k;
+                                    if il >= 0 && (il as usize) < input_length {
+                                        let input_idx = n * in_channels * input_length
+                                            + ic * input_length
+                                            + il as usize;
+                                        let weight_idx = oc * (in_channels / groups) * kernel_size
+                                            + ic_rel * kernel_size
+                                            + k;
 
-                                    let input_val = self.storage.get(input_idx)?;
-                                    let weight_val = weight.storage.get(weight_idx)?;
-                                    sum = sum + input_val * weight_val;
+                                        let input_val =
+                                            *input_data.get(input_idx).ok_or_else(|| {
+                                                TorshError::IndexOutOfBounds {
+                                                    index: input_idx,
+                                                    size: input_data.len(),
+                                                }
+                                            })?;
+                                        let weight_val =
+                                            *weight_data.get(weight_idx).ok_or_else(|| {
+                                                TorshError::IndexOutOfBounds {
+                                                    index: weight_idx,
+                                                    size: weight_data.len(),
+                                                }
+                                            })?;
+                                        sum = sum + input_val * weight_val;
+                                    }
                                 }
                             }
-                        }
 
-                        let output_idx = n * out_channels * output_length + oc * output_length + ol;
-                        output_data[output_idx] = sum;
+                            let output_idx =
+                                n * out_channels * output_length + oc * output_length + ol;
+                            output_data[output_idx] = sum;
+                        }
                     }
                 }
             }
-        }
+            Ok(())
+        })?;
 
         // Create output tensor
         let mut output = Tensor::from_data(
@@ -173,10 +327,11 @@ impl<T: FloatElement> Tensor<T> {
         }
 
         // Track operation for autograd
-        if self.requires_grad
-            || weight.requires_grad
-            || (bias.is_some() && bias.expect("bias checked with is_some").requires_grad)
-        {
+        if crate::should_record_grad(
+            self.requires_grad
+                || weight.requires_grad
+                || (bias.is_some() && bias.expect("bias checked with is_some").requires_grad),
+        ) {
             use std::sync::Arc;
             output.requires_grad = true;
             output.operation = crate::Operation::Custom(
@@ -262,66 +417,68 @@ impl<T: FloatElement> Tensor<T> {
             batch_size * out_channels * output_height * output_width
         ];
 
-        let self_data = self.to_vec()?;
-        let weight_data = weight.to_vec()?;
+        // Perform convolution. Both operands are borrowed out of storage once
+        // for the whole op — no per-operand copy, no per-MAC lock.
+        self.with_operand_slices(weight, |self_data, weight_data| {
+            for n in 0..batch_size {
+                for g in 0..groups {
+                    let out_ch_start = g * (out_channels / groups);
+                    let out_ch_end = (g + 1) * (out_channels / groups);
+                    let in_ch_start = g * (in_channels / groups);
+                    let in_ch_end = (g + 1) * (in_channels / groups);
 
-        // Perform convolution
-        for n in 0..batch_size {
-            for g in 0..groups {
-                let out_ch_start = g * (out_channels / groups);
-                let out_ch_end = (g + 1) * (out_channels / groups);
-                let in_ch_start = g * (in_channels / groups);
-                let in_ch_end = (g + 1) * (in_channels / groups);
+                    for oc in out_ch_start..out_ch_end {
+                        for oh in 0..output_height {
+                            for ow in 0..output_width {
+                                let mut sum = <T as TensorElement>::zero();
 
-                for oc in out_ch_start..out_ch_end {
-                    for oh in 0..output_height {
-                        for ow in 0..output_width {
-                            let mut sum = <T as TensorElement>::zero();
+                                for ic in in_ch_start..in_ch_end {
+                                    let ic_rel = ic - in_ch_start;
+                                    for kh in 0..kernel_height {
+                                        for kw in 0..kernel_width {
+                                            let ih = (oh * stride.0 + kh * dilation.0) as i32
+                                                - padding.0 as i32;
+                                            let iw = (ow * stride.1 + kw * dilation.1) as i32
+                                                - padding.1 as i32;
 
-                            for ic in in_ch_start..in_ch_end {
-                                let ic_rel = ic - in_ch_start;
-                                for kh in 0..kernel_height {
-                                    for kw in 0..kernel_width {
-                                        let ih = (oh * stride.0 + kh * dilation.0) as i32
-                                            - padding.0 as i32;
-                                        let iw = (ow * stride.1 + kw * dilation.1) as i32
-                                            - padding.1 as i32;
+                                            if ih >= 0
+                                                && (ih as usize) < input_height
+                                                && iw >= 0
+                                                && (iw as usize) < input_width
+                                            {
+                                                let input_idx =
+                                                    n * in_channels * input_height * input_width
+                                                        + ic * input_height * input_width
+                                                        + ih as usize * input_width
+                                                        + iw as usize;
+                                                let weight_idx = oc
+                                                    * (in_channels / groups)
+                                                    * kernel_height
+                                                    * kernel_width
+                                                    + ic_rel * kernel_height * kernel_width
+                                                    + kh * kernel_width
+                                                    + kw;
 
-                                        if ih >= 0
-                                            && (ih as usize) < input_height
-                                            && iw >= 0
-                                            && (iw as usize) < input_width
-                                        {
-                                            let input_idx =
-                                                n * in_channels * input_height * input_width
-                                                    + ic * input_height * input_width
-                                                    + ih as usize * input_width
-                                                    + iw as usize;
-                                            let weight_idx = oc
-                                                * (in_channels / groups)
-                                                * kernel_height
-                                                * kernel_width
-                                                + ic_rel * kernel_height * kernel_width
-                                                + kh * kernel_width
-                                                + kw;
-
-                                            sum = sum
-                                                + self_data[input_idx] * weight_data[weight_idx];
+                                                sum = sum
+                                                    + self_data[input_idx]
+                                                        * weight_data[weight_idx];
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            let output_idx = n * out_channels * output_height * output_width
-                                + oc * output_height * output_width
-                                + oh * output_width
-                                + ow;
-                            output_data[output_idx] = sum;
+                                let output_idx = n * out_channels * output_height * output_width
+                                    + oc * output_height * output_width
+                                    + oh * output_width
+                                    + ow;
+                                output_data[output_idx] = sum;
+                            }
                         }
                     }
                 }
             }
-        }
+            Ok(())
+        })?;
 
         // Create output tensor
         let mut output = Tensor::from_data(
@@ -360,10 +517,11 @@ impl<T: FloatElement> Tensor<T> {
         }
 
         // Track operation for autograd
-        if self.requires_grad
-            || weight.requires_grad
-            || (bias.is_some() && bias.expect("bias checked with is_some").requires_grad)
-        {
+        if crate::should_record_grad(
+            self.requires_grad
+                || weight.requires_grad
+                || (bias.is_some() && bias.expect("bias checked with is_some").requires_grad),
+        ) {
             use std::sync::Arc;
             output.requires_grad = true;
             output.operation = crate::Operation::Custom(
@@ -584,10 +742,11 @@ impl<T: FloatElement> Tensor<T> {
         }
 
         // Track operation for autograd
-        if self.requires_grad
-            || weight.requires_grad
-            || (bias.is_some() && bias.expect("bias checked with is_some").requires_grad)
-        {
+        if crate::should_record_grad(
+            self.requires_grad
+                || weight.requires_grad
+                || (bias.is_some() && bias.expect("bias checked with is_some").requires_grad),
+        ) {
             use std::sync::Arc;
             output.requires_grad = true;
             output.operation = crate::Operation::Custom(
@@ -665,51 +824,66 @@ impl<T: FloatElement> Tensor<T> {
             batch_size * in_channels * output_height * output_width
         ];
 
-        let _self_data = self.to_vec()?;
-        let _weight_data = weight.to_vec()?;
+        // Perform depthwise convolution. Both operands are borrowed out of
+        // storage once for the whole op instead of per multiply-add.
+        self.with_operand_slices(weight, |input_data, weight_data| {
+            for n in 0..batch_size {
+                for c in 0..in_channels {
+                    for oh in 0..output_height {
+                        for ow in 0..output_width {
+                            let mut sum = <T as TensorElement>::zero();
 
-        // Perform depthwise convolution
-        for n in 0..batch_size {
-            for c in 0..in_channels {
-                for oh in 0..output_height {
-                    for ow in 0..output_width {
-                        let mut sum = <T as TensorElement>::zero();
+                            for kh in 0..kernel_height {
+                                for kw in 0..kernel_width {
+                                    let ih =
+                                        (oh * stride.0 + kh * dilation.0) as i32 - padding.0 as i32;
+                                    let iw =
+                                        (ow * stride.1 + kw * dilation.1) as i32 - padding.1 as i32;
 
-                        for kh in 0..kernel_height {
-                            for kw in 0..kernel_width {
-                                let ih =
-                                    (oh * stride.0 + kh * dilation.0) as i32 - padding.0 as i32;
-                                let iw =
-                                    (ow * stride.1 + kw * dilation.1) as i32 - padding.1 as i32;
+                                    if ih >= 0
+                                        && (ih as usize) < input_height
+                                        && iw >= 0
+                                        && (iw as usize) < input_width
+                                    {
+                                        let input_idx =
+                                            n * in_channels * input_height * input_width
+                                                + c * input_height * input_width
+                                                + ih as usize * input_width
+                                                + iw as usize;
+                                        let weight_idx = c * kernel_height * kernel_width
+                                            + kh * kernel_width
+                                            + kw;
 
-                                if ih >= 0
-                                    && (ih as usize) < input_height
-                                    && iw >= 0
-                                    && (iw as usize) < input_width
-                                {
-                                    let input_idx = n * in_channels * input_height * input_width
-                                        + c * input_height * input_width
-                                        + ih as usize * input_width
-                                        + iw as usize;
-                                    let weight_idx =
-                                        c * kernel_height * kernel_width + kh * kernel_width + kw;
-
-                                    let input_val = self.storage.get(input_idx)?;
-                                    let weight_val = weight.storage.get(weight_idx)?;
-                                    sum = sum + input_val * weight_val;
+                                        let input_val =
+                                            *input_data.get(input_idx).ok_or_else(|| {
+                                                TorshError::IndexOutOfBounds {
+                                                    index: input_idx,
+                                                    size: input_data.len(),
+                                                }
+                                            })?;
+                                        let weight_val =
+                                            *weight_data.get(weight_idx).ok_or_else(|| {
+                                                TorshError::IndexOutOfBounds {
+                                                    index: weight_idx,
+                                                    size: weight_data.len(),
+                                                }
+                                            })?;
+                                        sum = sum + input_val * weight_val;
+                                    }
                                 }
                             }
-                        }
 
-                        let output_idx = n * in_channels * output_height * output_width
-                            + c * output_height * output_width
-                            + oh * output_width
-                            + ow;
-                        output_data[output_idx] = sum;
+                            let output_idx = n * in_channels * output_height * output_width
+                                + c * output_height * output_width
+                                + oh * output_width
+                                + ow;
+                            output_data[output_idx] = sum;
+                        }
                     }
                 }
             }
-        }
+            Ok(())
+        })?;
 
         // Create output tensor
         let mut output = Tensor::from_data(
@@ -749,10 +923,11 @@ impl<T: FloatElement> Tensor<T> {
         }
 
         // Track operation for autograd
-        if self.requires_grad
-            || weight.requires_grad
-            || (bias.is_some() && bias.expect("bias checked with is_some").requires_grad)
-        {
+        if crate::should_record_grad(
+            self.requires_grad
+                || weight.requires_grad
+                || (bias.is_some() && bias.expect("bias checked with is_some").requires_grad),
+        ) {
             use std::sync::Arc;
             output.requires_grad = true;
             output.operation = crate::Operation::Custom(
@@ -798,11 +973,12 @@ impl<T: FloatElement> Tensor<T> {
         )?;
 
         // Track operation for autograd
-        if self.requires_grad
-            || depthwise_weight.requires_grad
-            || pointwise_weight.requires_grad
-            || (bias.is_some() && bias.expect("bias checked with is_some").requires_grad)
-        {
+        if crate::should_record_grad(
+            self.requires_grad
+                || depthwise_weight.requires_grad
+                || pointwise_weight.requires_grad
+                || (bias.is_some() && bias.expect("bias checked with is_some").requires_grad),
+        ) {
             use std::sync::Arc;
             let mut tracked_output = output;
             tracked_output.requires_grad = true;
@@ -986,10 +1162,11 @@ impl<T: FloatElement> Tensor<T> {
         }
 
         // Track operation for autograd
-        if self.requires_grad
-            || weight.requires_grad
-            || (bias.is_some() && bias.expect("bias checked with is_some").requires_grad)
-        {
+        if crate::should_record_grad(
+            self.requires_grad
+                || weight.requires_grad
+                || (bias.is_some() && bias.expect("bias checked with is_some").requires_grad),
+        ) {
             use std::sync::Arc;
             output.requires_grad = true;
             output.operation = crate::Operation::Custom(

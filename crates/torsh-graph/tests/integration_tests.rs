@@ -68,9 +68,9 @@ fn test_graph_data_creation() {
 #[test]
 fn test_gcn_layer() {
     let graph = create_test_graph();
-    let gcn = GCNConv::new(3, 16, true);
+    let gcn = GCNConv::new(3, 16, true).expect("operation should succeed");
 
-    let output_graph = gcn.forward(&graph);
+    let output_graph = gcn.forward(&graph).expect("operation should succeed");
 
     assert_eq!(output_graph.num_nodes, graph.num_nodes);
     assert_eq!(output_graph.num_edges, graph.num_edges);
@@ -84,7 +84,7 @@ fn test_gcn_layer() {
 // #[test]
 // fn test_gat_layer() {
 //     let graph = create_test_graph();
-//     let gat = GATConv::new(3, 8, 2, 0.1, true); // 2 heads, 8 out features per head
+//     let gat = GATConv::new(3, 8, 2, 0.1, true).expect("operation should succeed"); // 2 heads, 8 out features per head
 
 //     let output_graph = gat.forward(&graph);
 
@@ -100,9 +100,9 @@ fn test_gcn_layer() {
 #[test]
 fn test_sage_layer() {
     let graph = create_test_graph();
-    let sage = SAGEConv::new(3, 12, true);
+    let sage = SAGEConv::new(3, 12, true).expect("operation should succeed");
 
-    let output_graph = sage.forward(&graph);
+    let output_graph = sage.forward(&graph).expect("operation should succeed");
 
     assert_eq!(output_graph.num_nodes, graph.num_nodes);
     assert_eq!(output_graph.num_edges, graph.num_edges);
@@ -116,9 +116,9 @@ fn test_sage_layer() {
 #[test]
 fn test_gin_layer() {
     let graph = create_test_graph();
-    let gin = GINConv::new(3, 10, 0.0, false, true);
+    let gin = GINConv::new(3, 10, 0.0, false, true).expect("operation should succeed");
 
-    let output_graph = gin.forward(&graph);
+    let output_graph = gin.forward(&graph).expect("operation should succeed");
 
     assert_eq!(output_graph.num_nodes, graph.num_nodes);
     assert_eq!(output_graph.num_edges, graph.num_edges);
@@ -132,9 +132,12 @@ fn test_gin_layer() {
 #[test]
 fn test_graph_transformer() {
     let graph = create_test_graph();
-    let transformer = GraphTransformer::new(3, 12, 3, 2, 0.1, true); // 3 heads
+    let transformer =
+        GraphTransformer::new(3, 12, 3, 2, 0.1, true).expect("operation should succeed"); // 3 heads
 
-    let output_graph = transformer.forward(&graph);
+    let output_graph = transformer
+        .forward(&graph)
+        .expect("operation should succeed");
 
     assert_eq!(output_graph.num_nodes, graph.num_nodes);
     assert_eq!(output_graph.num_edges, graph.num_edges);
@@ -150,29 +153,29 @@ fn test_activation_functions() {
     let input = from_vec(vec![-2.0, -1.0, 0.0, 1.0, 2.0], &[5], DeviceType::Cpu).unwrap();
 
     // Test LeakyReLU
-    let leaky_output = leaky_relu(&input, 0.01);
+    let leaky_output = leaky_relu(&input, 0.01).expect("operation should succeed");
     let leaky_vals = leaky_output.to_vec().unwrap();
     assert_relative_eq!(leaky_vals[0], -0.02, epsilon = 1e-6);
     assert_relative_eq!(leaky_vals[4], 2.0, epsilon = 1e-6);
 
     // Test ELU
-    let elu_output = elu(&input, 1.0);
+    let elu_output = elu(&input, 1.0).expect("operation should succeed");
     let elu_vals = elu_output.to_vec().unwrap();
     assert_relative_eq!(elu_vals[2], 0.0, epsilon = 1e-6); // ELU(0) = 0
     assert_relative_eq!(elu_vals[4], 2.0, epsilon = 1e-6); // ELU(2) = 2
 
     // Test Swish
-    let swish_output = swish(&input);
+    let swish_output = swish(&input).expect("operation should succeed");
     let swish_vals = swish_output.to_vec().unwrap();
     assert_relative_eq!(swish_vals[2], 0.0, epsilon = 1e-6); // Swish(0) = 0
 
     // Test GELU
-    let gelu_output = gelu(&input);
+    let gelu_output = gelu(&input).expect("operation should succeed");
     let gelu_vals = gelu_output.to_vec().unwrap();
     assert!(gelu_vals.iter().all(|&x| x.is_finite()));
 
     // Test Mish
-    let mish_output = mish(&input);
+    let mish_output = mish(&input).expect("operation should succeed");
     let mish_vals = mish_output.to_vec().unwrap();
     assert!(mish_vals.iter().all(|&x| x.is_finite()));
 }
@@ -182,15 +185,15 @@ fn test_global_pooling() {
     let graph = create_test_graph();
 
     // Test global mean pooling
-    let mean_pooled = global::global_mean_pool(&graph);
+    let mean_pooled = global::global_mean_pool(&graph).expect("operation should succeed");
     assert_eq!(mean_pooled.shape().dims(), &[3]); // Feature dimension
 
     // Test global max pooling
-    let max_pooled = global::global_max_pool(&graph);
+    let max_pooled = global::global_max_pool(&graph).expect("operation should succeed");
     assert_eq!(max_pooled.shape().dims(), &[3]);
 
     // Test global sum pooling
-    let sum_pooled = global::global_sum_pool(&graph);
+    let sum_pooled = global::global_sum_pool(&graph).expect("operation should succeed");
     assert_eq!(sum_pooled.shape().dims(), &[3]);
 
     // Verify that max >= mean >= some reasonable lower bound
@@ -205,9 +208,11 @@ fn test_global_pooling() {
 #[test]
 fn test_global_attention_pooling() {
     let graph = create_test_graph();
-    let attention_pool = global::GlobalAttentionPool::new(3, 8);
+    let attention_pool = global::GlobalAttentionPool::new(3, 8).expect("operation should succeed");
 
-    let pooled = attention_pool.forward(&graph);
+    let pooled = attention_pool
+        .forward(&graph)
+        .expect("operation should succeed");
     assert_eq!(pooled.shape().dims(), &[8]);
 
     // Check parameters
@@ -218,9 +223,9 @@ fn test_global_attention_pooling() {
 #[test]
 fn test_set2set_pooling() {
     let graph = create_test_graph();
-    let set2set = global::Set2Set::new(3, 16, 1, 3); // 3 iterations
+    let set2set = global::Set2Set::new(3, 16, 1, 3).expect("operation should succeed"); // 3 iterations
 
-    let pooled = set2set.forward(&graph);
+    let pooled = set2set.forward(&graph).expect("operation should succeed");
     assert_eq!(pooled.shape().dims(), &[16]);
 
     // Check parameters
@@ -231,9 +236,9 @@ fn test_set2set_pooling() {
 #[test]
 fn test_topk_pooling() {
     let graph = create_large_test_graph();
-    let topk_pool = hierarchical::TopKPool::new(8, 0.5, None); // Keep 50% of nodes
+    let topk_pool = hierarchical::TopKPool::new(8, 0.5, None).expect("operation should succeed"); // Keep 50% of nodes
 
-    let pooled_graph = topk_pool.forward(&graph);
+    let pooled_graph = topk_pool.forward(&graph).expect("operation should succeed");
 
     assert!(pooled_graph.num_nodes <= graph.num_nodes);
     assert!(pooled_graph.num_nodes >= 1);
@@ -247,9 +252,9 @@ fn test_topk_pooling() {
 #[test]
 fn test_diffpool() {
     let graph = create_test_graph();
-    let diffpool = hierarchical::DiffPool::new(3, 2); // Pool to 2 clusters
+    let diffpool = hierarchical::DiffPool::new(3, 2).expect("operation should succeed"); // Pool to 2 clusters
 
-    let (pooled_graph, aux_loss) = diffpool.forward(&graph);
+    let (pooled_graph, aux_loss) = diffpool.forward(&graph).expect("operation should succeed");
 
     assert_eq!(pooled_graph.num_nodes, 2);
     assert_eq!(pooled_graph.x.shape().dims(), &[2, 3]);
@@ -263,9 +268,11 @@ fn test_diffpool() {
 #[test]
 fn test_mincut_pooling() {
     let graph = create_test_graph();
-    let mincut_pool = hierarchical::MinCutPool::new(3, 2);
+    let mincut_pool = hierarchical::MinCutPool::new(3, 2).expect("operation should succeed");
 
-    let (pooled_graph, loss) = mincut_pool.forward(&graph);
+    let (pooled_graph, loss) = mincut_pool
+        .forward(&graph)
+        .expect("operation should succeed");
 
     assert_eq!(pooled_graph.num_nodes, 2);
     assert_eq!(pooled_graph.x.shape().dims(), &[2, 3]);
@@ -281,11 +288,13 @@ fn test_graph_laplacian() {
     let graph = create_test_graph();
 
     // Test normalized Laplacian
-    let normalized_laplacian = graph_laplacian(&graph.edge_index, graph.num_nodes, true);
+    let normalized_laplacian = graph_laplacian(&graph.edge_index, graph.num_nodes, true)
+        .expect("operation should succeed");
     assert_eq!(normalized_laplacian.shape().dims(), &[4, 4]);
 
     // Test unnormalized Laplacian
-    let unnormalized_laplacian = graph_laplacian(&graph.edge_index, graph.num_nodes, false);
+    let unnormalized_laplacian = graph_laplacian(&graph.edge_index, graph.num_nodes, false)
+        .expect("operation should succeed");
     assert_eq!(unnormalized_laplacian.shape().dims(), &[4, 4]);
 
     // Laplacian should be symmetric (approximately)
@@ -304,16 +313,19 @@ fn test_graph_connectivity() {
     let graph = create_test_graph();
 
     // Test connectivity
-    let is_connected = connectivity::is_connected(&graph.edge_index, graph.num_nodes);
+    let is_connected = connectivity::is_connected(&graph.edge_index, graph.num_nodes)
+        .expect("operation should succeed");
     assert!(is_connected); // Our test graph should be connected
 
     // Test connected components
-    let components = connectivity::connected_components(&graph.edge_index, graph.num_nodes);
+    let components = connectivity::connected_components(&graph.edge_index, graph.num_nodes)
+        .expect("operation should succeed");
     assert_eq!(components.len(), 1); // Should be one component if connected
     assert_eq!(components[0].len(), 4); // All nodes in one component
 
     // Test largest component
-    let largest = connectivity::largest_component(&graph.edge_index, graph.num_nodes);
+    let largest = connectivity::largest_component(&graph.edge_index, graph.num_nodes)
+        .expect("operation should succeed");
     assert_eq!(largest.len(), 4);
 }
 
@@ -322,21 +334,24 @@ fn test_graph_metrics() {
     let graph = create_test_graph();
 
     // Test centrality measures
-    let centrality = metrics::node_centrality(&graph.edge_index, graph.num_nodes);
+    let centrality = metrics::node_centrality(&graph.edge_index, graph.num_nodes)
+        .expect("operation should succeed");
     assert_eq!(centrality.degree.shape().dims(), &[4]);
     assert_eq!(centrality.betweenness.shape().dims(), &[4]);
     assert_eq!(centrality.closeness.shape().dims(), &[4]);
     assert_eq!(centrality.eigenvector.shape().dims(), &[4]);
 
     // Test clustering coefficient
-    let clustering = metrics::clustering_coefficient(&graph.edge_index, graph.num_nodes);
+    let clustering = metrics::clustering_coefficient(&graph.edge_index, graph.num_nodes)
+        .expect("operation should succeed");
     assert_eq!(clustering.shape().dims(), &[4]);
 
     let clustering_vals = clustering.to_vec().unwrap();
     assert!(clustering_vals.iter().all(|&x| x >= 0.0 && x <= 1.0));
 
     // Test graph diameter
-    let diameter = metrics::graph_diameter(&graph.edge_index, graph.num_nodes);
+    let diameter = metrics::graph_diameter(&graph.edge_index, graph.num_nodes)
+        .expect("operation should succeed");
     assert!(diameter > 0 && diameter < graph.num_nodes);
 }
 
@@ -345,13 +360,17 @@ fn test_layer_chaining() {
     let graph = create_test_graph();
 
     // Chain multiple layers
-    let gcn1 = GCNConv::new(3, 8, true);
-    let gat = GATConv::new(8, 4, 2, 0.1, true); // 2 heads * 4 = 8 features
-    let gcn2 = GCNConv::new(8, 5, false);
+    let gcn1 = GCNConv::new(3, 8, true).expect("operation should succeed");
+    let gat = GATConv::new(8, 4, 2, 0.1, true).expect("operation should succeed"); // 2 heads * 4 = 8 features
+    let gcn2 = GCNConv::new(8, 5, false).expect("operation should succeed");
 
-    let intermediate1 = gcn1.forward(&graph);
-    let intermediate2 = gat.forward(&intermediate1);
-    let final_output = gcn2.forward(&intermediate2);
+    let intermediate1 = gcn1.forward(&graph).expect("operation should succeed");
+    let intermediate2 = gat
+        .forward(&intermediate1)
+        .expect("operation should succeed");
+    let final_output = gcn2
+        .forward(&intermediate2)
+        .expect("operation should succeed");
 
     assert_eq!(final_output.x.shape().dims(), &[4, 5]);
     assert_eq!(final_output.num_nodes, graph.num_nodes);
@@ -362,9 +381,9 @@ fn test_layer_chaining() {
 fn test_gradient_flow_simulation() {
     // Simulate gradient flow by checking that parameters can be accessed
     let graph = create_test_graph();
-    let gcn = GCNConv::new(3, 16, true);
+    let gcn = GCNConv::new(3, 16, true).expect("operation should succeed");
 
-    let output_graph = gcn.forward(&graph);
+    let output_graph = gcn.forward(&graph).expect("operation should succeed");
     let params = gcn.parameters();
 
     // Simulate a simple gradient update
@@ -389,8 +408,10 @@ fn test_numerical_stability() {
     let edge_index = from_vec(edges, &[2, 5], DeviceType::Cpu).unwrap();
     let extreme_graph = GraphData::new(x, edge_index);
 
-    let gcn = GCNConv::new(3, 8, true);
-    let output = gcn.forward(&extreme_graph);
+    let gcn = GCNConv::new(3, 8, true).expect("operation should succeed");
+    let output = gcn
+        .forward(&extreme_graph)
+        .expect("operation should succeed");
 
     // Check that output is finite
     let output_vals = output.x.to_vec().unwrap();
@@ -404,8 +425,10 @@ fn test_empty_graph_handling() {
     let edge_index = zeros(&[2, 0]).unwrap();
     let minimal_graph = GraphData::new(x, edge_index);
 
-    let gcn = GCNConv::new(3, 5, true);
-    let output = gcn.forward(&minimal_graph);
+    let gcn = GCNConv::new(3, 5, true).expect("operation should succeed");
+    let output = gcn
+        .forward(&minimal_graph)
+        .expect("operation should succeed");
 
     assert_eq!(output.num_nodes, 1);
     assert_eq!(output.num_edges, 0);
@@ -419,15 +442,16 @@ fn test_normalization_functions() {
     let graph = create_test_graph();
 
     // Test layer normalization
-    let layer_normed = normalization::layer_norm(&graph.x, 1e-8);
+    let layer_normed = normalization::layer_norm(&graph.x, 1e-8).expect("operation should succeed");
     assert_eq!(layer_normed.shape().dims(), graph.x.shape().dims());
 
     // Test graph normalization
-    let graph_normed = normalization::graph_norm(&graph.x, &graph.edge_index, graph.num_nodes);
+    let graph_normed = normalization::graph_norm(&graph.x, &graph.edge_index, graph.num_nodes)
+        .expect("operation should succeed");
     assert_eq!(graph_normed.shape().dims(), graph.x.shape().dims());
 
     // Test batch normalization
-    let batch_normed = normalization::batch_norm(&graph.x, 1e-8);
+    let batch_normed = normalization::batch_norm(&graph.x, 1e-8).expect("operation should succeed");
     assert_eq!(batch_normed.shape().dims(), graph.x.shape().dims());
 }
 
@@ -438,7 +462,7 @@ fn test_dropout_behavior() {
     let input = randn(&[100]).unwrap();
 
     // Test training mode
-    let dropped_training = dropout(&input, 0.5, true);
+    let dropped_training = dropout(&input, 0.5, true).expect("operation should succeed");
     let dropped_values = dropped_training.to_vec().unwrap();
     let num_zeros = dropped_values.iter().filter(|&&x| x == 0.0).count();
 
@@ -446,7 +470,7 @@ fn test_dropout_behavior() {
     assert!(num_zeros > 10 && num_zeros < 90); // Roughly 50% with some variance
 
     // Test eval mode (no dropout)
-    let dropped_eval = dropout(&input, 0.5, false);
+    let dropped_eval = dropout(&input, 0.5, false).expect("operation should succeed");
     let original_values = input.to_vec().unwrap();
     let eval_values = dropped_eval.to_vec().unwrap();
 
@@ -471,9 +495,12 @@ fn test_mpnn_layer() {
     ];
 
     for &agg_type in &aggregation_types {
-        let mpnn = MPNNConv::new(3, 8, 2, 16, 16, agg_type, true);
+        let mpnn =
+            MPNNConv::new(3, 8, 2, 16, 16, agg_type, true).expect("operation should succeed");
 
-        let output_graph = mpnn.forward(&graph_with_attrs);
+        let output_graph = mpnn
+            .forward(&graph_with_attrs)
+            .expect("operation should succeed");
 
         assert_eq!(output_graph.num_nodes, graph.num_nodes);
         assert_eq!(output_graph.num_edges, graph.num_edges);
@@ -492,9 +519,10 @@ fn test_mpnn_layer() {
 #[test]
 fn test_mpnn_without_edge_attributes() {
     let graph = create_test_graph();
-    let mpnn = MPNNConv::new(3, 6, 0, 12, 12, AggregationType::Mean, false);
+    let mpnn = MPNNConv::new(3, 6, 0, 12, 12, AggregationType::Mean, false)
+        .expect("operation should succeed");
 
-    let output_graph = mpnn.forward(&graph);
+    let output_graph = mpnn.forward(&graph).expect("operation should succeed");
 
     assert_eq!(output_graph.num_nodes, graph.num_nodes);
     assert_eq!(output_graph.x.shape().dims(), &[4, 6]);
@@ -510,27 +538,28 @@ fn test_comprehensive_layer_pipeline() {
     let graph = create_test_graph();
 
     // Stage 1: GCN for initial feature transformation
-    let gcn = GCNConv::new(3, 16, true);
-    let stage1 = gcn.forward(&graph);
+    let gcn = GCNConv::new(3, 16, true).expect("operation should succeed");
+    let stage1 = gcn.forward(&graph).expect("operation should succeed");
     assert_eq!(stage1.x.shape().dims(), &[4, 16]);
 
     // Stage 2: GAT for attention-based refinement
-    let gat = GATConv::new(16, 8, 2, 0.1, true); // 2 heads * 8 = 16 features
-    let stage2 = gat.forward(&stage1);
+    let gat = GATConv::new(16, 8, 2, 0.1, true).expect("operation should succeed"); // 2 heads * 8 = 16 features
+    let stage2 = gat.forward(&stage1).expect("operation should succeed");
     assert_eq!(stage2.x.shape().dims(), &[4, 16]);
 
     // Stage 3: MPNN for message passing
-    let mpnn = MPNNConv::new(16, 12, 0, 24, 24, AggregationType::Mean, true);
-    let stage3 = mpnn.forward(&stage2);
+    let mpnn = MPNNConv::new(16, 12, 0, 24, 24, AggregationType::Mean, true)
+        .expect("operation should succeed");
+    let stage3 = mpnn.forward(&stage2).expect("operation should succeed");
     assert_eq!(stage3.x.shape().dims(), &[4, 12]);
 
     // Stage 4: GIN for final representation
-    let gin = GINConv::new(12, 8, 0.0, false, true);
-    let stage4 = gin.forward(&stage3);
+    let gin = GINConv::new(12, 8, 0.0, false, true).expect("operation should succeed");
+    let stage4 = gin.forward(&stage3).expect("operation should succeed");
     assert_eq!(stage4.x.shape().dims(), &[4, 8]);
 
     // Stage 5: Global pooling to graph-level representation
-    let graph_repr = global::global_mean_pool(&stage4);
+    let graph_repr = global::global_mean_pool(&stage4).expect("operation should succeed");
     assert_eq!(graph_repr.shape().dims(), &[8]);
 
     // Verify all intermediate outputs are finite
@@ -549,7 +578,7 @@ fn test_scirs2_algorithms_integration() {
     let graph = create_test_graph();
 
     // Test PageRank
-    let pagerank_scores = algorithms::pagerank(&graph, 0.85, 50);
+    let pagerank_scores = algorithms::pagerank(&graph, 0.85, 50).expect("operation should succeed");
     assert_eq!(pagerank_scores.shape().dims(), &[4]);
 
     let pr_vals = pagerank_scores.to_vec().unwrap();
@@ -568,13 +597,14 @@ fn test_scirs2_algorithms_integration() {
     assert!(clusters.iter().all(|&c| c < 2)); // Should be 2 clusters
 
     // Test centrality measures
-    let betweenness = algorithms::betweenness_centrality(&graph);
+    let betweenness = algorithms::betweenness_centrality(&graph).expect("operation should succeed");
     assert_eq!(betweenness.shape().dims(), &[4]);
 
-    let closeness = algorithms::closeness_centrality(&graph);
+    let closeness = algorithms::closeness_centrality(&graph).expect("operation should succeed");
     assert_eq!(closeness.shape().dims(), &[4]);
 
-    let eigenvector = algorithms::eigenvector_centrality(&graph, 100);
+    let eigenvector =
+        algorithms::eigenvector_centrality(&graph, 100).expect("operation should succeed");
     assert_eq!(eigenvector.shape().dims(), &[4]);
 
     // Test connectivity analysis
@@ -596,25 +626,25 @@ fn test_scirs2_algorithms_integration() {
 #[test]
 fn test_scirs2_graph_generation() {
     // Test Erdős-Rényi graph generation
-    let er_graph = generation::erdos_renyi(8, 0.3);
+    let er_graph = generation::erdos_renyi(8, 0.3).expect("operation should succeed");
     assert_eq!(er_graph.num_nodes, 8);
     assert_eq!(er_graph.x.shape().dims(), &[8, 16]); // Default features
                                                      // num_edges is usize, always >= 0
 
     // Test Barabási-Albert graph generation
-    let ba_graph = generation::barabasi_albert(10, 3);
+    let ba_graph = generation::barabasi_albert(10, 3).expect("operation should succeed");
     assert_eq!(ba_graph.num_nodes, 10);
     assert_eq!(ba_graph.x.shape().dims(), &[10, 16]);
     assert!(ba_graph.num_edges > 0); // Should have edges due to preferential attachment
 
     // Test Watts-Strogatz graph generation
-    let ws_graph = generation::watts_strogatz(12, 4, 0.2);
+    let ws_graph = generation::watts_strogatz(12, 4, 0.2).expect("operation should succeed");
     assert_eq!(ws_graph.num_nodes, 12);
     assert_eq!(ws_graph.x.shape().dims(), &[12, 16]);
     assert!(ws_graph.num_edges > 0);
 
     // Test complete graph generation
-    let complete_graph = generation::complete(5);
+    let complete_graph = generation::complete(5).expect("operation should succeed");
     assert_eq!(complete_graph.num_nodes, 5);
     assert_eq!(complete_graph.x.shape().dims(), &[5, 16]);
     // Complete graph stores bidirectional edges: n*(n-1) directed edges
@@ -638,18 +668,18 @@ fn test_scirs2_spatial_graphs() {
     .unwrap();
 
     // Test k-NN graph construction
-    let knn_graph = spatial::knn_graph(&points, 2);
+    let knn_graph = spatial::knn_graph(&points, 2).expect("operation should succeed");
     assert_eq!(knn_graph.num_nodes, 5);
     assert!(knn_graph.num_edges > 0);
     assert_eq!(knn_graph.x.shape().dims(), &[5, 2]); // Should preserve point coordinates
 
     // Test radius graph construction
-    let radius_graph = spatial::radius_graph(&points, 1.5);
+    let radius_graph = spatial::radius_graph(&points, 1.5).expect("operation should succeed");
     assert_eq!(radius_graph.num_nodes, 5);
     assert!(radius_graph.num_edges > 0);
 
     // Test Delaunay triangulation (approximation)
-    let delaunay_graph = spatial::delaunay_graph(&points);
+    let delaunay_graph = spatial::delaunay_graph(&points).expect("operation should succeed");
     assert_eq!(delaunay_graph.num_nodes, 5);
     // num_edges is usize, always >= 0
 }
@@ -657,19 +687,24 @@ fn test_scirs2_spatial_graphs() {
 #[test]
 fn test_advanced_pooling_with_generated_graphs() {
     // Test pooling on a larger generated graph
-    let large_graph = generation::erdos_renyi(20, 0.15);
+    let large_graph = generation::erdos_renyi(20, 0.15).expect("operation should succeed");
 
     // Test hierarchical pooling
-    let diffpool = hierarchical::DiffPool::new(16, 5); // Pool from 20 to 5 nodes
-    let (pooled_graph, aux_loss) = diffpool.forward(&large_graph);
+    let diffpool = hierarchical::DiffPool::new(16, 5).expect("operation should succeed"); // Pool from 20 to 5 nodes
+    let (pooled_graph, aux_loss) = diffpool
+        .forward(&large_graph)
+        .expect("operation should succeed");
 
     assert_eq!(pooled_graph.num_nodes, 5);
     assert_eq!(pooled_graph.x.shape().dims(), &[5, 16]);
     assert!(aux_loss.to_vec().unwrap()[0].is_finite());
 
     // Test TopK pooling
-    let topk_pool = hierarchical::TopKPool::new(16, 0.4, Some(0.1)); // Keep 40% with minimum score
-    let topk_pooled = topk_pool.forward(&large_graph);
+    let topk_pool =
+        hierarchical::TopKPool::new(16, 0.4, Some(0.1)).expect("operation should succeed"); // Keep 40% with minimum score
+    let topk_pooled = topk_pool
+        .forward(&large_graph)
+        .expect("operation should succeed");
 
     assert!(topk_pooled.num_nodes <= large_graph.num_nodes);
     assert!(topk_pooled.num_nodes >= 1);
@@ -697,13 +732,14 @@ fn test_numerical_robustness_comprehensive() {
     graph.x = extreme_features;
 
     // Test through multiple layers
-    let gcn = GCNConv::new(3, 8, true);
-    let sage = SAGEConv::new(8, 6, true);
-    let mpnn = MPNNConv::new(6, 4, 0, 12, 12, AggregationType::Mean, true);
+    let gcn = GCNConv::new(3, 8, true).expect("operation should succeed");
+    let sage = SAGEConv::new(8, 6, true).expect("operation should succeed");
+    let mpnn = MPNNConv::new(6, 4, 0, 12, 12, AggregationType::Mean, true)
+        .expect("operation should succeed");
 
-    let stage1 = gcn.forward(&graph);
-    let stage2 = sage.forward(&stage1);
-    let stage3 = mpnn.forward(&stage2);
+    let stage1 = gcn.forward(&graph).expect("operation should succeed");
+    let stage2 = sage.forward(&stage1).expect("operation should succeed");
+    let stage3 = mpnn.forward(&stage2).expect("operation should succeed");
 
     // All outputs should be finite
     let stages = [&stage1, &stage2, &stage3];
@@ -713,7 +749,7 @@ fn test_numerical_robustness_comprehensive() {
     }
 
     // Test pooling on extreme values
-    let pooled = global::global_mean_pool(&stage3);
+    let pooled = global::global_mean_pool(&stage3).expect("operation should succeed");
     let pooled_vals = pooled.to_vec().unwrap();
     assert!(pooled_vals.iter().all(|&x| x.is_finite()));
 }
@@ -723,9 +759,9 @@ fn test_graph_level_prediction_pipeline() {
     // Simulate a complete graph-level prediction pipeline
     let graphs = vec![
         create_test_graph(),
-        generation::erdos_renyi(6, 0.4),
-        generation::barabasi_albert(5, 2),
-        generation::complete(4),
+        generation::erdos_renyi(6, 0.4).expect("operation should succeed"),
+        generation::barabasi_albert(5, 2).expect("operation should succeed"),
+        generation::complete(4).expect("operation should succeed"),
     ];
 
     let mut graph_embeddings = Vec::new();
@@ -740,23 +776,25 @@ fn test_graph_level_prediction_pipeline() {
             }, // Handle different input dims
             32,
             true,
-        );
-        let gat = GATConv::new(32, 8, 4, 0.1, true); // 4 heads * 8 = 32 features
-        let mpnn = MPNNConv::new(32, 16, 0, 48, 48, AggregationType::Sum, true);
+        )
+        .expect("operation should succeed");
+        let gat = GATConv::new(32, 8, 4, 0.1, true).expect("operation should succeed"); // 4 heads * 8 = 32 features
+        let mpnn = MPNNConv::new(32, 16, 0, 48, 48, AggregationType::Sum, true)
+            .expect("operation should succeed");
 
-        let h1 = gcn1.forward(&graph);
-        let h2 = gat.forward(&h1);
-        let h3 = mpnn.forward(&h2);
+        let h1 = gcn1.forward(&graph).expect("operation should succeed");
+        let h2 = gat.forward(&h1).expect("operation should succeed");
+        let h3 = mpnn.forward(&h2).expect("operation should succeed");
 
         // Graph-level pooling
-        let graph_embedding = global::global_mean_pool(&h3);
+        let graph_embedding = global::global_mean_pool(&h3).expect("operation should succeed");
         graph_embeddings.push(graph_embedding);
     }
 
     // Verify all embeddings have the same dimension
     assert!(graph_embeddings
         .iter()
-        .all(|emb| emb.shape().dims() == &[16]));
+        .all(|emb| emb.shape().dims() == [16]));
 
     // Verify all embeddings are finite
     for embedding in graph_embeddings {

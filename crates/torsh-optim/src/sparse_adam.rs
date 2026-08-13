@@ -102,7 +102,7 @@ impl SparseAdam {
         let update = exp_avg_corrected.div(&denom)?;
 
         // Apply update
-        *param = param.sub(&update.mul_scalar(lr)?)?;
+        crate::param_update::sub_assign(&mut *param, &update.mul_scalar(lr)?)?;
 
         Ok(())
     }

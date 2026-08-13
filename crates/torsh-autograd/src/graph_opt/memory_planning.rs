@@ -7,6 +7,7 @@
 use super::graph_types::*;
 use std::collections::HashSet;
 use torsh_core::error::Result;
+use torsh_core::sync::RwLockExt;
 
 impl OptimizedGraph {
     /// Plan memory usage for optimal execution
@@ -96,10 +97,7 @@ impl OptimizedGraph {
         }
 
         // Update graph statistics
-        self.stats
-            .write()
-            .expect("lock should not be poisoned")
-            .peak_memory_bytes = memory_tracker.peak_memory;
+        self.stats.write_or_recover().peak_memory_bytes = memory_tracker.peak_memory;
 
         tracing::debug!(
             "Memory planning complete - Peak usage: {} bytes, Budget: {} bytes, Efficiency: {:.2}%",

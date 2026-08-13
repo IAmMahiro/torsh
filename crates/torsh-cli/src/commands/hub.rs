@@ -173,7 +173,7 @@ async fn download_model(args: DownloadArgs) -> Result<()> {
         "README.md",
     ];
 
-    let client = reqwest::Client::new();
+    let client = crate::tls::client_builder()?.build()?;
     let pb = progress::create_progress_bar(files.len() as u64, "Downloading model files...");
 
     let mut downloaded = 0;

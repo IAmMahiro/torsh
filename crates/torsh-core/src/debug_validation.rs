@@ -137,13 +137,13 @@ pub fn validate_shape_valid(shape: &Shape) -> Result<()> {
     }
 
     // Check for overflow in element count (standard validation)
+    //
+    // NOTE: `Shape::numel()` saturates to `usize::MAX` on overflow (it no
+    // longer wraps to zero), so a `numel() == 0` check can never detect
+    // overflow. Use the fallible `try_numel()` instead, which reports
+    // overflow as an explicit error.
     if config.should_validate_standard() {
-        let numel = shape.numel();
-        if numel == 0 && !shape.dims().is_empty() {
-            return Err(TorshError::InvalidShape(
-                "Shape element count overflowed to zero".to_string(),
-            ));
-        }
+        shape.try_numel()?;
     }
 
     Ok(())

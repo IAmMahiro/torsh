@@ -163,7 +163,6 @@ This will:
 - Perform comprehensive statistical analysis with bottleneck detection
 - Generate detailed reports including system info, analysis, and optimization guides
 - Provide actionable insights for performance improvements
-```
 
 ## Benchmark Categories
 
@@ -248,20 +247,22 @@ for regression in regressions {
 
 ## Environment Setup
 
-For consistent benchmarking results:
+For consistent benchmarking results, `Environment` reports on and validates the current machine before you run benchmarks:
 
 ```rust
 use torsh_benches::utils::Environment;
 
-Environment::setup_for_benchmarking();
-// Run benchmarks
-Environment::restore_environment();
+let info = Environment::get_info();
+println!("{}", info.summary());
+
+if !Environment::is_suitable_for_benchmarking() {
+    eprintln!("Warning: environment may not be suitable for stable benchmarking");
+}
 ```
 
-This will:
-- Set high process priority
-- Disable CPU frequency scaling (if possible)
-- Set CPU affinity for consistent results
+This checks:
+- Optimal thread count for the current machine
+- CPU frequency stability, system load, and whether a debugger is attached
 
 ## Integration with CI/CD
 
@@ -314,3 +315,7 @@ See existing benchmarks in `benches/` for examples.
 - Ensure all ToRSh crates are up to date
 - Check feature flag compatibility
 - Verify external library versions
+
+## Testing
+
+This crate is primarily a Criterion benchmark harness (`cargo bench`), not a unit-test suite: the library's `[lib] test = false` / `doctest = false` (see `Cargo.toml`) intentionally disables `cargo test`/`cargo nextest run`, since the `--all-features` build enables pyo3-backed comparison features (`pytorch`/`tensorflow`/`jax`/`numpy_baseline`) whose test binary has Python symbol-resolution issues under the workspace build. As a result, `cargo nextest run -p torsh-benches --all-features` reports 0 tests by design; use `cargo bench` to exercise the benchmark suites.

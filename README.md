@@ -99,12 +99,12 @@ Add ToRSh to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-torsh = "0.1.3"
-torsh-nn = "0.1.3"      # Neural networks
-torsh-graph = "0.1.3"   # Graph neural networks
-torsh-series = "0.1.3"  # Time series analysis
-torsh-vision = "0.1.3"  # Computer vision
-torsh-metrics = "0.1.3" # Evaluation metrics
+torsh = "0.2.0"
+torsh-nn = "0.2.0"      # Neural networks
+torsh-graph = "0.2.0"   # Graph neural networks
+torsh-series = "0.2.0"  # Time series analysis
+torsh-vision = "0.2.0"  # Computer vision
+torsh-metrics = "0.2.0" # Evaluation metrics
 ```
 
 ## 🚀 Quick Start
@@ -340,7 +340,9 @@ not publish fixed per-domain figures that cannot be reproduced from this repo.
 
 ### Roadmap
 
-**v0.1.3 (Current)** - *2026-06-30* — GPU backend migration to oxicuda 0.3: real CUDA execution on A4000 via PTX kernels, MOS (Mathematical Operations Suite) enhancements with expanded special-function coverage, CUDA backend integration for tensor core ops
+**v0.2.0 (In progress)** — *Production-hardening & Python-bindings release*. Two threads: (1) **Python/correctness** — pyo3 0.29 migration with real `Tensor` operator overloads (`+`/`-`/`*`/`/`/`@`), 6 PyTorch-compatible LR schedulers (`StepLR`, `MultiStepLR`, `ExponentialLR`, `CosineAnnealingLR`, `LinearLR`, `ReduceLROnPlateau`), real optimizer `state_dict()`/`load_state_dict()` checkpointing, real WebGPU cross-backend buffer transfers (previously a silent no-op), real autograd hyperparameter-optimization gradients (previously always zero), real Wavelet Packet Transform + lifting DWT/IDWT in torsh-signal (previously returned zeros), MPI all-gather/barrier fixes, and UB/correctness fixes found via Miri. (2) **Hardening campaign** — dependency truth-up (scirs2 0.6.5, oxicuda 0.5.4, oxifft 0.4.2, oxiarc 0.4.1, oxicode 0.2.6, oxionnx 0.1.6), legacy CUDA C-FFI backend removed in favor of the pure-Rust oxicuda stack (`cust`/`cuda-sys`/`cudnn-sys` dropped), real RNG seeding, completed autograd backward coverage (mul/div/matmul/cat/stack/narrow/log_softmax), real filter-design/eig/svd, security fixes (tar/zip-slip guards, integrity checks, Ed25519 signing), a real TCP distributed backend, and honest `Err` returns replacing fabricated success across many crates. See `CHANGELOG.md` for the full list.
+
+**v0.1.3** - *2026-06-30* — GPU backend migration to oxicuda 0.3: real CUDA execution on A4000 via PTX kernels, MOS (Mathematical Operations Suite) enhancements with expanded special-function coverage, CUDA backend integration for tensor core ops
 
 **v0.1.2** - *2026-04-26* — SIMD performance release: real AVX2/NEON dispatch for f32 arithmetic and activations, true buffer pool reuse (100% alloc reduction proven by dhat benchmark), criterion regression framework, streaming TAR extraction in torsh-hub, simd+parallel enabled by default
 
@@ -350,13 +352,7 @@ not publish fixed per-domain figures that cannot be reproduced from this repo.
 - ✅ Essential neural network layers
 - ✅ CPU backend with SIMD optimizations
 - ✅ Comprehensive SciRS2 integration (18 crates)
-- ✅ 100% Pure Rust (default features)
-
-**v0.2.0** - *Performance & Polish*
-- 🔄 Enhanced CUDA backend with cuDNN integration
-- 🔄 Enhanced distributed training capabilities
-- 🔄 Performance optimization and profiling tools
-- 🔄 Comprehensive documentation and examples
+- ✅ Pure-Rust default features (no C/C++/Fortran compiled; CUDA/MPI/HDF5/Arrow are opt-in feature flags)
 
 **v1.0 Vision** - *Production Ready*
 - 🎯 95%+ PyTorch API compatibility for common workflows
@@ -416,6 +412,7 @@ ToRSh follows a modular architecture with specialized crates:
 - **`torsh-sparse`** [![crates.io](https://img.shields.io/crates/v/torsh-sparse.svg)](https://crates.io/crates/torsh-sparse) - Sparse tensor operations
 - **`torsh-quantization`** [![crates.io](https://img.shields.io/crates/v/torsh-quantization.svg)](https://crates.io/crates/torsh-quantization) - Model quantization and compression
 - **`torsh-text`** [![crates.io](https://img.shields.io/crates/v/torsh-text.svg)](https://crates.io/crates/torsh-text) - Natural language processing
+- **`torsh-models`** [![crates.io](https://img.shields.io/crates/v/torsh-models.svg)](https://crates.io/crates/torsh-models) - Model zoo & architectures (ResNet, Vision Transformer; others on the roadmap)
 
 ### ⚡ Performance and Analysis
 - **`torsh-benches`** [![crates.io](https://img.shields.io/crates/v/torsh-benches.svg)](https://crates.io/crates/torsh-benches) - Comprehensive benchmark suite
@@ -426,6 +423,7 @@ ToRSh follows a modular architecture with specialized crates:
 - **`torsh-distributed`** [![crates.io](https://img.shields.io/crates/v/torsh-distributed.svg)](https://crates.io/crates/torsh-distributed) - Distributed training (DDP, FSDP, pipeline parallel)
 - **`torsh-jit`** [![crates.io](https://img.shields.io/crates/v/torsh-jit.svg)](https://crates.io/crates/torsh-jit) - JIT compilation and optimization
 - **`torsh-fx`** [![crates.io](https://img.shields.io/crates/v/torsh-fx.svg)](https://crates.io/crates/torsh-fx) - Graph-level transformations and analysis
+- **`torsh-hub`** [![crates.io](https://img.shields.io/crates/v/torsh-hub.svg)](https://crates.io/crates/torsh-hub) - Model hub: download, cache, and versioning
 
 ### 🧰 Utilities & Tools
 - **`torsh-linalg`** [![crates.io](https://img.shields.io/crates/v/torsh-linalg.svg)](https://crates.io/crates/torsh-linalg) - Linear algebra operations
@@ -435,8 +433,13 @@ ToRSh follows a modular architecture with specialized crates:
 - **`torsh-cluster`** [![crates.io](https://img.shields.io/crates/v/torsh-cluster.svg)](https://crates.io/crates/torsh-cluster) - Clustering algorithms
 - **`torsh-package`** [![crates.io](https://img.shields.io/crates/v/torsh-package.svg)](https://crates.io/crates/torsh-package) - Model packaging and export
 - **`torsh-utils`** [![crates.io](https://img.shields.io/crates/v/torsh-utils.svg)](https://crates.io/crates/torsh-utils) - Common utilities
-- **`torsh-ffi`** [![crates.io](https://img.shields.io/crates/v/torsh-ffi.svg)](https://crates.io/crates/torsh-ffi) - C/Python FFI bindings
+- **`torsh-ffi`** [![crates.io](https://img.shields.io/crates/v/torsh-ffi.svg)](https://crates.io/crates/torsh-ffi) - C / Node.js (N-API) FFI bindings and NumPy/pandas/SciPy interop bridge
+- **`torsh-python`** [![crates.io](https://img.shields.io/crates/v/torsh-python.svg)](https://crates.io/crates/torsh-python) - PyO3 Python bindings (`import rstorch`)
 - **`torsh-cli`** [![crates.io](https://img.shields.io/crates/v/torsh-cli.svg)](https://crates.io/crates/torsh-cli) - Command-line interface
+
+> **32 workspace crates total.** `torsh-python` and `torsh-ffi` are the binding
+> layers (PyO3 and C/N-API respectively) and are excluded from the default test
+> set; everything else builds and tests as part of the workspace.
 
 ## 🔬 SciRS2 Integration Details
 
@@ -457,7 +460,7 @@ ToRSh achieves **100% SciRS2 ecosystem integration** across 19 specialized crate
 | Datasets | `scirs2-datasets` [![crates.io](https://img.shields.io/crates/v/scirs2-datasets.svg)](https://crates.io/crates/scirs2-datasets) | Built-in datasets and data loading |
 | Text | `scirs2-text` [![crates.io](https://img.shields.io/crates/v/scirs2-text.svg)](https://crates.io/crates/scirs2-text) | NLP preprocessing and analysis |
 | Autograd | `scirs2-autograd` [![crates.io](https://img.shields.io/crates/v/scirs2-autograd.svg)](https://crates.io/crates/scirs2-autograd) | Advanced differentiation engine |
-| + 6 more | `scirs2-image`, `scirs2-signal`, `scirs2-ode`, `scirs2-optimize-genetic`, `scirs2-integrate`, `scirs2-sparse` | Specialized scientific computing |
+| + 6 more | `scirs2-signal`, `scirs2-sparse`, `scirs2-special`, `scirs2-fft`, `scirs2-vision`, `scirs2-numpy` | Specialized scientific computing |
 
 ## 🎯 PyTorch Migration Guide
 
@@ -538,7 +541,9 @@ make format    # Code formatting
 make audit     # Security audit
 ```
 
-**Test Coverage**: 10,170 tests across all modules.
+**Test Coverage**: 10,638 tests passing across the default workspace members
+(`cargo nextest run`, 0 failed). The count excludes the PyO3/N-API binding crates
+(`torsh-python`, `torsh-ffi`) and `torsh-benches`, which are tested separately.
 
 ## 📈 Performance Benchmarks
 
@@ -592,7 +597,7 @@ make docs     # Build documentation
 
 ### Getting Started
 
-- ✅ Core functionality is stable and tested (10,170 tests passing)
+- ✅ Core functionality is stable and tested (10,638 tests passing)
 - ✅ APIs are stabilized for core crates
 - ⚠️ Some advanced features are still under active development
 - ✅ Comprehensive documentation available
@@ -640,6 +645,6 @@ If you find Torsh useful, please consider sponsoring the project to support cont
 
 Your sponsorship helps us:
 - Maintain and improve the COOLJAPAN ecosystem
-- Keep the entire ecosystem (OxiBLAS, OxiFFT, SciRS2, etc.) 100% Pure Rust
+- Keep the entire ecosystem (OxiBLAS, OxiFFT, SciRS2, etc.) Pure Rust
 - Provide long-term support and security updates
 

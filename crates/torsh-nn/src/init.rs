@@ -1,7 +1,7 @@
 //! Parameter initialization functions
 
 // ✅ SciRS2 Policy Compliant - Using scirs2_core::random instead of direct rand
-use scirs2_core::random::{quick::random_f32, thread_rng};
+use scirs2_core::random::quick::random_f32;
 use scirs2_core::slice_random::shuffle;
 use torsh_core::error::{Result, TorshError};
 use torsh_tensor::{creation::*, Tensor};
@@ -97,7 +97,12 @@ pub enum Nonlinearity {
 }
 
 impl Nonlinearity {
-    /// Calculate the gain for this nonlinearity
+    /// Recommended gain for this nonlinearity.
+    ///
+    /// The values match `torch.nn.init.calculate_gain` where PyTorch defines
+    /// one — note that SELU's gain is `3/4`, *not* `sqrt(3/4)`. `ELU` and
+    /// `Swish` are not covered by PyTorch; the values documented below are the
+    /// ones ToRSh uses.
     pub fn gain(&self) -> f32 {
         match self {
             Nonlinearity::ReLU => (2.0_f32).sqrt(),
@@ -106,8 +111,12 @@ impl Nonlinearity {
             }
             Nonlinearity::Tanh => (5.0_f32 / 3.0_f32).sqrt(),
             Nonlinearity::Sigmoid => 1.0,
-            Nonlinearity::SELU => (3.0_f32 / 4.0_f32).sqrt(),
-            Nonlinearity::ELU => (5.0_f32 / 3.0_f32).sqrt(),
+            // torch.nn.init.calculate_gain('selu') == 3/4.
+            Nonlinearity::SELU => 3.0_f32 / 4.0_f32,
+            // ELU behaves like the identity for x > 0 and saturates below, so
+            // ToRSh uses the linear gain rather than borrowing Tanh's.
+            Nonlinearity::ELU => 1.0,
+            // Swish/SiLU is close to a (leaky) ReLU in the positive half-plane.
             Nonlinearity::Swish => (2.0_f32).sqrt(),
             Nonlinearity::Linear => 1.0,
         }
@@ -458,6 +467,23 @@ pub fn uniform(shape: &[usize], low: f32, high: f32) -> Result<Tensor> {
         .map_err(|e| TorshError::RuntimeError(format!("Failed to create uniform tensor: {}", e)))
 }
 
+/// Box-Muller transform of two uniform draws into one standard-normal sample.
+///
+/// `random_f32` samples the half-open interval `[0, 1)`, so `u1` can be exactly
+/// `0.0`; `0f32.ln()` is `-inf` and would poison the sample (and through it the
+/// whole initialized layer). Clamping `u1` to the smallest positive normal keeps
+/// the transform finite while perturbing the distribution by less than one part
+/// in 2^24.
+fn box_muller(u1: f32, u2: f32) -> f32 {
+    let u1 = u1.max(f32::MIN_POSITIVE);
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+}
+
+/// Draw a single standard-normal sample with the Box-Muller transform.
+fn standard_normal() -> f32 {
+    box_muller(random_f32(), random_f32())
+}
+
 /// Normal initialization
 pub fn normal(shape: &[usize], mean: f32, std: f32) -> Result<Tensor> {
     if std <= 0.0 {
@@ -467,15 +493,7 @@ pub fn normal(shape: &[usize], mean: f32, std: f32) -> Result<Tensor> {
     }
 
     let size = shape.iter().product();
-    let values: Vec<f32> = (0..size)
-        .map(|_| {
-            // Box-Muller transform for normal distribution
-            let u1 = random_f32();
-            let u2 = random_f32();
-            let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
-            mean + z0 * std
-        })
-        .collect();
+    let values: Vec<f32> = (0..size).map(|_| mean + standard_normal() * std).collect();
 
     Tensor::from_vec(values, shape)
         .map_err(|e| TorshError::RuntimeError(format!("Failed to create normal tensor: {}", e)))
@@ -515,11 +533,7 @@ pub fn truncated_normal(shape: &[usize], mean: f32, std: f32, a: f32, b: f32) ->
 
     for _ in 0..size {
         loop {
-            // Box-Muller transform for normal distribution
-            let u1 = random_f32();
-            let u2 = random_f32();
-            let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
-            let sample = mean + z0 * std;
+            let sample = mean + standard_normal() * std;
             if sample >= a && sample <= b {
                 values.push(sample);
                 break;
@@ -563,6 +577,13 @@ pub fn eye_init_tensor(shape: &[usize]) -> Result<Tensor> {
 /// using QR decomposition of a random Gaussian matrix. This initialization
 /// helps preserve gradient norms during backpropagation, improving training stability.
 ///
+/// Tensors of rank > 2 are handled the way `torch.nn.init.orthogonal_` does:
+/// the trailing axes are flattened, so a conv weight `[O, I, kh, kw]` is
+/// orthogonalized as an `[O, I*kh*kw]` matrix and then reshaped back.
+///
+/// The result satisfies `Q Q^T = I` when `rows <= cols` and `Q^T Q = I`
+/// otherwise, scaled by `gain`.
+///
 /// # Arguments
 /// * `shape` - Shape of the tensor (must be at least 2D)
 /// * `gain` - Scaling factor applied to the orthogonal matrix
@@ -577,56 +598,48 @@ pub fn orthogonal_init(shape: &[usize], gain: f32) -> Result<Tensor> {
     }
 
     let num_rows = shape[0];
-    let num_cols = shape[1];
+    let num_cols: usize = shape[1..].iter().product();
 
-    // Generate a random Gaussian matrix
-    // For non-square matrices, we need the larger dimension for proper orthogonalization
-    let (qr_rows, qr_cols) = if num_rows < num_cols {
+    if num_rows == 0 || num_cols == 0 {
+        return Err(TorshError::InvalidArgument(format!(
+            "Orthogonal initialization requires a non-empty shape, got {shape:?}"
+        )));
+    }
+
+    // QR needs a tall matrix, so the flattened weight is orthogonalized in its
+    // tall orientation and transposed afterwards when it is actually wide.
+    let transposed = num_rows < num_cols;
+    let (qr_rows, qr_cols) = if transposed {
         (num_cols, num_rows)
     } else {
         (num_rows, num_cols)
     };
 
-    // Generate random Gaussian tensor for QR decomposition
     let random_tensor = normal(&[qr_rows, qr_cols], 0.0, 1.0)?;
+    let (q, r) = torsh_linalg::decomposition::qr(&random_tensor)?;
 
-    // Perform QR decomposition to get orthogonal Q matrix
-    let (q, _r) = torsh_linalg::decomposition::qr(&random_tensor)?;
-
-    // Extract the portion we need
-    let orthogonal_tensor = if num_rows < num_cols {
-        // Transpose: we generated (num_cols × num_rows), need (num_rows × num_cols)
-        // Extract first num_rows columns and transpose
-        let mut values = Vec::with_capacity(num_rows * num_cols);
-        for col in 0..num_cols {
-            for row in 0..num_rows {
-                values.push(q.get(&[col, row])?);
-            }
-        }
-        Tensor::from_vec(values, &[num_rows, num_cols])?
-    } else {
-        // Normal case: extract first num_rows × num_cols portion
-        let mut values = Vec::with_capacity(num_rows * num_cols);
-        for row in 0..num_rows {
-            for col in 0..num_cols {
-                values.push(q.get(&[row, col])?);
-            }
-        }
-        Tensor::from_vec(values, &[num_rows, num_cols])?
-    };
-
-    // Apply gain scaling
-    if (gain - 1.0).abs() > 1e-6 {
-        // Scale all values by gain
-        let values: Vec<f32> = orthogonal_tensor
-            .to_vec()?
-            .iter()
-            .map(|&v| v * gain)
-            .collect();
-        Tensor::from_vec(values, shape)
-    } else {
-        Ok(orthogonal_tensor)
+    // Householder QR is only unique up to the signs of the diagonal of R.
+    // Multiplying column j of Q by sign(R[j][j]) makes the draw uniform over
+    // the (semi-)orthogonal matrices, matching `torch.nn.init.orthogonal_`.
+    let mut signs = Vec::with_capacity(qr_cols);
+    for j in 0..qr_cols {
+        let diagonal = r.get(&[j, j])?;
+        signs.push(if diagonal < 0.0 { -1.0f32 } else { 1.0f32 });
     }
+
+    // `values[row * num_cols + col]` is the (row, col) entry of the result.
+    let mut values = vec![0.0f32; num_rows * num_cols];
+    for row in 0..num_rows {
+        for col in 0..num_cols {
+            // When transposed, entry (row, col) of the result is entry
+            // (col, row) of Q.
+            let (q_row, q_col) = if transposed { (col, row) } else { (row, col) };
+            values[row * num_cols + col] = q.get(&[q_row, q_col])? * signs[q_col] * gain;
+        }
+    }
+
+    Tensor::from_vec(values, shape)
+        .map_err(|e| TorshError::RuntimeError(format!("Failed to create orthogonal tensor: {e}")))
 }
 
 /// Sparse initialization
@@ -650,14 +663,9 @@ pub fn sparse_init(shape: &[usize], sparsity: f32, std: f32) -> Result<Tensor> {
 
     // Start with normal initialization
     let mut values = Vec::with_capacity(total_elements);
-    let _rng = thread_rng();
 
     for _ in 0..total_elements {
-        // Box-Muller transform for normal distribution
-        let u1 = random_f32();
-        let u2 = random_f32();
-        let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
-        values.push(z0 * std); // mean = 0.0
+        values.push(standard_normal() * std); // mean = 0.0
     }
 
     // Randomly zero out elements
@@ -1319,6 +1327,18 @@ mod tests {
         let (fan_in, fan_out) = calculate_fan_in_fan_out(&[64, 32, 3, 3]).unwrap();
         assert_eq!(fan_in, 32 * 3 * 3);
         assert_eq!(fan_out, 64 * 3 * 3);
+    }
+
+    /// F304: `random_f32` samples `[0, 1)`, so the first uniform can be exactly
+    /// zero and the unguarded transform would return `-inf`/`NaN`.
+    #[test]
+    fn test_box_muller_survives_a_zero_uniform() {
+        assert!(box_muller(0.0, 0.5).is_finite());
+        assert!(box_muller(0.0, 0.0).is_finite());
+        assert!(box_muller(0.0, 1.0).is_finite());
+        // The guarded transform still agrees with the plain formula elsewhere.
+        let expected = (-2.0f32 * 0.25f32.ln()).sqrt() * (2.0 * std::f32::consts::PI * 0.75).cos();
+        assert!((box_muller(0.25, 0.75) - expected).abs() < 1e-6);
     }
 
     #[test]

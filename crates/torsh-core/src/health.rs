@@ -23,6 +23,7 @@
 //! }
 //! ```
 
+use crate::sync::MutexExt;
 use crate::telemetry::ErrorCode;
 
 #[cfg(feature = "std")]
@@ -355,11 +356,8 @@ impl HealthChecker {
         let report = HealthReport::new(checks);
 
         // Update last check
-        *self.last_check.lock().expect("lock should not be poisoned") = Some(report.clone());
-        *self
-            .check_count
-            .lock()
-            .expect("lock should not be poisoned") += 1;
+        *self.last_check.lock_or_recover() = Some(report.clone());
+        *self.check_count.lock_or_recover() += 1;
 
         report
     }
@@ -441,7 +439,7 @@ impl HealthChecker {
             use crate::perf_metrics::get_metrics_tracker;
 
             if let Some(tracker) = get_metrics_tracker() {
-                let tracker = tracker.lock().expect("lock should not be poisoned");
+                let tracker = tracker.lock_or_recover();
 
                 // Check SIMD utilization
                 let simd_metrics = tracker.simd_metrics();
@@ -466,18 +464,12 @@ impl HealthChecker {
 
     /// Get last health check
     pub fn last_check(&self) -> Option<HealthReport> {
-        self.last_check
-            .lock()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.last_check.lock_or_recover().clone()
     }
 
     /// Get total checks performed
     pub fn check_count(&self) -> u64 {
-        *self
-            .check_count
-            .lock()
-            .expect("lock should not be poisoned")
+        *self.check_count.lock_or_recover()
     }
 
     /// Readiness probe (for Kubernetes)

@@ -1,6 +1,7 @@
 //! Classification metrics
 
 use crate::Metric;
+use torsh_core::error::TorshError;
 use torsh_tensor::Tensor;
 // Enhanced with scirs2-metrics integration
 // use scirs2_metrics::classification::*; // Will be added when API stabilizes
@@ -34,13 +35,18 @@ impl Accuracy {
 
 impl Metric for Accuracy {
     fn compute(&self, predictions: &Tensor, targets: &Tensor) -> f64 {
-        if let Some(k) = self.top_k {
+        let result = if let Some(k) = self.top_k {
             // Top-k accuracy
             compute_top_k_accuracy(predictions, targets, k)
         } else {
             // Standard accuracy using robust implementation
             compute_standard_accuracy(predictions, targets)
-        }
+        };
+        // `Metric::compute` is infallible by trait signature; surface
+        // shape/argument errors as NaN (visibly wrong) rather than a
+        // plausible-looking 0.0. Use `compute_standard_accuracy`/
+        // `compute_top_k_accuracy` directly for the `Result` form.
+        result.unwrap_or(f64::NAN)
     }
 
     fn name(&self) -> &str {
@@ -80,7 +86,12 @@ impl Precision {
 
 impl Metric for Precision {
     fn compute(&self, predictions: &Tensor, targets: &Tensor) -> f64 {
-        compute_precision(predictions, targets, &self.average)
+        // `Metric::compute` is infallible by trait signature; surface
+        // shape/argument errors (and `AverageMethod::None`, which this
+        // scalar API cannot express) as NaN. Use `compute_precision`
+        // directly, or [`MultiClassMetrics::compute`], for the `Result`/
+        // per-class forms.
+        compute_precision(predictions, targets, &self.average).unwrap_or(f64::NAN)
     }
 
     fn name(&self) -> &str {
@@ -121,7 +132,8 @@ impl Recall {
 
 impl Metric for Recall {
     fn compute(&self, predictions: &Tensor, targets: &Tensor) -> f64 {
-        compute_recall(predictions, targets, &self.average)
+        // See the note on `Metric for Precision::compute` above.
+        compute_recall(predictions, targets, &self.average).unwrap_or(f64::NAN)
     }
 
     fn name(&self) -> &str {
@@ -162,7 +174,8 @@ impl F1Score {
 
 impl Metric for F1Score {
     fn compute(&self, predictions: &Tensor, targets: &Tensor) -> f64 {
-        compute_f1_score(predictions, targets, &self.average)
+        // See the note on `Metric for Precision::compute` above.
+        compute_f1_score(predictions, targets, &self.average).unwrap_or(f64::NAN)
     }
 
     fn name(&self) -> &str {
@@ -176,241 +189,382 @@ impl Metric for F1Score {
 }
 
 // Implementation functions for the metrics
-fn compute_standard_accuracy(predictions: &Tensor, targets: &Tensor) -> f64 {
-    // Handle empty tensors
+
+/// Compute standard classification accuracy.
+///
+/// Accepts either a 1-D tensor of positive-class probabilities (binary
+/// classification, thresholded at 0.5) or a 2-D `[n_rows, n_classes]`
+/// tensor of per-class scores (argmax per row).
+fn compute_standard_accuracy(predictions: &Tensor, targets: &Tensor) -> Result<f64, TorshError> {
     if predictions.numel() == 0 || targets.numel() == 0 {
-        return 0.0;
+        // An empty input has no accuracy to report. Returning `Ok(0.0)` here
+        // would read as "the model got everything wrong"; the honest answer is
+        // an error, which the `Metric::compute` boundary surfaces as NaN.
+        return Err(TorshError::InvalidArgument(
+            "accuracy is undefined for empty predictions or targets".to_string(),
+        ));
     }
 
-    // Use manual argmax as workaround for tensor API issues
-    match (predictions.to_vec(), targets.to_vec()) {
-        (Ok(pred_vec), Ok(targets_vec)) => {
-            // Get tensor shape
-            let shape = predictions.shape();
-            let dims = shape.dims();
+    let pred_vec = predictions
+        .to_vec()
+        .map_err(|e| TorshError::InvalidArgument(format!("failed to read predictions: {e}")))?;
+    let targets_vec = targets
+        .to_vec()
+        .map_err(|e| TorshError::InvalidArgument(format!("failed to read targets: {e}")))?;
 
-            // Handle both 1D and 2D predictions
-            let (rows, cols) = if dims.len() == 1 {
-                // 1D predictions - binary classification with threshold 0.5
-                let rows = dims[0];
-                if rows == 0 || targets_vec.len() != rows {
-                    return 0.0;
-                }
+    let shape = predictions.shape();
+    let dims = shape.dims();
 
-                let mut correct = 0;
-                for i in 0..rows {
-                    let predicted_class = if pred_vec[i] >= 0.5 { 1.0 } else { 0.0 };
-                    if (predicted_class - targets_vec[i]).abs() < 1e-6 {
-                        correct += 1;
-                    }
-                }
-                return correct as f64 / rows as f64;
-            } else if dims.len() == 2 {
-                let rows = dims[0];
-                let cols = dims[1];
-                if rows == 0 || cols == 0 || targets_vec.len() != rows {
-                    return 0.0;
-                }
-                (rows, cols)
+    // Handle both 1D and 2D predictions
+    let (rows, cols) = if dims.len() == 1 {
+        // 1D predictions - binary classification with threshold 0.5
+        let rows = dims[0];
+        if targets_vec.len() != rows {
+            return Err(TorshError::InvalidArgument(format!(
+                "targets length {} does not match predictions length {rows}",
+                targets_vec.len()
+            )));
+        }
+
+        let mut correct = 0;
+        for i in 0..rows {
+            let predicted_class = if pred_vec[i] >= 0.5 { 1.0 } else { 0.0 };
+            if (predicted_class - targets_vec[i]).abs() < 1e-6 {
+                correct += 1;
+            }
+        }
+        return Ok(correct as f64 / rows as f64);
+    } else if dims.len() == 2 {
+        let rows = dims[0];
+        let cols = dims[1];
+        if rows == 0 || cols == 0 {
+            return Err(TorshError::InvalidArgument(
+                "predictions tensor has a zero-sized dimension".to_string(),
+            ));
+        }
+        if targets_vec.len() != rows {
+            return Err(TorshError::InvalidArgument(format!(
+                "targets length {} does not match predictions rows {rows}",
+                targets_vec.len()
+            )));
+        }
+        (rows, cols)
+    } else {
+        return Err(TorshError::InvalidArgument(format!(
+            "predictions tensor must be 1-D or 2-D, got {}-D",
+            dims.len()
+        )));
+    };
+
+    let mut correct = 0;
+
+    // Manually compute argmax for each row
+    for i in 0..rows {
+        let mut max_idx = 0;
+        let mut max_val = pred_vec[i * cols];
+
+        for j in 1..cols {
+            let val = pred_vec[i * cols + j];
+            if val > max_val {
+                max_val = val;
+                max_idx = j;
+            }
+        }
+
+        if max_idx as i64 == targets_vec[i] as i64 {
+            correct += 1;
+        }
+    }
+
+    Ok(correct as f64 / rows as f64)
+}
+
+fn compute_top_k_accuracy(
+    predictions: &Tensor,
+    targets: &Tensor,
+    k: usize,
+) -> Result<f64, TorshError> {
+    if predictions.numel() == 0 || targets.numel() == 0 {
+        return Err(TorshError::InvalidArgument(
+            "predictions/targets tensor is empty".to_string(),
+        ));
+    }
+
+    let pred_vec = predictions
+        .to_vec()
+        .map_err(|e| TorshError::InvalidArgument(format!("failed to read predictions: {e}")))?;
+    let targets_vec = targets
+        .to_vec()
+        .map_err(|e| TorshError::InvalidArgument(format!("failed to read targets: {e}")))?;
+
+    let shape = predictions.shape();
+    let dims = shape.dims();
+
+    if dims.len() != 2 {
+        return Err(TorshError::InvalidArgument(format!(
+            "top-k accuracy requires a 2-D [n_rows, n_classes] predictions tensor, got {}-D",
+            dims.len()
+        )));
+    }
+
+    let rows = dims[0];
+    let cols = dims[1];
+
+    if rows == 0 || cols == 0 {
+        return Err(TorshError::InvalidArgument(
+            "predictions tensor has a zero-sized dimension".to_string(),
+        ));
+    }
+    if targets_vec.len() != rows {
+        return Err(TorshError::InvalidArgument(format!(
+            "targets length {} does not match predictions rows {rows}",
+            targets_vec.len()
+        )));
+    }
+    if k > cols {
+        return Err(TorshError::InvalidArgument(format!(
+            "k ({k}) exceeds the number of classes ({cols})"
+        )));
+    }
+
+    let mut correct = 0;
+
+    // Manually compute top-k for each row
+    for i in 0..rows {
+        let target = targets_vec[i] as usize;
+
+        // Get values for this row and find top-k indices
+        let mut row_values: Vec<(f32, usize)> =
+            (0..cols).map(|j| (pred_vec[i * cols + j], j)).collect();
+
+        // Sort by value in descending order
+        row_values.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .expect("row values should be comparable")
+        });
+
+        // Check if target is in top-k
+        for j in 0..k.min(row_values.len()) {
+            if row_values[j].1 == target {
+                correct += 1;
+                break;
+            }
+        }
+    }
+
+    Ok(correct as f64 / rows as f64)
+}
+
+/// Mean of per-class precision (macro average).
+fn per_class_precision(tp: &[f64], fp: &[f64]) -> Vec<f64> {
+    tp.iter()
+        .zip(fp.iter())
+        .map(|(&t, &f)| if t + f > 0.0 { t / (t + f) } else { 0.0 })
+        .collect()
+}
+
+/// Per-class recall from confusion components.
+fn per_class_recall(tp: &[f64], fn_: &[f64]) -> Vec<f64> {
+    tp.iter()
+        .zip(fn_.iter())
+        .map(|(&t, &f)| if t + f > 0.0 { t / (t + f) } else { 0.0 })
+        .collect()
+}
+
+/// Per-class F1 from per-class precision/recall (the binary F1 formula
+/// applied class-by-class, *not* applied to already-averaged P/R -- see
+/// F222).
+fn per_class_f1(precision: &[f64], recall: &[f64]) -> Vec<f64> {
+    precision
+        .iter()
+        .zip(recall.iter())
+        .map(|(&p, &r)| {
+            if p + r > 0.0 {
+                2.0 * p * r / (p + r)
             } else {
-                return 0.0;
-            };
-
-            let mut correct = 0;
-
-            // Manually compute argmax for each row
-            for i in 0..rows {
-                let mut max_idx = 0;
-                let mut max_val = pred_vec[i * cols];
-
-                for j in 1..cols {
-                    let val = pred_vec[i * cols + j];
-                    if val > max_val {
-                        max_val = val;
-                        max_idx = j;
-                    }
-                }
-
-                if max_idx as i64 == targets_vec[i] as i64 {
-                    correct += 1;
-                }
+                0.0
             }
+        })
+        .collect()
+}
 
-            correct as f64 / rows as f64
-        }
-        _ => 0.0,
+/// Per-class support (number of true instances), i.e. `tp + fn`.
+fn support_from_components(tp: &[f64], fn_: &[f64]) -> Vec<f64> {
+    tp.iter().zip(fn_.iter()).map(|(&t, &f)| t + f).collect()
+}
+
+/// Unweighted mean across classes (macro average). `0.0` for no classes.
+fn macro_average(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
     }
 }
 
-fn compute_top_k_accuracy(predictions: &Tensor, targets: &Tensor, k: usize) -> f64 {
-    // Handle empty tensors
-    if predictions.numel() == 0 || targets.numel() == 0 {
-        return 0.0;
-    }
-
-    // Use manual top-k computation as workaround
-    match (predictions.to_vec(), targets.to_vec()) {
-        (Ok(pred_vec), Ok(targets_vec)) => {
-            let shape = predictions.shape();
-            let dims = shape.dims();
-
-            if dims.len() != 2 {
-                return 0.0;
-            }
-
-            let rows = dims[0];
-            let cols = dims[1];
-
-            if rows == 0 || cols == 0 || targets_vec.len() != rows || k > cols {
-                return 0.0;
-            }
-
-            let mut correct = 0;
-
-            // Manually compute top-k for each row
-            for i in 0..rows {
-                let target = targets_vec[i] as usize;
-
-                // Get values for this row and find top-k indices
-                let mut row_values: Vec<(f32, usize)> =
-                    (0..cols).map(|j| (pred_vec[i * cols + j], j)).collect();
-
-                // Sort by value in descending order
-                row_values.sort_by(|a, b| {
-                    b.0.partial_cmp(&a.0)
-                        .expect("row values should be comparable")
-                });
-
-                // Check if target is in top-k
-                for j in 0..k.min(row_values.len()) {
-                    if row_values[j].1 == target {
-                        correct += 1;
-                        break;
-                    }
-                }
-            }
-
-            correct as f64 / rows as f64
-        }
-        _ => 0.0,
+/// Support-weighted mean across classes. `0.0` when total support is 0.
+fn weighted_average(values: &[f64], support: &[f64]) -> f64 {
+    let total: f64 = support.iter().sum();
+    if total > 0.0 {
+        values
+            .iter()
+            .zip(support.iter())
+            .map(|(&v, &s)| v * s)
+            .sum::<f64>()
+            / total
+    } else {
+        0.0
     }
 }
 
-fn compute_precision(predictions: &Tensor, targets: &Tensor, average: &AverageMethod) -> f64 {
-    let (tp, fp, _fn) = compute_confusion_components(predictions, targets);
+/// Error returned by [`compute_precision`]/[`compute_recall`]/
+/// [`compute_f1_score`] for `AverageMethod::None`: a scalar `f64` cannot
+/// express a per-class result, so this is a real error rather than a
+/// silent fallback to another averaging method.
+fn per_class_not_representable_error() -> TorshError {
+    TorshError::InvalidArgument(
+        "AverageMethod::None requests per-class results, which a scalar metric cannot express; \
+         use MultiClassMetrics::compute() for per-class precision/recall/F1"
+            .to_string(),
+    )
+}
+
+fn compute_precision(
+    predictions: &Tensor,
+    targets: &Tensor,
+    average: &AverageMethod,
+) -> Result<f64, TorshError> {
+    let (tp, fp, fn_) = compute_confusion_components(predictions, targets)?;
 
     match average {
         AverageMethod::Micro => {
             let total_tp: f64 = tp.iter().sum();
             let total_fp: f64 = fp.iter().sum();
 
-            if total_tp + total_fp > 0.0 {
+            Ok(if total_tp + total_fp > 0.0 {
                 total_tp / (total_tp + total_fp)
             } else {
                 0.0
-            }
+            })
         }
-        AverageMethod::Macro => {
-            let precisions: Vec<f64> = tp
-                .iter()
-                .zip(fp.iter())
-                .map(|(tp_val, fp_val)| {
-                    if tp_val + fp_val > 0.0 {
-                        tp_val / (tp_val + fp_val)
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
-
-            if precisions.is_empty() {
-                0.0
-            } else {
-                precisions.iter().sum::<f64>() / precisions.len() as f64
-            }
+        AverageMethod::Macro => Ok(macro_average(&per_class_precision(&tp, &fp))),
+        AverageMethod::Weighted => {
+            let support = support_from_components(&tp, &fn_);
+            Ok(weighted_average(&per_class_precision(&tp, &fp), &support))
         }
-        _ => {
-            // For weighted and per-class, return macro for now
-            compute_precision(predictions, targets, &AverageMethod::Macro)
-        }
+        AverageMethod::None => Err(per_class_not_representable_error()),
     }
 }
 
-fn compute_recall(predictions: &Tensor, targets: &Tensor, average: &AverageMethod) -> f64 {
-    let (tp, _fp, fn_) = compute_confusion_components(predictions, targets);
+fn compute_recall(
+    predictions: &Tensor,
+    targets: &Tensor,
+    average: &AverageMethod,
+) -> Result<f64, TorshError> {
+    let (tp, _fp, fn_) = compute_confusion_components(predictions, targets)?;
 
     match average {
         AverageMethod::Micro => {
             let total_tp: f64 = tp.iter().sum();
             let total_fn: f64 = fn_.iter().sum();
 
-            if total_tp + total_fn > 0.0 {
+            Ok(if total_tp + total_fn > 0.0 {
                 total_tp / (total_tp + total_fn)
             } else {
                 0.0
-            }
+            })
         }
-        AverageMethod::Macro => {
-            let recalls: Vec<f64> = tp
-                .iter()
-                .zip(fn_.iter())
-                .map(|(tp_val, fn_val)| {
-                    if tp_val + fn_val > 0.0 {
-                        tp_val / (tp_val + fn_val)
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
-
-            if recalls.is_empty() {
-                0.0
-            } else {
-                recalls.iter().sum::<f64>() / recalls.len() as f64
-            }
+        AverageMethod::Macro => Ok(macro_average(&per_class_recall(&tp, &fn_))),
+        AverageMethod::Weighted => {
+            let support = support_from_components(&tp, &fn_);
+            Ok(weighted_average(&per_class_recall(&tp, &fn_), &support))
         }
-        _ => {
-            // For weighted and per-class, return macro for now
-            compute_recall(predictions, targets, &AverageMethod::Macro)
-        }
+        AverageMethod::None => Err(per_class_not_representable_error()),
     }
 }
 
-fn compute_f1_score(predictions: &Tensor, targets: &Tensor, average: &AverageMethod) -> f64 {
-    let precision = compute_precision(predictions, targets, average);
-    let recall = compute_recall(predictions, targets, average);
-
-    if precision + recall > 0.0 {
-        2.0 * precision * recall / (precision + recall)
-    } else {
-        0.0
-    }
-}
-
-/// Compute confusion matrix components (TP, FP, FN) for each class
-fn compute_confusion_components(
+fn compute_f1_score(
     predictions: &Tensor,
     targets: &Tensor,
-) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    // Use manual argmax computation
-    match (predictions.to_vec(), targets.to_vec()) {
-        (Ok(pred_vec), Ok(targets_vec)) => {
-            let shape = predictions.shape();
-            let dims = shape.dims();
+    average: &AverageMethod,
+) -> Result<f64, TorshError> {
+    match average {
+        AverageMethod::Micro => {
+            // Micro-F1 is mathematically the harmonic mean of micro
+            // precision/recall (unlike macro/weighted-F1, see F222), so
+            // computing it from the already-aggregated P/R is correct here.
+            let precision = compute_precision(predictions, targets, &AverageMethod::Micro)?;
+            let recall = compute_recall(predictions, targets, &AverageMethod::Micro)?;
+            Ok(if precision + recall > 0.0 {
+                2.0 * precision * recall / (precision + recall)
+            } else {
+                0.0
+            })
+        }
+        AverageMethod::Macro => {
+            let (tp, fp, fn_) = compute_confusion_components(predictions, targets)?;
+            let precision = per_class_precision(&tp, &fp);
+            let recall = per_class_recall(&tp, &fn_);
+            Ok(macro_average(&per_class_f1(&precision, &recall)))
+        }
+        AverageMethod::Weighted => {
+            let (tp, fp, fn_) = compute_confusion_components(predictions, targets)?;
+            let precision = per_class_precision(&tp, &fp);
+            let recall = per_class_recall(&tp, &fn_);
+            let f1 = per_class_f1(&precision, &recall);
+            let support = support_from_components(&tp, &fn_);
+            Ok(weighted_average(&f1, &support))
+        }
+        AverageMethod::None => Err(per_class_not_representable_error()),
+    }
+}
 
-            if dims.len() != 2 || dims[0] == 0 || dims[1] == 0 || targets_vec.len() != dims[0] {
-                return (vec![0.0], vec![0.0], vec![0.0]);
+/// Derive one predicted class index per row from a predictions tensor, and
+/// the corresponding true class index per row from `targets`.
+///
+/// Accepts either a 1-D tensor of positive-class scores/probabilities
+/// (binary classification, thresholded at 0.5 -- the same convention
+/// [`compute_standard_accuracy`] uses) or a 2-D `[n_rows, n_classes]`
+/// tensor of per-class scores (argmax per row).
+fn predicted_and_target_classes(
+    predictions: &Tensor,
+    targets: &Tensor,
+) -> Result<(Vec<usize>, Vec<usize>), TorshError> {
+    let pred_vec = predictions
+        .to_vec()
+        .map_err(|e| TorshError::InvalidArgument(format!("failed to read predictions: {e}")))?;
+    let targets_vec = targets
+        .to_vec()
+        .map_err(|e| TorshError::InvalidArgument(format!("failed to read targets: {e}")))?;
+
+    let shape = predictions.shape();
+    let dims = shape.dims();
+
+    let preds: Vec<usize> = match dims.len() {
+        1 => {
+            let rows = dims[0];
+            if rows == 0 {
+                return Err(TorshError::InvalidArgument(
+                    "predictions tensor is empty".to_string(),
+                ));
             }
-
+            pred_vec
+                .iter()
+                .map(|&p| if p >= 0.5 { 1 } else { 0 })
+                .collect()
+        }
+        2 => {
             let rows = dims[0];
             let cols = dims[1];
-
-            // Manually compute predicted classes
-            let mut preds_vec = Vec::with_capacity(rows);
+            if rows == 0 || cols == 0 {
+                return Err(TorshError::InvalidArgument(
+                    "predictions tensor has a zero-sized dimension".to_string(),
+                ));
+            }
+            let mut preds = Vec::with_capacity(rows);
             for i in 0..rows {
                 let mut max_idx = 0;
                 let mut max_val = pred_vec[i * cols];
-
                 for j in 1..cols {
                     let val = pred_vec[i * cols + j];
                     if val > max_val {
@@ -418,37 +572,68 @@ fn compute_confusion_components(
                         max_idx = j;
                     }
                 }
-                preds_vec.push(max_idx as f32);
+                preds.push(max_idx);
             }
-
-            // Determine number of classes
-            let max_target = targets_vec.iter().map(|&x| x as usize).max().unwrap_or(0);
-            let max_pred = preds_vec.iter().map(|&x| x as usize).max().unwrap_or(0);
-            let num_classes = (max_target.max(max_pred) + 1).max(2);
-
-            let mut tp = vec![0.0; num_classes];
-            let mut fp = vec![0.0; num_classes];
-            let mut fn_ = vec![0.0; num_classes];
-
-            // Compute confusion matrix components
-            for i in 0..targets_vec.len().min(preds_vec.len()) {
-                let target = targets_vec[i] as usize;
-                let pred = preds_vec[i] as usize;
-
-                if target < num_classes && pred < num_classes {
-                    if target == pred {
-                        tp[target] += 1.0;
-                    } else {
-                        fp[pred] += 1.0;
-                        fn_[target] += 1.0;
-                    }
-                }
-            }
-
-            (tp, fp, fn_)
+            preds
         }
-        _ => (vec![0.0], vec![0.0], vec![0.0]),
+        d => {
+            return Err(TorshError::InvalidArgument(format!(
+                "predictions tensor must be 1-D or 2-D, got {d}-D"
+            )))
+        }
+    };
+
+    if targets_vec.len() != preds.len() {
+        return Err(TorshError::InvalidArgument(format!(
+            "targets length {} does not match predictions row count {}",
+            targets_vec.len(),
+            preds.len()
+        )));
     }
+
+    let targets: Vec<usize> = targets_vec.iter().map(|&t| t as usize).collect();
+
+    Ok((preds, targets))
+}
+
+/// Compute confusion matrix components (TP, FP, FN) for each class.
+///
+/// The number of classes is `max(observed target or predicted label) + 1`
+/// -- derived from the data, never forced to a minimum (see F227), so a
+/// legitimate single-class batch reports exactly 1 class.
+fn compute_confusion_components(
+    predictions: &Tensor,
+    targets: &Tensor,
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), TorshError> {
+    let (preds_vec, targets_vec) = predicted_and_target_classes(predictions, targets)?;
+
+    let num_classes = preds_vec
+        .iter()
+        .chain(targets_vec.iter())
+        .max()
+        .copied()
+        .unwrap_or(0)
+        + 1;
+
+    let mut tp = vec![0.0; num_classes];
+    let mut fp = vec![0.0; num_classes];
+    let mut fn_ = vec![0.0; num_classes];
+
+    // Compute confusion matrix components. Every index is guaranteed
+    // in-bounds by construction: num_classes is `max(preds ∪ targets) + 1`.
+    for i in 0..targets_vec.len() {
+        let target = targets_vec[i];
+        let pred = preds_vec[i];
+
+        if target == pred {
+            tp[target] += 1.0;
+        } else {
+            fp[pred] += 1.0;
+            fn_[target] += 1.0;
+        }
+    }
+
+    Ok((tp, fp, fn_))
 }
 
 /// Multi-class classification metrics with per-class statistics
@@ -469,70 +654,34 @@ pub struct MultiClassMetrics {
 }
 
 impl MultiClassMetrics {
-    /// Compute multi-class metrics from predictions and targets
-    pub fn compute(predictions: &Tensor, targets: &Tensor) -> Self {
-        let (tp, fp, fn_) = compute_confusion_components(predictions, targets);
+    /// Compute multi-class metrics from predictions and targets.
+    ///
+    /// Errors if `predictions`/`targets` are empty, mismatched in length,
+    /// or `predictions` is neither 1-D (binary, thresholded at 0.5) nor 2-D
+    /// (`[n_rows, n_classes]`, argmax per row).
+    pub fn compute(predictions: &Tensor, targets: &Tensor) -> Result<Self, TorshError> {
+        let (tp, fp, fn_) = compute_confusion_components(predictions, targets)?;
 
-        let num_classes = tp.len();
-        let mut per_class_precision = Vec::with_capacity(num_classes);
-        let mut per_class_recall = Vec::with_capacity(num_classes);
-        let mut per_class_f1 = Vec::with_capacity(num_classes);
-        let mut support = Vec::with_capacity(num_classes);
+        let per_class_precision = per_class_precision(&tp, &fp);
+        let per_class_recall = per_class_recall(&tp, &fn_);
+        let per_class_f1 = per_class_f1(&per_class_precision, &per_class_recall);
+        let support: Vec<usize> = support_from_components(&tp, &fn_)
+            .into_iter()
+            .map(|s| s as usize)
+            .collect();
+        let support_f64: Vec<f64> = support.iter().map(|&s| s as f64).collect();
 
-        // Compute per-class metrics
-        for i in 0..num_classes {
-            let precision = if tp[i] + fp[i] > 0.0 {
-                tp[i] / (tp[i] + fp[i])
-            } else {
-                0.0
-            };
+        let macro_avg = macro_average(&per_class_f1);
+        let weighted_avg = weighted_average(&per_class_f1, &support_f64);
 
-            let recall = if tp[i] + fn_[i] > 0.0 {
-                tp[i] / (tp[i] + fn_[i])
-            } else {
-                0.0
-            };
-
-            let f1 = if precision + recall > 0.0 {
-                2.0 * precision * recall / (precision + recall)
-            } else {
-                0.0
-            };
-
-            per_class_precision.push(precision);
-            per_class_recall.push(recall);
-            per_class_f1.push(f1);
-            support.push((tp[i] + fn_[i]) as usize);
-        }
-
-        // Compute macro average (simple mean)
-        let macro_avg = if !per_class_f1.is_empty() {
-            per_class_f1.iter().sum::<f64>() / per_class_f1.len() as f64
-        } else {
-            0.0
-        };
-
-        // Compute weighted average (weighted by support)
-        let total_support: usize = support.iter().sum();
-        let weighted_avg = if total_support > 0 {
-            per_class_f1
-                .iter()
-                .zip(support.iter())
-                .map(|(f1, sup)| f1 * (*sup as f64))
-                .sum::<f64>()
-                / total_support as f64
-        } else {
-            0.0
-        };
-
-        MultiClassMetrics {
+        Ok(MultiClassMetrics {
             per_class_precision,
             per_class_recall,
             per_class_f1,
             macro_avg,
             weighted_avg,
             support,
-        }
+        })
     }
 
     /// Get the number of classes
@@ -591,30 +740,36 @@ pub struct ConfusionMatrix {
 }
 
 impl ConfusionMatrix {
-    /// Create a confusion matrix from predictions and targets
-    pub fn compute(predictions: &Tensor, targets: &Tensor) -> Self {
-        let (matrix, num_classes) = compute_confusion_matrix(predictions, targets);
+    /// Create a confusion matrix from predictions and targets.
+    ///
+    /// Errors under the same conditions as
+    /// [`MultiClassMetrics::compute`]. The matrix is sized from the
+    /// observed labels (never forced to a minimum of 2x2, see F227).
+    pub fn compute(predictions: &Tensor, targets: &Tensor) -> Result<Self, TorshError> {
+        let (matrix, num_classes) = compute_confusion_matrix(predictions, targets)?;
 
-        ConfusionMatrix {
+        Ok(ConfusionMatrix {
             matrix,
             num_classes,
             labels: None,
-        }
+        })
     }
 
-    /// Create a confusion matrix with custom class labels
+    /// Create a confusion matrix with custom class labels.
+    ///
+    /// Errors under the same conditions as [`Self::compute`].
     pub fn compute_with_labels(
         predictions: &Tensor,
         targets: &Tensor,
         labels: Vec<String>,
-    ) -> Self {
-        let (matrix, num_classes) = compute_confusion_matrix(predictions, targets);
+    ) -> Result<Self, TorshError> {
+        let (matrix, num_classes) = compute_confusion_matrix(predictions, targets)?;
 
-        ConfusionMatrix {
+        Ok(ConfusionMatrix {
             matrix,
             num_classes,
             labels: Some(labels),
-        }
+        })
     }
 
     /// Get the value at position (true_class, predicted_class)
@@ -787,58 +942,32 @@ impl ConfusionMatrix {
     }
 }
 
-/// Helper function to compute the confusion matrix
-fn compute_confusion_matrix(predictions: &Tensor, targets: &Tensor) -> (Vec<Vec<usize>>, usize) {
-    match (predictions.to_vec(), targets.to_vec()) {
-        (Ok(pred_vec), Ok(targets_vec)) => {
-            let shape = predictions.shape();
-            let dims = shape.dims();
+/// Helper function to compute the confusion matrix.
+///
+/// See [`predicted_and_target_classes`] for the accepted input shapes and
+/// [`compute_confusion_components`]'s doc comment for the class-count
+/// derivation (never forced to a minimum, see F227).
+fn compute_confusion_matrix(
+    predictions: &Tensor,
+    targets: &Tensor,
+) -> Result<(Vec<Vec<usize>>, usize), TorshError> {
+    let (preds_vec, targets_vec) = predicted_and_target_classes(predictions, targets)?;
 
-            if dims.len() != 2 || dims[0] == 0 || dims[1] == 0 || targets_vec.len() != dims[0] {
-                return (vec![vec![0; 2]; 2], 2);
-            }
+    let num_classes = preds_vec
+        .iter()
+        .chain(targets_vec.iter())
+        .max()
+        .copied()
+        .unwrap_or(0)
+        + 1;
 
-            let rows = dims[0];
-            let cols = dims[1];
+    let mut matrix = vec![vec![0; num_classes]; num_classes];
 
-            // Manually compute predicted classes
-            let mut preds_vec = Vec::with_capacity(rows);
-            for i in 0..rows {
-                let mut max_idx = 0;
-                let mut max_val = pred_vec[i * cols];
-
-                for j in 1..cols {
-                    let val = pred_vec[i * cols + j];
-                    if val > max_val {
-                        max_val = val;
-                        max_idx = j;
-                    }
-                }
-                preds_vec.push(max_idx);
-            }
-
-            // Determine number of classes
-            let max_target = targets_vec.iter().map(|&x| x as usize).max().unwrap_or(0);
-            let max_pred = preds_vec.iter().map(|&x| x).max().unwrap_or(0);
-            let num_classes = (max_target.max(max_pred) + 1).max(2);
-
-            // Initialize confusion matrix
-            let mut matrix = vec![vec![0; num_classes]; num_classes];
-
-            // Populate confusion matrix
-            for i in 0..targets_vec.len().min(preds_vec.len()) {
-                let target = targets_vec[i] as usize;
-                let pred = preds_vec[i];
-
-                if target < num_classes && pred < num_classes {
-                    matrix[target][pred] += 1;
-                }
-            }
-
-            (matrix, num_classes)
-        }
-        _ => (vec![vec![0; 2]; 2], 2),
+    for i in 0..targets_vec.len() {
+        matrix[targets_vec[i]][preds_vec[i]] += 1;
     }
+
+    Ok((matrix, num_classes))
 }
 
 /// Threshold-dependent metrics for binary classification
@@ -888,13 +1017,29 @@ impl ThresholdMetrics {
         });
         thresholds.dedup();
 
-        // Add boundary thresholds
-        if !thresholds.contains(&0.0) {
-            thresholds.insert(0, 0.0);
-        }
-        if !thresholds.contains(&1.0) {
-            thresholds.push(1.0);
-        }
+        // Add boundary thresholds strictly below the minimum and above the
+        // maximum observed score, so the sequence stays monotonic
+        // regardless of the score range (scores confined to [0,1] are the
+        // common case, but nothing here guarantees it -- raw logits can be
+        // negative or exceed 1.0). Inserting fixed 0.0/1.0 sentinels broke
+        // monotonicity whenever scores fell outside [0,1] (see F225): e.g.
+        // scores [-2.0, 1.0, 3.0] became [0.0, -2.0, 1.0, 3.0], which the
+        // trapezoidal AUC in `calculate_auc` sums as unsigned area,
+        // inflating the result past 1.0 instead of cancelling out.
+        //
+        // The epsilon is scaled to the magnitude of the observed scores
+        // (floored at 1.0) rather than a fixed constant: thresholds are
+        // narrowed to `f32` before comparison in
+        // `compute_binary_confusion_matrix`, and a fixed epsilon like
+        // `1e-9` rounds away to nothing once the scores are large enough
+        // that it falls below `f32`'s representable precision at that
+        // magnitude.
+        let min_score = *thresholds.first().unwrap_or(&0.0);
+        let max_score = *thresholds.last().unwrap_or(&1.0);
+        let magnitude = min_score.abs().max(max_score.abs()).max(1.0);
+        let epsilon = magnitude * 1e-3;
+        thresholds.insert(0, min_score - epsilon);
+        thresholds.push(max_score + epsilon);
 
         let mut precisions = Vec::new();
         let mut recalls = Vec::new();
@@ -1050,7 +1195,7 @@ mod tests {
         .unwrap();
         let targets = from_vec(vec![0.0, 1.0, 2.0, 0.0, 1.0], &[5], DeviceType::Cpu).unwrap();
 
-        let metrics = MultiClassMetrics::compute(&predictions, &targets);
+        let metrics = MultiClassMetrics::compute(&predictions, &targets).unwrap();
 
         // Perfect predictions, so all metrics should be 1.0
         assert_eq!(metrics.num_classes(), 3);
@@ -1072,7 +1217,7 @@ mod tests {
         .unwrap();
         let targets = from_vec(vec![0.0, 1.0, 2.0], &[3], DeviceType::Cpu).unwrap();
 
-        let cm = ConfusionMatrix::compute(&predictions, &targets);
+        let cm = ConfusionMatrix::compute(&predictions, &targets).unwrap();
 
         assert_eq!(cm.num_classes, 3);
         assert_eq!(cm.total(), 3);
@@ -1112,7 +1257,7 @@ mod tests {
         .unwrap();
         let targets = from_vec(vec![0.0, 1.0, 0.0, 1.0], &[4], DeviceType::Cpu).unwrap();
 
-        let cm = ConfusionMatrix::compute(&predictions, &targets);
+        let cm = ConfusionMatrix::compute(&predictions, &targets).unwrap();
 
         let normalized = cm.normalize_by_true();
         // Each row should sum to 1.0

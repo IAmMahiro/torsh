@@ -123,15 +123,16 @@ pub fn erfc(input: &Tensor<f32>) -> TorshResult<Tensor<f32>> {
 /// Wrapper for the scaled complementary error function using SciRS2
 ///
 /// Computes erfcx(x) = exp(x²) * erfc(x).
+///
+/// The scaled function exists precisely so that large arguments stay
+/// representable: computing `exp(x²) * erfc(x)` directly overflows f64 for
+/// |x| > 26.6 even though the true value is a harmless ~1/(x·√π). The
+/// dedicated `scirs2_special::erfcx` is used instead of the product.
 pub fn erfcx(input: &Tensor<f32>) -> TorshResult<Tensor<f32>> {
     let data = input.data()?;
     let result_data: Vec<f32> = data
         .iter()
-        .map(|&x| {
-            // For erfcx, we need exp(x²) * erfc(x)
-            let x_f64 = x as f64;
-            ((x_f64 * x_f64).exp() * scirs2_special::erfc(x_f64)) as f32
-        })
+        .map(|&x| scirs2_special::erfcx(x as f64) as f32)
         .collect();
 
     Tensor::from_data(result_data, input.shape().dims().to_vec(), input.device())
@@ -234,18 +235,28 @@ pub fn sinc(input: &Tensor<f32>) -> TorshResult<Tensor<f32>> {
     Tensor::from_data(result_data, input.shape().dims().to_vec(), input.device())
 }
 
+/// Evaluate both Fresnel integrals at a single point, propagating failures.
+///
+/// The previous wrappers substituted `(0.0, 0.0)` for any error, which is a
+/// perfectly plausible pair of values (it is the exact answer at `x = 0`) and
+/// therefore indistinguishable from success.
+fn fresnel_scalar(x: f32) -> TorshResult<(f32, f32)> {
+    let (s, c) = scirs2_special::fresnel(x as f64).map_err(|e| {
+        TorshError::ComputeError(format!("Fresnel integral failed at x = {x}: {e}"))
+    })?;
+    Ok((s as f32, c as f32))
+}
+
 /// Wrapper for Fresnel sine integral using SciRS2
 ///
 /// Computes the Fresnel sine integral S(x) = ∫₀^x sin(πt²/2) dt.
 pub fn fresnel_s(input: &Tensor<f32>) -> TorshResult<Tensor<f32>> {
     let data = input.data()?;
-    let result_data: Vec<f32> = data
-        .iter()
-        .map(|&x| {
-            let (s, _c) = scirs2_special::fresnel(x as f64).unwrap_or((0.0, 0.0));
-            s as f32
-        })
-        .collect();
+    let mut result_data = Vec::with_capacity(data.len());
+    for &x in data.iter() {
+        let (s, _c) = fresnel_scalar(x)?;
+        result_data.push(s);
+    }
 
     Tensor::from_data(result_data, input.shape().dims().to_vec(), input.device())
 }
@@ -255,13 +266,11 @@ pub fn fresnel_s(input: &Tensor<f32>) -> TorshResult<Tensor<f32>> {
 /// Computes the Fresnel cosine integral C(x) = ∫₀^x cos(πt²/2) dt.
 pub fn fresnel_c(input: &Tensor<f32>) -> TorshResult<Tensor<f32>> {
     let data = input.data()?;
-    let result_data: Vec<f32> = data
-        .iter()
-        .map(|&x| {
-            let (_s, c) = scirs2_special::fresnel(x as f64).unwrap_or((0.0, 0.0));
-            c as f32
-        })
-        .collect();
+    let mut result_data = Vec::with_capacity(data.len());
+    for &x in data.iter() {
+        let (_s, c) = fresnel_scalar(x)?;
+        result_data.push(c);
+    }
 
     Tensor::from_data(result_data, input.shape().dims().to_vec(), input.device())
 }
@@ -277,9 +286,9 @@ pub fn fresnel(input: &Tensor<f32>) -> TorshResult<(Tensor<f32>, Tensor<f32>)> {
     let mut c_data = Vec::with_capacity(data.len());
 
     for &x in data.iter() {
-        let (s, c) = scirs2_special::fresnel(x as f64).unwrap_or((0.0, 0.0));
-        s_data.push(s as f32);
-        c_data.push(c as f32);
+        let (s, c) = fresnel_scalar(x)?;
+        s_data.push(s);
+        c_data.push(c);
     }
 
     let s_tensor = Tensor::from_data(s_data, input.shape().dims().to_vec(), input.device())?;

@@ -11,6 +11,7 @@ use objc2::runtime::Object;
 use objc2::{class, msg_send};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use torsh_core::sync::MutexExt;
 
 /// Metal Indirect Command Buffer capabilities
 #[derive(Debug, Clone)]
@@ -369,10 +370,7 @@ impl IndirectCommandManager {
 
             // Generate buffer ID
             let buffer_id = {
-                let mut next_id = self
-                    .next_buffer_id
-                    .lock()
-                    .expect("lock should not be poisoned");
+                let mut next_id = self.next_buffer_id.lock_or_recover();
                 let id = *next_id;
                 *next_id += 1;
                 id
@@ -390,19 +388,13 @@ impl IndirectCommandManager {
 
             // Store the buffer
             {
-                let mut active_buffers = self
-                    .active_buffers
-                    .lock()
-                    .expect("lock should not be poisoned");
+                let mut active_buffers = self.active_buffers.lock_or_recover();
                 active_buffers.insert(buffer_id, metal_buffer);
             }
 
             // Update statistics
             {
-                let mut stats = self
-                    .performance_stats
-                    .lock()
-                    .expect("lock should not be poisoned");
+                let mut stats = self.performance_stats.lock_or_recover();
                 stats.total_buffers_created += 1;
                 stats.active_buffers += 1;
                 stats.peak_buffer_count = stats.peak_buffer_count.max(stats.active_buffers);
@@ -482,10 +474,7 @@ impl IndirectCommandManager {
         command_index: u32,
         command: IndirectCommand,
     ) -> BackendResult<()> {
-        let active_buffers = self
-            .active_buffers
-            .lock()
-            .expect("lock should not be poisoned");
+        let active_buffers = self.active_buffers.lock_or_recover();
 
         if let Some(buffer) = active_buffers.get(&buffer_id) {
             let start_time = std::time::Instant::now();
@@ -544,10 +533,7 @@ impl IndirectCommandManager {
             // Update metrics
             let encoding_time = start_time.elapsed();
             {
-                let mut metrics = buffer
-                    .performance_metrics
-                    .lock()
-                    .expect("lock should not be poisoned");
+                let mut metrics = buffer.performance_metrics.lock_or_recover();
                 metrics.total_commands_encoded += 1;
                 metrics.avg_encoding_time_us = (metrics.avg_encoding_time_us
                     * (metrics.total_commands_encoded - 1) as f64
@@ -557,10 +543,7 @@ impl IndirectCommandManager {
 
             // Update command count
             {
-                let mut count = buffer
-                    .current_command_count
-                    .lock()
-                    .expect("lock should not be poisoned");
+                let mut count = buffer.current_command_count.lock_or_recover();
                 *count = (*count).max(command_index + 1);
             }
 
@@ -712,10 +695,7 @@ impl IndirectCommandManager {
         buffer_id: u64,
         range: Option<(u32, u32)>, // (start, count)
     ) -> BackendResult<()> {
-        let active_buffers = self
-            .active_buffers
-            .lock()
-            .expect("lock should not be poisoned");
+        let active_buffers = self.active_buffers.lock_or_recover();
 
         if let Some(buffer) = active_buffers.get(&buffer_id) {
             let start_time = std::time::Instant::now();
@@ -729,10 +709,7 @@ impl IndirectCommandManager {
                     let _ = (start, count); // Acknowledge parameters
                 } else {
                     // Execute all commands
-                    let command_count = *buffer
-                        .current_command_count
-                        .lock()
-                        .expect("lock should not be poisoned");
+                    let command_count = *buffer.current_command_count.lock_or_recover();
                     // Simplified implementation to avoid objc2 compatibility issues
                     // In production, this would execute all Metal commands
                     let _ = command_count; // Acknowledge parameter
@@ -742,10 +719,7 @@ impl IndirectCommandManager {
             // Update metrics
             let execution_time = start_time.elapsed();
             {
-                let mut metrics = buffer
-                    .performance_metrics
-                    .lock()
-                    .expect("lock should not be poisoned");
+                let mut metrics = buffer.performance_metrics.lock_or_recover();
                 metrics.total_commands_executed += 1;
                 metrics.avg_execution_time_us = (metrics.avg_execution_time_us
                     * (metrics.total_commands_executed - 1) as f64
@@ -771,17 +745,11 @@ impl IndirectCommandManager {
 
     /// Remove an indirect command buffer
     pub fn remove_command_buffer(&self, buffer_id: u64) -> BackendResult<()> {
-        let mut active_buffers = self
-            .active_buffers
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut active_buffers = self.active_buffers.lock_or_recover();
 
         if active_buffers.remove(&buffer_id).is_some() {
             // Update statistics
-            let mut stats = self
-                .performance_stats
-                .lock()
-                .expect("lock should not be poisoned");
+            let mut stats = self.performance_stats.lock_or_recover();
             stats.active_buffers = stats.active_buffers.saturating_sub(1);
             Ok(())
         } else {
@@ -794,26 +762,15 @@ impl IndirectCommandManager {
 
     /// Get performance statistics
     pub fn performance_stats(&self) -> IndirectCommandManagerStats {
-        (*self
-            .performance_stats
-            .lock()
-            .expect("lock should not be poisoned"))
-        .clone()
+        (*self.performance_stats.lock_or_recover()).clone()
     }
 
     /// Get buffer metrics
     pub fn buffer_metrics(&self, buffer_id: u64) -> BackendResult<IndirectCommandMetrics> {
-        let active_buffers = self
-            .active_buffers
-            .lock()
-            .expect("lock should not be poisoned");
+        let active_buffers = self.active_buffers.lock_or_recover();
 
         if let Some(buffer) = active_buffers.get(&buffer_id) {
-            Ok((*buffer
-                .performance_metrics
-                .lock()
-                .expect("lock should not be poisoned"))
-            .clone())
+            Ok((*buffer.performance_metrics.lock_or_recover()).clone())
         } else {
             Err(BackendError::InvalidArgument(format!(
                 "Indirect command buffer {} not found",
@@ -824,17 +781,11 @@ impl IndirectCommandManager {
 
     /// Optimize command buffer for better performance
     pub fn optimize_command_buffer(&self, buffer_id: u64) -> BackendResult<OptimizationResult> {
-        let active_buffers = self
-            .active_buffers
-            .lock()
-            .expect("lock should not be poisoned");
+        let active_buffers = self.active_buffers.lock_or_recover();
 
         if let Some(buffer) = active_buffers.get(&buffer_id) {
             // Analyze command patterns and suggest optimizations
-            let metrics = buffer
-                .performance_metrics
-                .lock()
-                .expect("lock should not be poisoned");
+            let metrics = buffer.performance_metrics.lock_or_recover();
             let config = &buffer.config;
 
             let mut suggestions = vec![];

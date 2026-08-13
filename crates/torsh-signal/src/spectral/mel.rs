@@ -3,10 +3,27 @@
 //! This module provides mel-scale filterbank operations commonly used in
 //! audio processing and speech recognition, with full PyTorch compatibility.
 
-use torsh_core::{device::DeviceType, error::Result};
+use torsh_core::{
+    device::DeviceType,
+    error::{Result, TorshError},
+};
 use torsh_tensor::Tensor;
 
-/// Mel scale filterbank
+/// Normalisation applied to each mel filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MelNorm {
+    /// No normalisation: every triangle peaks at 1.0 (torchaudio's default).
+    None,
+    /// Slaney normalisation: each filter is divided by its bandwidth so that
+    /// filters have equal area (librosa's `norm="slaney"` default).
+    Slaney,
+}
+
+/// Mel-scale triangular filterbank (unnormalised, torchaudio-compatible).
+///
+/// Returns a `[n_mels, n_fft / 2 + 1]` matrix of triangular weights computed
+/// from the *fractional* FFT bin frequencies, so no filter collapses to zero
+/// through integer truncation.
 pub fn mel_filterbank(
     n_mels: usize,
     n_fft: usize,
@@ -14,44 +31,81 @@ pub fn mel_filterbank(
     f_min: f32,
     f_max: Option<f32>,
 ) -> Result<Tensor<f32>> {
+    mel_filterbank_with_norm(n_mels, n_fft, sample_rate, f_min, f_max, MelNorm::None)
+}
+
+/// Mel-scale triangular filterbank with a selectable normalisation.
+pub fn mel_filterbank_with_norm(
+    n_mels: usize,
+    n_fft: usize,
+    sample_rate: f32,
+    f_min: f32,
+    f_max: Option<f32>,
+    norm: MelNorm,
+) -> Result<Tensor<f32>> {
+    if n_mels == 0 {
+        return Err(TorshError::InvalidArgument(
+            "Number of mel bands must be greater than zero".to_string(),
+        ));
+    }
+    if n_fft < 2 {
+        return Err(TorshError::InvalidArgument(
+            "n_fft must be at least 2".to_string(),
+        ));
+    }
+    if sample_rate <= 0.0 {
+        return Err(TorshError::InvalidArgument(
+            "Sample rate must be positive".to_string(),
+        ));
+    }
+
     let f_max = f_max.unwrap_or(sample_rate / 2.0);
+    if !(f_min >= 0.0 && f_max > f_min) {
+        return Err(TorshError::InvalidArgument(format!(
+            "Invalid mel frequency range: f_min = {f_min}, f_max = {f_max}"
+        )));
+    }
     let n_freqs = n_fft / 2 + 1;
 
-    // Convert frequency range to mel scale
-    let mel_min = hz_to_mel(f_min);
-    let mel_max = hz_to_mel(f_max);
-
-    // Create mel points
-    let mel_points = linspace(mel_min, mel_max, n_mels + 2);
-    let hz_points: Vec<f32> = mel_points.iter().map(|&m| mel_to_hz(m)).collect();
-
-    // Convert to FFT bin indices
-    let bin_points: Vec<usize> = hz_points
-        .iter()
-        .map(|&hz| ((n_fft as f32 + 1.0) * hz / sample_rate) as usize)
+    // Mel-spaced band edges, converted back to Hz.
+    let mel_min = hz_to_mel(f_min) as f64;
+    let mel_max = hz_to_mel(f_max) as f64;
+    let hz_points: Vec<f64> = (0..n_mels + 2)
+        .map(|i| {
+            let mel = mel_min + (mel_max - mel_min) * i as f64 / (n_mels + 1) as f64;
+            mel_to_hz(mel as f32) as f64
+        })
         .collect();
 
-    // Create filterbank matrix
+    // Exact (fractional) FFT bin frequencies.
+    let fft_freqs: Vec<f64> = (0..n_freqs)
+        .map(|k| k as f64 * sample_rate as f64 / n_fft as f64)
+        .collect();
+
     let mut filterbank: Tensor<f32> = Tensor::zeros(&[n_mels, n_freqs], DeviceType::Cpu)?;
 
     for i in 0..n_mels {
-        let start = bin_points[i];
-        let center = bin_points[i + 1];
-        let end = bin_points[i + 2];
-
-        // Rising edge
-        for j in start..center {
-            if j < n_freqs {
-                let value = (j - start) as f32 / (center - start) as f32;
-                filterbank.set_2d(i, j, value)?;
-            }
+        let (left, centre, right) = (hz_points[i], hz_points[i + 1], hz_points[i + 2]);
+        let rising = centre - left;
+        let falling = right - centre;
+        if rising <= 0.0 || falling <= 0.0 {
+            return Err(TorshError::InvalidArgument(
+                "Mel band edges are degenerate: reduce n_mels or widen the frequency range"
+                    .to_string(),
+            ));
         }
 
-        // Falling edge
-        for j in center..end {
-            if j < n_freqs {
-                let value = (end - j) as f32 / (end - center) as f32;
-                filterbank.set_2d(i, j, value)?;
+        let scale = match norm {
+            MelNorm::None => 1.0,
+            MelNorm::Slaney => 2.0 / (right - left),
+        };
+
+        for (k, &freq) in fft_freqs.iter().enumerate() {
+            let lower = (freq - left) / rising;
+            let upper = (right - freq) / falling;
+            let weight = lower.min(upper).max(0.0);
+            if weight > 0.0 {
+                filterbank.set_2d(i, k, (weight * scale) as f32)?;
             }
         }
     }
@@ -67,19 +121,6 @@ pub fn hz_to_mel(hz: f32) -> f32 {
 /// Convert mel scale to frequency in Hz
 pub fn mel_to_hz(mel: f32) -> f32 {
     700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0)
-}
-
-/// Create linearly spaced values
-pub(crate) fn linspace(start: f32, end: f32, num: usize) -> Vec<f32> {
-    if num == 0 {
-        return vec![];
-    }
-    if num == 1 {
-        return vec![start];
-    }
-
-    let step = (end - start) / (num - 1) as f32;
-    (0..num).map(|i| start + i as f32 * step).collect()
 }
 
 /// Convert frequency-domain data to mel scale using triangular filterbanks.
@@ -412,21 +453,5 @@ mod tests {
         }
 
         Ok(())
-    }
-
-    #[test]
-    fn test_linspace() {
-        let result = linspace(0.0, 10.0, 11);
-        assert_eq!(result.len(), 11);
-        assert_eq!(result[0], 0.0);
-        assert_eq!(result[10], 10.0);
-        assert_eq!(result[5], 5.0);
-
-        let empty = linspace(0.0, 10.0, 0);
-        assert_eq!(empty.len(), 0);
-
-        let single = linspace(5.0, 10.0, 1);
-        assert_eq!(single.len(), 1);
-        assert_eq!(single[0], 5.0);
     }
 }

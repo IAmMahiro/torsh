@@ -7,19 +7,19 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-#[cfg(feature = "webgpu")]
+#[cfg(feature = "wgpu")]
 use torsh_backend::webgpu::{
     WebGpuBackend, WebGpuBackendBuilder, WebGpuDevice, WebGpuBuffer, WebGpuKernelExecutor,
     WebGpuBackendConfig, AdapterInfo,
 };
 
-#[cfg(feature = "webgpu")]
+#[cfg(feature = "wgpu")]
 use torsh_backend::{
     BufferDescriptor, BufferUsage, MemoryLocation, BufferHandle,
     BackendBuilder, BackendType,
 };
 
-#[cfg(feature = "webgpu")]
+#[cfg(feature = "wgpu")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== ToRSh WebGPU Backend Demo ===\n");
@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "webgpu")]
+#[cfg(feature = "wgpu")]
 async fn demo_adapter_enumeration() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== WebGPU Adapter Enumeration ===");
     
@@ -106,7 +106,7 @@ async fn demo_adapter_enumeration() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "webgpu")]
+#[cfg(feature = "wgpu")]
 async fn demo_backend_initialization() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== WebGPU Backend Initialization ===");
     
@@ -170,7 +170,7 @@ async fn demo_backend_initialization() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-#[cfg(feature = "webgpu")]
+#[cfg(feature = "wgpu")]
 async fn demo_device_management() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== WebGPU Device Management ===");
     
@@ -223,7 +223,7 @@ async fn demo_device_management() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "webgpu")]
+#[cfg(feature = "wgpu")]
 async fn demo_buffer_operations() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== WebGPU Buffer Operations ===");
     
@@ -350,7 +350,7 @@ async fn demo_buffer_operations() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "webgpu")]
+#[cfg(feature = "wgpu")]
 async fn demo_compute_operations() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== WebGPU Compute Operations ===");
     
@@ -460,7 +460,7 @@ async fn demo_compute_operations() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "webgpu")]
+#[cfg(feature = "wgpu")]
 async fn demo_performance_benchmarks() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== WebGPU Performance Benchmarks ===");
     
@@ -592,7 +592,7 @@ async fn demo_performance_benchmarks() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-#[cfg(not(feature = "webgpu"))]
+#[cfg(not(feature = "wgpu"))]
 fn main() {
     println!("This demo requires the 'webgpu' feature to be enabled.");
     println!("Run with: cargo run --example webgpu_backend_demo --features webgpu");

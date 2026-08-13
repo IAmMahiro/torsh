@@ -2,10 +2,24 @@ use crate::{Result, TextError};
 use std::collections::HashMap;
 use std::path::Path;
 use torsh_core::{device::DeviceType as Device, dtype::DType};
-use torsh_tensor::creation::{arange, rand, randn, tensor_1d};
+use torsh_tensor::creation::{arange, rand, randn};
 use torsh_tensor::Tensor;
 
 // Temporary placeholder types until torsh-nn is available
+//
+/// A named, owned tensor with a bookkeeping `requires_grad` flag.
+///
+/// This is *not* wired to `Tensor`'s real autograd: `new` never calls
+/// `Tensor::requires_grad_(true)` on `tensor`, and `requires_grad` has no
+/// reader anywhere in this crate — it is stored and never consulted. Ops
+/// performed through [`Parameter::tensor`] therefore do not record a
+/// backward graph, and there is no `backward`/optimizer step anywhere in
+/// this module to consume one if they did. This is intentionally a stand-in
+/// for `torsh_nn::Parameter`
+/// (`Arc<RwLock<Tensor>>`-backed, and whose `new` *does* flip the wrapped
+/// tensor's `requires_grad`), used here only so `WordEmbedding` and friends
+/// have somewhere to put a weight tensor before torsh-nn-based layers exist
+/// for this crate.
 #[derive(Debug, Clone)]
 pub struct Parameter {
     tensor: Tensor,
@@ -81,6 +95,30 @@ impl Module for LayerNorm {
 // Word Embeddings
 // ============================================================================
 
+/// # `padding_idx` and gradients
+///
+/// [`WordEmbedding::new`] zeros `weight`'s `padding_idx` row at construction
+/// (see the comment there), matching PyTorch's `nn.Embedding(padding_idx=..)`
+/// forward behavior. PyTorch additionally *excludes* that row from gradient
+/// updates: its embedding backward kernel never accumulates into
+/// `grad_weight[padding_idx]`, so the row stays zero for the life of
+/// training even though it is a `requires_grad` leaf.
+///
+/// This module cannot offer that second half of the contract, and doesn't
+/// attempt to: `Parameter` here (see its doc comment) is a placeholder that
+/// never calls `Tensor::requires_grad_(true)` on the tensor it wraps, and
+/// this file defines no backward pass or optimizer step at all — `forward`'s
+/// `index_select` call runs against a `requires_grad = false` tensor, so no
+/// gradient reaches `weight` (padding row or otherwise) through this type
+/// today. There is consequently nothing here to mask. A real
+/// gradient-masking implementation needs, at minimum: (1) `weight`'s tensor
+/// actually tracking gradients, (2) an `index_select` backward that scatters
+/// into `grad_weight`, and (3) that scatter (or a post-hoc step before the
+/// optimizer applies it) skipping rows equal to `padding_idx` — for example
+/// by zeroing `grad_weight[padding_idx]` after backward and before the
+/// update, the way a layer built on the real, autograd-integrated
+/// `torsh_nn::Parameter` could. Until this type is rebuilt on that real
+/// `Parameter`, only the forward-time zeroing applies.
 #[derive(Debug, Clone)]
 pub struct WordEmbedding {
     pub weight: Parameter,
@@ -107,13 +145,32 @@ impl WordEmbedding {
     ) -> Result<Self> {
         let weight = Parameter::new(randn::<f32>(&[vocab_size, embedding_dim])?, true);
 
-        // Zero out padding embeddings if specified
+        // Zero out the padding row, in place, in the weight tensor `weight`
+        // itself owns.
+        //
+        // The previous implementation read `weight_data.index_select(0,
+        // &tensor_1d(&[pad_idx as i64])?)?`: `index_select` allocates and
+        // returns a *new* tensor with its own fresh storage (a gather, not a
+        // view), so `padding_row.fill_(0.0)` zeroed that fresh, temporary
+        // copy and then dropped it — `weight`'s actual storage, and every
+        // lookup `forward()` performs, kept the random initial values at
+        // `pad_idx`. `WordEmbedding::new(5, 4, Some(2), ..)`'s padding row
+        // was observably non-zero.
+        //
+        // `Tensor::set_slice` instead writes straight into the flat,
+        // row-major storage this freshly-created (and therefore contiguous,
+        // unviewed) `[vocab_size, embedding_dim]` weight tensor owns, at the
+        // flat offset `pad_idx * embedding_dim` — exactly the row `forward`
+        // reads back for that index. `set_slice` takes `&self` and writes
+        // through shared storage with no copy-on-write step (see its doc
+        // comment), which is fine here: `weight` was just constructed, so no
+        // other handle could be aliasing (and losing) this write.
         if let Some(pad_idx) = padding_idx {
             if pad_idx < vocab_size {
-                let weight_data = weight.tensor().clone();
-                let mut padding_row =
-                    weight_data.index_select(0, &tensor_1d(&[pad_idx as i64])?)?;
-                padding_row.fill_(0.0)?;
+                let zero_row = vec![0.0f32; embedding_dim];
+                weight
+                    .tensor()
+                    .set_slice(pad_idx * embedding_dim, &zero_row)?;
             }
         }
 
@@ -129,6 +186,15 @@ impl WordEmbedding {
         })
     }
 
+    /// Wrap a pre-trained embedding matrix.
+    ///
+    /// Unlike [`WordEmbedding::new`], this does *not* zero `embeddings`'s
+    /// `padding_idx` row: the caller supplied real weights, and PyTorch's
+    /// `nn.Embedding.from_pretrained` only forces the padding row to zero
+    /// when it generates the weights itself (`padding_idx` still disables
+    /// gradient updates for that row during training, but does not rewrite
+    /// values the caller explicitly provided). `padding_idx` is otherwise
+    /// stored and used exactly as it is for [`WordEmbedding::new`].
     pub fn from_pretrained(
         embeddings: Tensor,
         freeze: bool,

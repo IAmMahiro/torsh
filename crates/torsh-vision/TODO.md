@@ -2837,3 +2837,29 @@ This session successfully resolved **critical API compatibility issues** that we
 
 The torsh-vision crate is now **architecturally sound** with all major API compatibility issues resolved, pending only build environment cleanup for final validation.
 
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+- [ ] torsh-vision: feature_detection_advanced.rs:81 — "TODO: Integrate with torsh-nn for the actual neural network"
+  - **Approach:** SuperPointDetector currently has no model field at all (just config). Needs a real SuperPoint CNN backbone (conv encoder + detector/descriptor heads) plus pretrained-weight loading/format decision in torsh-nn — none of this exists yet.
+  - **Scope:** oversized
+  - **Prerequisites:** SuperPoint CNN architecture + pretrained weights in torsh-nn (don't exist)
+  - **Risk:** low immediate risk — detect() fails loudly (Err) rather than silently returning garbage, correct interim behavior.
+
+- [ ] torsh-vision: feature_detection_advanced.rs:92 — "TODO: Implement SuperPoint detection using torsh-nn"
+  - **Approach:** same as item 1. detect() explicitly returns Err(VisionError::InvalidParameter("SuperPoint detection not yet implemented...")) — honest fail-fast stub, good practice pending real impl.
+  - **Scope:** oversized
+  - **Prerequisites:** same as item 1
+  - **Risk:** low — errors clearly rather than returning wrong features.
+
+- [ ] torsh-vision: feature_detection_advanced.rs:148 — "TODO: Implement Learned SIFT detection"
+  - **Approach:** needs a learned-descriptor CNN head on top of classical SIFT keypoint detection in torsh-nn — not implemented. Same honest-fail pattern as SuperPoint.
+  - **Scope:** oversized
+  - **Prerequisites:** learned-descriptor CNN in torsh-nn (doesn't exist)
+  - **Risk:** low — fails loudly.
+
+- [ ] torsh-vision: feature_detection_advanced.rs:263 — "TODO: Implement full transformer-style attention with learned parameters"
+  - **Approach:** needs a multi-head attention module with learned Q/K/V weights (AttentionMatcherConfig already models num_heads/hidden_dim but they're unused by the simplified path). compute_attention_similarity() silently substitutes plain cosine similarity for the advertised transformer attention WITHOUT erroring — behavior differs from documented algorithm with no signal.
+  - **Scope:** large
+  - **Prerequisites:** multi-head attention module wiring
+  - **Risk:** MEDIUM — unlike the SuperPoint/SIFT stubs, this one runs and returns plausible-looking but algorithmically different results with no warning; callers may unknowingly get lower-quality matches than the API implies. Higher priority than items 1-3 for a future pass since it silently degrades rather than failing loudly.
+

@@ -460,25 +460,27 @@ let acc = accuracy(&large_y_true, &large_y_pred)?;  // Computed on GPU
 ```rust
 use torsh_metrics::prelude::*;
 
-// Define custom metric
+// Define custom metric by implementing the `Metric` trait
 struct CustomMetric;
 
 impl Metric for CustomMetric {
-    fn compute(&self, y_true: &Tensor, y_pred: &Tensor) -> Result<f32> {
+    fn compute(&self, predictions: &Tensor, targets: &Tensor) -> f64 {
         // Your custom logic
-        let diff = (y_true - y_pred)?.abs()?;
-        let custom_score = diff.mean()?.item();
-        Ok(custom_score)
+        let diff = (predictions - targets).unwrap().abs().unwrap();
+        diff.mean(None, false).unwrap().item::<f64>().unwrap()
+    }
+
+    fn name(&self) -> &str {
+        "custom"
     }
 }
 
-// Use custom metric
+// Use custom metric directly
 let metric = CustomMetric;
-let score = metric.compute(&y_true, &y_pred)?;
+let score = metric.compute(&y_true, &y_pred);
 
-// Register for use with metric name
-register_metric("custom", Box::new(CustomMetric))?;
-let score = compute_metric("custom", &y_true, &y_pred)?;
+// Or evaluate several metrics together with MetricCollection
+let collection = MetricCollection::new().add(CustomMetric);
 ```
 
 ## Integration with SciRS2
@@ -498,6 +500,10 @@ All implementations follow the [SciRS2 POLICY](https://github.com/cool-japan/sci
 3. **Batch predictions** before computing metrics when possible
 4. **Cache metric objects** when computing multiple metrics on the same data
 5. **Use parallel features** with `features = ["parallel"]` in Cargo.toml
+
+## Testing
+
+This crate has 259 passing tests (`cargo nextest run -p torsh-metrics --all-features`).
 
 ## License
 

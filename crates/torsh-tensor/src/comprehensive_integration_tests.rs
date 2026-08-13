@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use torsh_core::sync::MutexExt;
 
 use crate::adaptive_auto_tuner::{AdaptiveAutoTuner, AutoTuningConfig};
 use crate::cross_platform_validator::{
@@ -961,10 +962,7 @@ impl ComprehensiveIntegrationTestSuite {
 
     /// Record a test result
     fn record_test_result(&mut self, result: IntegrationTestResult) {
-        let mut collector = self
-            .results_collector
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut collector = self.results_collector.lock_or_recover();
         collector.test_results.push(result);
     }
 
@@ -973,10 +971,7 @@ impl ComprehensiveIntegrationTestSuite {
         &self,
         total_execution_time: Duration,
     ) -> Result<ComprehensiveTestReport, Box<dyn std::error::Error>> {
-        let collector = self
-            .results_collector
-            .lock()
-            .expect("lock should not be poisoned");
+        let collector = self.results_collector.lock_or_recover();
 
         let total_tests = collector.test_results.len();
         let passed_tests = collector.test_results.iter().filter(|r| r.success).count();

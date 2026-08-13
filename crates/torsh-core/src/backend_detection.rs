@@ -412,30 +412,15 @@ impl BackendFeatureDetector {
 
     /// Detect CUDA version if available
     ///
-    /// # SciRS2 Integration (Phase 2: GPU Kernel Integration)
-    /// This function will integrate with scirs2-core::gpu when available:
-    /// ```rust,ignore
-    /// #[cfg(scirs2_gpu_available)]
-    /// use scirs2_core::gpu::cuda::CudaContext;
-    /// let version = CudaContext::driver_version();
-    /// ```
-    ///
     /// # Current Status
-    /// Placeholder ready for scirs2-core GPU integration.
-    /// Detection logic will be activated when scirs2-core is built with CUDA support.
+    /// torsh-core has no direct CUDA bindings (GPU compute for ToRSh is
+    /// provided by oxicuda via `torsh-tensor`'s `gpu_dispatch`), so this
+    /// foundation crate cannot query a real driver version. Always returns
+    /// `None` rather than a fabricated version string.
     #[allow(dead_code)]
     #[cfg(all(feature = "gpu", feature = "cuda"))]
     fn detect_cuda_version(&self) -> Option<String> {
-        // Ready for scirs2-core::gpu::cuda integration
-        #[cfg(scirs2_gpu_available)]
-        {
-            // Will use: scirs2_core::gpu::cuda::CudaContext::driver_version()
-            None // Placeholder until scirs2-core GPU available
-        }
-        #[cfg(not(scirs2_gpu_available))]
-        {
-            None
-        }
+        None
     }
 
     #[allow(dead_code)]
@@ -446,34 +431,17 @@ impl BackendFeatureDetector {
 
     /// Detect CUDA compute capability
     ///
-    /// # SciRS2 Integration (Phase 2: GPU Kernel Integration)
-    /// Returns compute capability as (major, minor) version tuple.
-    /// Integration path:
-    /// ```rust,ignore
-    /// #[cfg(scirs2_gpu_available)]
-    /// use scirs2_core::gpu::cuda::CudaDevice;
-    /// let device = CudaDevice::new(0)?;
-    /// let (major, minor) = device.compute_capability();
-    /// ```
+    /// Returns compute capability as a (major, minor) version tuple.
     ///
-    /// # Performance Impact
-    /// Compute capability determines available GPU features and performance:
-    /// - 7.0+: Tensor Cores (mixed precision training)
-    /// - 8.0+: 3rd gen Tensor Cores, improved FP64
-    /// - 9.0+: 4th gen Tensor Cores, FP8 support
+    /// # Current Status
+    /// torsh-core has no direct CUDA bindings and cannot query a real
+    /// device, so this always returns `None` rather than a fabricated
+    /// capability tuple. Real compute-capability queries are available
+    /// through `torsh-tensor`'s oxicuda-backed `gpu_dispatch`.
     #[allow(dead_code)]
     #[cfg(all(feature = "gpu", feature = "cuda"))]
     fn detect_cuda_compute_capability(&self) -> Option<(u32, u32)> {
-        // Ready for scirs2-core::gpu::cuda integration
-        #[cfg(scirs2_gpu_available)]
-        {
-            // Will use: scirs2_core::gpu::cuda::CudaDevice::compute_capability()
-            None // Placeholder until scirs2-core GPU available
-        }
-        #[cfg(not(scirs2_gpu_available))]
-        {
-            None
-        }
+        None
     }
 
     #[allow(dead_code)]
@@ -484,34 +452,16 @@ impl BackendFeatureDetector {
 
     /// Detect Metal version (Apple platforms)
     ///
-    /// # SciRS2 Integration (Phase 2: GPU Kernel Integration)
-    /// Integration path for Metal GPU backend:
-    /// ```rust,ignore
-    /// #[cfg(scirs2_gpu_available)]
-    /// use scirs2_core::gpu::metal::MetalDevice;
-    /// let device = MetalDevice::default()?;
-    /// let version = device.feature_set();
-    /// ```
-    ///
-    /// # Platform Support
-    /// - macOS 10.13+: Metal 2.0
-    /// - macOS 10.15+: Metal 2.2 (enhanced ray tracing)
-    /// - macOS 11.0+: Metal 2.3 (Apple Silicon optimizations)
-    /// - macOS 12.0+: Metal 3.0 (mesh shaders, async compute)
+    /// # Current Status
+    /// torsh-core has no Metal framework bindings and does not query the
+    /// actual negotiated Metal feature set here; this returns a fixed
+    /// baseline value rather than a real detection result. (Not addressed
+    /// by this pass -- see FOLLOW-UP notes; only the dead phantom-cfg
+    /// branching that used to wrap this value has been removed.)
     #[allow(dead_code)]
     #[cfg(target_os = "macos")]
     fn detect_metal_version(&self) -> Option<String> {
-        // Ready for scirs2-core::gpu::metal integration
-        #[cfg(scirs2_gpu_available)]
-        {
-            // Will use: scirs2_core::gpu::metal::MetalDevice::feature_set()
-            Some("Metal 3".to_string()) // Placeholder - will query actual version
-        }
-        #[cfg(not(scirs2_gpu_available))]
-        {
-            // Metal is available on all modern macOS systems
-            Some("Metal 3".to_string())
-        }
+        Some("Metal 3".to_string())
     }
 
     #[allow(dead_code)]
@@ -522,37 +472,17 @@ impl BackendFeatureDetector {
 
     /// Detect WebGPU support
     ///
-    /// # SciRS2 Integration (Phase 2: GPU Kernel Integration)
-    /// WebGPU provides cross-platform GPU access via wgpu-rs.
-    /// Integration path:
-    /// ```rust,ignore
-    /// #[cfg(scirs2_gpu_available)]
-    /// use scirs2_core::gpu::webgpu::WebGpuBackend;
-    /// let available = WebGpuBackend::is_supported();
-    /// ```
-    ///
-    /// # Platform Coverage
-    /// WebGPU enables GPU acceleration on:
-    /// - Windows: D3D12 backend
-    /// - Linux: Vulkan backend
-    /// - macOS: Metal backend
-    /// - Web: WebGPU API (WASM)
-    ///
-    /// # Performance Note
-    /// Expected 10-100x speedup for large tensors (>50K elements) when GPU available.
+    /// # Current Status
+    /// torsh-core has no `wgpu` dependency wired into this detector (the
+    /// `wgpu` feature here is a marker flag, not `dep:wgpu`), so it cannot
+    /// probe for a real adapter. Always returns `false` rather than
+    /// unconditionally claiming WebGPU is available -- a hardcoded `true`
+    /// would send every caller, including headless CI with no GPU at all,
+    /// down a GPU code path that cannot work.
     #[allow(dead_code)]
     #[cfg(feature = "wgpu")]
     fn detect_webgpu_support(&self) -> bool {
-        // Ready for scirs2-core::gpu::webgpu integration
-        #[cfg(scirs2_gpu_available)]
-        {
-            // Will use: scirs2_core::gpu::webgpu::WebGpuBackend::is_supported()
-            true // Placeholder until scirs2-core GPU available
-        }
-        #[cfg(not(scirs2_gpu_available))]
-        {
-            true
-        }
+        false
     }
 
     #[allow(dead_code)]
@@ -577,38 +507,16 @@ impl BackendFeatureDetector {
 
     /// Count available GPU devices
     ///
-    /// # SciRS2 Integration (Phase 2: GPU Kernel Integration)
-    /// Enumerates all available GPU devices across backends.
-    /// Integration path:
-    /// ```rust,ignore
-    /// #[cfg(scirs2_gpu_available)]
-    /// use scirs2_core::gpu::GpuDeviceEnumerator;
-    /// let count = GpuDeviceEnumerator::new()?.count_all_devices();
-    /// ```
-    ///
     /// # Multi-Backend Support
-    /// Counts devices from all enabled backends:
-    /// - CUDA devices (NVIDIA GPUs)
-    /// - Metal devices (Apple GPUs)
-    /// - WebGPU devices (cross-platform)
-    /// - ROCm devices (AMD GPUs)
-    /// - OpenCL devices (generic GPU support)
-    ///
-    /// # Use Case
-    /// Essential for multi-GPU training and device selection strategies.
+    /// Would count devices from all enabled backends (CUDA, Metal, WebGPU,
+    /// OpenCL) once torsh-core has a real device enumeration path. It does
+    /// not today: torsh-core has no direct GPU bindings, so this always
+    /// returns `0` rather than a fabricated count. Real device enumeration
+    /// is available through `torsh-tensor`'s oxicuda-backed `gpu_dispatch`.
     #[allow(dead_code)]
     #[cfg(feature = "gpu")]
     fn count_gpu_devices(&self) -> usize {
-        // Ready for scirs2-core::gpu device enumeration
-        #[cfg(scirs2_gpu_available)]
-        {
-            // Will use: scirs2_core::gpu::GpuDeviceEnumerator::count_all_devices()
-            0 // Placeholder until scirs2-core GPU available
-        }
-        #[cfg(not(scirs2_gpu_available))]
-        {
-            0
-        }
+        0
     }
 
     #[allow(dead_code)]

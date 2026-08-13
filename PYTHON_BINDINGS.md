@@ -1,215 +1,70 @@
-# ToRSh Python Bindings Implementation
+# ToRSh Python Bindings
 
-## Overview
+PyO3-based, PyTorch-compatible Python bindings for ToRSh. The compiled
+extension is exposed as `rstorch._C` and wrapped by the pure-Python package in
+`python/rstorch/`.
 
-This document outlines the implementation of Python bindings for ToRSh using PyO3, providing a PyTorch-compatible API for Python users.
+## Build & install
 
-## Implementation Status: COMPLETED ✅
+The single canonical maturin manifest is the workspace-root `pyproject.toml`
+(distribution name `torsh`). It points `manifest-path` at
+`crates/torsh-python/Cargo.toml`, whose `#[pymodule(name = "_C")]` produces the
+`PyInit__C` init symbol that `module-name = "rstorch._C"` expects.
 
-The Python bindings foundation has been successfully implemented with the following components:
-
-### Core Components Implemented
-
-#### 1. **Tensor Bindings** (`torsh-python/src/tensor_simple.rs`)
-- **PyTensor**: Main tensor wrapper class
-- **Creation functions**: `tensor()`, `zeros()`, `ones()`, `randn()`
-- **Shape operations**: `view()`, `reshape()`, `transpose()`, `squeeze()`, `unsqueeze()`, `flatten()`
-- **Arithmetic operations**: `+`, `-`, `*`, `/` operators
-- **Data access**: `numpy()`, `item()`, `tolist()`, indexing
-- **Device transfer**: `to()`, `cpu()`, `cuda()`
-- **Gradient operations**: `backward()`, `requires_grad_()`, `detach()`, `zero_grad()`
-- **NumPy interoperability**: Direct conversion to/from NumPy arrays
-
-#### 2. **Neural Network Bindings** (`torsh-python/src/nn_simple.rs`)
-- **PyModule**: Base class for all neural network modules
-- **PyLinear**: Linear (fully connected) layer implementation
-- **Parameter management**: `parameters()`, `named_parameters()`
-- **Training modes**: `train()`, `eval()` methods
-- **Device management**: `to()` method for device transfer
-
-#### 3. **Device Management** (`torsh-python/src/device.rs`)
-- **PyDevice**: Device wrapper class supporting CPU, CUDA, Metal, and WGPU
-- **Device constants**: `cpu`, device detection functions
-- **Device utilities**: `device_count()`, `cuda_is_available()`, etc.
-
-#### 4. **Data Type System** (`torsh-python/src/dtype.rs`)
-- **PyDType**: Data type wrapper with PyTorch compatibility
-- **Type constants**: `float32`, `float64`, `int32`, `int64`, `bool`, etc.
-- **Type utilities**: Size information, type checking methods
-
-#### 5. **Error Handling** (`torsh-python/src/error.rs`)
-- **TorshPyError**: Custom Python exception class
-- **Error conversion**: Automatic conversion from Rust errors to Python exceptions
-- **Error categories**: Shape errors, index errors, device errors, etc.
-
-#### 6. **Package Structure** (`python/torsh/`)
-- **Main package**: `__init__.py` with full PyTorch-compatible API
-- **Submodules**: `nn.py`, `optim.py`, `autograd.py`, `distributed.py`, `functional.py`
-- **Tensor creation**: Factory functions with default device/dtype support
-- **Math operations**: Element-wise and linear algebra functions
-
-### Build System
-
-#### 1. **Cargo Configuration** (`Cargo.toml`)
-- PyO3 integration with extension module support
-- NumPy bindings for array interoperability
-- ABI3 compatibility for Python 3.8+
-
-#### 2. **Python Packaging** (`pyproject.toml`)
-- Maturin build system configuration
-- Package metadata and dependencies
-- Development and documentation dependencies
-
-### Example Usage
-
-#### Basic Tensor Operations
-```python
-import rstorch
-
-# Create tensors
-x = rstorch.tensor([[1.0, 2.0], [3.0, 4.0]])
-y = rstorch.randn(2, 2)
-
-# Arithmetic operations
-z = x + y
-w = x @ y  # Matrix multiplication
-
-# Shape operations
-reshaped = x.view(-1)
-transposed = x.transpose(0, 1)
-
-# NumPy interoperability
-numpy_array = x.numpy()
-from_numpy = rstorch.tensor(numpy_array)
-```
-
-#### Neural Network Training
-```python
-import rstorch
-import rstorch.nn as nn
-
-# Create model
-model = nn.Sequential([
-    nn.Linear(784, 128),
-    nn.Linear(128, 10)
-])
-
-# Training loop
-optimizer = rstorch.optim.SGD(model.parameters(), lr=0.01)
-
-for epoch in range(100):
-    # Forward pass
-    output = model(input_data)
-    loss = rstorch.nn.functional.cross_entropy(output, targets)
-    
-    # Backward pass
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-```
-
-### Architecture Features
-
-#### 1. **PyTorch API Compatibility**
-- Drop-in replacement for common PyTorch operations
-- Same function signatures and behavior
-- Compatible tensor indexing and broadcasting
-
-#### 2. **Zero-Copy NumPy Integration**
-- Direct memory sharing with NumPy arrays
-- Efficient data transfer between Python and Rust
-- Support for all major NumPy dtypes
-
-#### 3. **Gradient Computation**
-- Automatic differentiation support
-- Computation graph tracking
-- Custom autograd functions
-
-#### 4. **Device Management**
-- Multi-device support (CPU, CUDA, Metal, WGPU)
-- Automatic device detection
-- Seamless tensor transfers between devices
-
-#### 5. **Error Handling**
-- Descriptive error messages
-- Proper Python exception hierarchy
-- Stack trace preservation
-
-### Performance Benefits
-
-#### 1. **Memory Safety**
-- Rust's ownership system prevents memory errors
-- No garbage collection overhead
-- Safe concurrent operations
-
-#### 2. **Speed Optimizations**
-- Zero-cost abstractions from Rust
-- SIMD optimizations
-- Parallel computation support
-
-#### 3. **Reduced Binary Size**
-- Statically linked dependencies
-- No Python runtime overhead for core operations
-- Efficient serialization
-
-### Testing and Examples
-
-#### 1. **Example Scripts**
-- `examples/python/tensor_operations.py`: Basic tensor usage
-- `examples/python/neural_network.py`: Complete training example
-
-#### 2. **Integration Tests**
-- PyTorch compatibility tests
-- NumPy interoperability tests
-- Device transfer tests
-
-### Future Enhancements
-
-#### 1. **API Completeness**
-- Additional tensor operations
-- More neural network layers
-- Complete optimizer implementations
-
-#### 2. **Performance Optimizations**
-- JIT compilation integration
-- Custom CUDA kernels
-- Memory pool management
-
-#### 3. **Ecosystem Integration**
-- TorchScript compatibility
-- ONNX model export/import
-- Hugging Face integration
-
-## Development Setup
-
-### Building from Source
 ```bash
-# Install maturin
-pip install maturin
-
-# Build and install in development mode
-cd torsh
-maturin develop
-
-# Test the installation
-python -c "import rstorch; print(rstorch.tensor([1, 2, 3]))"
+# From the repo root, inside a virtualenv:
+python -m venv .venv && source .venv/bin/activate
+pip install maturin numpy
+maturin develop            # builds rstorch._C and installs the rstorch package
+python -c "import rstorch; print(rstorch.__version__)"
 ```
 
-### Requirements
-- Python 3.8+
-- Rust 1.76+
-- NumPy 1.19+
+`cargo test` does NOT exercise these bindings (the import-time defects are
+invisible to Rust). The regression suite is `python/tests/test_import_hardening.py`
+and must be run against a maturin-built wheel.
 
-## Conclusion
+## Source layout (real files)
 
-The ToRSh Python bindings provide a solid foundation for PyTorch-compatible deep learning in Python, leveraging Rust's performance and safety benefits. The implementation demonstrates:
+| Area | Files |
+|------|-------|
+| Tensor | `crates/torsh-python/src/tensor/{core,creation,...}.rs` |
+| Neural nets | `crates/torsh-python/src/nn/{module,linear,conv,normalization,dropout,pooling,container,activation,loss}.rs` |
+| Optimizers | `crates/torsh-python/src/optim/{sgd,adam,adagrad,rmsprop,base,lr_scheduler}.rs` |
+| Functional | `crates/torsh-python/src/functional.rs` |
+| Device / dtype | `crates/torsh-python/src/{device,dtype}.rs` |
+| Autograd | `crates/torsh-python/src/autograd.rs` |
+| Distributed | `crates/torsh-python/src/distributed.rs` |
+| Data | `crates/torsh-python/src/data.rs` |
+| Errors | `crates/torsh-python/src/error.rs` |
+| Python package | `python/rstorch/{__init__,nn,optim,autograd,distributed,functional}.py` |
 
-1. **Successful PyO3 Integration**: Complete tensor and neural network bindings
-2. **PyTorch API Compatibility**: Drop-in replacement capability
-3. **Production-Ready Structure**: Proper packaging, error handling, and documentation
-4. **Performance Foundation**: Zero-copy operations and memory safety
-5. **Extensible Architecture**: Easy to add new operations and features
+There is no `tensor_simple.rs` or `nn_simple.rs`; earlier revisions of this
+document referenced files and a `python/torsh/` package that never existed.
 
-The bindings are production-ready and provide a strong foundation for the next phase of development, which focuses on completing the remaining PyTorch API surface and optimizing performance.
+## Status matrix
 
-**Status: IMPLEMENTATION COMPLETED** ✅
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `import rstorch` and submodules | Working | Submodules registered in `sys.modules` as `rstorch._C.<sub>`. |
+| Tensor creation (`zeros`, `ones`, `full`, `randn`, `*_like`, ...) | Working | Provided by the extension; `full` fills correctly. |
+| `nn` layers (`Linear`, `Conv1/2d`, `BatchNorm`, `LayerNorm`, `Dropout*`, pooling, `Sequential`, `ModuleList`) | Working | `Module.__call__` dispatches dynamically to the subclass `forward`. |
+| Activations (`relu`/`elu`/`selu`/`gelu`/`mish`/`softplus`/`softsign`/`leaky_relu`/`silu`) | Working | Delegated to `torsh_functional`; no relu/tanh placeholders. |
+| Loss (`mse_loss`, `l1_loss`, `cross_entropy`, `binary_cross_entropy`) | Working | Delegated to `torsh_functional`. |
+| `batch_norm` / `layer_norm` / `dropout` (functional) | Working | Delegated to `torsh_functional`. |
+| Optimizers (`SGD`, `Adam`, `AdamW`, `Adagrad`, `RMSprop`) + `lr_scheduler` | Working | Wrap real `torsh_optim`. |
+| `autograd.no_grad` / `set_grad_enabled` | Working | Bridged to `torsh_autograd` / `torsh_core::grad_mode` global flag. |
+| `distributed` collectives | Not implemented | Raise `NotImplementedError`; `is_available()` returns `False`. No real multi-process backend is wired yet. |
+| `uint16` dtype | Not supported | `torsh_core::DType` has no `U16` variant. |
+
+## Known gaps / follow-ups
+
+- Add `DType::U16` to `torsh-core` to restore a `uint16` dtype.
+- Wire `rstorch.distributed` to a real (TCP) `torsh-distributed` backend; today
+  only a mock backend exists, so the Python collectives raise instead of
+  silently corrupting gradients.
+- `numpy_compatibility` / `pandas` / `scipy` interop live in `torsh-ffi`, not in
+  `torsh-python`.
+- Splitting the combined binding cdylib (PyO3 `torsh-python` + N-API `torsh-ffi`)
+  into separate `torsh-capi` / `torsh-node` packages is **deferred** to a later
+  0.2.x. The current single-crate layout builds, imports, and passes
+  maturin + pytest today; the split is a packaging cleanup, not a bugfix.

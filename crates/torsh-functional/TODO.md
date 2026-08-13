@@ -1049,3 +1049,17 @@ The functional crate provides a comprehensive PyTorch-compatible functional API 
 - [ ] Add interactive examples and tutorials
 - [ ] Create operation comparison and selection guides
 - [ ] Add community contribution guidelines and standards
+
+## Stubs to implement (added 2026-07-03 by /stub-check)
+
+- [ ] torsh-functional: utils.rs:348 — "TODO: Implement proper in-place operations when tensor mutation is available"
+  - **Approach:** torsh-tensor confirmed still missing a set_data/write(&self)/fill_/copy_ or similar in-place VALUE mutation primitive (Tensor has interior mutability for gradients via RwLock, e.g. set_grad, but not for values). handle_inplace_operation() always computes out-of-place (operation(input)) regardless of the inplace flag; it's a shared utility, so fixing it (once Tensor gains real mutation) automatically fixes dropout.rs:39 and any other caller.
+  - **Scope:** medium
+  - **Prerequisites:** torsh-tensor needs a real in-place value-mutation primitive (doesn't exist yet)
+  - **Risk:** low correctness risk (functionally equivalent output), real memory/perf risk — callers requesting inplace=true get no memory savings, silently.
+
+- [ ] torsh-functional: dropout.rs:39 — "TODO: Implement inplace operations when available"
+  - **Approach:** thin call site of the same underlying gap as utils.rs:348 — input.clone().mul_op(&mask) clones then does a normal multiply. Fix centrally in torsh-tensor; this site becomes trivial once that lands.
+  - **Scope:** small
+  - **Prerequisites:** utils.rs:348 / torsh-tensor in-place mutation primitive
+  - **Risk:** low — same as item 1.

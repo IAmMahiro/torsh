@@ -262,6 +262,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+    use torsh_core::sync::MutexExt;
 
     #[test]
     fn test_lock_timeout_configuration() {
@@ -299,7 +300,7 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel::<()>();
 
         let handle = thread::spawn(move || {
-            let _guard = mutex_clone.lock().expect("lock should not be poisoned");
+            let _guard = mutex_clone.lock_or_recover();
             // Announce that the lock is now held.
             acquired_tx
                 .send(())

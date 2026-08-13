@@ -55,6 +55,11 @@ pub enum CompositionType {
 
 impl PrivacyBudget {
     /// Create a new privacy budget
+    ///
+    /// # Panics
+    ///
+    /// Panics if `epsilon <= 0.0` or `delta` is outside `[0.0, 1.0)`. See
+    /// [`Self::try_new`] for a non-panicking variant.
     pub fn new(epsilon: f64, delta: f64) -> Self {
         assert!(epsilon > 0.0, "epsilon must be positive");
         assert!(delta >= 0.0 && delta < 1.0, "delta must be in [0, 1)");
@@ -66,6 +71,19 @@ impl PrivacyBudget {
             used_delta: 0.0,
             composition_type: CompositionType::Basic,
         }
+    }
+
+    /// Fallible variant of [`Self::new`] that returns an error instead of
+    /// panicking on invalid `(epsilon, delta)` privacy parameters.
+    pub fn try_new(epsilon: f64, delta: f64) -> Result<Self> {
+        dp_utils::validate_privacy_parameters(epsilon, delta)?;
+        Ok(Self {
+            epsilon,
+            delta,
+            used_epsilon: 0.0,
+            used_delta: 0.0,
+            composition_type: CompositionType::Basic,
+        })
     }
 
     /// Set composition type
@@ -333,19 +351,48 @@ pub trait NoiseGenerator: Send + Sync {
 pub struct LaplaceNoise {
     // Store seed instead of RNG for thread safety
     seed: u64,
+    // F007 (extended sweep): advances on every draw so repeated calls on the
+    // same instance reconstruct a DIFFERENT `Random::seed(..)` instead of the
+    // identical one. Reseeding from the same constant on every call - the
+    // exact bug pattern F007 fixes for image transforms - is far more severe
+    // here: noise that repeats provides no differential-privacy protection
+    // at all, since every query after the first leaks the same fixed offset.
+    calls: u64,
 }
 
-// LaplaceNoise is thread-safe since it only stores a u64 seed
+// LaplaceNoise is thread-safe since it only stores u64 fields
 unsafe impl Send for LaplaceNoise {}
 unsafe impl Sync for LaplaceNoise {}
 
 impl LaplaceNoise {
+    /// Create a generator seeded from real entropy, so two instances don't
+    /// draw the same noise sequence. See [`Self::with_seed`] for a
+    /// reproducible variant (e.g. for tests).
     pub fn new() -> Self {
-        Self { seed: 42 }
+        use scirs2_core::random::Random;
+        let mut entropy_rng = Random::default();
+        Self {
+            seed: entropy_rng.gen_range(0..=u64::MAX),
+            calls: 0,
+        }
     }
 
     pub fn with_seed(seed: u64) -> Self {
-        Self { seed }
+        Self { seed, calls: 0 }
+    }
+
+    /// Effective seed for the next draw; advances so repeated calls on the
+    /// same instance don't reconstruct an identical RNG (see `calls` above).
+    fn next_seed(&mut self) -> u64 {
+        let effective = self.seed.wrapping_add(self.calls);
+        self.calls = self.calls.wrapping_add(1);
+        effective
+    }
+}
+
+impl Default for LaplaceNoise {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -359,8 +406,8 @@ impl NoiseGenerator for LaplaceNoise {
 
         let size: usize = shape.iter().product();
 
-        // Create RNG from seed for thread safety
-        let mut rng = scirs2_core::random::Random::seed(self.seed);
+        // Create RNG from the per-call-advancing seed (see `next_seed`)
+        let mut rng = scirs2_core::random::Random::seed(self.next_seed());
 
         // Approximate Laplace distribution using two exponential distributions
         let data: Vec<f32> = (0..size)
@@ -392,8 +439,8 @@ impl NoiseGenerator for LaplaceNoise {
             ))
         })?;
 
-        // Create RNG from seed for thread safety
-        let mut rng = scirs2_core::random::Random::seed(self.seed);
+        // Create RNG from the per-call-advancing seed (see `next_seed`)
+        let mut rng = scirs2_core::random::Random::seed(self.next_seed());
         let data: Vec<f32> = (0..size).map(|_| normal.sample(&mut rng) as f32).collect();
 
         torsh_tensor::Tensor::from_data(data, shape.to_vec(), torsh_core::DeviceType::Cpu).map_err(
@@ -407,19 +454,43 @@ impl NoiseGenerator for LaplaceNoise {
 pub struct GaussianNoise {
     // Store seed instead of RNG for thread safety
     seed: u64,
+    // See `LaplaceNoise::calls` - identical reasoning applies here.
+    calls: u64,
 }
 
-// GaussianNoise is thread-safe since it only stores a u64 seed
+// GaussianNoise is thread-safe since it only stores u64 fields
 unsafe impl Send for GaussianNoise {}
 unsafe impl Sync for GaussianNoise {}
 
 impl GaussianNoise {
+    /// Create a generator seeded from real entropy, so two instances don't
+    /// draw the same noise sequence. See [`Self::with_seed`] for a
+    /// reproducible variant (e.g. for tests).
     pub fn new() -> Self {
-        Self { seed: 42 }
+        use scirs2_core::random::Random;
+        let mut entropy_rng = Random::default();
+        Self {
+            seed: entropy_rng.gen_range(0..=u64::MAX),
+            calls: 0,
+        }
     }
 
     pub fn with_seed(seed: u64) -> Self {
-        Self { seed }
+        Self { seed, calls: 0 }
+    }
+
+    /// Effective seed for the next draw; advances so repeated calls on the
+    /// same instance don't reconstruct an identical RNG (see `calls` above).
+    fn next_seed(&mut self) -> u64 {
+        let effective = self.seed.wrapping_add(self.calls);
+        self.calls = self.calls.wrapping_add(1);
+        effective
+    }
+}
+
+impl Default for GaussianNoise {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -448,8 +519,8 @@ impl NoiseGenerator for GaussianNoise {
             ))
         })?;
 
-        // Create RNG from seed for thread safety
-        let mut rng = scirs2_core::random::Random::seed(self.seed);
+        // Create RNG from the per-call-advancing seed (see `next_seed`)
+        let mut rng = scirs2_core::random::Random::seed(self.next_seed());
         let data: Vec<f32> = (0..size).map(|_| normal.sample(&mut rng) as f32).collect();
 
         torsh_tensor::Tensor::from_data(data, shape.to_vec(), torsh_core::DeviceType::Cpu).map_err(
@@ -465,17 +536,28 @@ pub struct PrivateSampler<S: Sampler> {
     dp_mechanism: DPMechanism,
     sample_access_counts: HashMap<usize, usize>,
     max_sample_accesses: usize,
+    // F007 (extended sweep): entropy-seeded base for `ReportNoisyMax`
+    // shuffling, plus a call counter that advances the effective seed on
+    // every draw. See `LaplaceNoise::calls` for why a fixed per-call seed is
+    // a privacy bug, not just a determinism nuisance: identical noise on
+    // every `private_iter()` call is not noise.
+    noise_seed: u64,
+    noise_calls: u64,
 }
 
 impl<S: Sampler> PrivateSampler<S> {
     /// Create a new private sampler
     pub fn new(base_sampler: S, privacy_budget: PrivacyBudget, dp_mechanism: DPMechanism) -> Self {
+        use scirs2_core::random::Random;
+        let mut entropy_rng = Random::default();
         Self {
             base_sampler,
             privacy_budget,
             dp_mechanism,
             sample_access_counts: HashMap::new(),
             max_sample_accesses: 10, // Default limit
+            noise_seed: entropy_rng.gen_range(0..=u64::MAX),
+            noise_calls: 0,
         }
     }
 
@@ -520,11 +602,16 @@ impl<S: Sampler> PrivateSampler<S> {
     }
 
     /// Add noise to sampling process
-    fn add_sampling_noise(&self, indices: &mut Vec<usize>) -> Result<()> {
+    fn add_sampling_noise(&mut self, indices: &mut Vec<usize>) -> Result<()> {
         // ✅ SciRS2 Policy Compliant - Using scirs2_core::random instead of direct rand
 
         if let DPMechanism::ReportNoisyMax { epsilon } = &self.dp_mechanism {
-            let mut rng = scirs2_core::random::Random::seed(42);
+            // Advance the seed on every call (see `noise_calls` field doc):
+            // reconstructing `Random::seed(42)` fresh each time would shuffle
+            // every `private_iter()` call into the identical order.
+            let effective_seed = self.noise_seed.wrapping_add(self.noise_calls);
+            self.noise_calls = self.noise_calls.wrapping_add(1);
+            let mut rng = scirs2_core::random::Random::seed(effective_seed);
 
             // Add some randomization to the indices
             let noise_level = (1.0 / epsilon * indices.len() as f64 * 0.1) as usize;

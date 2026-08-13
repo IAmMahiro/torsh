@@ -630,13 +630,15 @@ where
     let operation = operation.into();
     let tracer = OpTracer::global();
 
-    let trace_id = {
-        let mut inner = tracer.inner.lock().ok().ok_or_else(|| {
-            // Can't really return a meaningful error here without the user's error type
-            panic!("Failed to acquire tracer lock")
-        })?;
-        inner.start_trace(operation.clone())
-    };
+    // Tracing must never be able to fail the traced operation: if the tracer
+    // lock is poisoned (some other thread panicked while holding it), degrade
+    // to "no trace was recorded" rather than panicking here too. A panic
+    // inside an observability helper would turn it into a crash amplifier.
+    let trace_id = tracer
+        .inner
+        .lock()
+        .ok()
+        .and_then(|mut inner| inner.start_trace(operation.clone()));
 
     let builder = trace_id.map(TraceBuilder::new);
 
@@ -646,16 +648,14 @@ where
     };
 
     if let Some(tid) = trace_id {
-        let mut inner = tracer
-            .inner
-            .lock()
-            .ok()
-            .ok_or_else(|| panic!("Failed to acquire tracer lock"))?;
-
-        match &result {
-            Ok(_) => inner.complete_trace(tid),
-            Err(e) => inner.mark_error(tid, e.to_string()),
+        if let Ok(mut inner) = tracer.inner.lock() {
+            match &result {
+                Ok(_) => inner.complete_trace(tid),
+                Err(e) => inner.mark_error(tid, e.to_string()),
+            }
         }
+        // If the lock is poisoned here, silently skip trace completion --
+        // the traced operation's result must still be returned untouched.
     }
 
     result
@@ -664,6 +664,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::MutexExt;
+
+    /// F091 regression test: `trace_operation_result` must degrade to "no
+    /// trace recorded" rather than panic when the tracer's internal lock is
+    /// poisoned. This requires access to the private `inner` field to
+    /// deliberately poison the *global* tracer's mutex (the poisoned
+    /// `OpTracer::global()` and `trace_operation_result` share the same
+    /// process-wide `OnceLock`), so it lives here rather than in the
+    /// external `tests/hardening_core.rs`; nextest runs each test in its own
+    /// process, so poisoning the global tracer here does not affect other
+    /// tests.
+    #[test]
+    fn test_trace_operation_result_survives_poisoned_lock() {
+        let tracer = OpTracer::global();
+        let inner = tracer.inner.clone();
+        let join_result = std::thread::spawn(move || {
+            let _guard = inner.lock_or_recover();
+            panic!("intentionally poisoning the tracer lock for the F091 regression test");
+        })
+        .join();
+        assert!(
+            join_result.is_err(),
+            "the spawned thread should have panicked, poisoning the lock"
+        );
+
+        // Before the fix, this called `.ok_or_else(|| panic!(...))?` on the
+        // poisoned lock and aborted the process. It must now simply skip
+        // tracing and return the traced closure's own result untouched.
+        let result: std::result::Result<i32, String> =
+            trace_operation_result("poisoned_lock_op", |_builder| Ok(42));
+        assert_eq!(result, Ok(42));
+
+        let result: std::result::Result<i32, String> =
+            trace_operation_result("poisoned_lock_op_err", |_builder| Err("boom".to_string()));
+        assert_eq!(result, Err("boom".to_string()));
+    }
 
     #[test]
     fn test_tracer_enable_disable() {
@@ -684,7 +720,7 @@ mod tests {
 
         // Manually start/complete trace
         let trace_id = {
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner
                 .start_trace("test_op".to_string())
                 .expect("start_trace should succeed")
@@ -693,7 +729,7 @@ mod tests {
         assert!(tracer.get_trace(trace_id).is_some());
 
         {
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner.complete_trace(trace_id);
         }
 
@@ -708,7 +744,7 @@ mod tests {
         tracer.set_enabled(true);
 
         let trace_id = {
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner
                 .start_trace("matmul".to_string())
                 .expect("start_trace should succeed")
@@ -716,7 +752,7 @@ mod tests {
 
         // Record inputs/outputs by directly accessing the tracer
         {
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             if let Some(trace) = inner.traces.get_mut(&trace_id) {
                 trace.add_input(TensorMetadata::new("lhs", vec![10, 20]).with_dtype(DType::F32));
                 trace.add_input(TensorMetadata::new("rhs", vec![20, 30]).with_dtype(DType::F32));
@@ -726,7 +762,7 @@ mod tests {
         }
 
         {
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner.complete_trace(trace_id);
         }
 
@@ -745,14 +781,14 @@ mod tests {
 
         // This should be traced
         let trace_id1 = {
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner.start_trace("matmul".to_string())
         };
         assert!(trace_id1.is_some());
 
         // This should not be traced
         let trace_id2 = {
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner.start_trace("add".to_string())
         };
         assert!(trace_id2.is_none());
@@ -764,21 +800,21 @@ mod tests {
         tracer.set_enabled(true);
 
         let parent_id = {
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner
                 .start_trace("parent_op".to_string())
                 .expect("start_trace should succeed")
         };
 
         let child_id = {
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner
                 .start_trace("child_op".to_string())
                 .expect("start_trace should succeed")
         };
 
         {
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner.complete_trace(child_id);
             inner.complete_trace(parent_id);
         }
@@ -814,13 +850,13 @@ mod tests {
         // Create some traces
         for i in 0..5 {
             let trace_id = {
-                let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+                let mut inner = tracer.inner.lock_or_recover();
                 inner
                     .start_trace(format!("op_{}", i))
                     .expect("start_trace should succeed")
             };
 
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner.complete_trace(trace_id);
         }
 
@@ -835,14 +871,14 @@ mod tests {
         tracer.set_enabled(true);
 
         let trace_id = {
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner
                 .start_trace("failing_op".to_string())
                 .expect("start_trace should succeed")
         };
 
         {
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner.mark_error(trace_id, "Test error".to_string());
         }
 
@@ -865,13 +901,13 @@ mod tests {
         // Create more traces than the limit
         for i in 0..10 {
             let trace_id = {
-                let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+                let mut inner = tracer.inner.lock_or_recover();
                 inner
                     .start_trace(format!("op_{}", i))
                     .expect("start_trace should succeed")
             };
 
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner.complete_trace(trace_id);
         }
 
@@ -885,7 +921,7 @@ mod tests {
         tracer.set_enabled(true);
 
         let trace_id = {
-            let mut inner = tracer.inner.lock().expect("lock should not be poisoned");
+            let mut inner = tracer.inner.lock_or_recover();
             inner
                 .start_trace("test_op".to_string())
                 .expect("start_trace should succeed")

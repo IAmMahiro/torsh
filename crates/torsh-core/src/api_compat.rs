@@ -27,6 +27,7 @@
 //! );
 //! ```
 
+use crate::sync::MutexExt;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -309,10 +310,7 @@ fn get_tracker() -> Arc<Mutex<DeprecationTracker>> {
 /// register_deprecation(info);
 /// ```
 pub fn register_deprecation(info: DeprecationInfo) {
-    get_tracker()
-        .lock()
-        .expect("lock should not be poisoned")
-        .register(info);
+    get_tracker().lock_or_recover().register(info);
 }
 
 /// Emit a deprecation warning for an API
@@ -325,10 +323,7 @@ pub fn register_deprecation(info: DeprecationInfo) {
 /// deprecation_warning("old_function");
 /// ```
 pub fn deprecation_warning(api_name: &str) -> bool {
-    get_tracker()
-        .lock()
-        .expect("lock should not be poisoned")
-        .emit_warning(api_name)
+    get_tracker().lock_or_recover().emit_warning(api_name)
 }
 
 /// Convenience function to emit a deprecation warning with inline info
@@ -361,41 +356,28 @@ pub fn deprecation_warning_inline(
 
 /// Get deprecation info for an API
 pub fn get_deprecation_info(api_name: &str) -> Option<DeprecationInfo> {
-    get_tracker()
-        .lock()
-        .expect("lock should not be poisoned")
-        .get_info(api_name)
-        .cloned()
+    get_tracker().lock_or_recover().get_info(api_name).cloned()
 }
 
 /// Get all registered deprecations
 pub fn get_all_deprecations() -> Vec<DeprecationInfo> {
-    get_tracker()
-        .lock()
-        .expect("lock should not be poisoned")
-        .get_all_deprecations()
+    get_tracker().lock_or_recover().get_all_deprecations()
 }
 
 /// Get deprecation warning statistics
 pub fn get_deprecation_stats() -> HashMap<String, usize> {
-    get_tracker()
-        .lock()
-        .expect("lock should not be poisoned")
-        .get_warning_stats()
+    get_tracker().lock_or_recover().get_warning_stats()
 }
 
 /// Clear deprecation warning counts
 pub fn clear_deprecation_counts() {
-    get_tracker()
-        .lock()
-        .expect("lock should not be poisoned")
-        .clear_warning_counts();
+    get_tracker().lock_or_recover().clear_warning_counts();
 }
 
 /// Configure deprecation warning behavior
 pub fn configure_deprecation_warnings(emit: bool, max_per_api: usize) {
     let binding = get_tracker();
-    let mut tracker = binding.lock().expect("lock should not be poisoned");
+    let mut tracker = binding.lock_or_recover();
     tracker.set_emit_warnings(emit);
     tracker.set_max_warnings_per_api(max_per_api);
 }
@@ -405,7 +387,7 @@ pub fn configure_deprecation_warnings(emit: bool, max_per_api: usize) {
 #[cfg(test)]
 pub fn reset_deprecation_tracker() {
     let binding = get_tracker();
-    let mut tracker = binding.lock().expect("lock should not be poisoned");
+    let mut tracker = binding.lock_or_recover();
     tracker.deprecations.clear();
     tracker.warning_counts.clear();
     tracker.max_warnings_per_api = 10;
@@ -428,7 +410,7 @@ impl DeprecationReport {
     /// Generate a deprecation report
     pub fn generate() -> Self {
         let binding = get_tracker();
-        let tracker = binding.lock().expect("lock should not be poisoned");
+        let tracker = binding.lock_or_recover();
         let all_deprecations = tracker.get_all_deprecations();
 
         let mut active = Vec::new();

@@ -3,6 +3,7 @@
 use crate::profiler::{EventId, EventType};
 use crate::{Profiler, ProfilerEvent, ProfilerStats};
 use torsh_core::error::Result;
+use torsh_core::sync::MutexExt;
 
 #[cfg(feature = "std")]
 use std::sync::{Arc, Mutex};
@@ -39,10 +40,7 @@ impl CpuProfiler {
     }
 
     fn next_id(&self) -> EventId {
-        let mut id = self
-            .next_event_id
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut id = self.next_event_id.lock_or_recover();
         let event_id = EventId(*id);
         *id += 1;
         event_id
@@ -51,26 +49,26 @@ impl CpuProfiler {
 
 impl Profiler for CpuProfiler {
     fn start(&mut self) -> Result<()> {
-        let mut enabled = self.enabled.lock().expect("lock should not be poisoned");
+        let mut enabled = self.enabled.lock_or_recover();
         *enabled = true;
 
-        let mut events = self.events.lock().expect("lock should not be poisoned");
+        let mut events = self.events.lock_or_recover();
         events.clear();
 
-        let mut stats = self.stats.lock().expect("lock should not be poisoned");
+        let mut stats = self.stats.lock_or_recover();
         *stats = ProfilerStats::default();
 
         Ok(())
     }
 
     fn stop(&mut self) -> Result<()> {
-        let mut enabled = self.enabled.lock().expect("lock should not be poisoned");
+        let mut enabled = self.enabled.lock_or_recover();
         *enabled = false;
         Ok(())
     }
 
     fn is_enabled(&self) -> bool {
-        *self.enabled.lock().expect("lock should not be poisoned")
+        *self.enabled.lock_or_recover()
     }
 
     fn begin_event(&mut self, name: &str) -> Result<EventId> {
@@ -85,7 +83,7 @@ impl Profiler for CpuProfiler {
             EventType::Custom(name.to_string()),
         );
 
-        let mut events = self.events.lock().expect("lock should not be poisoned");
+        let mut events = self.events.lock_or_recover();
         events.push(event);
 
         Ok(event_id)
@@ -96,7 +94,7 @@ impl Profiler for CpuProfiler {
             return Ok(());
         }
 
-        let mut events = self.events.lock().expect("lock should not be poisoned");
+        let mut events = self.events.lock_or_recover();
         if let Some(event) = events.iter_mut().find(|e| e.id == event_id) {
             event.finish();
         }
@@ -113,17 +111,14 @@ impl Profiler for CpuProfiler {
         let mut event = ProfilerEvent::new(event_id, name.to_string(), EventType::Marker);
         event.finish();
 
-        let mut events = self.events.lock().expect("lock should not be poisoned");
+        let mut events = self.events.lock_or_recover();
         events.push(event);
 
         Ok(())
     }
 
     fn stats(&self) -> ProfilerStats {
-        self.stats
-            .lock()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.stats.lock_or_recover().clone()
     }
 
     fn events(&self) -> &[ProfilerEvent] {
@@ -134,16 +129,16 @@ impl Profiler for CpuProfiler {
     }
 
     fn clear(&mut self) {
-        let mut events = self.events.lock().expect("lock should not be poisoned");
+        let mut events = self.events.lock_or_recover();
         events.clear();
 
-        let mut stats = self.stats.lock().expect("lock should not be poisoned");
+        let mut stats = self.stats.lock_or_recover();
         *stats = ProfilerStats::default();
     }
 
     fn report(&self) -> String {
-        let events = self.events.lock().expect("lock should not be poisoned");
-        let stats = self.stats.lock().expect("lock should not be poisoned");
+        let events = self.events.lock_or_recover();
+        let stats = self.stats.lock_or_recover();
 
         let mut report = String::new();
         report.push_str("=== CPU Profiler Report ===\n");

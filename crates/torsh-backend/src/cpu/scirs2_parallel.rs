@@ -53,6 +53,7 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use torsh_core::sync::MutexExt;
 
     #[test]
     fn test_parallel_threads() {
@@ -67,11 +68,11 @@ mod tests {
         let sum_clone = Arc::clone(&sum);
 
         parallel_for_range(0, 100, move |i| {
-            let mut s = sum_clone.lock().expect("lock should not be poisoned");
+            let mut s = sum_clone.lock_or_recover();
             *s += i;
         });
 
-        let result = *sum.lock().expect("lock should not be poisoned");
+        let result = *sum.lock_or_recover();
         assert_eq!(result, (0..100).sum::<usize>());
     }
 

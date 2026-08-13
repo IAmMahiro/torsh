@@ -1,8 +1,9 @@
 //! Model registry for managing pre-trained models
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::{ModelError, ModelResult};
 use serde::{Deserialize, Serialize};
@@ -87,10 +88,23 @@ impl ModelHandle {
         Ok(metadata.len())
     }
 
-    /// Validate model checksum
+    /// Validate the model checksum against the registered SHA-256.
+    ///
+    /// An empty registered checksum means "no checksum available": verification
+    /// is skipped and the file is treated as valid (with a warning), rather than
+    /// failing forever against a placeholder. A non-empty checksum is compared
+    /// against the file's real SHA-256.
     pub fn validate_checksum(&self) -> ModelResult<bool> {
         if !self.exists() {
             return Ok(false);
+        }
+
+        if self.info.checksum.is_empty() {
+            tracing::warn!(
+                model = %self.info.name,
+                "no checksum registered; skipping integrity verification"
+            );
+            return Ok(true);
         }
 
         let data = std::fs::read(&self.local_path)?;
@@ -140,7 +154,7 @@ impl ModelRegistry {
 
     /// Register a new model
     pub fn register_model(&self, info: ModelInfo) -> ModelResult<()> {
-        let mut models = self.models.lock().expect("lock should not be poisoned");
+        let mut models = self.models.lock();
         let key = format!("{}:{}", info.name, info.version);
         models.insert(key, info);
         Ok(())
@@ -148,7 +162,7 @@ impl ModelRegistry {
 
     /// Get model information by name and version
     pub fn get_model_info(&self, name: &str, version: Option<&str>) -> ModelResult<ModelInfo> {
-        let models = self.models.lock().expect("lock should not be poisoned");
+        let models = self.models.lock();
 
         if let Some(version) = version {
             let key = format!("{}:{}", name, version);
@@ -180,13 +194,13 @@ impl ModelRegistry {
 
     /// List all registered models
     pub fn list_models(&self) -> Vec<ModelInfo> {
-        let models = self.models.lock().expect("lock should not be poisoned");
+        let models = self.models.lock();
         models.values().cloned().collect()
     }
 
     /// Search models by domain
     pub fn search_by_domain(&self, domain: &str) -> Vec<ModelInfo> {
-        let models = self.models.lock().expect("lock should not be poisoned");
+        let models = self.models.lock();
         models
             .values()
             .filter(|info| info.domain == domain)
@@ -196,7 +210,7 @@ impl ModelRegistry {
 
     /// Search models by tags
     pub fn search_by_tags(&self, tags: &[&str]) -> Vec<ModelInfo> {
-        let models = self.models.lock().expect("lock should not be poisoned");
+        let models = self.models.lock();
         models
             .values()
             .filter(|info| tags.iter().any(|tag| info.tags.contains(&tag.to_string())))
@@ -211,7 +225,7 @@ impl ModelRegistry {
 
         // Check if handle already exists
         {
-            let handles = self.handles.lock().expect("lock should not be poisoned");
+            let handles = self.handles.lock();
             if let Some(handle) = handles.get(&key) {
                 return Ok(ModelHandle {
                     info: handle.info.clone(),
@@ -227,7 +241,7 @@ impl ModelRegistry {
 
         // Cache the handle
         {
-            let mut handles = self.handles.lock().expect("lock should not be poisoned");
+            let mut handles = self.handles.lock();
             handles.insert(
                 key,
                 ModelHandle {
@@ -319,7 +333,7 @@ impl ModelRegistry {
             tags: vec!["classification".to_string(), "imagenet".to_string(), "cnn".to_string()],
             license: "BSD".to_string(),
             citation: Some("He, K., Zhang, X., Ren, S., & Sun, J. (2016). Deep residual learning for image recognition.".to_string()),
-            checksum: "5c106cde0abbf5e61f9b0e5d5c51b2a9e17896b7".to_string(),
+            checksum: String::new(), // no verified SHA-256 available; verification skipped (see validate_checksum)
         };
         self.register_model(resnet18)?;
 
@@ -344,7 +358,7 @@ impl ModelRegistry {
             tags: vec!["classification".to_string(), "imagenet".to_string(), "cnn".to_string()],
             license: "BSD".to_string(),
             citation: Some("He, K., Zhang, X., Ren, S., & Sun, J. (2016). Deep residual learning for image recognition.".to_string()),
-            checksum: "19c8e357f2b6c76a2a39b97e94f5e71e8bbde6b7".to_string(),
+            checksum: String::new(), // no verified SHA-256 available; verification skipped (see validate_checksum)
         };
         self.register_model(resnet50)?;
 
@@ -369,7 +383,7 @@ impl ModelRegistry {
             tags: vec!["classification".to_string(), "imagenet".to_string(), "efficient".to_string()],
             license: "Apache-2.0".to_string(),
             citation: Some("Tan, M., & Le, Q. (2019). Efficientnet: Rethinking model scaling for convolutional neural networks.".to_string()),
-            checksum: "3dd342df789abc123456".to_string(),
+            checksum: String::new(), // no verified SHA-256 available; verification skipped (see validate_checksum)
         };
         self.register_model(efficientnet_b0)?;
 
@@ -394,7 +408,7 @@ impl ModelRegistry {
             tags: vec!["classification".to_string(), "imagenet".to_string(), "transformer".to_string()],
             license: "Apache-2.0".to_string(),
             citation: Some("Dosovitskiy, A., et al. (2020). An image is worth 16x16 words: Transformers for image recognition at scale.".to_string()),
-            checksum: "c867db9123456789abc".to_string(),
+            checksum: String::new(), // no verified SHA-256 available; verification skipped (see validate_checksum)
         };
         self.register_model(vit_base)?;
 
@@ -426,7 +440,7 @@ impl ModelRegistry {
             tags: vec!["transformer".to_string(), "encoder".to_string(), "english".to_string()],
             license: "Apache-2.0".to_string(),
             citation: Some("Devlin, J., Chang, M. W., Lee, K., & Toutanova, K. (2018). Bert: Pre-training of deep bidirectional transformers for language understanding.".to_string()),
-            checksum: "abc123def456789".to_string(),
+            checksum: String::new(), // no verified SHA-256 available; verification skipped (see validate_checksum)
         };
         self.register_model(bert_base)?;
 
@@ -461,7 +475,7 @@ impl ModelRegistry {
                 "Radford, A., et al. (2019). Language models are unsupervised multitask learners."
                     .to_string(),
             ),
-            checksum: "def456789abc123".to_string(),
+            checksum: String::new(), // no verified SHA-256 available; verification skipped (see validate_checksum)
         };
         self.register_model(gpt2_base)?;
 
@@ -495,7 +509,7 @@ impl ModelRegistry {
                 "Liu, Y., et al. (2019). RoBERTa: A robustly optimized BERT pretraining approach."
                     .to_string(),
             ),
-            checksum: "789abc123def456".to_string(),
+            checksum: String::new(), // no verified SHA-256 available; verification skipped (see validate_checksum)
         };
         self.register_model(roberta_base)?;
 
@@ -527,7 +541,7 @@ impl ModelRegistry {
             tags: vec!["speech".to_string(), "recognition".to_string(), "self-supervised".to_string()],
             license: "MIT".to_string(),
             citation: Some("Baevski, A., et al. (2020). wav2vec 2.0: A framework for self-supervised learning of speech representations.".to_string()),
-            checksum: "123abc456def789".to_string(),
+            checksum: String::new(), // no verified SHA-256 available; verification skipped (see validate_checksum)
         };
         self.register_model(wav2vec2_base)?;
 
@@ -554,7 +568,7 @@ impl ModelRegistry {
             tags: vec!["speech".to_string(), "transcription".to_string(), "multilingual".to_string()],
             license: "MIT".to_string(),
             citation: Some("Radford, A., et al. (2022). Robust speech recognition via large-scale weak supervision.".to_string()),
-            checksum: "456def789abc123".to_string(),
+            checksum: String::new(), // no verified SHA-256 available; verification skipped (see validate_checksum)
         };
         self.register_model(whisper_base)?;
 
@@ -586,7 +600,7 @@ impl ModelRegistry {
             tags: vec!["vision-language".to_string(), "contrastive".to_string(), "zero-shot".to_string()],
             license: "MIT".to_string(),
             citation: Some("Radford, A., et al. (2021). Learning transferable visual representations from natural language supervision.".to_string()),
-            checksum: "789abc123def456".to_string(),
+            checksum: String::new(), // no verified SHA-256 available; verification skipped (see validate_checksum)
         };
         self.register_model(clip_base)?;
 
@@ -594,18 +608,31 @@ impl ModelRegistry {
     }
 }
 
-lazy_static::lazy_static! {
-    /// Create a global model registry instance
-    static ref GLOBAL_REGISTRY: ModelRegistry = {
-        let registry = ModelRegistry::default().expect("Failed to create model registry");
-        registry.register_builtin_models().expect("Failed to register builtin models");
-        registry
-    };
-}
+/// Lazily-initialized global model registry.
+///
+/// Initialization is fallible (it creates the cache directory and registers the
+/// built-in models), so the result is stored as a `ModelResult`. Callers get an
+/// honest error via [`get_global_registry`] instead of the process aborting on
+/// first access.
+static GLOBAL_REGISTRY: std::sync::OnceLock<ModelResult<ModelRegistry>> =
+    std::sync::OnceLock::new();
 
-/// Get the global model registry
-pub fn get_global_registry() -> &'static ModelRegistry {
-    &GLOBAL_REGISTRY
+/// Get the global model registry, initializing it on first access.
+///
+/// Returns an error if the registry could not be created or the built-in models
+/// could not be registered, rather than panicking.
+pub fn get_global_registry() -> ModelResult<&'static ModelRegistry> {
+    let slot = GLOBAL_REGISTRY.get_or_init(|| {
+        let registry = ModelRegistry::default()?;
+        registry.register_builtin_models()?;
+        Ok(registry)
+    });
+    match slot {
+        Ok(registry) => Ok(registry),
+        Err(e) => Err(ModelError::LoadingError {
+            reason: format!("failed to initialize global model registry: {e}"),
+        }),
+    }
 }
 
 #[cfg(test)]

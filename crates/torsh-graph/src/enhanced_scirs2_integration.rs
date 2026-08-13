@@ -12,9 +12,12 @@
 //! - Graph partitioning for distributed processing
 //! - Efficient graph sampling methods
 //! - Graph augmentation and transformation
-
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
+
 use crate::GraphData;
 use scirs2_core::random::thread_rng;
 use std::collections::{HashMap, HashSet};
@@ -30,12 +33,9 @@ impl SciRS2GraphAlgorithms {
         damping: f64,
         max_iterations: usize,
         tolerance: f64,
-    ) -> Vec<f64> {
+    ) -> Result<Vec<f64>> {
         let num_nodes = graph.num_nodes;
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
 
         // Build adjacency list
         let mut adj_list: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -87,16 +87,13 @@ impl SciRS2GraphAlgorithms {
             }
         }
 
-        pr
+        Ok(pr)
     }
 
     /// Compute betweenness centrality
-    pub fn betweenness_centrality(graph: &GraphData) -> Vec<f64> {
+    pub fn betweenness_centrality(graph: &GraphData) -> Result<Vec<f64>> {
         let num_nodes = graph.num_nodes;
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
 
         // Build adjacency list
         let mut adj_list: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -168,16 +165,13 @@ impl SciRS2GraphAlgorithms {
         let normalization = 2.0 / ((num_nodes * (num_nodes - 1)) as f64);
         betweenness.iter_mut().for_each(|x| *x *= normalization);
 
-        betweenness
+        Ok(betweenness)
     }
 
     /// Compute closeness centrality
-    pub fn closeness_centrality(graph: &GraphData) -> Vec<f64> {
+    pub fn closeness_centrality(graph: &GraphData) -> Result<Vec<f64>> {
         let num_nodes = graph.num_nodes;
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
 
         // Build adjacency list
         let mut adj_list: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -221,16 +215,13 @@ impl SciRS2GraphAlgorithms {
             }
         }
 
-        closeness
+        Ok(closeness)
     }
 
     /// Detect communities using Louvain algorithm
-    pub fn louvain_communities(graph: &GraphData, resolution: f64) -> Vec<usize> {
+    pub fn louvain_communities(graph: &GraphData, resolution: f64) -> Result<Vec<usize>> {
         let num_nodes = graph.num_nodes;
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
 
         // Build weighted adjacency
         let mut adj: HashMap<(usize, usize), f64> = HashMap::new();
@@ -317,9 +308,9 @@ impl SciRS2GraphAlgorithms {
                 // Move node to best community
                 if best_community != current_community {
                     communities[node] = best_community;
-                    *community_sizes
-                        .get_mut(&current_community)
-                        .expect("key verified to exist") -= 1;
+                    if let Some(size) = community_sizes.get_mut(&current_community) {
+                        *size -= 1;
+                    }
                     *community_sizes.entry(best_community).or_insert(0) += 1;
                     improved = true;
                 }
@@ -337,16 +328,13 @@ impl SciRS2GraphAlgorithms {
             }
         }
 
-        communities.iter().map(|&c| community_map[&c]).collect()
+        Ok(communities.iter().map(|&c| community_map[&c]).collect())
     }
 
     /// Compute k-core decomposition
-    pub fn k_core_decomposition(graph: &GraphData) -> Vec<usize> {
+    pub fn k_core_decomposition(graph: &GraphData) -> Result<Vec<usize>> {
         let num_nodes = graph.num_nodes;
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
 
         // Build adjacency list
         let mut adj_list: HashMap<usize, HashSet<usize>> = HashMap::new();
@@ -384,7 +372,10 @@ impl SciRS2GraphAlgorithms {
                 break;
             }
 
-            let min_deg = min_degree.expect("checked is_some above");
+            let min_deg = match min_degree {
+                Some(value) => value,
+                None => break,
+            };
 
             // Remove all nodes with minimum degree
             let nodes_to_remove: Vec<usize> = degrees
@@ -409,16 +400,13 @@ impl SciRS2GraphAlgorithms {
             }
         }
 
-        core_numbers
+        Ok(core_numbers)
     }
 
     /// Triangle counting
-    pub fn count_triangles(graph: &GraphData) -> usize {
+    pub fn count_triangles(graph: &GraphData) -> Result<usize> {
         let num_nodes = graph.num_nodes;
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
 
         // Build adjacency list
         let mut adj_list: HashMap<usize, HashSet<usize>> = HashMap::new();
@@ -458,16 +446,13 @@ impl SciRS2GraphAlgorithms {
         }
 
         // Each triangle is counted 3 times
-        triangle_count / 3
+        Ok(triangle_count / 3)
     }
 
     /// Compute clustering coefficient for each node
-    pub fn clustering_coefficients(graph: &GraphData) -> Vec<f64> {
+    pub fn clustering_coefficients(graph: &GraphData) -> Result<Vec<f64>> {
         let num_nodes = graph.num_nodes;
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
 
         // Build adjacency list
         let mut adj_list: HashMap<usize, HashSet<usize>> = HashMap::new();
@@ -516,7 +501,7 @@ impl SciRS2GraphAlgorithms {
             }
         }
 
-        coefficients
+        Ok(coefficients)
     }
 }
 
@@ -525,12 +510,12 @@ pub struct GraphSampler;
 
 impl GraphSampler {
     /// Random node sampling
-    pub fn sample_nodes(graph: &GraphData, num_samples: usize) -> GraphData {
+    pub fn sample_nodes(graph: &GraphData, num_samples: usize) -> Result<GraphData> {
         let mut rng = thread_rng();
         let num_nodes = graph.num_nodes;
 
         if num_samples >= num_nodes {
-            return graph.clone();
+            return Ok(graph.clone());
         }
 
         // Sample nodes
@@ -552,7 +537,7 @@ impl GraphSampler {
         // Sample features
         let mut sampled_features = Vec::new();
         let feature_dim = graph.x.shape().dims()[1];
-        let all_features = graph.x.to_vec().expect("conversion should succeed");
+        let all_features = graph.x.to_vec()?;
 
         for &node in &sampled_nodes {
             let start = node * feature_dim;
@@ -564,14 +549,10 @@ impl GraphSampler {
             sampled_features,
             &[num_samples, feature_dim],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("sampled feature tensor creation should succeed");
+        )?;
 
         // Sample edges
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
         let mut sampled_edges = Vec::new();
 
         for i in (0..edge_data.len()).step_by(2) {
@@ -591,10 +572,9 @@ impl GraphSampler {
             sampled_edges,
             &[2, num_sampled_edges],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("sampled edge tensor creation should succeed");
+        )?;
 
-        GraphData::new(sampled_x, sampled_edge_index)
+        Ok(GraphData::new(sampled_x, sampled_edge_index))
     }
 
     /// Random walk sampling
@@ -602,12 +582,9 @@ impl GraphSampler {
         graph: &GraphData,
         start_nodes: &[usize],
         walk_length: usize,
-    ) -> Vec<Vec<usize>> {
+    ) -> Result<Vec<Vec<usize>>> {
         let mut rng = thread_rng();
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+        let edge_data = graph.edge_index.to_vec()?;
 
         // Build adjacency list
         let mut adj_list: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -642,15 +619,16 @@ impl GraphSampler {
             walks.push(walk);
         }
 
-        walks
+        Ok(walks)
     }
 
     /// Subgraph sampling based on k-hop neighborhood
-    pub fn k_hop_subgraph(graph: &GraphData, center_nodes: &[usize], k: usize) -> GraphData {
-        let edge_data = graph
-            .edge_index
-            .to_vec()
-            .expect("conversion should succeed");
+    pub fn k_hop_subgraph(
+        graph: &GraphData,
+        center_nodes: &[usize],
+        k: usize,
+    ) -> Result<GraphData> {
+        let edge_data = graph.edge_index.to_vec()?;
 
         // Build adjacency list
         let mut adj_list: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -697,7 +675,7 @@ impl GraphSampler {
         // Extract features
         let mut sampled_features = Vec::new();
         let feature_dim = graph.x.shape().dims()[1];
-        let all_features = graph.x.to_vec().expect("conversion should succeed");
+        let all_features = graph.x.to_vec()?;
 
         for &node in &subgraph_nodes_vec {
             let start = node * feature_dim;
@@ -711,8 +689,7 @@ impl GraphSampler {
             sampled_features,
             &[subgraph_nodes_vec.len(), feature_dim],
             torsh_core::device::DeviceType::Cpu,
-        )
-        .expect("subgraph feature tensor creation should succeed");
+        )?;
 
         // Extract edges
         let mut sampled_edges = Vec::new();
@@ -735,14 +712,12 @@ impl GraphSampler {
                 sampled_edges,
                 &[2, num_sampled_edges],
                 torsh_core::device::DeviceType::Cpu,
-            )
-            .expect("subgraph edge tensor creation should succeed")
+            )?
         } else {
-            from_vec(vec![], &[2, 0], torsh_core::device::DeviceType::Cpu)
-                .expect("empty edge tensor creation should succeed")
+            from_vec(vec![], &[2, 0], torsh_core::device::DeviceType::Cpu)?
         };
 
-        GraphData::new(sampled_x, sampled_edge_index)
+        Ok(GraphData::new(sampled_x, sampled_edge_index))
     }
 }
 
@@ -759,7 +734,8 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 5], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let pr = SciRS2GraphAlgorithms::pagerank(&graph, 0.85, 100, 1e-6);
+        let pr = SciRS2GraphAlgorithms::pagerank(&graph, 0.85, 100, 1e-6)
+            .expect("operation should succeed");
 
         assert_eq!(pr.len(), 5);
         let sum: f64 = pr.iter().sum();
@@ -773,7 +749,8 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 4], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let bc = SciRS2GraphAlgorithms::betweenness_centrality(&graph);
+        let bc = SciRS2GraphAlgorithms::betweenness_centrality(&graph)
+            .expect("operation should succeed");
 
         assert_eq!(bc.len(), 4);
         assert!(bc.iter().all(|&x| x >= 0.0));
@@ -786,7 +763,8 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 3], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let cc = SciRS2GraphAlgorithms::closeness_centrality(&graph);
+        let cc =
+            SciRS2GraphAlgorithms::closeness_centrality(&graph).expect("operation should succeed");
 
         assert_eq!(cc.len(), 4);
         assert!(cc.iter().all(|&x| x >= 0.0)); // Closeness can be > 1.0 in some graph configurations
@@ -803,7 +781,8 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 7], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let communities = SciRS2GraphAlgorithms::louvain_communities(&graph, 1.0);
+        let communities = SciRS2GraphAlgorithms::louvain_communities(&graph, 1.0)
+            .expect("operation should succeed");
 
         assert_eq!(communities.len(), 6);
     }
@@ -815,7 +794,8 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 6], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let cores = SciRS2GraphAlgorithms::k_core_decomposition(&graph);
+        let cores =
+            SciRS2GraphAlgorithms::k_core_decomposition(&graph).expect("operation should succeed");
 
         assert_eq!(cores.len(), 5);
         assert!(cores.iter().all(|&x| x > 0));
@@ -828,7 +808,8 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 4], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let count = SciRS2GraphAlgorithms::count_triangles(&graph);
+        let count =
+            SciRS2GraphAlgorithms::count_triangles(&graph).expect("operation should succeed");
 
         assert_eq!(count, 1); // Only one triangle: 0-1-2
     }
@@ -840,7 +821,8 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 4], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let coeffs = SciRS2GraphAlgorithms::clustering_coefficients(&graph);
+        let coeffs = SciRS2GraphAlgorithms::clustering_coefficients(&graph)
+            .expect("operation should succeed");
 
         assert_eq!(coeffs.len(), 4);
         assert!(coeffs.iter().all(|&x| x >= 0.0 && x <= 1.0));
@@ -853,7 +835,7 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 5], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let sampled = GraphSampler::sample_nodes(&graph, 5);
+        let sampled = GraphSampler::sample_nodes(&graph, 5).expect("operation should succeed");
 
         assert_eq!(sampled.num_nodes, 5);
         assert_eq!(sampled.x.shape().dims()[0], 5);
@@ -866,7 +848,8 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 4], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let walks = GraphSampler::random_walk_sampling(&graph, &[0, 1], 3);
+        let walks = GraphSampler::random_walk_sampling(&graph, &[0, 1], 3)
+            .expect("operation should succeed");
 
         assert_eq!(walks.len(), 2);
         assert!(walks.iter().all(|w| w.len() <= 4)); // Max walk_length + 1
@@ -879,7 +862,8 @@ mod tests {
         let edge_index = from_vec(edges, &[2, 5], DeviceType::Cpu).unwrap();
         let graph = GraphData::new(features, edge_index);
 
-        let subgraph = GraphSampler::k_hop_subgraph(&graph, &[2], 2);
+        let subgraph =
+            GraphSampler::k_hop_subgraph(&graph, &[2], 2).expect("operation should succeed");
 
         assert!(subgraph.num_nodes >= 3); // At least 2-hop neighborhood
         assert!(subgraph.num_nodes <= 6);

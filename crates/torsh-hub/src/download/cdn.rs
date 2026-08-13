@@ -300,7 +300,7 @@ impl AdvancedCdnManager {
     /// * `Ok(AdvancedCdnManager)` - Configured manager ready for use
     /// * `Err(TorshError)` - If initialization fails
     pub fn new(config: CdnConfig) -> Result<Self> {
-        let client = Client::builder()
+        let client = crate::tls::client_builder()?
             .user_agent("torsh-hub/0.1.0-alpha.2")
             .timeout(config.endpoint_timeout)
             .build()

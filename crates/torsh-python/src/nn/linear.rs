@@ -20,11 +20,12 @@ pub struct PyLinear {
 #[pymethods]
 impl PyLinear {
     #[new]
+    #[pyo3(signature = (in_features, out_features, bias=None))]
     fn new(
         in_features: usize,
         out_features: usize,
         bias: Option<bool>,
-    ) -> PyResult<(Self, PyModule)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let has_bias = bias.unwrap_or(true);
 
         // Initialize weight with Xavier/Glorot uniform initialization
@@ -49,13 +50,17 @@ impl PyLinear {
                 training: true,
             },
             PyModule::new(),
-        ))
+        )
+            .into())
     }
 
     /// Forward pass through the linear layer
     fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
-        // Compute input @ weight.T
-        let result = py_result!(input.tensor.matmul(&self.weight))?;
+        // Compute input @ weight.T. `weight` is stored as [out_features,
+        // in_features] (PyTorch layout), so it must be transposed before the
+        // matmul — otherwise `Linear(in, out)(x)` fails with a shape mismatch.
+        let weight_t = py_result!(self.weight.transpose(0, 1))?;
+        let result = py_result!(input.tensor.matmul(&weight_t))?;
 
         // Add bias if present
         let result = if let Some(ref bias) = self.bias {

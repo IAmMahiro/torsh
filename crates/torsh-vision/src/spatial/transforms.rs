@@ -970,21 +970,53 @@ impl GeometricProcessor {
         }
     }
 
-    /// Apply affine transformation to an image
+    /// Apply an affine transformation to an image
+    ///
+    /// `image` is a 2D `(H, W)` or 3D `(C, H, W)` tensor. `transform_matrix` is a
+    /// `2x3` or `3x3` matrix mapping *source* pixel coordinates to *destination*
+    /// pixel coordinates; it is inverted internally so every destination pixel is
+    /// resampled from the source with clamped bilinear interpolation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported tensor rank, a matrix that is not
+    /// `2x3`/`3x3`, or a singular matrix.
     pub fn apply_affine_transform(
         &self,
         image: &Tensor,
-        _transform_matrix: &Array2<f64>,
+        transform_matrix: &Array2<f64>,
     ) -> Result<Tensor> {
-        // Placeholder for affine transformation
-        // Real implementation would apply the transformation matrix to image coordinates
-        Ok(image.clone())
+        let matrix = to_homogeneous_3x3(transform_matrix)?;
+        let inverse = crate::ops::common::utils::invert_3x3(&matrix)?;
+
+        crate::ops::common::utils::inverse_warp_chw(image, |x, y| {
+            let (sx, sy) = apply_homogeneous(&inverse, x as f64, y as f64);
+            (sx as f32, sy as f32)
+        })
     }
 
-    /// Rectify image using homography
-    pub fn rectify_image(&self, image: &Tensor, _homography: &Array2<f64>) -> Result<Tensor> {
-        // Placeholder for image rectification
-        Ok(image.clone())
+    /// Rectify an image using a homography
+    ///
+    /// `homography` is the `3x3` projective matrix mapping *source* pixel
+    /// coordinates to *destination* pixel coordinates. It is inverted and applied
+    /// as an inverse warp with clamped bilinear resampling, including the
+    /// perspective divide.
+    pub fn rectify_image(&self, image: &Tensor, homography: &Array2<f64>) -> Result<Tensor> {
+        if homography.nrows() != 3 || homography.ncols() != 3 {
+            return Err(VisionError::InvalidArgument(format!(
+                "Homography must be 3x3, got {}x{}",
+                homography.nrows(),
+                homography.ncols()
+            )));
+        }
+
+        let matrix = to_homogeneous_3x3(homography)?;
+        let inverse = crate::ops::common::utils::invert_3x3(&matrix)?;
+
+        crate::ops::common::utils::inverse_warp_chw(image, |x, y| {
+            let (sx, sy) = apply_homogeneous(&inverse, x as f64, y as f64);
+            (sx as f32, sy as f32)
+        })
     }
 
     /// Correct perspective distortion
@@ -1007,13 +1039,51 @@ impl GeometricProcessor {
         self.rectify_image(image, &homography)
     }
 
+    /// Estimate the homography mapping `source` onto `target`
     fn compute_homography(
         &self,
-        _source: &Array2<f64>,
-        _target: &Array2<f64>,
+        source: &Array2<f64>,
+        target: &Array2<f64>,
     ) -> Result<Array2<f64>> {
-        // Placeholder for homography computation
-        Ok(Array2::eye(3))
+        estimate_homography_dlt(source, target)
+    }
+}
+
+/// Convert a 2x3 or 3x3 transformation matrix into homogeneous 3x3 form
+fn to_homogeneous_3x3(matrix: &Array2<f64>) -> Result<[[f64; 3]; 3]> {
+    let (rows, cols) = (matrix.nrows(), matrix.ncols());
+    if cols != 3 || (rows != 2 && rows != 3) {
+        return Err(VisionError::InvalidArgument(format!(
+            "Transformation matrix must be 2x3 or 3x3, got {}x{}",
+            rows, cols
+        )));
+    }
+
+    let mut out = [[0.0f64; 3]; 3];
+    for r in 0..rows {
+        for c in 0..3 {
+            out[r][c] = matrix[[r, c]];
+        }
+    }
+    if rows == 2 {
+        out[2] = [0.0, 0.0, 1.0];
+    }
+
+    Ok(out)
+}
+
+/// Apply a homogeneous 3x3 transform to a 2D point, including the perspective divide
+fn apply_homogeneous(matrix: &[[f64; 3]; 3], x: f64, y: f64) -> (f64, f64) {
+    let wx = matrix[0][0] * x + matrix[0][1] * y + matrix[0][2];
+    let wy = matrix[1][0] * x + matrix[1][1] * y + matrix[1][2];
+    let ww = matrix[2][0] * x + matrix[2][1] * y + matrix[2][2];
+
+    if ww.abs() < 1e-12 {
+        // Point maps to infinity: clamp to the origin so the sampler falls back
+        // to the border instead of producing NaN.
+        (0.0, 0.0)
+    } else {
+        (wx / ww, wy / ww)
     }
 }
 

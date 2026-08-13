@@ -64,12 +64,16 @@ pub fn quantize_int4_per_tensor(
     Ok((quantized_tensor, scale, zero_point))
 }
 
-/// INT4 per-channel quantization
-pub fn quantize_int4_per_channel(
+/// INT4 per-channel quantization preserving the full per-channel parameter set.
+///
+/// Returns the quantized tensor together with one scale and one zero point per
+/// channel along `axis`, so the transform can be inverted with
+/// [`crate::algorithms::dequantize_per_channel`].
+pub fn quantize_int4_per_channel_full(
     tensor: &Tensor,
     axis: usize,
     _config: &QuantConfig,
-) -> TorshResult<(Tensor, f32, i32)> {
+) -> TorshResult<(Tensor, Vec<f32>, Vec<i32>)> {
     let binding = tensor.shape();
     let shape = binding.dims();
 
@@ -88,38 +92,22 @@ pub fn quantize_int4_per_channel(
         strides[i] = strides[i + 1] * shape[i + 1];
     }
 
+    // Single pass over the data to gather per-channel statistics.
+    let mut channel_mins = vec![f32::INFINITY; num_channels];
+    let mut channel_maxs = vec![f32::NEG_INFINITY; num_channels];
+    for (i, &val) in data.iter().enumerate() {
+        let ch = (i / strides[axis]) % num_channels;
+        channel_mins[ch] = channel_mins[ch].min(val);
+        channel_maxs[ch] = channel_maxs[ch].max(val);
+    }
+
     let mut scales = Vec::with_capacity(num_channels);
     let mut zero_points = Vec::with_capacity(num_channels);
-    let mut quantized_data = vec![0.0f32; data.len()];
 
-    // Process each channel
     for ch in 0..num_channels {
-        let mut channel_min = f32::INFINITY;
-        let mut channel_max = f32::NEG_INFINITY;
-
-        // Calculate channel statistics
-        for (i, &val) in data.iter().enumerate() {
-            let mut ch_idx = 0;
-            let mut remaining = i;
-
-            // Calculate channel index for this element
-            for (dim, &stride) in strides.iter().enumerate() {
-                let coord = remaining / stride;
-                remaining %= stride;
-                if dim == axis {
-                    ch_idx = coord;
-                }
-            }
-
-            if ch_idx == ch {
-                channel_min = channel_min.min(val);
-                channel_max = channel_max.max(val);
-            }
-        }
-
-        // Ensure min <= max
-        channel_min = channel_min.min(0.0);
-        channel_max = channel_max.max(0.0);
+        // Ensure the range always contains zero
+        let channel_min = channel_mins[ch].min(0.0);
+        let channel_max = channel_maxs[ch].max(0.0);
 
         // Calculate INT4 quantization parameters for this channel
         let scale = (channel_max - channel_min) / 15.0; // INT4 range: -8 to 7
@@ -128,28 +116,38 @@ pub fn quantize_int4_per_channel(
 
         scales.push(scale);
         zero_points.push(zero_point);
-
-        // Quantize channel data
-        for (i, &val) in data.iter().enumerate() {
-            let mut ch_idx = 0;
-            let mut remaining = i;
-
-            for (dim, &stride) in strides.iter().enumerate() {
-                let coord = remaining / stride;
-                remaining %= stride;
-                if dim == axis {
-                    ch_idx = coord;
-                }
-            }
-
-            if ch_idx == ch {
-                let quantized = (val / scale).round() + zero_point as f32;
-                quantized_data[i] = quantized.clamp(-8.0, 7.0);
-            }
-        }
     }
 
+    // Quantize using each element's own channel parameters
+    let quantized_data: Vec<f32> = data
+        .iter()
+        .enumerate()
+        .map(|(i, &val)| {
+            let ch = (i / strides[axis]) % num_channels;
+            let quantized = (val / scales[ch]).round() + zero_points[ch] as f32;
+            quantized.clamp(-8.0, 7.0)
+        })
+        .collect();
+
     let quantized_tensor = Tensor::from_data(quantized_data, shape.to_vec(), tensor.device())?;
+
+    Ok((quantized_tensor, scales, zero_points))
+}
+
+/// INT4 per-channel quantization (legacy scalar-parameter API).
+///
+/// # Parameter loss
+///
+/// The returned `(scale, zero_point)` pair is the arithmetic **mean** of the
+/// per-channel parameters and cannot invert the quantization. Use
+/// [`quantize_int4_per_channel_full`] when the result has to be dequantized.
+pub fn quantize_int4_per_channel(
+    tensor: &Tensor,
+    axis: usize,
+    config: &QuantConfig,
+) -> TorshResult<(Tensor, f32, i32)> {
+    let (quantized_tensor, scales, zero_points) =
+        quantize_int4_per_channel_full(tensor, axis, config)?;
 
     // Return average parameters for compatibility
     let avg_scale = scales.iter().sum::<f32>() / scales.len() as f32;
@@ -237,13 +235,18 @@ pub fn quantize_ternary(tensor: &Tensor) -> TorshResult<(Tensor, f32, i32)> {
     Ok((quantized_tensor, scale, 0)) // Ternary is symmetric, so zero_point = 0
 }
 
-/// Group-wise quantization (divide channels into groups and quantize per-group)
-pub fn quantize_group_wise(
+/// Group-wise quantization preserving the full per-group parameter set.
+///
+/// Channels along `axis` are split into contiguous groups of `group_size`
+/// channels. The returned vectors hold one scale and one zero point per group
+/// (`ceil(shape[axis] / group_size)` entries), so the result can be inverted
+/// with [`crate::algorithms::dequantize_per_group`].
+pub fn quantize_group_wise_full(
     tensor: &Tensor,
     axis: usize,
     group_size: usize,
     config: &QuantConfig,
-) -> TorshResult<(Tensor, f32, i32)> {
+) -> TorshResult<(Tensor, Vec<f32>, Vec<i32>)> {
     let binding = tensor.shape();
     let shape = binding.dims();
 
@@ -263,7 +266,6 @@ pub fn quantize_group_wise(
     let num_groups = num_channels.div_ceil(group_size); // Ceiling division
 
     let data = tensor.data()?;
-    let mut quantized_data = vec![0.0f32; data.len()];
 
     // Calculate strides for indexing (optimized version)
     let mut strides = vec![1; shape.len()];
@@ -271,53 +273,27 @@ pub fn quantize_group_wise(
         strides[i] = strides[i + 1] * shape[i + 1];
     }
 
-    let mut group_scales = Vec::new();
-    let mut group_zero_points = Vec::new();
+    // Single pass to gather per-group statistics.
+    let mut group_mins = vec![f32::INFINITY; num_groups];
+    let mut group_maxs = vec![f32::NEG_INFINITY; num_groups];
+    for (i, &val) in data.iter().enumerate() {
+        let group = ((i / strides[axis]) % num_channels) / group_size;
+        group_mins[group] = group_mins[group].min(val);
+        group_maxs[group] = group_maxs[group].max(val);
+    }
 
-    // Process each group
-    for group_idx in 0..num_groups {
-        let start_ch = group_idx * group_size;
-        let end_ch = (start_ch + group_size).min(num_channels);
+    let (qmin, qmax) = config.get_qint_range();
+    let mut group_scales = Vec::with_capacity(num_groups);
+    let mut group_zero_points = Vec::with_capacity(num_groups);
 
-        // Collect data for this group
-        let mut group_data = Vec::new();
-        for ch in start_ch..end_ch {
-            // Extract data for this channel
-            for (i, _) in data.iter().enumerate() {
-                let idx = i;
-                let mut ch_idx = 0;
-                let mut remaining = idx;
+    for group in 0..num_groups {
+        // Empty groups (possible only for an empty tensor) get identity params.
+        let (min_val, max_val) = if group_mins[group].is_finite() {
+            (group_mins[group].min(0.0), group_maxs[group].max(0.0))
+        } else {
+            (0.0, 0.0)
+        };
 
-                // Calculate channel index for this element
-                for (dim, &stride) in strides.iter().enumerate() {
-                    let coord = remaining / stride;
-                    remaining %= stride;
-                    if dim == axis {
-                        ch_idx = coord;
-                    }
-                }
-
-                if ch_idx == ch {
-                    group_data.push(data[i]);
-                }
-            }
-        }
-
-        if group_data.is_empty() {
-            continue;
-        }
-
-        // Calculate quantization parameters for this group
-        let min_val = group_data
-            .iter()
-            .fold(f32::INFINITY, |a, &b| a.min(b))
-            .min(0.0);
-        let max_val = group_data
-            .iter()
-            .fold(f32::NEG_INFINITY, |a, &b| a.max(b))
-            .max(0.0);
-
-        let (qmin, qmax) = config.get_qint_range();
         let scale = (max_val - min_val) / (qmax - qmin) as f32;
         let scale = if scale == 0.0 { 1.0 } else { scale };
 
@@ -328,36 +304,39 @@ pub fn quantize_group_wise(
 
         group_scales.push(scale);
         group_zero_points.push(zero_point);
-
-        // Quantize this group's data
-        for ch in start_ch..end_ch {
-            for i in 0..data.len() {
-                let idx = i;
-                let mut ch_idx = 0;
-                let mut remaining = idx;
-
-                // Calculate channel index for this element
-                for (dim, &stride) in strides.iter().enumerate() {
-                    let coord = remaining / stride;
-                    remaining %= stride;
-                    if dim == axis {
-                        ch_idx = coord;
-                    }
-                }
-
-                if ch_idx == ch {
-                    let quantized = (data[i] / scale).round() + zero_point as f32;
-                    quantized_data[i] = quantized.max(qmin as f32).min(qmax as f32);
-                }
-            }
-        }
     }
 
-    let quantized_tensor = Tensor::from_data(
-        quantized_data,
-        tensor.shape().dims().to_vec(),
-        tensor.device(),
-    )?;
+    // Quantize each element with its own group's parameters.
+    let quantized_data: Vec<f32> = data
+        .iter()
+        .enumerate()
+        .map(|(i, &val)| {
+            let group = ((i / strides[axis]) % num_channels) / group_size;
+            let quantized = (val / group_scales[group]).round() + group_zero_points[group] as f32;
+            quantized.clamp(qmin as f32, qmax as f32)
+        })
+        .collect();
+
+    let quantized_tensor = Tensor::from_data(quantized_data, shape.to_vec(), tensor.device())?;
+
+    Ok((quantized_tensor, group_scales, group_zero_points))
+}
+
+/// Group-wise quantization (legacy scalar-parameter API).
+///
+/// # Parameter loss
+///
+/// The returned `(scale, zero_point)` pair is the arithmetic **mean** of the
+/// per-group parameters and cannot invert the quantization. Use
+/// [`quantize_group_wise_full`] when the result has to be dequantized.
+pub fn quantize_group_wise(
+    tensor: &Tensor,
+    axis: usize,
+    group_size: usize,
+    config: &QuantConfig,
+) -> TorshResult<(Tensor, f32, i32)> {
+    let (quantized_tensor, group_scales, group_zero_points) =
+        quantize_group_wise_full(tensor, axis, group_size, config)?;
 
     // Return average scale and zero_point for compatibility
     let avg_scale = if group_scales.is_empty() {

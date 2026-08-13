@@ -96,6 +96,7 @@ impl WebGpuBuffer {
         buffer
             .slice(..)
             .get_mapped_range_mut()
+            .map_err(|e| WebGpuError::BufferMapping(e.to_string()))?
             .slice(..data_bytes.len())
             .copy_from_slice(data_bytes);
         buffer.unmap();
@@ -218,7 +219,9 @@ impl WebGpuBuffer {
 
         let actual_size = size.unwrap_or(self.size - offset);
         let slice = self.buffer.slice(offset..offset + actual_size);
-        Ok(slice.get_mapped_range())
+        slice
+            .get_mapped_range()
+            .map_err(|e| WebGpuError::BufferMapping(e.to_string()))
     }
 
     /// Get mapped range for writing
@@ -237,7 +240,9 @@ impl WebGpuBuffer {
 
         let actual_size = size.unwrap_or(self.size - offset);
         let slice = self.buffer.slice(offset..offset + actual_size);
-        Ok(slice.get_mapped_range_mut())
+        slice
+            .get_mapped_range_mut()
+            .map_err(|e| WebGpuError::BufferMapping(e.to_string()))
     }
 
     /// Unmap the buffer
@@ -397,6 +402,14 @@ impl WebGpuBuffer {
 
     pub fn descriptor(&self) -> &BufferDescriptor {
         &self.descriptor
+    }
+
+    /// Get this buffer as `&dyn Any` for downcasting from trait-object
+    /// contexts. Mirrors the `as_any` convention used elsewhere in this
+    /// crate (e.g. `WebGpuKernel::as_any` in `webgpu::kernels`, and
+    /// `cuda::unified_buffer::BufferTrait::as_any`).
+    pub fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use torsh_core::sync::MutexExt;
 
 use super::common_types::{CacheStatistics, GeneratedKernel};
 
@@ -26,19 +27,19 @@ impl KernelCache {
 
     /// Get a kernel from cache
     pub fn get(&self, key: &str) -> Option<GeneratedKernel> {
-        let cache = self.cache.lock().expect("lock should not be poisoned");
+        let cache = self.cache.lock_or_recover();
         if let Some(kernel) = cache.get(key) {
-            *self.hit_count.lock().expect("lock should not be poisoned") += 1;
+            *self.hit_count.lock_or_recover() += 1;
             Some(kernel.clone())
         } else {
-            *self.miss_count.lock().expect("lock should not be poisoned") += 1;
+            *self.miss_count.lock_or_recover() += 1;
             None
         }
     }
 
     /// Insert a kernel into cache
     pub fn insert(&self, key: String, kernel: GeneratedKernel) {
-        let mut cache = self.cache.lock().expect("lock should not be poisoned");
+        let mut cache = self.cache.lock_or_recover();
         if cache.len() >= self.max_size {
             if let Some(first_key) = cache.keys().next().cloned() {
                 cache.remove(&first_key);
@@ -49,8 +50,8 @@ impl KernelCache {
 
     /// Get cache statistics
     pub fn statistics(&self) -> CacheStatistics {
-        let hits = *self.hit_count.lock().expect("lock should not be poisoned");
-        let misses = *self.miss_count.lock().expect("lock should not be poisoned");
+        let hits = *self.hit_count.lock_or_recover();
+        let misses = *self.miss_count.lock_or_recover();
         let total = hits + misses;
         let hit_rate = if total > 0 {
             hits as f64 / total as f64
@@ -62,22 +63,15 @@ impl KernelCache {
             misses,
             total_requests: total,
             hit_rate,
-            cache_size: self
-                .cache
-                .lock()
-                .expect("lock should not be poisoned")
-                .len(),
+            cache_size: self.cache.lock_or_recover().len(),
             max_cache_size: self.max_size,
         }
     }
 
     /// Clear the cache
     pub fn clear(&self) {
-        self.cache
-            .lock()
-            .expect("lock should not be poisoned")
-            .clear();
-        *self.hit_count.lock().expect("lock should not be poisoned") = 0;
-        *self.miss_count.lock().expect("lock should not be poisoned") = 0;
+        self.cache.lock_or_recover().clear();
+        *self.hit_count.lock_or_recover() = 0;
+        *self.miss_count.lock_or_recover() = 0;
     }
 }

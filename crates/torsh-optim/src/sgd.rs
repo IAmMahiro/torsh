@@ -453,7 +453,69 @@ pub struct SGD {
 }
 
 impl SGD {
-    /// Create a new SGD optimizer
+    /// Create a new SGD optimizer, returning an error for an invalid configuration.
+    ///
+    /// This is the recoverable form of [`SGD::new`] and the one to prefer: an
+    /// invalid hyper-parameter is a user-facing configuration error (PyTorch
+    /// raises a catchable `ValueError` for exactly these cases), and it is
+    /// reachable from the Python/FFI bindings where a panic would unwind across
+    /// a language boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptimizerError::InvalidParameter`] if
+    /// - `lr` is not finite or is negative,
+    /// - `momentum`, `dampening` or `weight_decay` is not finite or is negative, or
+    /// - `nesterov` is requested without positive momentum / with non-zero dampening.
+    pub fn try_new(
+        params: Vec<Arc<RwLock<Tensor>>>,
+        lr: f32,
+        momentum: Option<f32>,
+        dampening: Option<f32>,
+        weight_decay: Option<f32>,
+        nesterov: bool,
+    ) -> OptimizerResult<Self> {
+        let momentum = momentum.unwrap_or(0.0);
+        let dampening = dampening.unwrap_or(0.0);
+        let weight_decay = weight_decay.unwrap_or(0.0);
+
+        for (name, value) in [
+            ("learning rate", lr),
+            ("momentum", momentum),
+            ("dampening", dampening),
+            ("weight_decay", weight_decay),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(OptimizerError::InvalidParameter(format!(
+                    "SGD {name} must be a finite non-negative value, got {value}"
+                )));
+            }
+        }
+
+        if nesterov && (momentum <= 0.0 || dampening != 0.0) {
+            return Err(OptimizerError::InvalidParameter(format!(
+                "Nesterov momentum requires momentum > 0 and dampening == 0, \
+                 got momentum={momentum}, dampening={dampening}"
+            )));
+        }
+
+        Ok(Self::build(
+            params,
+            lr,
+            momentum,
+            dampening,
+            weight_decay,
+            nesterov,
+        ))
+    }
+
+    /// Create a new SGD optimizer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `nesterov` is requested without positive momentum or with
+    /// non-zero dampening. Use [`SGD::try_new`] to handle an invalid
+    /// configuration without unwinding.
     pub fn new(
         params: Vec<Arc<RwLock<Tensor>>>,
         lr: f32,
@@ -470,6 +532,18 @@ impl SGD {
             panic!("Nesterov momentum requires a momentum and zero dampening");
         }
 
+        Self::build(params, lr, momentum, dampening, weight_decay, nesterov)
+    }
+
+    /// Assemble a validated SGD optimizer.
+    fn build(
+        params: Vec<Arc<RwLock<Tensor>>>,
+        lr: f32,
+        momentum: f32,
+        dampening: f32,
+        weight_decay: f32,
+        nesterov: bool,
+    ) -> Self {
         let mut defaults = HashMap::new();
         defaults.insert("lr".to_string(), lr);
         defaults.insert("momentum".to_string(), momentum);
@@ -538,18 +612,19 @@ impl Optimizer for SGD {
                         );
                     }
 
-                    let mut buf = state
-                        .get("momentum_buffer")
-                        .expect("momentum_buffer state should exist")
-                        .clone();
-
-                    // Update momentum buffer: buf = momentum * buf + (1 - dampening) * d_p
-                    buf.mul_scalar_(self.momentum)
-                        .map_err(OptimizerError::TensorError)?;
+                    // Update momentum buffer in place:
+                    // buf = momentum * buf + (1 - dampening) * d_p
+                    // The buffer is mutated where it lives in the state map, so no
+                    // clone-and-reinsert round trip is needed.
                     let grad_term = d_p
                         .mul_scalar(1.0 - self.dampening)
                         .map_err(OptimizerError::TensorError)?;
-                    buf = buf.add(&grad_term).map_err(OptimizerError::TensorError)?;
+                    let buf = state
+                        .get_mut("momentum_buffer")
+                        .expect("momentum_buffer state should exist");
+                    buf.mul_scalar_(self.momentum)
+                        .map_err(OptimizerError::TensorError)?;
+                    buf.add_(&grad_term).map_err(OptimizerError::TensorError)?;
 
                     if self.nesterov {
                         // Nesterov momentum: d_p = d_p + momentum * buf
@@ -563,16 +638,14 @@ impl Optimizer for SGD {
                         // Standard momentum: d_p = buf
                         d_p = buf.clone();
                     }
-
-                    // Update state
-                    state.insert("momentum_buffer".to_string(), buf);
                 }
 
                 // Apply update: param = param - lr * d_p
                 let update = d_p
                     .mul_scalar(group.lr)
                     .map_err(OptimizerError::TensorError)?;
-                *param = param.sub(&update).map_err(OptimizerError::TensorError)?;
+                crate::param_update::sub_assign(&mut param, &update)
+                    .map_err(OptimizerError::TensorError)?;
             }
         }
 
@@ -589,6 +662,10 @@ impl Optimizer for SGD {
 
     fn set_lr(&mut self, lr: f32) {
         self.base.set_lr(lr);
+    }
+
+    fn set_lrs(&mut self, lrs: &[f32]) {
+        self.base.set_lrs(lrs);
     }
 
     fn add_param_group(&mut self, params: Vec<Arc<RwLock<Tensor>>>, options: HashMap<String, f32>) {

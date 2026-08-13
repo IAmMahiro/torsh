@@ -51,7 +51,10 @@ pub struct StftParams {
     pub hop_length: Option<usize>,
     /// Length of the window function (default: n_fft)
     pub win_length: Option<usize>,
-    /// Window function to apply (default: Hann window)
+    /// Window function to apply (default: Hann window).
+    ///
+    /// The window is generated in its *periodic* form, matching
+    /// `torch.stft` / librosa, so that overlap-add reconstruction is exact.
     pub window: Option<Window>,
     /// Whether to center the signal by padding (default: true)
     pub center: bool,
@@ -180,9 +183,11 @@ pub fn stft(input: &Tensor<f32>, params: StftParams) -> Result<Tensor<Complex32>
     let hop_length = params.hop_length.unwrap_or(n_fft / 4);
     let win_length = params.win_length.unwrap_or(n_fft);
 
-    // Get window
+    // Get window. PyTorch (`torch.stft`) and librosa both use *periodic*
+    // windows for spectral analysis: only the periodic form satisfies the
+    // constant-overlap-add condition required for perfect reconstruction.
     let window = match params.window {
-        Some(w) => crate::windows::window(w, win_length, false)?,
+        Some(w) => crate::windows::window(w, win_length, true)?,
         None => ones(&[win_length])?,
     };
 
@@ -212,6 +217,17 @@ pub fn stft(input: &Tensor<f32>, params: StftParams) -> Result<Tensor<Complex32>
     };
 
     let padded_length = signal.shape().dims()[1];
+    if hop_length == 0 {
+        return Err(TorshError::InvalidArgument(
+            "hop_length must be greater than zero".to_string(),
+        ));
+    }
+    if padded_length < n_fft {
+        return Err(TorshError::InvalidArgument(format!(
+            "Signal is too short for the requested STFT: padded length {} < n_fft {}",
+            padded_length, n_fft
+        )));
+    }
     let n_frames = (padded_length - n_fft) / hop_length + 1;
 
     // Compute STFT frames - create complex zeros
@@ -274,9 +290,9 @@ pub fn istft(
     let hop_length = hop_length.unwrap_or(n_fft / 4);
     let win_length = win_length.unwrap_or(n_fft);
 
-    // Get window
+    // Get window (periodic, matching the analysis window used by `stft`).
     let window = match window {
-        Some(w) => crate::windows::window(w, win_length, false)?,
+        Some(w) => crate::windows::window(w, win_length, true)?,
         None => ones(&[win_length])?,
     };
 
@@ -381,15 +397,23 @@ pub(crate) fn pad_signal(signal: &Tensor<f32>, pad_amount: usize) -> Result<Tens
     let signal_length = shape.dims()[1];
     let padded_length = signal_length + 2 * pad_amount;
 
+    if pad_amount >= signal_length {
+        return Err(TorshError::InvalidArgument(format!(
+            "Reflect padding requires pad_amount ({}) < signal length ({})",
+            pad_amount, signal_length
+        )));
+    }
+
     let mut padded: Tensor<f32> = Tensor::zeros(&[batch_size, padded_length], DeviceType::Cpu)?;
 
     for b in 0..batch_size {
-        // Reflect padding
+        // Reflect padding, mirroring about the first/last sample without
+        // repeating it (numpy's "reflect" mode, torch.stft's default).
         for i in 0..pad_amount {
             let left_val = signal.get_2d(b, pad_amount - i)?;
             padded.set_2d(b, i, left_val)?;
 
-            let right_val = signal.get_2d(b, signal_length - pad_amount + i)?;
+            let right_val = signal.get_2d(b, signal_length - 2 - i)?;
             padded.set_2d(b, signal_length + pad_amount + i, right_val)?;
         }
 
@@ -446,9 +470,11 @@ pub(crate) fn extract_stft_frame(
             };
             frame.set_1d(f, value)?;
 
-            // Mirror for negative frequencies (except DC and Nyquist)
+            // Mirror for negative frequencies (except DC and Nyquist).
+            // A real signal has a Hermitian spectrum, so the mirrored bin is
+            // the *conjugate* of its positive-frequency counterpart.
             if f > 0 && f < n_freqs - 1 {
-                frame.set_1d(n_freqs * 2 - 2 - f, value)?;
+                frame.set_1d(n_freqs * 2 - 2 - f, value.conj())?;
             }
         }
     } else {
@@ -486,6 +512,37 @@ mod tests {
         assert_eq!(shape.ndim(), 2);
         assert_eq!(shape.dims()[0], 257); // n_fft/2 + 1 for onesided
         Ok(())
+    }
+
+    #[test]
+    fn f143_pad_signal_reflects_on_both_sides() -> Result<()> {
+        let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let signal = Tensor::from_data(data, vec![1, 8], DeviceType::Cpu)?;
+        let padded = pad_signal(&signal, 3)?;
+
+        // numpy.pad(x, 3, mode="reflect") for x = 0..8
+        let expected = [
+            3.0f32, 2.0, 1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 6.0, 5.0, 4.0,
+        ];
+        assert_eq!(padded.shape().dims(), &[1, expected.len()]);
+        for (i, want) in expected.iter().enumerate() {
+            let got = padded.get_2d(0, i)?;
+            assert!(
+                (got - want).abs() < 1e-6,
+                "padded[{i}] = {got}, expected {want}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn f143_pad_signal_rejects_oversized_padding() {
+        let signal = Tensor::from_data(vec![1.0f32, 2.0, 3.0], vec![1, 3], DeviceType::Cpu)
+            .expect("tensor creation should succeed");
+        assert!(
+            pad_signal(&signal, 3).is_err(),
+            "reflect padding requires pad_amount < signal_length"
+        );
     }
 
     #[test]

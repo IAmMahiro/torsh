@@ -147,12 +147,20 @@ fn display_scirs2_results(result: &torsh_profiler::SciRS2AnalysisResult) {
         result.simd_statistics.simd_accelerated_kurtosis
     );
     println!(
-        "   Vectorization efficiency: {:.1}%",
-        result.simd_statistics.vectorization_efficiency * 100.0
+        "   Vectorization efficiency: {}",
+        result
+            .simd_statistics
+            .vectorization_efficiency
+            .map(|v| format!("{:.1}%", v * 100.0))
+            .unwrap_or_else(|| "not measured".to_string())
     );
     println!(
-        "   Cache hit ratio: {:.1}%",
-        result.simd_statistics.cache_hit_ratio * 100.0
+        "   Cache hit ratio: {}",
+        result
+            .simd_statistics
+            .cache_hit_ratio
+            .map(|v| format!("{:.1}%", v * 100.0))
+            .unwrap_or_else(|| "not measured".to_string())
     );
     println!();
 
@@ -166,10 +174,10 @@ fn display_scirs2_results(result: &torsh_profiler::SciRS2AnalysisResult) {
         "   Load balance score: {:.1}%",
         result.parallel_analysis.load_balance_score * 100.0
     );
-    println!(
-        "   Memory efficiency: {:.1}%",
-        result.parallel_analysis.memory_efficiency * 100.0
-    );
+    match result.parallel_analysis.memory_efficiency {
+        Some(eff) => println!("   Memory efficiency: {:.1}%", eff * 100.0),
+        None => println!("   Memory efficiency: n/a (no bytes-transferred data)"),
+    }
     println!(
         "   CPU utilization: {:.1}%",
         result.parallel_analysis.cpu_utilization * 100.0

@@ -33,7 +33,7 @@ indexmap = { workspace = true }
 once_cell = { workspace = true }
 lazy_static = { workspace = true }
 num-traits = { workspace = true }
-num_cpus = "1.17"
+num_cpus = { workspace = true }
 # fastrand = "2.3"  # REMOVED: Use scirs2-core::random instead (SciRS2 POLICY)
 # ✅ SciRS2 Policy: Use scirs2-core::random instead of direct rand
 

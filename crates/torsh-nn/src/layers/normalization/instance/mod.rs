@@ -18,7 +18,41 @@ use std::collections::HashMap;
 #[cfg(not(feature = "std"))]
 use hashbrown::HashMap;
 
-/// 1D instance normalization layer
+/// Pull the affine parameters out of a module base, if the layer is affine.
+///
+/// Returns clones of the parameter tensors, which share their storage *and*
+/// their gradient slot with the registered `Parameter`, so `backward()`
+/// accumulates straight into the module's gamma/beta.
+fn affine_tensors(base: &ModuleBase, affine: bool) -> (Option<Tensor>, Option<Tensor>) {
+    if !affine {
+        return (None, None);
+    }
+    let weight = base
+        .parameters
+        .get("weight")
+        .map(|p| p.tensor().read().clone());
+    let bias = base
+        .parameters
+        .get("bias")
+        .map(|p| p.tensor().read().clone());
+    (weight, bias)
+}
+
+/// 1D instance normalization layer, for `(N, C)` inputs.
+///
+/// # Degenerate by construction
+///
+/// This layer's rank contract is `(N, C)`, not PyTorch's `(N, C, L)`: there is
+/// no spatial axis left to normalize over, so each `(sample, channel)` statistic
+/// is taken over a *single* element. The mean is the element itself, the
+/// variance is zero, and the output is therefore exactly `bias`, constant in the
+/// input — `d output / d input` is identically zero.
+///
+/// That is what the arithmetic says, and it is now what `backward()` reports.
+/// While the mean was a detached constant the layer instead claimed a gradient
+/// of `gamma / sqrt(eps)` (about `316 * gamma` at the default epsilon), which
+/// was pure noise. Callers that want a real 1-D instance norm should feed an
+/// `(N, C, L)` tensor to [`crate::functional::instance_norm`].
 pub struct InstanceNorm1d {
     base: ModuleBase,
     num_features: usize,
@@ -55,31 +89,6 @@ impl InstanceNorm1d {
     pub fn eps(&self) -> f32 {
         self.config.eps
     }
-
-    fn compute_instance_stats(&self, input: &Tensor) -> Result<(Tensor, Tensor)> {
-        let input_shape = input.shape();
-        let dims = input_shape.dims();
-        let batch_size = dims[0];
-        let channels = dims[1];
-
-        let input_data = input.to_vec()?;
-        let mut means = vec![0.0f32; batch_size * channels];
-        let mut vars = vec![0.0f32; batch_size * channels];
-
-        // For 1D instance norm, each sample's each channel is normalized independently
-        for batch in 0..batch_size {
-            for c in 0..channels {
-                let idx = batch * channels + c;
-                means[idx] = input_data[idx];
-                vars[idx] = 0.0; // No variance for single element
-            }
-        }
-
-        let mean_tensor = Tensor::from_data(means, vec![batch_size, channels], input.device())?;
-        let var_tensor = Tensor::from_data(vars, vec![batch_size, channels], input.device())?;
-
-        Ok((mean_tensor, var_tensor))
-    }
 }
 
 impl Module for InstanceNorm1d {
@@ -101,34 +110,8 @@ impl Module for InstanceNorm1d {
             )));
         }
 
-        // Compute instance statistics
-        let (mean, var) = self.compute_instance_stats(input)?;
-
-        // Get learnable parameters
-        let weight = if self.config.affine {
-            self.base.parameters.get("weight")
-        } else {
-            None
-        };
-
-        let bias = if self.config.affine {
-            self.base.parameters.get("bias")
-        } else {
-            None
-        };
-
-        // Apply normalization
-        let weight_tensor = weight.as_ref().map(|p| p.tensor().read().clone());
-        let bias_tensor = bias.as_ref().map(|p| p.tensor().read().clone());
-
-        utils::apply_normalization(
-            input,
-            &mean,
-            &var,
-            weight_tensor.as_ref(),
-            bias_tensor.as_ref(),
-            self.config.eps,
-        )
+        let (weight, bias) = affine_tensors(&self.base, self.config.affine);
+        utils::instance_normalize(input, weight.as_ref(), bias.as_ref(), self.config.eps)
     }
 
     fn parameters(&self) -> HashMap<String, Parameter> {
@@ -193,53 +176,6 @@ impl InstanceNorm2d {
     pub fn eps(&self) -> f32 {
         self.config.eps
     }
-
-    fn compute_instance_stats(&self, input: &Tensor) -> Result<(Tensor, Tensor)> {
-        let input_shape = input.shape();
-        let dims = input_shape.dims();
-        let batch_size = dims[0];
-        let channels = dims[1];
-        let height = dims[2];
-        let width = dims[3];
-
-        let input_data = input.to_vec()?;
-        let mut means = vec![0.0f32; batch_size * channels];
-        let mut vars = vec![0.0f32; batch_size * channels];
-
-        let spatial_size = (height * width) as f32;
-
-        // Compute mean and variance for each instance-channel pair
-        for batch in 0..batch_size {
-            for c in 0..channels {
-                let mut sum = 0.0;
-                let mut sum_sq = 0.0;
-
-                for h in 0..height {
-                    for w in 0..width {
-                        let idx = batch * (channels * height * width)
-                            + c * (height * width)
-                            + h * width
-                            + w;
-                        let val = input_data[idx];
-                        sum += val;
-                        sum_sq += val * val;
-                    }
-                }
-
-                let mean = sum / spatial_size;
-                let var = (sum_sq / spatial_size) - (mean * mean);
-
-                let stat_idx = batch * channels + c;
-                means[stat_idx] = mean;
-                vars[stat_idx] = var;
-            }
-        }
-
-        let mean_tensor = Tensor::from_data(means, vec![batch_size, channels], input.device())?;
-        let var_tensor = Tensor::from_data(vars, vec![batch_size, channels], input.device())?;
-
-        Ok((mean_tensor, var_tensor))
-    }
 }
 
 impl Module for InstanceNorm2d {
@@ -261,38 +197,8 @@ impl Module for InstanceNorm2d {
             )));
         }
 
-        // Compute instance statistics
-        let (mean, var) = self.compute_instance_stats(input)?;
-
-        // Expand dimensions for broadcasting
-        let mean_expanded = mean.unsqueeze(2)?.unsqueeze(3)?;
-        let var_expanded = var.unsqueeze(2)?.unsqueeze(3)?;
-
-        // Get learnable parameters
-        let weight = if self.config.affine {
-            self.base.parameters.get("weight")
-        } else {
-            None
-        };
-
-        let bias = if self.config.affine {
-            self.base.parameters.get("bias")
-        } else {
-            None
-        };
-
-        // Apply normalization
-        let weight_tensor = weight.as_ref().map(|p| p.tensor().read().clone());
-        let bias_tensor = bias.as_ref().map(|p| p.tensor().read().clone());
-
-        utils::apply_normalization(
-            input,
-            &mean_expanded,
-            &var_expanded,
-            weight_tensor.as_ref(),
-            bias_tensor.as_ref(),
-            self.config.eps,
-        )
+        let (weight, bias) = affine_tensors(&self.base, self.config.affine);
+        utils::instance_normalize(input, weight.as_ref(), bias.as_ref(), self.config.eps)
     }
 
     fn parameters(&self) -> HashMap<String, Parameter> {
@@ -357,57 +263,6 @@ impl InstanceNorm3d {
     pub fn eps(&self) -> f32 {
         self.config.eps
     }
-
-    fn compute_instance_stats(&self, input: &Tensor) -> Result<(Tensor, Tensor)> {
-        let input_shape = input.shape();
-        let dims = input_shape.dims();
-        let batch_size = dims[0];
-        let channels = dims[1];
-        let depth = dims[2];
-        let height = dims[3];
-        let width = dims[4];
-
-        let input_data = input.to_vec()?;
-        let mut means = vec![0.0f32; batch_size * channels];
-        let mut vars = vec![0.0f32; batch_size * channels];
-
-        let spatial_size = (depth * height * width) as f32;
-
-        // Compute mean and variance for each instance-channel pair
-        for batch in 0..batch_size {
-            for c in 0..channels {
-                let mut sum = 0.0;
-                let mut sum_sq = 0.0;
-
-                for d in 0..depth {
-                    for h in 0..height {
-                        for w in 0..width {
-                            let idx = batch * (channels * depth * height * width)
-                                + c * (depth * height * width)
-                                + d * (height * width)
-                                + h * width
-                                + w;
-                            let val = input_data[idx];
-                            sum += val;
-                            sum_sq += val * val;
-                        }
-                    }
-                }
-
-                let mean = sum / spatial_size;
-                let var = (sum_sq / spatial_size) - (mean * mean);
-
-                let stat_idx = batch * channels + c;
-                means[stat_idx] = mean;
-                vars[stat_idx] = var;
-            }
-        }
-
-        let mean_tensor = Tensor::from_data(means, vec![batch_size, channels], input.device())?;
-        let var_tensor = Tensor::from_data(vars, vec![batch_size, channels], input.device())?;
-
-        Ok((mean_tensor, var_tensor))
-    }
 }
 
 impl Module for InstanceNorm3d {
@@ -429,38 +284,8 @@ impl Module for InstanceNorm3d {
             )));
         }
 
-        // Compute instance statistics
-        let (mean, var) = self.compute_instance_stats(input)?;
-
-        // Expand dimensions for broadcasting
-        let mean_expanded = mean.unsqueeze(2)?.unsqueeze(3)?.unsqueeze(4)?;
-        let var_expanded = var.unsqueeze(2)?.unsqueeze(3)?.unsqueeze(4)?;
-
-        // Get learnable parameters
-        let weight = if self.config.affine {
-            self.base.parameters.get("weight")
-        } else {
-            None
-        };
-
-        let bias = if self.config.affine {
-            self.base.parameters.get("bias")
-        } else {
-            None
-        };
-
-        // Apply normalization
-        let weight_tensor = weight.as_ref().map(|p| p.tensor().read().clone());
-        let bias_tensor = bias.as_ref().map(|p| p.tensor().read().clone());
-
-        utils::apply_normalization(
-            input,
-            &mean_expanded,
-            &var_expanded,
-            weight_tensor.as_ref(),
-            bias_tensor.as_ref(),
-            self.config.eps,
-        )
+        let (weight, bias) = affine_tensors(&self.base, self.config.affine);
+        utils::instance_normalize(input, weight.as_ref(), bias.as_ref(), self.config.eps)
     }
 
     fn parameters(&self) -> HashMap<String, Parameter> {

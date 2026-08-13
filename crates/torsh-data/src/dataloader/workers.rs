@@ -281,7 +281,13 @@ where
     sampler_iter: S::Iter,
     worker_pool: &'a WorkerPool<D, C>,
     pending_tasks: HashMap<usize, Vec<usize>>,
+    /// Completed results that arrived out of order, keyed by task_id, waiting
+    /// for `next_expected_id` to catch up so they can be emitted in
+    /// submission order.
+    result_buffer: HashMap<usize, Result<C::Output>>,
     next_task_id: usize,
+    /// task_id of the next batch that must be returned from `next()`.
+    next_expected_id: usize,
     max_pending: usize,
 }
 
@@ -310,7 +316,9 @@ where
             sampler_iter,
             worker_pool,
             pending_tasks: HashMap::new(),
+            result_buffer: HashMap::new(),
             next_task_id: 0,
+            next_expected_id: 0,
             max_pending,
         }
     }
@@ -335,14 +343,21 @@ where
             sampler_iter,
             worker_pool,
             pending_tasks: HashMap::new(),
+            result_buffer: HashMap::new(),
             next_task_id: 0,
+            next_expected_id: 0,
             max_pending,
         }
     }
 
-    /// Submit tasks to keep the pipeline full
+    /// Submit tasks to keep the pipeline full.
+    ///
+    /// The outstanding work (tasks still in flight, plus results already
+    /// completed but not yet emitted because an earlier task hasn't finished)
+    /// is capped at `max_pending`, so a slow worker applies backpressure
+    /// instead of letting `result_buffer` grow without bound.
     fn submit_tasks(&mut self) {
-        while self.pending_tasks.len() < self.max_pending {
+        while self.pending_tasks.len() + self.result_buffer.len() < self.max_pending {
             if let Some(indices) = self.sampler_iter.next() {
                 let task_id = self.next_task_id;
                 self.next_task_id += 1;
@@ -385,22 +400,33 @@ where
     type Item = Result<C::Output>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Submit new tasks to keep pipeline full
-        self.submit_tasks();
-
-        // If no pending tasks, we're done
-        if self.pending_tasks.is_empty() {
-            return None;
-        }
-
-        // Wait for a result
-        match self.worker_pool.get_result() {
-            Ok(WorkerResult { task_id, result }) => {
-                // Remove the completed task
-                self.pending_tasks.remove(&task_id);
-                Some(result)
+        // Reorder buffer: workers can finish tasks out of order (thread
+        // scheduling), but callers need batches back in sampler/submission
+        // order for reproducibility, matching PyTorch's DataLoader. Drain
+        // worker results into `result_buffer` until the one this call must
+        // return (`next_expected_id`) is present, then emit it.
+        loop {
+            if let Some(result) = self.result_buffer.remove(&self.next_expected_id) {
+                self.next_expected_id += 1;
+                return Some(result);
             }
-            Err(e) => Some(Err(e)),
+
+            // Submit new tasks to keep the pipeline full.
+            self.submit_tasks();
+
+            // Nothing in flight and nothing buffered: the sampler is exhausted.
+            if self.pending_tasks.is_empty() && self.result_buffer.is_empty() {
+                return None;
+            }
+
+            // Wait for the next completion, which may be out of order.
+            match self.worker_pool.get_result() {
+                Ok(WorkerResult { task_id, result }) => {
+                    self.pending_tasks.remove(&task_id);
+                    self.result_buffer.insert(task_id, result);
+                }
+                Err(e) => return Some(Err(e)),
+            }
         }
     }
 }

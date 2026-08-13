@@ -487,7 +487,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "KNOWN ISSUE: TransformerBlock tensor slicing - FlashMultiHeadAttention uses complex 5D tensor reshaping with narrow/squeeze operations that fail in batch scenarios. Deferred to v0.2.0 for attention mechanism refactor. See: TODO.md"]
     fn test_advanced_models() {
         let result = demonstrate_advanced_models();
         assert!(result.is_ok());
@@ -501,7 +500,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "KNOWN ISSUE: TransformerBlock tensor slicing - FlashMultiHeadAttention uses complex 5D tensor reshaping with narrow/squeeze operations that fail in batch scenarios. Deferred to v0.2.0 for attention mechanism refactor. See: TODO.md"]
     fn test_end_to_end_workflow() {
         let result = demonstrate_end_to_end_workflow();
         assert!(result.is_ok());

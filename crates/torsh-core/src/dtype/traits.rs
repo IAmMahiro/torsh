@@ -259,11 +259,13 @@ impl TensorElement for f16 {
     }
 }
 
-// TODO: f16 FloatElement implementation requires scirs2_core::Float trait implementation for half::f16
-// This will be available when scirs2-core adds Float trait support for f16/bf16 types
-// For now, f16 tensors can be created but may have limited Float-based operations
-// Uncomment when scirs2-core 0.1.1+ provides Float impl for f16
-/*
+/// `FloatElement` implementation for f16 (half precision)
+///
+/// `scirs2_core::numeric::Float` is a re-export of `num_traits::float::Float`,
+/// which `half::f16` implements when the `half` crate's `num-traits` feature is
+/// enabled (see the `half` dependency in this crate's Cargo.toml). That satisfies
+/// the `FloatElement: TensorElement + Float` supertrait bound; the methods below
+/// otherwise just forward to f16's own unconditional inherent consts/methods.
 impl FloatElement for f16 {
     fn epsilon() -> Self {
         f16::EPSILON
@@ -293,7 +295,6 @@ impl FloatElement for f16 {
         f16::NAN
     }
 }
-*/
 
 /// Custom implementation for bf16 (brain floating point)
 impl TensorElement for bf16 {
@@ -326,11 +327,13 @@ impl TensorElement for bf16 {
     }
 }
 
-// TODO: bf16 FloatElement implementation requires scirs2_core::Float trait implementation for half::bf16
-// This will be available when scirs2-core adds Float trait support for f16/bf16 types
-// For now, bf16 tensors can be created but may have limited Float-based operations
-// Uncomment when scirs2-core 0.1.1+ provides Float impl for bf16
-/*
+/// `FloatElement` implementation for bf16 (brain floating point)
+///
+/// `scirs2_core::numeric::Float` is a re-export of `num_traits::float::Float`,
+/// which `half::bf16` implements when the `half` crate's `num-traits` feature is
+/// enabled (see the `half` dependency in this crate's Cargo.toml). That satisfies
+/// the `FloatElement: TensorElement + Float` supertrait bound; the methods below
+/// otherwise just forward to bf16's own unconditional inherent consts/methods.
 impl FloatElement for bf16 {
     fn epsilon() -> Self {
         bf16::EPSILON
@@ -360,7 +363,6 @@ impl FloatElement for bf16 {
         bf16::NAN
     }
 }
-*/
 
 /// Type aliases for complex numbers
 pub type Complex32 = Complex<f32>;
@@ -763,6 +765,123 @@ mod tests {
         assert!(TensorElement::is_zero(&bf16_zero));
         assert!(TensorElement::is_one(&bf16_one));
         assert_eq!(<half::bf16 as TensorElement>::dtype(), DType::BF16);
+    }
+
+    #[test]
+    fn test_f16_float_element_epsilon() {
+        // IEEE 754 binary16 (half precision) machine epsilon = 2^-10.
+        assert_eq!(<f16 as FloatElement>::epsilon(), f16::EPSILON);
+        assert_eq!(<f16 as FloatElement>::epsilon().to_f64(), 0.0009765625_f64);
+    }
+
+    #[test]
+    fn test_bf16_float_element_epsilon() {
+        // bfloat16 machine epsilon = 2^-7.
+        assert_eq!(<bf16 as FloatElement>::epsilon(), bf16::EPSILON);
+        assert_eq!(<bf16 as FloatElement>::epsilon().to_f64(), 0.0078125_f64);
+    }
+
+    #[test]
+    fn test_f16_float_element_special_values() {
+        let inf = <f16 as FloatElement>::infinity();
+        let neg_inf = <f16 as FloatElement>::neg_infinity();
+        let nan = <f16 as FloatElement>::nan();
+        let finite = f16::from_f64(1.5);
+
+        assert_eq!(inf, f16::INFINITY);
+        assert_eq!(neg_inf, f16::NEG_INFINITY);
+
+        assert!(FloatElement::is_infinite(&inf));
+        assert!(!FloatElement::is_finite(&inf));
+        assert!(FloatElement::is_infinite(&neg_inf));
+        assert!(!FloatElement::is_finite(&neg_inf));
+        assert!(FloatElement::is_nan(&nan));
+        assert!(!FloatElement::is_nan(&inf));
+
+        assert!(FloatElement::is_finite(&finite));
+        assert!(!FloatElement::is_infinite(&finite));
+        assert!(!FloatElement::is_nan(&finite));
+    }
+
+    #[test]
+    fn test_bf16_float_element_special_values() {
+        let inf = <bf16 as FloatElement>::infinity();
+        let neg_inf = <bf16 as FloatElement>::neg_infinity();
+        let nan = <bf16 as FloatElement>::nan();
+        let finite = bf16::from_f64(1.5);
+
+        assert_eq!(inf, bf16::INFINITY);
+        assert_eq!(neg_inf, bf16::NEG_INFINITY);
+
+        assert!(FloatElement::is_infinite(&inf));
+        assert!(!FloatElement::is_finite(&inf));
+        assert!(FloatElement::is_infinite(&neg_inf));
+        assert!(!FloatElement::is_finite(&neg_inf));
+        assert!(FloatElement::is_nan(&nan));
+        assert!(!FloatElement::is_nan(&inf));
+
+        assert!(FloatElement::is_finite(&finite));
+        assert!(!FloatElement::is_infinite(&finite));
+        assert!(!FloatElement::is_nan(&finite));
+    }
+
+    #[test]
+    fn test_f16_known_ieee754_binary16_constants() {
+        // Known IEEE 754 binary16 (half precision) constants, see
+        // https://en.wikipedia.org/wiki/Half-precision_floating-point_format
+        assert_eq!(f16::MAX.to_f64(), 65504.0_f64);
+        assert_eq!(f16::MIN.to_f64(), -65504.0_f64);
+        assert_eq!(f16::MIN_POSITIVE.to_f64(), 6.103515625e-5_f64);
+        assert_eq!(f16::EPSILON.to_f64(), 0.0009765625_f64);
+    }
+
+    #[test]
+    fn test_bf16_known_bfloat16_constants() {
+        // bfloat16 shares its 8-bit exponent field with f32 but has only 7
+        // mantissa bits, so MAX/MIN = (2 - 2^-7) * 2^127 and MIN_POSITIVE is
+        // bit-for-bit identical to f32::MIN_POSITIVE (2^-126).
+        let expected_max = (2.0_f64 - 2f64.powi(-7)) * 2f64.powi(127);
+        assert_eq!(bf16::MAX.to_f64(), expected_max);
+        assert_eq!(bf16::MIN.to_f64(), -expected_max);
+        assert_eq!(bf16::MIN_POSITIVE.to_f64(), f32::MIN_POSITIVE as f64);
+        assert_eq!(bf16::EPSILON.to_f64(), 0.0078125_f64);
+    }
+
+    #[test]
+    fn test_f16_bf16_satisfy_float_supertrait() {
+        // The crux of this fix: `FloatElement: TensorElement + Float` now
+        // resolves for f16/bf16 because half's `num-traits` Cargo feature is
+        // enabled (torsh-core/Cargo.toml), which provides `num_traits::float::
+        // Float` impls for half::f16/bf16 that satisfy the supertrait bound
+        // (`scirs2_core::numeric::Float` is a re-export of that same trait).
+        fn assert_float_element<T: FloatElement>() {}
+        assert_float_element::<f16>();
+        assert_float_element::<bf16>();
+
+        // Exercise the `Float` supertrait methods directly (as opposed to
+        // FloatElement's own epsilon()/infinity()/etc. wrappers) to prove the
+        // bound is load-bearing, not just declared.
+        assert_eq!(<f16 as Float>::max_value(), f16::MAX);
+        assert_eq!(<f16 as Float>::min_value(), f16::MIN);
+        assert_eq!(<f16 as Float>::epsilon(), f16::EPSILON);
+        assert_eq!(<bf16 as Float>::max_value(), bf16::MAX);
+        assert_eq!(<bf16 as Float>::min_value(), bf16::MIN);
+        assert_eq!(<bf16 as Float>::epsilon(), bf16::EPSILON);
+    }
+
+    #[test]
+    fn test_f16_bf16_arithmetic_via_float_element() {
+        // Sanity-check basic arithmetic now that f16/bf16 are full
+        // FloatElement (and thus Float) citizens.
+        let a = f16::from_f64(1.5);
+        let b = f16::from_f64(1.5);
+        assert_eq!((a + b).to_f64(), 3.0_f64);
+        assert!(FloatElement::is_finite(&(a + b)));
+
+        let x = bf16::from_f64(1.5);
+        let y = bf16::from_f64(1.5);
+        assert_eq!((x + y).to_f64(), 3.0_f64);
+        assert!(FloatElement::is_finite(&(x + y)));
     }
 
     #[test]

@@ -8,6 +8,156 @@ use crate::device::DeviceType;
 use crate::error::Result;
 use std::collections::HashMap;
 
+/// Real (as opposed to fabricated) macOS hardware queries
+///
+/// torsh-core has no IOKit/Metal framework bindings, so it cannot query GPU
+/// specs through Apple's native APIs. It can, however, ask the OS itself
+/// through the same command-line tools a user would run (`sysctl`,
+/// `system_profiler`), which are part of every macOS install. Each query is
+/// resolved at most once per process (cached in a `OnceLock`) and degrades
+/// to a clearly-documented conservative default -- never a specific
+/// "detected-looking" number -- if the command is unavailable, fails, or
+/// returns output this module doesn't recognize.
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_hw {
+    use std::process::Command;
+    use std::sync::OnceLock;
+
+    /// Real total system memory in bytes, queried via `sysctl -n hw.memsize`.
+    ///
+    /// This is unified memory on Apple Silicon, so it is equally valid as
+    /// "system memory" (CPU perspective) and "GPU memory" (Metal
+    /// perspective). Falls back to a documented conservative default of
+    /// 16 GiB if the query fails for any reason.
+    pub(crate) fn total_memory_bytes() -> u64 {
+        static CACHE: OnceLock<u64> = OnceLock::new();
+        *CACHE.get_or_init(|| {
+            Command::new("sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(16 * 1024 * 1024 * 1024) // Documented default: 16 GiB
+        })
+    }
+
+    /// Real GPU core count, queried via `system_profiler SPDisplaysDataType -json`
+    /// (looks for the `sppci_cores` field).
+    ///
+    /// Falls back to a conservative documented default of `1` -- not a
+    /// plausible-looking number like the `32` this replaced -- if
+    /// `system_profiler` is unavailable, slow to respond in a way that
+    /// fails, or the field isn't present (e.g. some older Intel GPUs don't
+    /// report it).
+    pub(crate) fn gpu_core_count() -> u32 {
+        static CACHE: OnceLock<u32> = OnceLock::new();
+        *CACHE.get_or_init(|| {
+            Command::new("system_profiler")
+                .args(["SPDisplaysDataType", "-json"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .and_then(|json| parse_sppci_cores(&json))
+                .unwrap_or(1)
+        })
+    }
+
+    /// Real chip/GPU name, queried via `sysctl -n machdep.cpu.brand_string`.
+    ///
+    /// On Apple Silicon the GPU is integrated into the same chip as the CPU
+    /// (e.g. "Apple M3"), so the CPU brand string is also an accurate GPU
+    /// name. Falls back to a clearly-labeled placeholder, never a
+    /// synthesized name, if the query fails.
+    pub(crate) fn chip_name() -> String {
+        static CACHE: OnceLock<String> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                Command::new("sysctl")
+                    .args(["-n", "machdep.cpu.brand_string"])
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .and_then(|out| String::from_utf8(out.stdout).ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "Unknown Apple GPU".to_string())
+            })
+            .clone()
+    }
+
+    /// Dependency-free extraction of `"sppci_cores" : "N"` from
+    /// `system_profiler`'s JSON output. A full JSON parser is deliberately
+    /// not pulled in for a single scalar field; this mirrors the existing
+    /// line-based `/proc/meminfo`/`/proc/cpuinfo` parsing used on Linux.
+    fn parse_sppci_cores(json: &str) -> Option<u32> {
+        let key_idx = json.find("\"sppci_cores\"")?;
+        let after_key = &json[key_idx + "\"sppci_cores\"".len()..];
+        let colon_idx = after_key.find(':')?;
+        let after_colon = &after_key[colon_idx + 1..];
+        let quote_start = after_colon.find('"')?;
+        let rest = &after_colon[quote_start + 1..];
+        let quote_end = rest.find('"')?;
+        rest[..quote_end].trim().parse::<u32>().ok()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_parse_sppci_cores_typical_output() {
+            let json = r#"{
+  "SPDisplaysDataType" : [
+    {
+      "_name" : "Apple M3",
+      "sppci_cores" : "10",
+      "sppci_device_type" : "spdisplays_gpu"
+    }
+  ]
+}"#;
+            assert_eq!(parse_sppci_cores(json), Some(10));
+        }
+
+        #[test]
+        fn test_parse_sppci_cores_missing_field() {
+            let json = r#"{"SPDisplaysDataType": [{"_name": "Some GPU"}]}"#;
+            assert_eq!(parse_sppci_cores(json), None);
+        }
+
+        #[test]
+        fn test_parse_sppci_cores_malformed() {
+            assert_eq!(parse_sppci_cores("not json at all"), None);
+            assert_eq!(parse_sppci_cores(""), None);
+        }
+
+        #[test]
+        fn test_total_memory_bytes_is_nonzero() {
+            // Either genuinely queried or the documented fallback -- both
+            // are nonzero and cached across calls.
+            let first = total_memory_bytes();
+            let second = total_memory_bytes();
+            assert!(first > 0);
+            assert_eq!(first, second);
+        }
+
+        #[test]
+        fn test_gpu_core_count_is_nonzero() {
+            let first = gpu_core_count();
+            let second = gpu_core_count();
+            assert!(first > 0);
+            assert_eq!(first, second);
+        }
+
+        #[test]
+        fn test_chip_name_is_nonempty() {
+            assert!(!chip_name().is_empty());
+        }
+    }
+}
+
 /// Comprehensive device capability information
 ///
 /// Provides detailed information about device capabilities including memory,
@@ -200,24 +350,28 @@ impl DeviceCapabilities {
         })
     }
 
+    /// Detect CUDA device capabilities
+    ///
+    /// torsh-core has no direct CUDA driver bindings -- real CUDA device
+    /// queries (`cudaGetDeviceProperties`, `cudaMemGetInfo`, etc.) are
+    /// available through `torsh-tensor`'s oxicuda-backed `cuda_backend`, but
+    /// this foundation crate cannot depend on `torsh-tensor` without a
+    /// circular dependency. Rather than fabricate plausible-looking specs
+    /// (this used to hardcode an RTX-3080-class 8 GiB/900 GB/s/108-SM
+    /// profile regardless of the actual card), this honestly reports the
+    /// capability as undeterminable here.
     fn detect_cuda_capabilities(index: usize) -> Result<Self> {
         #[cfg(feature = "cuda")]
         {
-            // In a real implementation, this would query CUDA runtime
-            Ok(DeviceCapabilities {
-                device_type: DeviceType::Cuda(index),
-                total_memory: 8 * 1024 * 1024 * 1024, // Mock: 8GB
-                available_memory: 7 * 1024 * 1024 * 1024, // Mock: 7GB available
-                memory_bandwidth: Some(900 * 1024 * 1024 * 1024), // Mock: 900 GB/s
-                compute_units: 108,                   // Mock: 108 SMs
-                clock_rate: Some(1755),               // Mock: 1755 MHz
-                simd_features: SimdFeatures::cuda_default(),
-                hardware_features: Self::detect_cuda_features(index),
-                driver_version: Some("12.0".to_string()),
-                device_name: format!("CUDA Device {}", index),
-                pci_info: Some(PciInfo::mock_cuda()),
-                thermal_info: Some(ThermalInfo::mock_gpu()),
-            })
+            let _ = index; // reserved for when a real query path exists
+            Err(crate::error::TorshError::General(
+                crate::error::GeneralError::DeviceError(format!(
+                    "CUDA device {} capabilities cannot be honestly determined: torsh-core has \
+                     no direct CUDA driver access (use torsh-tensor's oxicuda-backed \
+                     cuda_backend for real device queries)",
+                    index
+                )),
+            ))
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -230,22 +384,44 @@ impl DeviceCapabilities {
         }
     }
 
+    /// Detect Metal device capabilities
+    ///
+    /// Metal is enabled by default on every macOS build (no feature flag
+    /// gates it), so unlike CUDA/WebGPU this path is on by default and gets
+    /// real values wherever a real query is available: total memory and GPU
+    /// core count are queried from the OS itself (see [`macos_hw`]). Values
+    /// that genuinely cannot be queried without private frameworks or
+    /// elevated privileges (memory bandwidth, clock rate, driver/feature-set
+    /// version, thermal telemetry) are honestly reported as `None` rather
+    /// than a fabricated number.
     fn detect_metal_capabilities(index: usize) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
             Ok(DeviceCapabilities {
                 device_type: DeviceType::Metal(index),
-                total_memory: Self::get_system_memory(), // Unified memory on Apple Silicon
+                total_memory: Self::get_system_memory(), // Real: unified memory via sysctl hw.memsize
                 available_memory: Self::get_available_memory(),
-                memory_bandwidth: Some(400 * 1024 * 1024 * 1024), // Mock: 400 GB/s
-                compute_units: 32,                                // Mock: 32 GPU cores
-                clock_rate: Some(1398),                           // Mock: 1398 MHz
+                // Real GPU memory bandwidth varies per Apple Silicon SKU
+                // (e.g. M1 ~68 GB/s vs M1 Max ~400 GB/s) and there is no
+                // standard macOS API to query it without vendor-specific
+                // tooling, so this is honestly unknown rather than guessed.
+                memory_bandwidth: None,
+                // Real GPU core count, queried via `system_profiler`.
+                compute_units: macos_hw::gpu_core_count(),
+                // GPU clock rate is not exposed by any standard macOS API
+                // and varies dynamically (thermal/power management), so
+                // this is honestly unknown rather than a fixed guess.
+                clock_rate: None,
                 simd_features: SimdFeatures::metal_default(),
                 hardware_features: Self::detect_metal_features(),
-                driver_version: Some("Metal 3.0".to_string()),
-                device_name: format!("Metal Device {}", index),
+                // Metal has no queryable "driver version" concept from user
+                // space without private frameworks.
+                driver_version: None,
+                device_name: format!("{} (Metal Device {})", macos_hw::chip_name(), index),
                 pci_info: None, // Apple Silicon doesn't use PCIe for GPU
-                thermal_info: Some(ThermalInfo::mock_integrated()),
+                // Real thermal telemetry requires elevated privileges
+                // (powermetrics) or IOKit/SMC bindings not available here.
+                thermal_info: None,
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -259,23 +435,23 @@ impl DeviceCapabilities {
         }
     }
 
+    /// Detect WebGPU device capabilities
+    ///
+    /// torsh-core's `wgpu` feature here is only a marker flag (not
+    /// `dep:wgpu`), so it has no adapter to probe. Rather than fabricate
+    /// plausible-looking specs, this honestly reports the capability as
+    /// undeterminable here.
     fn detect_wgpu_capabilities(index: usize) -> Result<Self> {
         #[cfg(feature = "wgpu")]
         {
-            Ok(DeviceCapabilities {
-                device_type: DeviceType::Wgpu(index),
-                total_memory: 4 * 1024 * 1024 * 1024, // Mock: 4GB
-                available_memory: 3 * 1024 * 1024 * 1024, // Mock: 3GB available
-                memory_bandwidth: Some(300 * 1024 * 1024 * 1024), // Mock: 300 GB/s
-                compute_units: 24,                    // Mock: 24 compute units
-                clock_rate: Some(1200),               // Mock: 1200 MHz
-                simd_features: SimdFeatures::wgpu_default(),
-                hardware_features: Self::detect_wgpu_features(),
-                driver_version: Some("WebGPU 1.0".to_string()),
-                device_name: format!("WebGPU Device {}", index),
-                pci_info: None,
-                thermal_info: None,
-            })
+            let _ = index; // reserved for when a real wgpu::Adapter probe exists
+            Err(crate::error::TorshError::General(
+                crate::error::GeneralError::DeviceError(format!(
+                    "WebGPU device {} capabilities cannot be honestly determined: torsh-core's \
+                     wgpu feature has no wgpu::Instance/Adapter wired up to query",
+                    index
+                )),
+            ))
         }
         #[cfg(not(feature = "wgpu"))]
         {
@@ -308,8 +484,9 @@ impl DeviceCapabilities {
         }
         #[cfg(target_os = "macos")]
         {
-            // On macOS, we could use sysctl to get memory info
-            16 * 1024 * 1024 * 1024 // Default 16GB for macOS
+            // Real value queried via `sysctl -n hw.memsize` (falls back to a
+            // documented 16 GiB default if the query fails); see `macos_hw`.
+            macos_hw::total_memory_bytes()
         }
         #[cfg(target_os = "windows")]
         {
@@ -421,40 +598,23 @@ impl DeviceCapabilities {
 
     /// Detect CUDA device features at runtime
     ///
-    /// # SciRS2 POLICY COMPLIANCE
-    /// Uses scirs2-core GPU detection when available for accurate capability detection.
+    /// # Current Status
+    /// torsh-core has no direct CUDA bindings to query real per-device
+    /// feature support, so this returns a fixed "optimistic modern device"
+    /// feature set rather than a genuinely detected one. (Not addressed by
+    /// this pass; only the dead phantom-cfg branch that used to wrap this --
+    /// which referenced a nonexistent `crate::gpu::GpuDevice` type and an
+    /// out-of-scope `index` variable, so it could never have compiled even
+    /// if the cfg were ever set -- has been removed. See FOLLOW-UP notes.)
     ///
     /// # Arguments
-    /// * `index` - CUDA device index to query
+    /// * `index` - CUDA device index (currently unused; reserved for a real query path)
     ///
     /// # Returns
     /// HashMap of feature names and their availability
     #[allow(dead_code)]
     fn detect_cuda_features(_index: usize) -> HashMap<String, bool> {
         let mut features = HashMap::new();
-
-        // Try to use scirs2-core GPU detection if available
-        #[cfg(all(feature = "gpu", scirs2_gpu_available))]
-        {
-            use crate::gpu;
-            if let Ok(device) = gpu::GpuDevice::new(index) {
-                // Query actual device capabilities from scirs2-core
-                features.insert("double_precision".to_string(), device.supports_f64());
-                features.insert("half_precision".to_string(), device.supports_f16());
-                features.insert("tensor_cores".to_string(), device.has_tensor_cores());
-                features.insert(
-                    "unified_memory".to_string(),
-                    device.supports_unified_memory(),
-                );
-                features.insert("peer_to_peer".to_string(), device.supports_p2p());
-                features.insert(
-                    "concurrent_kernels".to_string(),
-                    device.supports_concurrent_kernels(),
-                );
-                features.insert("async_copy".to_string(), device.supports_async_copy());
-                return features;
-            }
-        }
 
         // Fallback: Optimistic feature set for modern CUDA devices
         // These are typical capabilities for CUDA Compute Capability 7.0+
@@ -479,32 +639,20 @@ impl DeviceCapabilities {
 
     /// Detect Metal GPU features at runtime
     ///
-    /// # SciRS2 POLICY COMPLIANCE
-    /// Uses scirs2-core GPU detection when available for accurate Metal capability detection.
+    /// # Current Status
+    /// torsh-core has no Metal framework bindings to query real per-device
+    /// feature support, so this returns a fixed "typical Metal 2.0+/3.0+"
+    /// feature set rather than a genuinely detected one. (Not addressed by
+    /// this pass; only the dead phantom-cfg branch that used to wrap this --
+    /// which referenced a nonexistent `crate::gpu::GpuDevice` type, so it
+    /// could never have compiled even if the cfg were ever set -- has been
+    /// removed. See FOLLOW-UP notes.)
     ///
     /// # Platform
     /// Only available on macOS/iOS platforms
     #[cfg(target_os = "macos")]
     fn detect_metal_features() -> HashMap<String, bool> {
         let mut features = HashMap::new();
-
-        // Try to use scirs2-core Metal detection if available
-        #[cfg(all(feature = "gpu", scirs2_gpu_available, target_os = "macos"))]
-        {
-            use crate::gpu;
-            if let Ok(device) = gpu::GpuDevice::new(0) {
-                // Query actual Metal device capabilities
-                features.insert("half_precision".to_string(), device.supports_f16());
-                features.insert("unified_memory".to_string(), true); // Always true on Metal
-                features.insert("tile_shaders".to_string(), device.supports_tile_shaders());
-                features.insert("compute_shaders".to_string(), true); // Always supported
-                features.insert(
-                    "indirect_command_buffers".to_string(),
-                    device.supports_indirect_command_buffers(),
-                );
-                return features;
-            }
-        }
 
         // Fallback: Typical Metal 2.0+ features (macOS 10.13+)
         features.insert("half_precision".to_string(), true);
@@ -530,38 +678,20 @@ impl DeviceCapabilities {
 
     /// Detect WebGPU features at runtime
     ///
-    /// # SciRS2 POLICY COMPLIANCE
-    /// Uses scirs2-core WebGPU detection when available for accurate capability detection.
+    /// # Current Status
+    /// torsh-core has no `wgpu::Adapter` wired up to query real per-device
+    /// feature support, so this returns a fixed "WebGPU 1.0 baseline"
+    /// feature set rather than a genuinely detected one. (Not addressed by
+    /// this pass; only the dead phantom-cfg branch that used to wrap this --
+    /// which referenced a nonexistent `crate::gpu::GpuDevice` type, so it
+    /// could never have compiled even if the cfg were ever set -- has been
+    /// removed. See FOLLOW-UP notes.)
     ///
     /// # Platform
     /// Cross-platform (web, desktop, mobile)
     #[allow(dead_code)]
     fn detect_wgpu_features() -> HashMap<String, bool> {
         let mut features = HashMap::new();
-
-        // Try to use scirs2-core WebGPU detection if available
-        #[cfg(all(feature = "gpu", scirs2_gpu_available, feature = "wgpu"))]
-        {
-            use crate::gpu;
-            if let Ok(device) = gpu::GpuDevice::new(0) {
-                // Query actual WebGPU device capabilities
-                features.insert(
-                    "compute_shaders".to_string(),
-                    device.supports_compute_shaders(),
-                );
-                features.insert(
-                    "storage_buffers".to_string(),
-                    device.supports_storage_buffers(),
-                );
-                features.insert(
-                    "push_constants".to_string(),
-                    device.supports_push_constants(),
-                );
-                features.insert("half_precision".to_string(), device.supports_f16());
-                features.insert("subgroups".to_string(), device.supports_subgroups());
-                return features;
-            }
-        }
 
         // Fallback: WebGPU 1.0 baseline features
         features.insert("compute_shaders".to_string(), true);
@@ -586,43 +716,30 @@ impl DeviceCapabilities {
     /// Query comprehensive GPU memory information
     ///
     /// Returns detailed memory statistics for GPU devices when available.
+    ///
+    /// # Current Status
+    /// torsh-core has no direct GPU bindings to query real per-device memory
+    /// statistics (real GPU memory queries are available through
+    /// `torsh-tensor`'s oxicuda-backed `gpu_dispatch`), so this always
+    /// returns `None` rather than a fabricated `GpuMemoryInfo`. The dead
+    /// phantom-cfg branch that used to wrap a (non-compiling, since it
+    /// referenced a nonexistent `crate::gpu::GpuDevice` type) attempt at
+    /// this has been removed.
     pub fn query_gpu_memory(_device_index: usize) -> Option<GpuMemoryInfo> {
-        #[cfg(all(feature = "gpu", scirs2_gpu_available))]
-        {
-            use crate::gpu;
-            if let Ok(device) = gpu::GpuDevice::new(device_index) {
-                return Some(GpuMemoryInfo {
-                    total_memory: device.total_memory(),
-                    free_memory: device.free_memory(),
-                    used_memory: device.used_memory(),
-                    supports_unified_memory: device.supports_unified_memory(),
-                    memory_clock_rate: device.memory_clock_rate(),
-                    memory_bus_width: device.memory_bus_width(),
-                });
-            }
-        }
         None
     }
 
     /// Query GPU compute capabilities
     ///
     /// Returns compute capability version and other compute-specific information.
+    ///
+    /// # Current Status
+    /// torsh-core has no direct GPU bindings to query a real device's
+    /// compute capability, so this always returns `None` rather than a
+    /// fabricated `ComputeCapability`. The dead phantom-cfg branch that used
+    /// to wrap a (non-compiling, since it referenced a nonexistent
+    /// `crate::gpu::GpuDevice` type) attempt at this has been removed.
     pub fn query_compute_capability(_device_index: usize) -> Option<ComputeCapability> {
-        #[cfg(all(feature = "gpu", scirs2_gpu_available))]
-        {
-            use crate::gpu;
-            if let Ok(device) = gpu::GpuDevice::new(device_index) {
-                return Some(ComputeCapability {
-                    major: device.compute_capability_major(),
-                    minor: device.compute_capability_minor(),
-                    max_threads_per_block: device.max_threads_per_block(),
-                    max_block_dimensions: device.max_block_dimensions(),
-                    max_grid_dimensions: device.max_grid_dimensions(),
-                    warp_size: device.warp_size(),
-                    max_shared_memory_per_block: device.max_shared_memory_per_block(),
-                });
-            }
-        }
         None
     }
 }
@@ -807,7 +924,15 @@ pub struct PciInfo {
 }
 
 impl PciInfo {
-    pub fn mock_cuda() -> Self {
+    /// Fabricated PCI info for use in tests only.
+    ///
+    /// This used to also back the production `detect_cuda_capabilities`
+    /// path, presenting an invented NVIDIA/RTX-4090 PCI ID as if it were a
+    /// real query result. `detect_cuda_capabilities` now honestly reports
+    /// that torsh-core cannot determine real CUDA PCI info instead, so this
+    /// constructor is test-only.
+    #[cfg(test)]
+    pub(crate) fn mock_cuda() -> Self {
         Self {
             vendor_id: 0x10de, // NVIDIA
             device_id: 0x2684, // RTX 4090
@@ -829,7 +954,14 @@ pub struct ThermalInfo {
 }
 
 impl ThermalInfo {
-    pub fn mock_gpu() -> Self {
+    /// Fabricated GPU thermal reading for use in tests only.
+    ///
+    /// This used to also back the production `detect_cuda_capabilities`
+    /// path. Real thermal telemetry requires vendor tooling this crate does
+    /// not have access to, so the production path now honestly reports
+    /// `None` instead, and this constructor is test-only.
+    #[cfg(test)]
+    pub(crate) fn mock_gpu() -> Self {
         Self {
             current_temp: 65.0,
             max_temp: 83.0,
@@ -837,7 +969,15 @@ impl ThermalInfo {
         }
     }
 
-    pub fn mock_integrated() -> Self {
+    /// Fabricated integrated-GPU thermal reading for use in tests only.
+    ///
+    /// This used to also back the production `detect_metal_capabilities`
+    /// path. Real thermal telemetry on macOS requires elevated privileges
+    /// (`powermetrics`) or IOKit/SMC bindings this crate does not have, so
+    /// the production path now honestly reports `None` instead, and this
+    /// constructor is test-only.
+    #[cfg(test)]
+    pub(crate) fn mock_integrated() -> Self {
         Self {
             current_temp: 45.0,
             max_temp: 100.0,
@@ -1005,6 +1145,25 @@ mod tests {
         let thermal = ThermalInfo::mock_gpu();
         assert!(thermal.is_temperature_safe());
         assert!(thermal.temperature_ratio() >= 0.0 && thermal.temperature_ratio() <= 1.0);
+
+        // Integrated-GPU variant (used to also back the production Metal
+        // path before that was made honest; still a valid fixture for
+        // exercising ThermalInfo's own accessor logic).
+        let integrated = ThermalInfo::mock_integrated();
+        assert!(integrated.is_temperature_safe());
+        assert!(integrated.temperature_ratio() >= 0.0 && integrated.temperature_ratio() <= 1.0);
+    }
+
+    #[test]
+    fn test_pci_info_fixture() {
+        // PciInfo::mock_cuda used to also back the production CUDA
+        // capability path (presenting an invented NVIDIA/RTX-4090 ID as a
+        // detection result); it is now a test-only fixture, exercised here
+        // to confirm its fields round-trip through the struct correctly.
+        let pci = PciInfo::mock_cuda();
+        assert_eq!(pci.vendor_id, 0x10de);
+        assert_eq!(pci.device_id, 0x2684);
+        assert_eq!(pci.bus, 1);
     }
 
     #[test]

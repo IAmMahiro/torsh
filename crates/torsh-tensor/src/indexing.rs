@@ -1,6 +1,8 @@
 //! Tensor indexing and slicing operations
 
+use crate::core_ops::{Operation, ViewKind};
 use crate::{Tensor, TensorElement};
+use std::sync::Arc;
 use torsh_core::error::{Result, TorshError};
 
 /// Index type for tensor indexing
@@ -209,28 +211,119 @@ impl<T: TensorElement> Tensor<T> {
             output_shape.push(1);
         }
 
+        // A contiguous single-axis slice is pure geometry: it records a view and
+        // skips the index map entirely (see `narrow_geometry`).
+        let narrow = self.narrow_geometry(&expanded_indices, &slices);
+
         // Use specialized extraction logic for advanced indexing
-        if expanded_indices
+        let (mut result, index_map) = if expanded_indices
             .iter()
             .any(|idx| matches!(idx, TensorIndex::List(_) | TensorIndex::Mask(_)))
         {
-            self.extract_advanced_indexing(&expanded_indices, &output_shape)
+            self.extract_advanced_indexing(&expanded_indices, &output_shape)?
         } else {
-            self.extract_basic_indexing(&expanded_indices, &output_shape, &slices)
+            self.extract_basic_indexing(
+                &expanded_indices,
+                &output_shape,
+                &slices,
+                narrow.is_none(),
+            )?
+        };
+        match narrow {
+            // The slab's geometry determines the backward scatter on its own.
+            Some((dim, start)) => self.record_view(&mut result, ViewKind::Narrow { dim, start }),
+            // Record the gather so gradients scatter back into the indexed
+            // tensor (this is what makes fancy indexing differentiable).
+            // `index_map[o]` is the input logical index that fed output
+            // position `o`.
+            None => self.record_gather(&mut result, index_map),
+        }
+        Ok(result)
+    }
+
+    /// Recognise a contiguous single-axis slice among already-normalised indices.
+    ///
+    /// Returns `Some((dim, start))` when every axis is taken whole except at
+    /// most one, which is a step-1 range — the same geometry
+    /// [`Tensor::narrow`] and [`Tensor::slice_tensor`] build directly as an
+    /// aliasing view, reached here through `slice_with_step` with `step == 1`
+    /// and through plain range indexing. Such a slice needs no index map:
+    /// [`ViewKind::Narrow`] scatters the gradient back as one zero-padded slab
+    /// instead of one element at a time.
+    ///
+    /// `slices[axis]` is read rather than re-derived from the `TensorIndex`
+    /// because the caller has already folded negative bounds and clamped the
+    /// range against the axis extent. Anything that re-indexes (single indices,
+    /// lists, masks, `NewAxis`) or strides (`step != 1`, including a negative
+    /// step, which wraps to a large `usize`) keeps the gather path.
+    fn narrow_geometry(
+        &self,
+        indices: &[TensorIndex],
+        slices: &[(usize, usize, usize)],
+    ) -> Option<(usize, usize)> {
+        let ndim = self.ndim();
+        if ndim == 0 || indices.len() != ndim || slices.len() != ndim {
+            return None;
+        }
+        let shape = self.shape();
+        let dims = shape.dims();
+
+        let mut narrowed: Option<(usize, usize)> = None;
+        for (axis, index) in indices.iter().enumerate() {
+            if !matches!(index, TensorIndex::All | TensorIndex::Range(..)) {
+                return None;
+            }
+            let (start, stop, step) = slices[axis];
+            if step != 1 {
+                return None;
+            }
+            if start == 0 && stop == dims[axis] {
+                continue;
+            }
+            if narrowed.is_some() {
+                // Two narrowed axes are not a single contiguous slab.
+                return None;
+            }
+            narrowed = Some((axis, start));
+        }
+        // Every axis taken whole is still a slab — the full one.
+        Some(narrowed.unwrap_or((0, 0)))
+    }
+
+    /// Record `result` as a gather of `self` for autograd. No-op when gradients
+    /// are not being tracked, so inference keeps building plain leaves.
+    pub(crate) fn record_gather(&self, result: &mut Self, index_map: Vec<usize>) {
+        if crate::should_record_grad(self.requires_grad) {
+            result.requires_grad = true;
+            result.operation = Operation::Gather {
+                input: Arc::new(self.clone()),
+                index_map: Arc::new(index_map),
+            };
         }
     }
 
-    /// Extract data using basic indexing (ranges, single indices, all)
+    /// Extract data using basic indexing (ranges, single indices, all).
+    ///
+    /// Returns the gathered tensor and, alongside it, the map from each output
+    /// logical position to the input logical index it was copied from — the
+    /// exact information the backward pass scatters through. `record_index_map`
+    /// is cleared by callers that record the slice's geometry instead (see
+    /// [`ViewKind::Narrow`]), which skips the one-usize-per-output allocation.
     fn extract_basic_indexing(
         &self,
         indices: &[TensorIndex],
         output_shape: &[usize],
         slices: &[(usize, usize, usize)],
-    ) -> Result<Self> {
+        record_index_map: bool,
+    ) -> Result<(Self, Vec<usize>)> {
         let input_data = self.to_vec()?;
 
         let output_size = output_shape.iter().product();
         let mut output_data = Vec::with_capacity(output_size);
+        // Only the autograd path needs the output→input map; inference skips the
+        // allocation entirely.
+        let record = record_index_map && crate::should_record_grad(self.requires_grad);
+        let mut index_map = Vec::with_capacity(if record { output_size } else { 0 });
 
         let input_strides = self.compute_strides();
         let output_strides = compute_strides_from_shape(output_shape);
@@ -279,21 +372,31 @@ impl<T: TensorElement> Tensor<T> {
             }
 
             output_data.push(input_data[input_flat_idx]);
+            if record {
+                index_map.push(input_flat_idx);
+            }
         }
 
-        Self::from_data(output_data, output_shape.to_vec(), self.device)
+        let result = Self::from_data(output_data, output_shape.to_vec(), self.device)?;
+        Ok((result, index_map))
     }
 
-    /// Extract data using advanced indexing (lists, masks)
+    /// Extract data using advanced indexing (lists, masks).
+    ///
+    /// Also returns the output→input logical index map for the backward scatter;
+    /// fancy indexing that reads one input element several times produces
+    /// duplicate entries, and the scatter accumulates them (PyTorch semantics).
     fn extract_advanced_indexing(
         &self,
         indices: &[TensorIndex],
         output_shape: &[usize],
-    ) -> Result<Self> {
+    ) -> Result<(Self, Vec<usize>)> {
         let input_data = self.to_vec()?;
 
         let output_size = output_shape.iter().product();
         let mut output_data = Vec::with_capacity(output_size);
+        let record = crate::should_record_grad(self.requires_grad);
+        let mut index_map = Vec::with_capacity(if record { output_size } else { 0 });
 
         let input_strides = self.compute_strides();
         let output_strides = compute_strides_from_shape(output_shape);
@@ -427,9 +530,13 @@ impl<T: TensorElement> Tensor<T> {
             }
 
             output_data.push(input_data[input_flat_idx]);
+            if record {
+                index_map.push(input_flat_idx);
+            }
         }
 
-        Self::from_data(output_data, output_shape.to_vec(), self.device)
+        let result = Self::from_data(output_data, output_shape.to_vec(), self.device)?;
+        Ok((result, index_map))
     }
 
     /// Expand ellipsis into explicit All indices
@@ -686,7 +793,53 @@ impl<T: TensorElement> Tensor<T> {
         self.index(&indices)
     }
 
-    /// Narrow along a dimension
+    /// Narrow `dim` to the `length` elements starting at `start`.
+    ///
+    /// The result is a **view**, exactly as in PyTorch: it shares storage with
+    /// the source, so writing through it is visible in the source and no data
+    /// is copied (which is what makes per-timestep gate splitting in the RNN
+    /// layers affordable). It is the same view [`Tensor::slice_tensor`] builds
+    /// for the same range — only the arguments differ: `dim` and `start` may be
+    /// negative (counted from the end), the window is given as a `length`
+    /// rather than an `end`, and a `length` of 0 yields an empty view.
+    ///
+    /// Under `requires_grad` the window's geometry is recorded
+    /// ([`ViewKind::Narrow`]), so the gradient scatters back into the source as
+    /// one zero-padded slab.
+    ///
+    /// # Arguments
+    ///
+    /// * `dim` - Axis to narrow. Negative values count from the end.
+    /// * `start` - First index on `dim`. Negative values count from the end.
+    /// * `length` - Number of elements to keep on `dim`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `dim` is out of range for the tensor's rank, if
+    /// `start` is not a valid index on `dim` (note that `start == dim_size` is
+    /// rejected even for a zero `length`), or if `start + length` exceeds the
+    /// extent of `dim`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use torsh_core::device::DeviceType;
+    /// use torsh_tensor::Tensor;
+    ///
+    /// let base = Tensor::from_data(vec![1.0f32, 2.0, 3.0, 4.0], vec![2, 2], DeviceType::Cpu)
+    ///     .expect("tensor creation should succeed");
+    /// let mut row = base.narrow(0, 1, 1).expect("narrow should succeed");
+    /// assert_eq!(row.to_vec().expect("to_vec"), vec![3.0, 4.0]);
+    ///
+    /// // The view aliases its source: the write lands in `base`.
+    /// row.set_item_flat(0, -1.0).expect("write through the view");
+    /// assert_eq!(base.to_vec().expect("to_vec"), vec![1.0, 2.0, -1.0, 4.0]);
+    /// ```
+    ///
+    /// # See Also
+    ///
+    /// * [`Tensor::slice_tensor`] - The same view, with unsigned `start`/`end`
+    /// * [`Tensor::slice_with_step`] - Strided slicing (copies)
     pub fn narrow(&self, dim: i32, start: i64, length: usize) -> Result<Self> {
         let ndim = self.ndim() as i32;
         let dim = if dim < 0 { ndim + dim } else { dim } as usize;
@@ -715,18 +868,13 @@ impl<T: TensorElement> Tensor<T> {
             )));
         }
 
-        // Create index array for slicing
-        let mut indices = Vec::new();
-        for d in 0..self.ndim() {
-            if d == dim {
-                indices.push(TensorIndex::Range(Some(start), Some(end), None));
-            } else {
-                indices.push(TensorIndex::All);
-            }
-        }
-
-        // Use the existing index function
-        self.index(&indices)
+        // The window is a single-axis contiguous range, i.e. exactly the view
+        // `slice_tensor` builds — so build it directly instead of routing
+        // through `index()`, which *gathers* the elements into a fresh buffer
+        // (a full slab copy per call, and a result that no longer aliases its
+        // source). `start` is a valid index on `dim` and `start + length` is
+        // within its extent, which is all `narrow_view` needs.
+        Ok(self.narrow_view(dim, start as usize, length))
     }
 
     /// Boolean indexing (masking)
@@ -828,6 +976,12 @@ impl<T: TensorElement> Tensor<T> {
     }
 
     /// Select indices along a dimension
+    ///
+    /// The result joins the autograd graph as an [`Operation::Gather`] (same
+    /// machinery as fancy indexing): each output element records the logical
+    /// index of the input element it came from, so the backward pass scatters
+    /// the gradient back and **accumulates** on any index selected more than
+    /// once. The index map is only built when gradients are being recorded.
     pub fn index_select(&self, dim: i32, index: &Tensor<i64>) -> Result<Self> {
         let ndim = self.ndim() as i32;
         let dim = if dim < 0 { ndim + dim } else { dim } as usize;
@@ -853,6 +1007,8 @@ impl<T: TensorElement> Tensor<T> {
 
         let output_size: usize = output_shape.iter().product();
         let mut output_data = Vec::with_capacity(output_size);
+        let record = crate::should_record_grad(self.requires_grad);
+        let mut index_map = Vec::with_capacity(if record { output_size } else { 0 });
 
         let self_data = self.data()?;
 
@@ -893,9 +1049,22 @@ impl<T: TensorElement> Tensor<T> {
                 .sum::<usize>();
 
             output_data.push(self_data[src_flat_idx]);
+            if record {
+                // `self_strides` are the default row-major strides of `self`'s
+                // shape, so this is a logical index into `self` — exactly what
+                // `Operation::Gather`'s backward scatters through.
+                index_map.push(src_flat_idx);
+            }
         }
 
-        Self::from_data(output_data, output_shape, self.device)
+        let mut result = Self::from_data(output_data, output_shape, self.device)?;
+        // See `gather`: guarded on the same `record` that decided whether to
+        // build the map, so a mid-call grad-mode flip cannot record a node whose
+        // index map is empty.
+        if record {
+            self.record_gather(&mut result, index_map);
+        }
+        Ok(result)
     }
 
     /// Compute strides for the tensor's shape
@@ -1590,5 +1759,89 @@ mod tests {
         assert_eq!(result.get(&[0]).expect("data access should succeed"), 5.0); // -1 -> index 4
         assert_eq!(result.get(&[1]).expect("data access should succeed"), 4.0); // -2 -> index 3
         assert_eq!(result.get(&[2]).expect("data access should succeed"), 1.0); // 0 -> index 0
+    }
+
+    // -----------------------------------------------------------------------
+    // ITEM 3 / T3 - routing: a contiguous single-axis slice must record its
+    // geometry, everything else must keep the element-wise gather.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn narrow_records_a_geometric_view() {
+        let source = tensor_2d(&[
+            &[0.0f32, 1.0, 2.0, 3.0],
+            &[4.0, 5.0, 6.0, 7.0],
+            &[8.0, 9.0, 10.0, 11.0],
+        ])
+        .expect("tensor creation should succeed")
+        .requires_grad_(true);
+
+        let narrowed = source.narrow(1, 1, 2).expect("narrow should succeed");
+        assert!(matches!(
+            narrowed.operation,
+            Operation::View {
+                kind: ViewKind::Narrow { dim: 1, start: 1 },
+                ..
+            }
+        ));
+
+        // Every axis taken whole is still one slab.
+        let whole = source
+            .index(&[TensorIndex::All, TensorIndex::All])
+            .expect("indexing should succeed");
+        assert!(matches!(
+            whole.operation,
+            Operation::View {
+                kind: ViewKind::Narrow { dim: 0, start: 0 },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn non_geometric_indexing_keeps_the_gather() {
+        let source = tensor_2d(&[
+            &[0.0f32, 1.0, 2.0, 3.0],
+            &[4.0, 5.0, 6.0, 7.0],
+            &[8.0, 9.0, 10.0, 11.0],
+        ])
+        .expect("tensor creation should succeed")
+        .requires_grad_(true);
+
+        // A stride skips elements, so the backward is not one slab.
+        let stepped = source
+            .slice_with_step(1, Some(0), Some(4), Some(2))
+            .expect("stepped slice should succeed");
+        assert!(matches!(stepped.operation, Operation::Gather { .. }));
+
+        // Two narrowed axes are not a contiguous slab either.
+        let corner = source
+            .index(&[
+                TensorIndex::Range(Some(1), Some(3), None),
+                TensorIndex::Range(Some(1), Some(3), None),
+            ])
+            .expect("indexing should succeed");
+        assert!(matches!(corner.operation, Operation::Gather { .. }));
+
+        // Fancy indexing may read one element several times.
+        let listed = source
+            .index(&[TensorIndex::All, TensorIndex::List(vec![0, 0, 3])])
+            .expect("indexing should succeed");
+        assert!(matches!(listed.operation, Operation::Gather { .. }));
+
+        // A single index drops an axis, so the output rank differs.
+        let row = source
+            .index(&[TensorIndex::Index(1), TensorIndex::All])
+            .expect("indexing should succeed");
+        assert!(matches!(row.operation, Operation::Gather { .. }));
+    }
+
+    #[test]
+    fn geometric_slices_of_a_detached_tensor_stay_leaves() {
+        let source = tensor_2d(&[&[0.0f32, 1.0, 2.0], &[3.0, 4.0, 5.0]])
+            .expect("tensor creation should succeed");
+        let narrowed = source.narrow(1, 1, 2).expect("narrow should succeed");
+        assert!(!narrowed.requires_grad());
+        assert!(matches!(narrowed.operation, Operation::Leaf));
     }
 }

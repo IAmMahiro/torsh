@@ -6,7 +6,6 @@
 use crate::dataset::Dataset;
 use crate::error::{DataError, Result};
 use crate::sampler::{Sampler, SamplerIterator};
-use scirs2_core::RngExt;
 use std::collections::HashMap;
 
 #[cfg(not(feature = "std"))]
@@ -226,9 +225,13 @@ impl FederatedDataset {
     /// Select random clients for the round
     fn select_random_clients(&self, available_clients: &[ClientId]) -> Vec<ClientId> {
         // ✅ SciRS2 Policy Compliant - Using scirs2_core::random instead of direct rand
-        use scirs2_core::random::Random;
+        //
+        // Uses the thread-local entropy-seeded RNG rather than a fixed-literal
+        // seed: reseeding from the same constant on every call would select
+        // the identical client subset on every federated round (F007).
+        use scirs2_core::random::thread_rng;
 
-        let mut rng = Random::seed(42);
+        let mut rng = thread_rng();
         let num_clients = self.max_clients_per_round.min(available_clients.len());
 
         // Use slice shuffle method instead
@@ -618,9 +621,13 @@ pub mod federated_utils {
         availability_prob: f64,
     ) -> Vec<ClientId> {
         // ✅ SciRS2 Policy Compliant - Using scirs2_core::random instead of direct rand
-        use scirs2_core::random::Random;
+        //
+        // Uses the thread-local entropy-seeded RNG rather than a fixed-literal
+        // seed: reseeding from the same constant on every call would simulate
+        // the identical set of available clients on every round (F007).
+        use scirs2_core::random::thread_rng;
 
-        let mut rng = Random::seed(42);
+        let mut rng = thread_rng();
         client_ids
             .iter()
             .filter(|_| rng.random::<f64>() < availability_prob)

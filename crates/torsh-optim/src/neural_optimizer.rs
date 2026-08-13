@@ -381,7 +381,7 @@ impl Optimizer for NeuralOptimizer {
                 };
 
                 // Apply update to parameter
-                *param = param.sub(&clipped_update)?;
+                crate::param_update::sub_assign(&mut *param, &clipped_update)?;
 
                 // Clear gradients
                 param.set_grad(None);

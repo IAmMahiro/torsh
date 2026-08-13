@@ -46,10 +46,23 @@ impl Default for NewtonCGConfig {
     }
 }
 
+/// Objective function evaluated at a flattened parameter vector.
+pub type ObjectiveFn = Arc<dyn Fn(&Tensor) -> Result<f32> + Send + Sync>;
+
 /// Newton-CG optimizer
 ///
 /// Implements the Newton-Conjugate Gradient method for second-order optimization.
 /// Uses CG to approximately solve the Newton equations, optionally with trust regions.
+///
+/// # Objective closure
+///
+/// When the trust region is enabled (the default), accepting or rejecting a step
+/// requires comparing the predicted decrease with the decrease the objective
+/// actually delivered, so an objective closure must be registered with
+/// [`NewtonCG::set_objective`] before stepping. Without one, [`NewtonCG::step`]
+/// returns an error rather than inventing a reduction ratio. Set
+/// `config.use_trust_region = false` to take every Newton step unconditionally
+/// and avoid needing an objective.
 pub struct NewtonCG {
     param_groups: Vec<ParamGroup>,
     state: HashMap<String, HashMap<String, Tensor>>,
@@ -57,6 +70,7 @@ pub struct NewtonCG {
     config: NewtonCGConfig,
     tolerance_grad: f32,
     tolerance_change: f32,
+    objective: Option<ObjectiveFn>,
 }
 
 impl NewtonCG {
@@ -78,7 +92,24 @@ impl NewtonCG {
             config: config.unwrap_or_default(),
             tolerance_grad: tolerance_grad.unwrap_or(1e-7),
             tolerance_change: tolerance_change.unwrap_or(1e-9),
+            objective: None,
         }
+    }
+
+    /// Register the objective function used to measure the actual decrease.
+    ///
+    /// The closure receives the flattened parameter vector (in the same layout
+    /// [`NewtonCG`] uses internally) and returns the objective value there.
+    pub fn set_objective<F>(&mut self, objective: F)
+    where
+        F: Fn(&Tensor) -> Result<f32> + Send + Sync + 'static,
+    {
+        self.objective = Some(Arc::new(objective));
+    }
+
+    /// Remove a previously registered objective function.
+    pub fn clear_objective(&mut self) {
+        self.objective = None;
     }
 
     /// Create a Newton-CG optimizer with builder pattern
@@ -150,11 +181,12 @@ impl NewtonCG {
                 let param_size = param_shape.numel();
 
                 let param_data = &flat_data[offset..offset + param_size];
-                *param_write = Tensor::from_data(
+                let new_values = Tensor::from_data(
                     param_data.to_vec(),
                     param_shape.dims().to_vec(),
                     param_write.device(),
                 )?;
+                crate::param_update::assign(&mut param_write, &new_values)?;
 
                 offset += param_size;
             }
@@ -271,18 +303,47 @@ impl NewtonCG {
         Ok(x)
     }
 
-    /// Compute the actual reduction vs predicted reduction
+    /// Compute the actual reduction over the reduction predicted by the model.
+    ///
+    /// The predicted reduction is `-g^T s - 0.5 s^T H s`, evaluated with the same
+    /// Hessian approximation the CG solve uses, and the actual reduction is
+    /// `f(x) - f(x + s)` from the registered objective.
+    ///
+    /// # Errors
+    /// Returns an error if no objective closure has been registered: the actual
+    /// reduction is a measurement, and a constant standing in for it would
+    /// silently defeat the trust-region acceptance test.
     fn compute_reduction_ratio(
         &self,
-        _old_params: &Tensor,
-        _new_params: &Tensor,
-        _old_grad: &Tensor,
-        _step: &Tensor,
+        old_params: &Tensor,
+        new_params: &Tensor,
+        old_grad: &Tensor,
+        step: &Tensor,
     ) -> Result<f32> {
-        // Simplified implementation
-        // In practice, this would evaluate the function at both points
-        // and compute actual_reduction / predicted_reduction
-        Ok(0.75) // Placeholder value
+        let objective = self.objective.as_ref().ok_or_else(|| {
+            TorshError::InvalidArgument(
+                "NewtonCG with a trust region requires an objective function to measure \
+                 the actual reduction; register one with `set_objective`, or set \
+                 `config.use_trust_region = false`"
+                    .to_string(),
+            )
+        })?;
+
+        // Predicted reduction from the quadratic model. `epsilon = 1.0` asks for
+        // the plain Hessian-vector product H*s (the finite-difference scaling is
+        // applied by the caller of `hessian_vector_product`).
+        let hessian_step = self.hessian_vector_product(old_grad, step, 1.0)?;
+        let predicted = -old_grad.dot(step)?.item()? - 0.5 * step.dot(&hessian_step)?.item()?;
+
+        // Actual reduction from the objective itself.
+        let actual = objective(old_params)? - objective(new_params)?;
+
+        if predicted.abs() < 1e-12 {
+            // A model that predicts no change carries no information about the
+            // step's quality; treat it as a rejected step.
+            return Ok(0.0);
+        }
+        Ok(actual / predicted)
     }
 
     /// Update trust region radius based on reduction ratio
@@ -562,10 +623,29 @@ mod tests {
 
         let params = vec![param];
         let mut optimizer = NewtonCG::new(params, Some(0.1), None, None, None);
+        // The trust region is enabled by default, so an objective is required.
+        optimizer.set_objective(|x: &Tensor| Ok(0.5 * x.dot(x)?.item()?));
 
         optimizer.step()?;
 
         Ok(())
+    }
+
+    #[test]
+    fn test_newton_cg_step_requires_objective_with_trust_region() {
+        let param = Arc::new(RwLock::new(
+            randn::<f32>(&[2, 2]).expect("parameter creation"),
+        ));
+        param
+            .write()
+            .set_grad(Some(randn::<f32>(&[2, 2]).expect("gradient creation")));
+
+        let mut optimizer = NewtonCG::new(vec![param], Some(0.1), None, None, None);
+        assert!(
+            optimizer.step().is_err(),
+            "a trust-region step without an objective must report an error, \
+             not fabricate a reduction ratio"
+        );
     }
 
     #[test]

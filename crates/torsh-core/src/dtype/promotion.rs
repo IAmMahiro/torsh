@@ -134,7 +134,12 @@ impl TypePromotion for DType {
             }
 
             // Float promotions
-            (DType::F16, DType::F32 | DType::F64 | DType::BF16) => true,
+            // NOTE: F16 -> BF16 is intentionally NOT listed here. F16 has a
+            // 10-bit mantissa and BF16 only 7, so converting F16 -> BF16
+            // drops 3 bits of significand on every value: it is a lossy,
+            // precision-narrowing conversion even though BF16's exponent
+            // range is wider. Both F16 and BF16 promote losslessly to F32.
+            (DType::F16, DType::F32 | DType::F64) => true,
             (DType::BF16, DType::F32 | DType::F64) => true,
             (DType::F32, DType::F64) => true,
 

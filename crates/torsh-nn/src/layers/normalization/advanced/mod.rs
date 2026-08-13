@@ -76,223 +76,105 @@ impl SwitchableNorm2d {
         self.config.eps
     }
 
-    /// Compute batch normalization statistics
-    fn compute_batch_norm_stats(&self, input: &Tensor) -> Result<(Tensor, Tensor)> {
-        utils::compute_channel_mean(input)
-            .and_then(|mean| utils::compute_channel_variance(input, &mean).map(|var| (mean, var)))
+    /// Per-channel batch statistics, shaped `[1, C, 1, 1]`.
+    fn batch_norm_stats(&self, input: &Tensor) -> Result<(Tensor, Tensor)> {
+        let mean = input.mean(Some(&[0, 2, 3]), true)?;
+        let centered = input.sub(&mean)?;
+        let variance = centered.pow_scalar(2.0)?.mean(Some(&[0, 2, 3]), true)?;
+        Ok((mean, variance))
     }
 
-    /// Compute instance normalization statistics
-    fn compute_instance_norm_stats(&self, input: &Tensor) -> Result<(Tensor, Tensor)> {
-        let input_shape = input.shape();
-        let dims = input_shape.dims();
-        let batch_size = dims[0];
-        let channels = dims[1];
-        let height = dims[2];
-        let width = dims[3];
-
-        let input_data = input.to_vec()?;
-        let mut means = vec![0.0f32; batch_size * channels];
-        let mut vars = vec![0.0f32; batch_size * channels];
-
-        let spatial_size = (height * width) as f32;
-
-        // Compute mean and variance for each instance-channel pair
-        for batch in 0..batch_size {
-            for c in 0..channels {
-                let mut sum = 0.0;
-                let mut sum_sq = 0.0;
-
-                for h in 0..height {
-                    for w in 0..width {
-                        let idx = batch * (channels * height * width)
-                            + c * (height * width)
-                            + h * width
-                            + w;
-                        let val = input_data[idx];
-                        sum += val;
-                        sum_sq += val * val;
-                    }
-                }
-
-                let mean = sum / spatial_size;
-                let var = (sum_sq / spatial_size) - (mean * mean);
-
-                let stat_idx = batch * channels + c;
-                means[stat_idx] = mean;
-                vars[stat_idx] = var;
-            }
-        }
-
-        let mean_tensor =
-            Tensor::from_data(means, vec![batch_size, channels, 1, 1], input.device())?;
-        let var_tensor = Tensor::from_data(vars, vec![batch_size, channels, 1, 1], input.device())?;
-
-        Ok((mean_tensor, var_tensor))
+    /// Per-instance statistics, shaped `[N, C, 1, 1]`.
+    fn instance_norm_stats(&self, input: &Tensor) -> Result<(Tensor, Tensor)> {
+        let mean = input.mean(Some(&[2, 3]), true)?;
+        let centered = input.sub(&mean)?;
+        let variance = centered.pow_scalar(2.0)?.mean(Some(&[2, 3]), true)?;
+        Ok((mean, variance))
     }
 
-    /// Compute layer normalization statistics
-    fn compute_layer_norm_stats(&self, input: &Tensor) -> Result<(Tensor, Tensor)> {
-        let input_shape = input.shape();
-        let dims = input_shape.dims();
-        let batch_size = dims[0];
-        let channels = dims[1];
-        let height = dims[2];
-        let width = dims[3];
-
-        let input_data = input.to_vec()?;
-        let mut means = vec![0.0f32; batch_size];
-        let mut vars = vec![0.0f32; batch_size];
-
-        let layer_size = (channels * height * width) as f32;
-
-        // Compute mean and variance for each sample across all channels and spatial dims
-        for batch in 0..batch_size {
-            let mut sum = 0.0;
-            let mut sum_sq = 0.0;
-
-            let batch_start = batch * (channels * height * width);
-            for i in 0..(channels * height * width) {
-                let val = input_data[batch_start + i];
-                sum += val;
-                sum_sq += val * val;
-            }
-
-            let mean = sum / layer_size;
-            let var = (sum_sq / layer_size) - (mean * mean);
-
-            means[batch] = mean;
-            vars[batch] = var;
-        }
-
-        let mean_tensor = Tensor::from_data(means, vec![batch_size, 1, 1, 1], input.device())?;
-        let var_tensor = Tensor::from_data(vars, vec![batch_size, 1, 1, 1], input.device())?;
-
-        Ok((mean_tensor, var_tensor))
+    /// Per-sample statistics over channels and space, shaped `[N, 1, 1, 1]`.
+    fn layer_norm_stats(&self, input: &Tensor) -> Result<(Tensor, Tensor)> {
+        let mean = input.mean(Some(&[1, 2, 3]), true)?;
+        let centered = input.sub(&mean)?;
+        let variance = centered.pow_scalar(2.0)?.mean(Some(&[1, 2, 3]), true)?;
+        Ok((mean, variance))
     }
 
-    /// Apply switchable normalization
-    fn apply_switchable_norm(&self, input: &Tensor) -> Result<Tensor> {
-        // Compute statistics for all three normalization types
-        let (bn_mean, bn_var) = self.compute_batch_norm_stats(input)?;
-        let (in_mean, in_var) = self.compute_instance_norm_stats(input)?;
-        let (ln_mean, ln_var) = self.compute_layer_norm_stats(input)?;
-
-        // Get switch weights and apply softmax to normalize
+    /// Per-channel softmax over the three normalization types.
+    ///
+    /// The max subtraction is the same numerical stabilisation the scalar
+    /// implementation performed, but the shift is a *constant* tensor, which
+    /// leaves the softmax exactly shift-invariant and therefore leaves the
+    /// gradient with respect to `switch_weight` intact. Before the rewrite the
+    /// whole softmax ran on `to_vec()` values, so `switch_weight` never reached
+    /// the autograd graph at all and could not be trained.
+    fn switch_probabilities(&self) -> Result<Tensor> {
         let switch_weight = self.base.parameters.get("switch_weight").ok_or_else(|| {
             torsh_core::error::TorshError::InvalidOperation(
                 "Switch weight parameter not found".to_string(),
             )
         })?;
+        let logits = switch_weight.tensor().read().clone();
 
-        let switch_data = switch_weight.tensor().read().to_vec()?;
-        let mut normalized_weights = vec![0.0f32; switch_data.len()];
-
-        // Apply softmax for each channel (3 weights per channel)
-        for c in 0..self.num_features {
-            let mut max_val = switch_data[c];
-            for norm_type in 1..3 {
-                let idx = norm_type * self.num_features + c;
-                if switch_data[idx] > max_val {
-                    max_val = switch_data[idx];
-                }
+        let values = logits.to_vec()?;
+        let channels = self.num_features;
+        let mut maxima = vec![f32::NEG_INFINITY; channels];
+        for (index, value) in values.iter().enumerate() {
+            let channel = index % channels;
+            if *value > maxima[channel] {
+                maxima[channel] = *value;
             }
+        }
+        let shift = Tensor::from_data(maxima, vec![1, channels], logits.device())?;
 
-            let mut sum = 0.0;
-            for norm_type in 0..3 {
-                let idx = norm_type * self.num_features + c;
-                let exp_val = (switch_data[idx] - max_val).exp();
-                normalized_weights[idx] = exp_val;
-                sum += exp_val;
+        let exponentials = logits.sub(&shift)?.exp()?;
+        let total = exponentials.sum_dim(&[0], true)?;
+        exponentials.div(&total)
+    }
+
+    /// Apply switchable normalization
+    fn apply_switchable_norm(&self, input: &Tensor) -> Result<Tensor> {
+        let (bn_mean, bn_var) = self.batch_norm_stats(input)?;
+        let (in_mean, in_var) = self.instance_norm_stats(input)?;
+        let (ln_mean, ln_var) = self.layer_norm_stats(input)?;
+
+        // `[3, C]` probabilities sliced into three `[1, C, 1, 1]` weights.
+        let probabilities = self.switch_probabilities()?;
+        let channels = self.num_features as i32;
+        let weight_for = |row: i64| -> Result<Tensor> {
+            probabilities
+                .narrow(0, row, 1)?
+                .reshape(&[1, channels, 1, 1])
+        };
+        let bn_weight = weight_for(0)?;
+        let in_weight = weight_for(1)?;
+        let ln_weight = weight_for(2)?;
+
+        let combined_mean = bn_mean
+            .mul(&bn_weight)?
+            .add(&in_mean.mul(&in_weight)?)?
+            .add(&ln_mean.mul(&ln_weight)?)?;
+        let combined_var = bn_var
+            .mul(&bn_weight)?
+            .add(&in_var.mul(&in_weight)?)?
+            .add(&ln_var.mul(&ln_weight)?)?;
+
+        let std = combined_var.add_scalar(self.config.eps)?.sqrt()?;
+        let mut normalized = input.sub(&combined_mean)?.div(&std)?;
+
+        if self.config.affine {
+            let broadcast = utils::channel_broadcast_shape(4, self.num_features);
+            if let Some(w) = self.base.parameters.get("weight") {
+                let weight = w.tensor().read().reshape(&broadcast)?;
+                normalized = normalized.mul(&weight)?;
             }
-
-            for norm_type in 0..3 {
-                let idx = norm_type * self.num_features + c;
-                normalized_weights[idx] /= sum;
+            if let Some(b) = self.base.parameters.get("bias") {
+                let bias = b.tensor().read().reshape(&broadcast)?;
+                normalized = normalized.add(&bias)?;
             }
         }
 
-        // Expand means and variances for broadcasting
-        let bn_mean_expanded = bn_mean.unsqueeze(0)?.unsqueeze(2)?.unsqueeze(3)?;
-        let bn_var_expanded = bn_var.unsqueeze(0)?.unsqueeze(2)?.unsqueeze(3)?;
-
-        // Combine statistics using learned weights
-        let input_shape = input.shape();
-        let dims = input_shape.dims();
-        let mut combined_mean_data = vec![0.0f32; dims.iter().product()];
-        let mut combined_var_data = vec![0.0f32; dims.iter().product()];
-
-        let bn_mean_data = bn_mean_expanded.to_vec()?;
-        let bn_var_data = bn_var_expanded.to_vec()?;
-        let in_mean_data = in_mean.to_vec()?;
-        let in_var_data = in_var.to_vec()?;
-        let ln_mean_data = ln_mean.to_vec()?;
-        let ln_var_data = ln_var.to_vec()?;
-
-        let batch_size = dims[0];
-        let channels = dims[1];
-        let height = dims[2];
-        let width = dims[3];
-
-        for batch in 0..batch_size {
-            for c in 0..channels {
-                let bn_weight = normalized_weights[c];
-                let in_weight = normalized_weights[self.num_features + c];
-                let ln_weight = normalized_weights[2 * self.num_features + c];
-
-                for h in 0..height {
-                    for w in 0..width {
-                        let idx = batch * (channels * height * width)
-                            + c * (height * width)
-                            + h * width
-                            + w;
-
-                        // Combine means
-                        let bn_idx = c;
-                        let in_idx = batch * channels + c;
-                        let ln_idx = batch;
-
-                        combined_mean_data[idx] = bn_weight * bn_mean_data[bn_idx]
-                            + in_weight * in_mean_data[in_idx]
-                            + ln_weight * ln_mean_data[ln_idx];
-
-                        // Combine variances
-                        combined_var_data[idx] = bn_weight * bn_var_data[bn_idx]
-                            + in_weight * in_var_data[in_idx]
-                            + ln_weight * ln_var_data[ln_idx];
-                    }
-                }
-            }
-        }
-
-        let combined_mean = Tensor::from_data(combined_mean_data, dims.to_vec(), input.device())?;
-        let combined_var = Tensor::from_data(combined_var_data, dims.to_vec(), input.device())?;
-
-        // Get learnable parameters
-        let weight = if self.config.affine {
-            self.base.parameters.get("weight")
-        } else {
-            None
-        };
-
-        let bias = if self.config.affine {
-            self.base.parameters.get("bias")
-        } else {
-            None
-        };
-
-        // Apply final normalization
-        let weight_tensor = weight.as_ref().map(|p| p.tensor().read().clone());
-        let bias_tensor = bias.as_ref().map(|p| p.tensor().read().clone());
-
-        utils::apply_normalization(
-            input,
-            &combined_mean,
-            &combined_var,
-            weight_tensor.as_ref(),
-            bias_tensor.as_ref(),
-            self.config.eps,
-        )
+        Ok(normalized)
     }
 }
 

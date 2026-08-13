@@ -51,6 +51,19 @@ impl WebGpuMemoryManager {
         &self.buffer_pool
     }
 
+    /// Look up the live `WebGpuBuffer` backing an allocated buffer handle.
+    ///
+    /// `crate::Buffer` only carries a lightweight, backend-agnostic
+    /// `BufferHandle` (for WebGPU, just an opaque id + size). The actual
+    /// GPU-side `WebGpuBuffer` created by [`MemoryManager::allocate`] is
+    /// tracked here in `active_buffers`, keyed by that same handle. This
+    /// lets code that only has a `Buffer` (e.g. cross-backend transfers in
+    /// `copy_buffer`/`copy_to_device`/`copy_from_device`) recover the real
+    /// wgpu resource instead of having nothing to operate on.
+    pub fn find_active_buffer(&self, handle: &BufferHandle) -> Option<Arc<WebGpuBuffer>> {
+        self.active_buffers.read().get(handle).cloned()
+    }
+
     /// Update memory statistics
     fn update_stats(&self, delta_allocated: i64, delta_count: i64) {
         let mut stats = self.stats.write();

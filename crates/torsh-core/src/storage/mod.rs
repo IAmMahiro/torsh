@@ -50,6 +50,7 @@
 //! All storage components are designed to be thread-safe and can be shared
 //! across threads using [`SharedStorage`] and similar wrapper types.
 
+use crate::sync::RwLockExt;
 // Module declarations
 pub mod aligned;
 pub mod allocation;
@@ -246,10 +247,7 @@ pub mod utils {
     pub fn storage_system_stats() -> StorageSystemStats {
         let pool_stats = pooled_memory_stats();
         let registry = global_registry();
-        let registry_stats = registry
-            .read()
-            .expect("lock should not be poisoned")
-            .statistics();
+        let registry_stats = registry.read_or_recover().statistics();
 
         StorageSystemStats {
             pooled_memory_types: pool_stats.len(),

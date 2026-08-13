@@ -1,6 +1,7 @@
 use crate::{OptimizerError, OptimizerResult};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+use torsh_core::error::TorshError;
 
 /// Configuration for sparse parameter updates
 #[derive(Debug, Clone)]
@@ -212,16 +213,27 @@ pub struct BlockSparseGradient {
 
 impl BlockSparseGradient {
     /// Create block-sparse gradient from dense gradient
+    ///
+    /// Only rank-1 and rank-2 gradients have a block-sparse layout defined here;
+    /// higher-rank gradients (e.g. 4-D convolution weights) are reported as
+    /// unsupported so the caller can fall back to a dense update. A sparse-update
+    /// optimisation must degrade to correct dense behaviour, never abort.
+    ///
+    /// # Errors
+    /// Returns [`TorshError::UnsupportedOperation`] if `shape` is not rank 1 or 2.
     pub fn from_dense(
         gradient: &[f32],
         shape: Vec<usize>,
         block_size: usize,
         threshold: f32,
-    ) -> Self {
+    ) -> torsh_core::error::Result<Self> {
         match shape.len() {
-            1 => Self::from_dense_1d(gradient, shape, block_size, threshold),
-            2 => Self::from_dense_2d(gradient, shape, block_size, threshold),
-            _ => panic!("Unsupported gradient dimensionality for block-sparse representation"),
+            1 => Ok(Self::from_dense_1d(gradient, shape, block_size, threshold)),
+            2 => Ok(Self::from_dense_2d(gradient, shape, block_size, threshold)),
+            rank => Err(TorshError::UnsupportedOperation {
+                op: "block-sparse gradient representation".to_string(),
+                dtype: format!("rank-{rank} gradient (only rank 1 and 2 are supported)"),
+            }),
         }
     }
 
@@ -586,9 +598,17 @@ impl SparseUpdateManager {
     ) -> SparseUpdateResult {
         let threshold = self.get_threshold(&parameter_id, &gradient);
 
-        // Create block-sparse representation
-        let block_sparse =
-            BlockSparseGradient::from_dense(&gradient, shape, self.config.block_size, threshold);
+        // Create block-sparse representation. Ranks without a block layout fall
+        // back to the dense update path rather than failing the step.
+        let block_sparse = match BlockSparseGradient::from_dense(
+            &gradient,
+            shape,
+            self.config.block_size,
+            threshold,
+        ) {
+            Ok(block_sparse) => block_sparse,
+            Err(_) => return SparseUpdateResult::Dense(gradient),
+        };
 
         if block_sparse.is_worth_block_sparse(self.config.min_sparsity_ratio) {
             SparseUpdateResult::BlockSparse(block_sparse)
@@ -913,7 +933,8 @@ mod tests {
         let block_size = 2;
         let threshold = 0.1;
 
-        let block_sparse = BlockSparseGradient::from_dense(&dense, shape, block_size, threshold);
+        let block_sparse = BlockSparseGradient::from_dense(&dense, shape, block_size, threshold)
+            .expect("rank-2 gradients are supported");
 
         // Should have 2 non-zero blocks
         assert_eq!(block_sparse.blocks.len(), 2);

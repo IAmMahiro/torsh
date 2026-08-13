@@ -41,10 +41,14 @@ pub struct Parameter {
 }
 
 impl Parameter {
-    /// Create a new parameter
+    /// Create a new parameter.
+    ///
+    /// The wrapped tensor is marked as requiring gradients, which is what makes
+    /// every op that consumes this parameter record an autograd node. Without
+    /// this, `loss.backward()` cannot reach module parameters at all.
     pub fn new(tensor: Tensor) -> Self {
         Self {
-            data: Arc::new(RwLock::new(tensor)),
+            data: Arc::new(RwLock::new(tensor.requires_grad_(true))),
             requires_grad: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -52,7 +56,7 @@ impl Parameter {
     /// Create a parameter that doesn't require gradients
     pub fn new_no_grad(tensor: Tensor) -> Self {
         Self {
-            data: Arc::new(RwLock::new(tensor)),
+            data: Arc::new(RwLock::new(tensor.requires_grad_(false))),
             requires_grad: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -64,10 +68,26 @@ impl Parameter {
 
     /// Create a parameter from an existing tensor Arc
     pub fn from_tensor(tensor: Arc<RwLock<Tensor>>) -> Self {
+        Self::write_through_requires_grad(&tensor, true);
         Self {
             data: tensor,
             requires_grad: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Mirror the wrapper's gradient flag onto the wrapped tensor.
+    ///
+    /// `Tensor::requires_grad_` consumes the tensor, so the value is swapped in
+    /// place through the lock. Cloning a `Tensor` shares its storage *and* its
+    /// gradient slot, so identity (and any already-accumulated gradient) is
+    /// preserved by this round trip.
+    fn write_through_requires_grad(data: &Arc<RwLock<Tensor>>, requires_grad: bool) {
+        let mut guard = data.write();
+        if guard.requires_grad() == requires_grad {
+            return;
+        }
+        let updated = guard.clone().requires_grad_(requires_grad);
+        *guard = updated;
     }
 
     /// Set whether this parameter requires gradients (builder style).
@@ -75,7 +95,7 @@ impl Parameter {
     /// Note: the flag is shared across clones (see [`Parameter`]), so this updates
     /// the shared state observed by every clone of `self`.
     pub fn requires_grad_(self, requires_grad: bool) -> Self {
-        self.requires_grad.store(requires_grad, Ordering::SeqCst);
+        self.set_requires_grad(requires_grad);
         self
     }
 
@@ -86,8 +106,12 @@ impl Parameter {
     /// which is what makes [`crate::core::ModuleExt::freeze_matching`] /
     /// [`crate::core::ModuleExt::unfreeze_matching`] actually take effect on
     /// parameters returned by value from a module.
+    ///
+    /// The flag is written through to the wrapped tensor as well, so freezing a
+    /// parameter really does stop the autograd graph from recording it.
     pub fn set_requires_grad(&self, requires_grad: bool) {
         self.requires_grad.store(requires_grad, Ordering::SeqCst);
+        Self::write_through_requires_grad(&self.data, requires_grad);
     }
 
     /// Check if parameter requires gradients
@@ -110,18 +134,36 @@ impl Parameter {
         Ok(self.data.read().shape().numel())
     }
 
-    /// Move parameter to device
+    /// Move parameter to device.
+    ///
+    /// Delegates to [`Tensor::to_device`], so the transfer succeeds or fails
+    /// exactly as the tensor backend reports it and [`Parameter::device`]
+    /// afterwards reflects reality — previously this method discarded its
+    /// argument and returned `Ok(())` unconditionally. The gradient-tracking
+    /// flag is re-applied afterwards because the transfer rebuilds the tensor.
+    ///
+    /// Note that `torsh-tensor`'s CPU-to-accelerator paths currently re-tag the
+    /// tensor rather than performing a real DMA; the fidelity of the move is
+    /// therefore whatever the tensor layer provides.
     pub fn to_device(&mut self, device: DeviceType) -> Result<()> {
-        // This would move the tensor to the specified device
-        // For now, just update the device field when tensor supports it
-        let _ = device; // Suppress warning
+        let requires_grad = self.requires_grad.load(Ordering::SeqCst);
+        {
+            let mut guard = self.data.write();
+            if guard.device() == device {
+                return Ok(());
+            }
+            let moved = guard.to_device(device)?;
+            *guard = moved.requires_grad_(requires_grad);
+        }
         Ok(())
     }
 
-    /// Zero the parameter gradients
+    /// Zero the parameter gradients.
+    ///
+    /// Clears the gradient slot of the wrapped tensor so the next backward pass
+    /// starts from zero instead of accumulating across iterations.
     pub fn zero_grad(&mut self) {
-        // This would zero gradients when autograd is available
-        // For now, this is a placeholder
+        self.data.write().zero_grad();
     }
 
     /// Clone the parameter data

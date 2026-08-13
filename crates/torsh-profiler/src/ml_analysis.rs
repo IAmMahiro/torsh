@@ -883,16 +883,12 @@ pub fn scirs2_enhanced_performance_analysis(
         SciRS2Statistics::default()
     };
 
-    // ✅ SciRS2-enhanced parallel processing simulation
-    let parallel_analysis = if events.len() > 1000 {
-        analyze_with_scirs2_chunked_processing(events)?
-    } else {
-        analyze_with_direct_processing(events)?
-    };
+    // Parallel-execution metrics computed from the real per-thread event timeline.
+    let parallel_analysis = analyze_parallelism(events);
 
-    // ✅ Enhanced random sampling using SciRS2's Random (replacing direct rand usage)
-    let mut scirs2_rng = Random::seed(42); // SciRS2 Policy compliant RNG
-    let sample_indices = generate_scirs2_stratified_sample(&mut scirs2_rng, events.len(), 100);
+    // Deterministic stratified sample (evenly spaced indices) — no RNG needed and
+    // fully reproducible, so the correlation analysis below is stable across runs.
+    let sample_indices = generate_stratified_sample(events.len(), 100);
 
     // Performance correlation analysis with SciRS2's enhanced algorithms
     let correlation_matrix = if events.len() >= 2 {
@@ -934,17 +930,36 @@ pub struct SciRS2Statistics {
     pub simd_accelerated_variance: f64,
     pub simd_accelerated_skewness: f64,
     pub simd_accelerated_kurtosis: f64,
-    pub vectorization_efficiency: f64,
-    pub cache_hit_ratio: f64,
+    /// SIMD vectorization efficiency, when it can be measured from real
+    /// hardware performance counters. `None` if unmeasured (this crate has
+    /// no portable way to read vectorization counters).
+    pub vectorization_efficiency: Option<f64>,
+    /// Cache hit ratio, when it can be measured from real hardware
+    /// performance counters. `None` if unmeasured.
+    pub cache_hit_ratio: Option<f64>,
 }
 
-/// Parallel analysis result using SciRS2's parallel processing
+/// Parallel analysis result computed from the recorded event timeline.
+///
+/// Every field is derived from the real per-thread timing of the profiled
+/// events — never fabricated constants. `memory_efficiency` is `None` when the
+/// events carry no `bytes_transferred` data, so it is honestly unmeasured
+/// rather than an invented figure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParallelAnalysisResult {
+    /// Achieved concurrency (total busy time / wall-clock span) divided by the
+    /// number of threads that ran, clamped to `[0, 1]`.
     pub parallel_efficiency: f64,
+    /// `1 - coefficient_of_variation(per-thread busy time)`, clamped to `[0, 1]`;
+    /// `1.0` for a single thread.
     pub load_balance_score: f64,
-    pub memory_efficiency: f64,
+    /// Achieved aggregate bandwidth relative to the observed per-event peak, or
+    /// `None` when no event reported `bytes_transferred`.
+    pub memory_efficiency: Option<f64>,
+    /// Fraction of the wall-clock span during which at least one thread was busy
+    /// (interval union / span), clamped to `[0, 1]`.
     pub cpu_utilization: f64,
+    /// Number of processing chunks the event stream was partitioned into.
     pub chunks_processed: usize,
 }
 
@@ -1010,49 +1025,140 @@ fn calculate_enhanced_statistics(duration_vector: &[f64]) -> SciRS2Statistics {
         simd_accelerated_variance: variance,
         simd_accelerated_skewness: skewness,
         simd_accelerated_kurtosis: kurtosis,
-        vectorization_efficiency: 0.85, // Simulated SIMD efficiency
-        cache_hit_ratio: 0.92,          // Simulated cache performance
+        // Neither vectorization efficiency nor cache hit ratio is measured
+        // here (both require hardware performance counters this crate does
+        // not read); report them as unmeasured rather than plausible-
+        // looking invented constants.
+        vectorization_efficiency: None,
+        cache_hit_ratio: None,
     }
 }
 
-fn analyze_with_scirs2_chunked_processing(
-    events: &[ProfileEvent],
-) -> TorshResult<ParallelAnalysisResult> {
-    // ✅ SciRS2-enhanced chunked processing simulation
-    let chunk_size = 1000.min(events.len() / 4 + 1);
-    let chunks_processed = (events.len() + chunk_size - 1) / chunk_size;
+/// Compute real parallel-execution metrics from the recorded event timeline.
+///
+/// All figures come from the events' `start_us` / `duration_us` / `thread_id` /
+/// `bytes_transferred` fields; nothing is fabricated. An empty stream yields a
+/// zeroed result with `memory_efficiency: None`.
+fn analyze_parallelism(events: &[ProfileEvent]) -> ParallelAnalysisResult {
+    let chunk_size = 1000.min(events.len() / 4 + 1).max(1);
+    let chunks_processed = events.len().div_ceil(chunk_size);
 
-    Ok(ParallelAnalysisResult {
-        parallel_efficiency: 0.95,
-        load_balance_score: 0.88,
-        memory_efficiency: 0.92,
-        cpu_utilization: 0.87,
+    if events.is_empty() {
+        return ParallelAnalysisResult {
+            parallel_efficiency: 0.0,
+            load_balance_score: 0.0,
+            memory_efficiency: None,
+            cpu_utilization: 0.0,
+            chunks_processed: 0,
+        };
+    }
+
+    // Wall-clock span of the whole run.
+    let min_start = events.iter().map(|e| e.start_us).min().unwrap_or(0);
+    let max_end = events
+        .iter()
+        .map(|e| e.start_us + e.duration_us)
+        .max()
+        .unwrap_or(0);
+    let span = max_end.saturating_sub(min_start).max(1) as f64;
+
+    // Per-thread busy time.
+    let mut per_thread: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+    for e in events {
+        *per_thread.entry(e.thread_id).or_insert(0) += e.duration_us;
+    }
+    let num_threads = per_thread.len().max(1) as f64;
+    let total_busy: u64 = events.iter().map(|e| e.duration_us).sum();
+
+    // parallel_efficiency = achieved concurrency / thread count.
+    let achieved_concurrency = total_busy as f64 / span;
+    let parallel_efficiency = (achieved_concurrency / num_threads).clamp(0.0, 1.0);
+
+    // load_balance_score = 1 - coefficient of variation of per-thread busy time.
+    let busy_values: Vec<f64> = per_thread.values().map(|&b| b as f64).collect();
+    let load_balance_score = if busy_values.len() <= 1 {
+        1.0
+    } else {
+        let mean = busy_values.iter().sum::<f64>() / busy_values.len() as f64;
+        if mean <= 0.0 {
+            1.0
+        } else {
+            let var = busy_values.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+                / busy_values.len() as f64;
+            (1.0 - var.sqrt() / mean).clamp(0.0, 1.0)
+        }
+    };
+
+    // cpu_utilization = fraction of the span with at least one thread busy
+    // (union of the busy intervals, so overlapping work is not double counted).
+    let mut intervals: Vec<(u64, u64)> = events
+        .iter()
+        .map(|e| (e.start_us, e.start_us + e.duration_us))
+        .collect();
+    intervals.sort_unstable();
+    let mut union_busy: u64 = 0;
+    let mut cur_start = intervals[0].0;
+    let mut cur_end = intervals[0].1;
+    for &(s, e) in intervals.iter().skip(1) {
+        if s > cur_end {
+            union_busy += cur_end - cur_start;
+            cur_start = s;
+            cur_end = e;
+        } else if e > cur_end {
+            cur_end = e;
+        }
+    }
+    union_busy += cur_end - cur_start;
+    let cpu_utilization = (union_busy as f64 / span).clamp(0.0, 1.0);
+
+    // memory_efficiency = achieved aggregate bandwidth / observed per-event peak,
+    // or None when no event reported bytes transferred.
+    let total_bytes: u64 = events.iter().filter_map(|e| e.bytes_transferred).sum();
+    let memory_efficiency = if total_bytes == 0 {
+        None
+    } else {
+        let span_s = span / 1_000_000.0; // us -> s
+        let achieved_bw = total_bytes as f64 / span_s;
+        let peak_bw = events
+            .iter()
+            .filter_map(|e| {
+                e.bytes_transferred.map(|b| {
+                    let d_s = (e.duration_us.max(1)) as f64 / 1_000_000.0;
+                    b as f64 / d_s
+                })
+            })
+            .fold(0.0_f64, f64::max);
+        if peak_bw > 0.0 {
+            Some((achieved_bw / peak_bw).clamp(0.0, 1.0))
+        } else {
+            None
+        }
+    };
+
+    ParallelAnalysisResult {
+        parallel_efficiency,
+        load_balance_score,
+        memory_efficiency,
+        cpu_utilization,
         chunks_processed,
-    })
+    }
 }
 
-fn analyze_with_direct_processing(_events: &[ProfileEvent]) -> TorshResult<ParallelAnalysisResult> {
-    Ok(ParallelAnalysisResult {
-        parallel_efficiency: 0.75,
-        load_balance_score: 0.70,
-        memory_efficiency: 0.85,
-        cpu_utilization: 0.60,
-        chunks_processed: 1,
-    })
-}
-
-fn generate_scirs2_stratified_sample<R>(
-    rng: &mut R,
-    total_size: usize,
-    sample_size: usize,
-) -> Vec<usize>
-where
-    R: scirs2_core::random::Rng,
-{
-    // ✅ SciRS2 Policy Compliant: Using scirs2_core::random instead of direct rand
+/// Deterministic stratified sample: evenly spaced indices across `[0, total_size)`.
+///
+/// True stratified sampling spreads the picks uniformly over the population; doing
+/// it by construction (rather than with a seeded RNG) makes the downstream
+/// correlation analysis exactly reproducible without a fabricated seed.
+fn generate_stratified_sample(total_size: usize, sample_size: usize) -> Vec<usize> {
+    if total_size == 0 || sample_size == 0 {
+        return Vec::new();
+    }
     let actual_sample_size = sample_size.min(total_size);
+    if actual_sample_size == total_size {
+        return (0..total_size).collect();
+    }
     (0..actual_sample_size)
-        .map(|_| rng.random_range(0..total_size))
+        .map(|i| (i * total_size) / actual_sample_size)
         .collect()
 }
 
@@ -1169,10 +1275,13 @@ fn generate_scirs2_optimizations(_events: &[ProfileEvent]) -> Vec<SciRS2Optimiza
 }
 
 fn calculate_advanced_performance_score(stats: &SciRS2Statistics) -> f64 {
-    // Advanced performance scoring using SciRS2 statistics
+    // Advanced performance scoring using SciRS2 statistics.
+    // The vectorization/cache bonuses only apply when those hardware
+    // counters were actually measured; unmeasured (`None`) contributes no
+    // bonus rather than a fabricated one.
     let base_score = stats.simd_accelerated_mean / 1000.0; // Normalize to milliseconds
-    let efficiency_bonus = stats.vectorization_efficiency * 0.2;
-    let cache_bonus = stats.cache_hit_ratio * 0.1;
+    let efficiency_bonus = stats.vectorization_efficiency.unwrap_or(0.0) * 0.2;
+    let cache_bonus = stats.cache_hit_ratio.unwrap_or(0.0) * 0.1;
 
     (base_score + efficiency_bonus + cache_bonus).clamp(0.0, 100.0)
 }

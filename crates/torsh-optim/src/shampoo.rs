@@ -399,10 +399,10 @@ impl Optimizer for Shampoo {
                         .mul_scalar(self.momentum)?
                         .add(&corrected_grad)?;
                     let update = momentum_buffer.mul_scalar(self.lr)?;
-                    *param = param.sub(&update)?;
+                    crate::param_update::sub_assign(&mut param, &update)?;
                 } else {
                     let update = corrected_grad.mul_scalar(self.lr)?;
-                    *param = param.sub(&update)?;
+                    crate::param_update::sub_assign(&mut param, &update)?;
                 }
 
                 // Update state
@@ -425,6 +425,13 @@ impl Optimizer for Shampoo {
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
         self.base.set_lr(lr);
+    }
+
+    fn set_lrs(&mut self, lrs: &[f32]) {
+        if let Some(&lr) = lrs.first() {
+            self.lr = lr;
+        }
+        self.base.set_lrs(lrs);
     }
 
     fn add_param_group(&mut self, params: Vec<Arc<RwLock<Tensor>>>, options: HashMap<String, f32>) {

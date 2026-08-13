@@ -47,7 +47,7 @@ cranelift-object = { workspace = true, optional = true }
 # Profiling and analysis
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
-num_cpus = "1.17"
+num_cpus = { workspace = true }
 
 [dev-dependencies]
 # torsh-nn = { path = "../torsh-nn", version = "0.1.0-alpha.3" }

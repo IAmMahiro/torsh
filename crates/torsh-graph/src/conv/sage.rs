@@ -1,4 +1,7 @@
 //! GraphSAGE (Sample and Aggregate) layer implementation
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
 
 use crate::parameter::Parameter;
 use crate::{GraphData, GraphLayer};
@@ -19,28 +22,22 @@ pub struct SAGEConv {
 
 impl SAGEConv {
     /// Create a new GraphSAGE convolution layer
-    pub fn new(in_features: usize, out_features: usize, bias: bool) -> Self {
-        let weight_neighbor = Parameter::new(
-            randn(&[in_features, out_features]).expect("failed to create neighbor weight tensor"),
-        );
-        let weight_self = Parameter::new(
-            randn(&[in_features, out_features]).expect("failed to create self weight tensor"),
-        );
+    pub fn new(in_features: usize, out_features: usize, bias: bool) -> Result<Self> {
+        let weight_neighbor = Parameter::new(randn(&[in_features, out_features])?);
+        let weight_self = Parameter::new(randn(&[in_features, out_features])?);
         let bias = if bias {
-            Some(Parameter::new(
-                zeros(&[out_features]).expect("failed to create bias tensor"),
-            ))
+            Some(Parameter::new(zeros(&[out_features])?))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             in_features,
             out_features,
             weight_neighbor,
             weight_self,
             bias,
-        }
+        })
     }
 
     /// Get input feature dimension
@@ -54,10 +51,9 @@ impl SAGEConv {
     }
 
     /// Apply GraphSAGE convolution
-    pub fn forward(&self, graph: &GraphData) -> GraphData {
+    pub fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         let num_nodes = graph.num_nodes;
-        let edge_data = crate::utils::tensor_to_vec2::<f32>(&graph.edge_index)
-            .expect("failed to extract edge index data");
+        let edge_data = crate::utils::tensor_to_vec2::<f32>(&graph.edge_index)?;
 
         // Build adjacency list for efficient neighbor aggregation
         let mut adjacency_list: Vec<Vec<usize>> = vec![Vec::new(); num_nodes];
@@ -68,90 +64,61 @@ impl SAGEConv {
         }
 
         // Aggregate neighbor features (mean aggregation)
-        let mut neighbor_features = zeros(&[num_nodes, self.in_features])
-            .expect("failed to create neighbor features tensor");
+        let mut neighbor_features = zeros(&[num_nodes, self.in_features])?;
 
         for node in 0..num_nodes {
             if !adjacency_list[node].is_empty() {
-                let mut aggregated = zeros(&[self.in_features])
-                    .expect("failed to create aggregated features tensor");
+                let mut aggregated = zeros(&[self.in_features])?;
 
                 for &neighbor in &adjacency_list[node] {
-                    let neighbor_slice = graph
-                        .x
-                        .slice(0, neighbor, neighbor + 1)
-                        .expect("failed to slice neighbor features")
-                        .to_tensor()
-                        .expect("failed to convert slice to tensor");
-                    let neighbor_feat = neighbor_slice.squeeze(0).expect("squeeze should succeed");
-                    aggregated = aggregated
-                        .add(&neighbor_feat)
-                        .expect("operation should succeed");
+                    let neighbor_slice = graph.x.slice(0, neighbor, neighbor + 1)?.to_tensor()?;
+                    let neighbor_feat = neighbor_slice.squeeze(0)?;
+                    aggregated = aggregated.add(&neighbor_feat)?;
                 }
 
                 // Mean aggregation
-                aggregated = aggregated
-                    .div_scalar(adjacency_list[node].len() as f32)
-                    .expect("failed to compute mean aggregation");
+                aggregated = aggregated.div_scalar(adjacency_list[node].len() as f32)?;
                 // Store aggregated features for this node
-                let aggregated_data = aggregated.to_vec().expect("conversion should succeed");
+                let aggregated_data = aggregated.to_vec()?;
                 for (i, &value) in aggregated_data.iter().enumerate() {
-                    neighbor_features
-                        .set_item(&[node, i], value)
-                        .expect("failed to set neighbor feature value");
+                    neighbor_features.set_item(&[node, i], value)?;
                 }
             }
         }
 
         // Transform neighbor features and self features
-        let neighbor_transformed = neighbor_features
-            .matmul(&self.weight_neighbor.clone_data())
-            .expect("operation should succeed");
-        let self_transformed = graph
-            .x
-            .matmul(&self.weight_self.clone_data())
-            .expect("operation should succeed");
+        let neighbor_transformed = neighbor_features.matmul(&self.weight_neighbor.clone_data())?;
+        let self_transformed = graph.x.matmul(&self.weight_self.clone_data())?;
 
         // Combine neighbor and self representations
-        let mut output_features = neighbor_transformed
-            .add(&self_transformed)
-            .expect("operation should succeed");
+        let mut output_features = neighbor_transformed.add(&self_transformed)?;
 
         // Add bias if present
         if let Some(ref bias) = self.bias {
-            output_features = output_features
-                .add(&bias.clone_data())
-                .expect("operation should succeed");
+            output_features = output_features.add(&bias.clone_data())?;
         }
 
         // L2 normalize the output features (common in GraphSAGE)
         // For simplicity, using standard normalization instead of row-wise normalization
-        let norm_val = output_features
-            .norm()
-            .expect("failed to compute feature norm");
+        let norm_val = output_features.norm()?;
         let epsilon = 1e-8_f32;
-        let norm_scalar = norm_val
-            .item()
-            .expect("tensor should have single item")
-            .max(epsilon);
-        output_features = output_features
-            .div_scalar(norm_scalar)
-            .expect("failed to normalize output features");
+        let norm_scalar = norm_val.item()?.max(epsilon);
+        output_features = output_features.div_scalar(norm_scalar)?;
 
         // Create output graph
-        GraphData {
+        Ok(GraphData {
             x: output_features,
             edge_index: graph.edge_index.clone(),
             edge_attr: graph.edge_attr.clone(),
             batch: graph.batch.clone(),
             num_nodes: graph.num_nodes,
             num_edges: graph.num_edges,
-        }
+        })
     }
 }
 
 impl GraphLayer for SAGEConv {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         self.forward(graph)
     }
 
@@ -176,7 +143,7 @@ mod tests {
     #[test]
     fn test_sage_creation() {
         let sage = SAGEConv::new(10, 20, true);
-        let params = sage.parameters();
+        let params = sage.expect("operation should succeed").parameters();
         assert_eq!(params.len(), 3); // weight_neighbor + weight_self + bias
     }
 
@@ -199,7 +166,10 @@ mod tests {
             .expect("from vec should succeed");
         let graph = GraphData::new(x, edge_index);
 
-        let output = sage.forward(&graph);
+        let output = sage
+            .expect("operation should succeed")
+            .forward(&graph)
+            .expect("operation should succeed");
         assert_eq!(output.x.shape().dims(), &[3, 8]);
         assert_eq!(output.num_nodes, 3);
 

@@ -56,11 +56,12 @@ impl LayerNorm {
         self.config.eps
     }
 
-    fn compute_layer_stats(&self, input: &Tensor) -> Result<(Tensor, Tensor)> {
+    /// Axes the layer normalizes over: the trailing `normalized_shape.len()`
+    /// dimensions, validated against `normalized_shape`.
+    fn normalized_axes(&self, input: &Tensor) -> Result<Vec<usize>> {
         let input_shape = input.shape();
         let dims = input_shape.dims();
 
-        // Determine which dimensions to normalize over
         let normalized_dims = self.normalized_shape.len();
         let input_dims = dims.len();
 
@@ -71,7 +72,6 @@ impl LayerNorm {
             )));
         }
 
-        // Check that the last dimensions match normalized_shape
         let start_idx = input_dims - normalized_dims;
         for (i, &norm_dim) in self.normalized_shape.iter().enumerate() {
             if dims[start_idx + i] != norm_dim {
@@ -84,45 +84,23 @@ impl LayerNorm {
             }
         }
 
-        // Calculate the number of elements to normalize over
-        let norm_elements: usize = self.normalized_shape.iter().product();
-        let batch_size: usize = dims[..start_idx].iter().product();
+        Ok((start_idx..input_dims).collect())
+    }
 
-        let input_data = input.to_vec()?;
-        let mut means = vec![0.0f32; batch_size];
-        let mut vars = vec![0.0f32; batch_size];
-
-        // Compute mean and variance for each batch element
-        for batch in 0..batch_size {
-            let mut sum = 0.0;
-            let mut sum_sq = 0.0;
-
-            let batch_start = batch * norm_elements;
-            for i in 0..norm_elements {
-                let val = input_data[batch_start + i];
-                sum += val;
-                sum_sq += val * val;
-            }
-
-            let mean = sum / norm_elements as f32;
-            let var = (sum_sq / norm_elements as f32) - (mean * mean);
-
-            means[batch] = mean;
-            vars[batch] = var;
-        }
-
-        // Reshape to match input batch dimensions
-        let mut batch_shape = dims[..start_idx].to_vec();
-        for _ in 0..normalized_dims {
-            batch_shape.push(1);
-        }
-
-        let mean_tensor = Tensor::from_data(means, dims[..start_idx].to_vec(), input.device())?
-            .reshape(&batch_shape.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
-        let var_tensor = Tensor::from_data(vars, dims[..start_idx].to_vec(), input.device())?
-            .reshape(&batch_shape.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
-
-        Ok((mean_tensor, var_tensor))
+    /// Per-sample mean and *biased* variance over the normalized axes, kept on
+    /// the autograd graph.
+    ///
+    /// Both come back with `keepdim`, i.e. shaped `[..batch.., 1, ..., 1]`,
+    /// which is exactly what the pre-rewrite `to_vec()` loop reshaped its
+    /// detached leaves to — the difference is only that these carry a backward
+    /// rule, so `d loss / d input` now includes the mean-subtraction and
+    /// variance terms of the true layer-norm Jacobian.
+    fn compute_layer_stats(&self, input: &Tensor) -> Result<(Tensor, Tensor)> {
+        let axes = self.normalized_axes(input)?;
+        let mean = input.mean(Some(&axes), true)?;
+        let centered = input.sub(&mean)?;
+        let variance = centered.pow_scalar(2.0)?.mean(Some(&axes), true)?;
+        Ok((mean, variance))
     }
 }
 
@@ -144,18 +122,22 @@ impl Module for LayerNorm {
             None
         };
 
-        // Apply normalization
+        // `weight`/`bias` have exactly `normalized_shape`, so trailing-axis
+        // broadcasting lines them up with the normalized axes by construction.
         let weight_tensor = weight.as_ref().map(|p| p.tensor().read().clone());
         let bias_tensor = bias.as_ref().map(|p| p.tensor().read().clone());
 
-        utils::apply_normalization(
-            input,
-            &mean,
-            &var,
-            weight_tensor.as_ref(),
-            bias_tensor.as_ref(),
-            self.config.eps,
-        )
+        let std = var.add_scalar(self.config.eps)?.sqrt()?;
+        let mut normalized = input.sub(&mean)?.div(&std)?;
+
+        if let Some(w) = weight_tensor.as_ref() {
+            normalized = normalized.mul(w)?;
+        }
+        if let Some(b) = bias_tensor.as_ref() {
+            normalized = normalized.add(b)?;
+        }
+
+        Ok(normalized)
     }
 
     fn parameters(&self) -> HashMap<String, Parameter> {
@@ -238,7 +220,8 @@ impl GroupNorm {
         self.config.eps
     }
 
-    fn compute_group_stats(&self, input: &Tensor) -> Result<(Tensor, Tensor)> {
+    /// Validate the input's rank and channel count.
+    fn validate(&self, input: &Tensor) -> Result<()> {
         let input_shape = input.shape();
         let dims = input_shape.dims();
 
@@ -249,16 +232,32 @@ impl GroupNorm {
             )));
         }
 
-        let batch_size = dims[0];
-        let channels = dims[1];
-
-        if channels != self.num_channels {
+        if dims[1] != self.num_channels {
             return Err(torsh_core::error::TorshError::InvalidShape(format!(
                 "Expected {} channels, got {}",
-                self.num_channels, channels
+                self.num_channels, dims[1]
             )));
         }
 
+        Ok(())
+    }
+}
+
+impl Module for GroupNorm {
+    /// Normalize each `(sample, group)` slice over its channels and spatial
+    /// extent.
+    ///
+    /// The statistics used to come from a `to_vec()` loop, i.e. from detached
+    /// leaves, so `backward()` saw a constant mean and variance. Here the whole
+    /// expression is a recording composition evaluated in a
+    /// `[N * G, (C / G) * spatial]` view, which is the same arithmetic the loop
+    /// performed and gives the real Jacobian.
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.validate(input)?;
+
+        let input_shape = input.shape();
+        let dims = input_shape.dims();
+        let batch_size = dims[0];
         let channels_per_group = self.num_channels / self.num_groups;
         let spatial_size: usize = if dims.len() > 2 {
             dims[2..].iter().product()
@@ -266,128 +265,33 @@ impl GroupNorm {
             1
         };
 
-        let input_data = input.to_vec()?;
-        let mut means = vec![0.0f32; batch_size * self.num_groups];
-        let mut vars = vec![0.0f32; batch_size * self.num_groups];
+        let grouped = input.reshape(&[
+            (batch_size * self.num_groups) as i32,
+            (channels_per_group * spatial_size) as i32,
+        ])?;
+        let mean = grouped.mean(Some(&[1]), true)?;
+        let centered = grouped.sub(&mean)?;
+        let variance = centered.pow_scalar(2.0)?.mean(Some(&[1]), true)?;
+        let std = variance.add_scalar(self.config.eps)?.sqrt()?;
 
-        let group_elements = channels_per_group * spatial_size;
+        let original: Vec<i32> = dims.iter().map(|&d| d as i32).collect();
+        let mut normalized = centered.div(&std)?.reshape(&original)?;
 
-        // Compute statistics for each group
-        for batch in 0..batch_size {
-            for group in 0..self.num_groups {
-                let mut sum = 0.0;
-                let mut sum_sq = 0.0;
-
-                let group_start_channel = group * channels_per_group;
-                let group_end_channel = group_start_channel + channels_per_group;
-
-                for c in group_start_channel..group_end_channel {
-                    for spatial in 0..spatial_size {
-                        let idx = batch * (channels * spatial_size) + c * spatial_size + spatial;
-                        let val = input_data[idx];
-                        sum += val;
-                        sum_sq += val * val;
-                    }
-                }
-
-                let mean = sum / group_elements as f32;
-                let var = (sum_sq / group_elements as f32) - (mean * mean);
-
-                let stat_idx = batch * self.num_groups + group;
-                means[stat_idx] = mean;
-                vars[stat_idx] = var;
-            }
-        }
-
-        // Expand statistics to match channel dimension
-        let mut expanded_means = vec![0.0f32; batch_size * channels];
-        let mut expanded_vars = vec![0.0f32; batch_size * channels];
-
-        for batch in 0..batch_size {
-            for c in 0..channels {
-                let group = c / channels_per_group;
-                let stat_idx = batch * self.num_groups + group;
-                let channel_idx = batch * channels + c;
-
-                expanded_means[channel_idx] = means[stat_idx];
-                expanded_vars[channel_idx] = vars[stat_idx];
-            }
-        }
-
-        // Create result shape for broadcasting
-        let mut result_shape = vec![batch_size, channels];
-        for _ in 2..dims.len() {
-            result_shape.push(1);
-        }
-
-        let mean_tensor =
-            Tensor::from_data(expanded_means, vec![batch_size, channels], input.device())?
-                .reshape(&result_shape.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
-        let var_tensor =
-            Tensor::from_data(expanded_vars, vec![batch_size, channels], input.device())?
-                .reshape(&result_shape.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
-
-        Ok((mean_tensor, var_tensor))
-    }
-}
-
-impl Module for GroupNorm {
-    fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        // Compute group statistics
-        let (mean, var) = self.compute_group_stats(input)?;
-
-        // Get learnable parameters
-        let weight = if self.config.affine {
+        // Per-channel affine parameters, reshaped to `[1, C, 1, ...]` so they
+        // can never be aligned with the trailing axis by accident.
+        let broadcast = utils::channel_broadcast_shape(dims.len(), self.num_channels);
+        if self.config.affine {
             if let Some(w) = self.base.parameters.get("weight") {
-                // Reshape weight to match input dimensions for broadcasting
-                let input_shape = input.shape();
-                let dims = input_shape.dims();
-                let mut weight_shape = vec![1, self.num_channels];
-                for _ in 2..dims.len() {
-                    weight_shape.push(1);
-                }
-                Some(
-                    w.tensor()
-                        .read()
-                        .reshape(&weight_shape.iter().map(|&x| x as i32).collect::<Vec<i32>>())?,
-                )
-            } else {
-                None
+                let weight = w.tensor().read().reshape(&broadcast)?;
+                normalized = normalized.mul(&weight)?;
             }
-        } else {
-            None
-        };
-
-        let bias = if self.config.affine {
             if let Some(b) = self.base.parameters.get("bias") {
-                // Reshape bias to match input dimensions for broadcasting
-                let input_shape = input.shape();
-                let dims = input_shape.dims();
-                let mut bias_shape = vec![1, self.num_channels];
-                for _ in 2..dims.len() {
-                    bias_shape.push(1);
-                }
-                Some(
-                    b.tensor()
-                        .read()
-                        .reshape(&bias_shape.iter().map(|&x| x as i32).collect::<Vec<i32>>())?,
-                )
-            } else {
-                None
+                let bias = b.tensor().read().reshape(&broadcast)?;
+                normalized = normalized.add(&bias)?;
             }
-        } else {
-            None
-        };
+        }
 
-        // Apply normalization
-        utils::apply_normalization(
-            input,
-            &mean,
-            &var,
-            weight.as_ref(),
-            bias.as_ref(),
-            self.config.eps,
-        )
+        Ok(normalized)
     }
 
     fn parameters(&self) -> HashMap<String, Parameter> {
@@ -535,7 +439,12 @@ impl RMSNorm {
         self.affine
     }
 
-    /// Compute RMS (Root Mean Square) for the input
+    /// Compute RMS (Root Mean Square) for the input.
+    ///
+    /// `sqrt(mean(x²) + eps)` as a recording composition: the pre-rewrite
+    /// `to_vec()` loop handed back a detached leaf, so `x / RMS(x)` was
+    /// differentiated as if `RMS(x)` were a constant and the `-x·(x/RMS³)/n`
+    /// term of the true Jacobian went missing.
     fn compute_rms(&self, input: &Tensor) -> Result<Tensor> {
         let input_shape = input.shape();
         let dims = input_shape.dims();
@@ -564,40 +473,12 @@ impl RMSNorm {
             }
         }
 
-        // Calculate the number of elements to normalize over
-        let norm_elements: usize = self.normalized_shape.iter().product();
-        let batch_size: usize = dims[..start_idx].iter().product();
-
-        let input_data = input.to_vec()?;
-        let mut rms_values = vec![0.0f32; batch_size];
-
-        // Compute RMS for each batch element
-        // RMS = sqrt(mean(x^2))
-        for batch in 0..batch_size {
-            let mut sum_sq = 0.0;
-
-            let batch_start = batch * norm_elements;
-            for i in 0..norm_elements {
-                let val = input_data[batch_start + i];
-                sum_sq += val * val;
-            }
-
-            let mean_sq = sum_sq / norm_elements as f32;
-            let rms = (mean_sq + self.eps).sqrt();
-
-            rms_values[batch] = rms;
-        }
-
-        // Reshape to match input batch dimensions for broadcasting
-        let mut batch_shape = dims[..start_idx].to_vec();
-        for _ in 0..normalized_dims {
-            batch_shape.push(1);
-        }
-
-        let rms_tensor = Tensor::from_data(rms_values, dims[..start_idx].to_vec(), input.device())?
-            .reshape(&batch_shape.iter().map(|&x| x as i32).collect::<Vec<i32>>())?;
-
-        Ok(rms_tensor)
+        let axes: Vec<usize> = (start_idx..input_dims).collect();
+        input
+            .pow_scalar(2.0)?
+            .mean(Some(&axes), true)?
+            .add_scalar(self.eps)?
+            .sqrt()
     }
 }
 

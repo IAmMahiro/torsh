@@ -21,6 +21,7 @@ pub type TorshResult<T> = Result<T>;
 pub mod advanced_ops;
 pub mod comparison;
 pub mod decomposition;
+mod dense_kernels;
 pub mod matrix_functions;
 pub mod numerical_stability;
 pub mod perf;

@@ -16,6 +16,184 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use torsh_core::error::{Result, TorshError};
 
+/// Graph executor emitted into the generated inference server.
+///
+/// The exported `model.json` carries the serialized FX graph, so the server
+/// executes that graph with numpy instead of guessing an output. Operations whose
+/// parameters are not part of the export (linear, conv2d, batch_norm, ...) raise
+/// `NotImplementedError`, which the prediction endpoint turns into HTTP 501 — a
+/// generated service must never substitute an identity for the model.
+const GRAPH_EXECUTOR_PY: &str = r#"
+def _predecessors(node_id):
+    """Return the ids feeding a node, in edge declaration order."""
+    return [src for src, dst in GRAPH_EDGES if dst == node_id]
+
+
+def _topological_order():
+    """Return graph node ids in dependency order."""
+    indegree = {node_id: 0 for node_id in GRAPH_NODES}
+    for _, dst in GRAPH_EDGES:
+        if dst in indegree:
+            indegree[dst] += 1
+    ready = [node_id for node_id, degree in indegree.items() if degree == 0]
+    order = []
+    while ready:
+        current = ready.pop()
+        order.append(current)
+        for src, dst in GRAPH_EDGES:
+            if src == current and dst in indegree:
+                indegree[dst] -= 1
+                if indegree[dst] == 0:
+                    ready.append(dst)
+    if len(order) != len(GRAPH_NODES):
+        raise ValueError('exported graph contains a cycle and cannot be executed')
+    return order
+
+
+def _apply_op(op_name, operands):
+    """Evaluate a single graph operation with numpy."""
+    if op_name in ('relu', 'relu_inplace'):
+        return np.maximum(operands[0], 0.0)
+    if op_name in ('sigmoid', 'sigmoid_inplace'):
+        return 1.0 / (1.0 + np.exp(-operands[0]))
+    if op_name in ('tanh', 'tanh_inplace'):
+        return np.tanh(operands[0])
+    if op_name == 'gelu':
+        x = operands[0]
+        inner = np.sqrt(2.0 / np.pi) * (x + 0.044715 * np.power(x, 3))
+        return 0.5 * x * (1.0 + np.tanh(inner))
+    if op_name == 'softmax':
+        x = operands[0]
+        shifted = x - np.max(x, axis=-1, keepdims=True)
+        exps = np.exp(shifted)
+        return exps / np.sum(exps, axis=-1, keepdims=True)
+    if op_name == 'exp':
+        return np.exp(operands[0])
+    if op_name == 'log':
+        return np.log(operands[0])
+    if op_name == 'sqrt':
+        return np.sqrt(operands[0])
+    if op_name == 'neg':
+        return -operands[0]
+    if op_name == 'abs':
+        return np.abs(operands[0])
+    if op_name in ('add', 'add_inplace'):
+        return operands[0] + operands[1]
+    if op_name == 'sub':
+        return operands[0] - operands[1]
+    if op_name in ('mul', 'mul_inplace'):
+        return operands[0] * operands[1]
+    if op_name == 'div':
+        return operands[0] / operands[1]
+    if op_name == 'matmul':
+        return np.matmul(operands[0], operands[1])
+    if op_name == 'identity':
+        return operands[0]
+    if op_name == 'constant_zero':
+        return np.zeros(1, dtype=np.float32)
+    if op_name == 'constant_one':
+        return np.ones(1, dtype=np.float32)
+    raise NotImplementedError(
+        "operation '" + op_name + "' cannot be executed from the exported graph: it "
+        "requires model parameters that are not part of model.json. Supply a runtime "
+        "that provides the weights for this operation, or export a graph that only "
+        "uses parameter-free operations."
+    )
+
+
+def run_graph(input_arrays):
+    """Execute the exported graph and return its outputs as nested lists."""
+    values = {}
+    graph_inputs = GRAPH['inputs']
+    if len(input_arrays) != len(graph_inputs):
+        raise ValueError(
+            'expected %d input(s), received %d' % (len(graph_inputs), len(input_arrays))
+        )
+    for node_id, array in zip(graph_inputs, input_arrays):
+        values[node_id] = array
+
+    for node_id in _topological_order():
+        if node_id in values:
+            continue
+        node = GRAPH_NODES.get(node_id)
+        if node is None:
+            raise ValueError('graph references unknown node %r' % (node_id,))
+        node_type = node['node_type']
+        if node_type.startswith('input:'):
+            raise ValueError('no value supplied for graph input %r' % (node_id,))
+        preds = _predecessors(node_id)
+        if node_type == 'output':
+            if preds:
+                values[node_id] = values[preds[0]]
+            continue
+        if node_type.startswith('call:'):
+            op_name = node_type.split(':', 1)[1]
+            if op_name == 'constant':
+                params = node.get('params', {})
+                values[node_id] = np.asarray(
+                    [float(params.get('value', 0.0))], dtype=np.float32
+                )
+                continue
+            values[node_id] = _apply_op(op_name, [values[p] for p in preds])
+            continue
+        raise NotImplementedError(
+            "graph node type '" + node_type + "' is not supported by the generated server"
+        )
+
+    return [
+        np.asarray(values[node_id]).tolist()
+        for node_id in GRAPH['outputs']
+        if node_id in values
+    ]
+
+
+"#;
+
+/// Prediction endpoint emitted into the generated inference server.
+///
+/// Delegates to [`GRAPH_EXECUTOR_PY`]'s `run_graph` and maps a refusal to HTTP 501
+/// so an unrunnable model is visible instead of silently echoing the request.
+const PREDICT_ENDPOINT_PY: &str = r#"@app.route('/predict', methods=['POST'])
+def predict():
+    global request_count, total_inference_time, error_count
+    try:
+        start_time = time.time()
+
+        data = request.get_json()
+        if not data or 'inputs' not in data:
+            return jsonify({'error': 'Missing inputs'}), 400
+
+        inputs = data.get('inputs')
+
+        # Convert the request payload into the graph's input arrays
+        if len(GRAPH['inputs']) == 1:
+            input_arrays = [np.array(inputs, dtype=np.float32)]
+        else:
+            input_arrays = [np.array(item, dtype=np.float32) for item in inputs]
+
+        # Run the exported graph
+        outputs = run_graph(input_arrays)
+
+        inference_time = time.time() - start_time
+        request_count += 1
+        total_inference_time += inference_time
+
+        return jsonify({
+            'outputs': outputs,
+            'inference_time_ms': inference_time * 1000,
+            'request_id': request_count
+        })
+    except NotImplementedError as exc:
+        error_count += 1
+        logger.error(f'Model cannot be executed: {exc}')
+        return jsonify({'error': str(exc)}), 501
+    except Exception as e:
+        error_count += 1
+        logger.error(f'Prediction error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+"#;
+
 /// Cloud deployment target
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CloudPlatform {
@@ -368,10 +546,18 @@ impl CloudDeploymentPackager {
         server.push_str("logger.info('Loading model...')\n");
         server.push_str("with open('model.json', 'r') as f:\n");
         server.push_str("    model_data = json.load(f)\n");
+        server.push_str("GRAPH = model_data['graph']\n");
+        server.push_str("GRAPH_NODES = {node['id']: node for node in GRAPH['nodes']}\n");
+        server.push_str("GRAPH_EDGES = [tuple(edge) for edge in GRAPH['edges']]\n");
         server.push_str(&format!(
             "logger.info('Loaded model: {}')\n\n",
             entry.metadata.name
         ));
+
+        // Graph executor. The exported graph is executed for real; operations whose
+        // parameters are not part of the export refuse loudly instead of returning
+        // something that merely looks like a prediction.
+        server.push_str(GRAPH_EXECUTOR_PY);
 
         // Health check endpoint
         server.push_str("@app.route('/health', methods=['GET'])\n");
@@ -379,50 +565,7 @@ impl CloudDeploymentPackager {
         server.push_str("    return jsonify({'status': 'healthy'})\n\n");
 
         // Prediction endpoint
-        server.push_str("@app.route('/predict', methods=['POST'])\n");
-        server.push_str("def predict():\n");
-        server.push_str("    try:\n");
-        server.push_str("        import time\n");
-        server.push_str("        start_time = time.time()\n");
-        server.push_str("        \n");
-        server.push_str("        data = request.get_json()\n");
-        server.push_str("        if not data or 'inputs' not in data:\n");
-        server.push_str("            return jsonify({'error': 'Missing inputs'}), 400\n");
-        server.push_str("        \n");
-        server.push_str("        inputs = data.get('inputs')\n");
-        server.push_str("        \n");
-        server.push_str("        # Implement actual inference with the loaded model\n");
-        server.push_str("        # Convert inputs to appropriate tensor format\n");
-        server.push_str("        import numpy as np\n");
-        server.push_str("        input_array = np.array(inputs, dtype=np.float32)\n");
-        server.push_str("        \n");
-        server.push_str("        # TODO: Load and use actual model\n");
-        server.push_str("        # Example inference logic:\n");
-        server.push_str("        # with torch.no_grad():\n");
-        server.push_str("        #     input_tensor = torch.from_numpy(input_array)\n");
-        server.push_str("        #     output_tensor = model(input_tensor)\n");
-        server.push_str("        #     outputs = output_tensor.numpy().tolist()\n");
-        server.push_str("        \n");
-        server.push_str("        # For now, use identity function as placeholder\n");
-        server.push_str("        outputs = input_array.tolist()\n");
-        server.push_str("        \n");
-        server.push_str("        inference_time = time.time() - start_time\n");
-        server.push_str("        \n");
-        server.push_str("        # Update metrics\n");
-        server.push_str("        global request_count, total_inference_time\n");
-        server.push_str("        request_count += 1\n");
-        server.push_str("        total_inference_time += inference_time\n");
-        server.push_str("        \n");
-        server.push_str("        return jsonify({\n");
-        server.push_str("            'outputs': outputs,\n");
-        server.push_str("            'inference_time_ms': inference_time * 1000,\n");
-        server.push_str("            'request_id': request_count\n");
-        server.push_str("        })\n");
-        server.push_str("    except Exception as e:\n");
-        server.push_str("        global error_count\n");
-        server.push_str("        error_count += 1\n");
-        server.push_str("        logger.error(f'Prediction error: {e}')\n");
-        server.push_str("        return jsonify({'error': str(e)}), 500\n\n");
+        server.push_str(PREDICT_ENDPOINT_PY);
 
         // Metrics endpoint
         if self.config.monitoring.enable_metrics {

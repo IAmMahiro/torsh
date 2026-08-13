@@ -12,6 +12,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod commands;
 mod config;
+mod tls;
 mod utils;
 
 use commands::*;
@@ -162,7 +163,11 @@ fn init_logging(verbose: bool, quiet: bool) -> Result<()> {
                 tracing::Level::TRACE => tracing_subscriber::EnvFilter::new("trace"),
             }),
         )
-        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(std::io::stderr),
+        )
         .init();
 
     Ok(())

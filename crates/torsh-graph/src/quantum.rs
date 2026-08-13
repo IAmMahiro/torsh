@@ -2,9 +2,12 @@
 //!
 //! This module provides quantum-inspired algorithms for graph processing
 //! and quantum neural network architectures adapted for graph data.
-
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
+
 use crate::{GraphData, GraphLayer};
 use std::f32::consts::PI;
 use torsh_tensor::{
@@ -176,7 +179,7 @@ impl QuantumGraphLayer {
 }
 
 impl GraphLayer for QuantumGraphLayer {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         // Quantum graph processing pipeline
         if let Ok(quantum_state) = self.quantum_encoding(&graph.x) {
             if let Ok(adjacency) = self.build_adjacency_matrix(graph) {
@@ -185,7 +188,7 @@ impl GraphLayer for QuantumGraphLayer {
                         self.quantum_interference(&entangled_state, &graph.edge_index)
                     {
                         if let Ok(output_features) = self.quantum_measurement(&interfered_state) {
-                            return GraphData::new(output_features, graph.edge_index.clone());
+                            return Ok(GraphData::new(output_features, graph.edge_index.clone()));
                         }
                     }
                 }
@@ -193,7 +196,7 @@ impl GraphLayer for QuantumGraphLayer {
         }
 
         // Fallback to identity if quantum operations fail
-        graph.clone()
+        Ok(graph.clone())
     }
 
     fn parameters(&self) -> Vec<Tensor> {

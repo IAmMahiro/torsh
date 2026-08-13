@@ -2,7 +2,8 @@
 
 #![allow(unexpected_cfgs)]
 
-use crate::backend::{Backend, BackendConfig, BackendType, MockBackend};
+use crate::backend::{Backend, BackendConfig, BackendType};
+use crate::tcp_backend::TcpBackend;
 use crate::{TorshDistributedError, TorshResult};
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -18,9 +19,7 @@ pub struct ProcessGroup {
     backend: Arc<RwLock<Box<dyn Backend>>>,
     rank: Rank,
     world_size: WorldSize,
-    #[allow(dead_code)]
     master_addr: String,
-    #[allow(dead_code)]
     master_port: u16,
 }
 
@@ -33,7 +32,7 @@ impl ProcessGroup {
         master_addr: &str,
         master_port: u16,
     ) -> TorshResult<Self> {
-        let mut backend = create_backend(backend_type, rank, world_size)?;
+        let mut backend = create_backend(backend_type, rank, world_size, master_addr, master_port)?;
 
         // Initialize the backend with default config
         let config = BackendConfig::default();
@@ -65,55 +64,65 @@ impl ProcessGroup {
         self.backend.read().backend_type()
     }
 
+    /// Get the master (rendezvous) address this group was configured with
+    pub fn master_addr(&self) -> &str {
+        &self.master_addr
+    }
+
+    /// Get the master (rendezvous) port this group was configured with
+    pub fn master_port(&self) -> u16 {
+        self.master_port
+    }
+
     /// Get a reference to the backend
     pub fn backend(&self) -> &Arc<RwLock<Box<dyn Backend>>> {
         &self.backend
     }
 }
 
-/// Create a backend based on the type
+/// Create a backend based on the type.
+///
+/// Honesty policy: this only ever returns a backend that can actually perform
+/// the collectives it advertises. There is NO mock substitution in production
+/// paths.
+///
+/// - `Gloo` (default): the real pure-Rust [`TcpBackend`] (store-based TCP
+///   collectives). Works on a single node across processes/threads.
+/// - `Mpi` (feature `mpi`): the real `MpiBackend` bound to a live MPI
+///   communicator. Requires a system MPI library.
+/// - `Nccl`: an honest error — no real NCCL/oxicuda-comm transport exists yet,
+///   so callers must not receive a backend that silently fabricates results.
+/// - `Custom`: an honest error until a concrete implementation is registered.
 fn create_backend(
     backend_type: BackendType,
     rank: Rank,
     world_size: WorldSize,
+    master_addr: &str,
+    master_port: u16,
 ) -> TorshResult<Box<dyn Backend>> {
     match backend_type {
-        #[cfg(feature = "nccl")]
-        BackendType::Nccl => {
-            // For now, use mock backend - NCCL backend needs implementation
-            Ok(Box::new(MockBackend::with_backend_type(
-                rank,
-                world_size,
-                BackendType::Nccl,
-            )))
-        }
-        #[cfg(not(feature = "nccl"))]
         BackendType::Nccl => Err(TorshDistributedError::feature_not_available(
             "NCCL backend",
-            "nccl",
+            "a real NCCL/oxicuda-comm implementation (not yet available); \
+             the previous mock has been removed to avoid fabricated collectives",
         )),
         #[cfg(feature = "mpi")]
         BackendType::Mpi => {
-            // For now, use mock backend - MPI backend needs implementation
-            Ok(Box::new(MockBackend::with_backend_type(
-                rank,
-                world_size,
-                BackendType::Mpi,
-            )))
+            // Wire the real MPI backend (bound to a live MPI communicator).
+            // rank/world_size come from MPI itself, not the caller's arguments.
+            Ok(Box::new(crate::backend::MpiBackend::new()?))
         }
         #[cfg(not(feature = "mpi"))]
         BackendType::Mpi => Err(TorshDistributedError::feature_not_available(
             "MPI backend",
             "mpi",
         )),
-        BackendType::Gloo => {
-            // Use mock backend for now
-            Ok(Box::new(MockBackend::with_backend_type(
-                rank,
-                world_size,
-                BackendType::Gloo,
-            )))
-        }
+        BackendType::Gloo => Ok(Box::new(TcpBackend::new(
+            rank,
+            world_size,
+            master_addr,
+            master_port,
+        ))),
         BackendType::Custom(name) => Err(TorshDistributedError::feature_not_available(
             format!("Custom backend: {}", name),
             "custom backend implementation",

@@ -15,6 +15,7 @@
 use crate::dtype::DType;
 use crate::error::{Result, TorshError};
 use crate::shape::Shape;
+use crate::sync::MutexExt;
 
 #[cfg(feature = "std")]
 use std::sync::Arc;
@@ -655,7 +656,7 @@ impl SharedBufferManager {
     /// * `id` - Unique buffer identifier
     /// * `buffer` - Shared buffer data
     pub fn register_buffer(&self, id: usize, buffer: Arc<[u8]>) {
-        let mut buffers = self.buffers.lock().expect("lock should not be poisoned");
+        let mut buffers = self.buffers.lock_or_recover();
         buffers.insert(id, buffer);
     }
 
@@ -669,7 +670,7 @@ impl SharedBufferManager {
     ///
     /// Shared buffer if found
     pub fn get_buffer(&self, id: usize) -> Option<Arc<[u8]>> {
-        let buffers = self.buffers.lock().expect("lock should not be poisoned");
+        let buffers = self.buffers.lock_or_recover();
         buffers.get(&id).cloned()
     }
 
@@ -679,19 +680,19 @@ impl SharedBufferManager {
     ///
     /// * `id` - Buffer identifier
     pub fn remove_buffer(&self, id: usize) {
-        let mut buffers = self.buffers.lock().expect("lock should not be poisoned");
+        let mut buffers = self.buffers.lock_or_recover();
         buffers.remove(&id);
     }
 
     /// Get total number of registered buffers
     pub fn buffer_count(&self) -> usize {
-        let buffers = self.buffers.lock().expect("lock should not be poisoned");
+        let buffers = self.buffers.lock_or_recover();
         buffers.len()
     }
 
     /// Get total bytes in all buffers
     pub fn total_bytes(&self) -> usize {
-        let buffers = self.buffers.lock().expect("lock should not be poisoned");
+        let buffers = self.buffers.lock_or_recover();
         buffers.values().map(|b| b.len()).sum()
     }
 }

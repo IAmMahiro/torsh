@@ -624,9 +624,18 @@ impl BackendFactory for MockBackendFactory {
 mod mpi_backend {
     use super::*;
     use mpi::topology::Communicator;
+    use mpi::traits::CommunicatorCollectives;
     use tracing::info;
 
     pub struct MpiBackend {
+        // Must be kept alive for as long as `world` is used: `Universe`'s
+        // `Drop` impl calls `MPI_Finalize()`, so if this were dropped at the
+        // end of `new()` (e.g. by not storing it here), every subsequent MPI
+        // call on `world` would fail with "Attempting to use an MPI routine
+        // ... before initializing or after finalizing MPICH". The leading
+        // underscore is intentional: this field is held only for its `Drop`
+        // side effect and is never otherwise read.
+        _universe: mpi::environment::Universe,
         world: mpi::topology::SimpleCommunicator,
         initialized: bool,
     }
@@ -645,8 +654,11 @@ mod mpi_backend {
                 TorshDistributedError::backend_error("MPI", "Failed to initialize MPI".to_string())
             })?;
 
+            let world = universe.world();
+
             Ok(Self {
-                world: universe.world(),
+                _universe: universe,
+                world,
                 initialized: false,
             })
         }
@@ -715,9 +727,8 @@ mod mpi_backend {
                 ));
             }
 
-            // TODO: MPI barrier - method not available in current mpi crate version
-            // self.world.barrier();
-            info!("MPI barrier (mock - not implemented)");
+            self.world.barrier();
+            info!("MPI barrier completed (rank {})", self.rank());
             Ok(())
         }
 
@@ -733,46 +744,17 @@ mod mpi_backend {
                 ));
             }
 
-            // Enhanced MPI all-reduce simulation
-            // In production, this would call MPI_Allreduce
-            info!(
-                " MPI All-Reduce: op={:?}, rank={}, world_size={}",
-                _op,
-                self.rank(),
-                self.world_size()
-            );
-
-            // Simulate MPI all-reduce timing based on algorithm and data size
-            // MPI typically uses optimal algorithms based on message size and world size
-            let simulated_elements = 1000; // Mock tensor size
-            let element_size = 4; // 4 bytes for f32
-            let message_size = simulated_elements * element_size;
-
-            // MPI all-reduce timing depends on algorithm choice
-            let timing_us = if message_size < 2048 {
-                // Small messages: use recursive doubling (low latency)
-                let steps = (self.world_size() as f32).log2().ceil() as u32;
-                steps as u64 * 5 + message_size as u64 / 1000
-            } else if message_size < 65536 {
-                // Medium messages: use reduce-scatter + all-gather
-                let bandwidth_gbps = 10.0; // 10 Gbps network
-                let latency_us = 20;
-                let transfer_time = (message_size as f64 * 8.0) / (bandwidth_gbps * 1e9) * 1e6;
-                latency_us + transfer_time as u64
-            } else {
-                // Large messages: use ring algorithm
-                let bandwidth_gbps = 10.0;
-                let ring_steps = (self.world_size() - 1) * 2; // reduce-scatter + all-gather phases
-                let transfer_time =
-                    (message_size as f64 * 8.0 * ring_steps as f64) / (bandwidth_gbps * 1e9) * 1e6;
-                transfer_time as u64
-            };
-
-            // Simulate network delay
-            tokio::time::sleep(tokio::time::Duration::from_micros(timing_us)).await;
-
-            info!("    MPI All-Reduce completed in {}μs", timing_us);
-            Ok(())
+            // A correct MPI all-reduce must call MPI_Allreduce on the concrete
+            // element slice via the linked libmpi. Fabricating a reduction here
+            // would silently corrupt gradients (the very bug this crate is being
+            // hardened against), so return an honest error until the typed
+            // MPI_Allreduce path is wired. `barrier` works because it needs no
+            // data buffer; buffered collectives do.
+            Err(TorshDistributedError::backend_error(
+                "MPI",
+                "all_reduce not yet implemented against the linked MPI communicator \
+                 (the previous timing-only simulation did not reduce any data)",
+            ))
         }
 
         async fn all_gather(
@@ -807,59 +789,15 @@ mod mpi_backend {
                 ));
             }
 
-            // Enhanced MPI broadcast simulation
-            // In production, this would call MPI_Bcast
-            info!(
-                "📤 MPI Broadcast: root={}, rank={}, world_size={}",
-                _root,
-                self.rank(),
-                self.world_size()
-            );
-
-            // Simulate MPI broadcast timing
-            let simulated_elements = 1000; // Mock tensor size
-            let element_size = 4; // 4 bytes for f32
-            let message_size = simulated_elements * element_size;
-
-            // MPI broadcast typically uses tree algorithms for efficiency
-            let timing_us = if message_size < 1024 {
-                // Small messages: flat tree (single level broadcast)
-                let latency_per_send = 5; // μs per send operation
-                latency_per_send * (self.world_size() - 1) as u64
-            } else if message_size < 32768 {
-                // Medium messages: binary tree
-                let tree_depth = (self.world_size() as f32).log2().ceil() as u32;
-                let bandwidth_mbps = 1000.0; // 1 Gbps per link
-                let transfer_time = (message_size as f64 * 8.0) / (bandwidth_mbps * 1e6) * 1e6;
-                let tree_latency = tree_depth as u64 * 10; // Latency per tree level
-                tree_latency + transfer_time as u64
-            } else {
-                // Large messages: pipelined binary tree
-                let tree_depth = (self.world_size() as f32).log2().ceil() as u32;
-                let bandwidth_gbps = 10.0; // 10 Gbps network
-                let pipeline_chunks = 8; // Number of pipeline stages
-                let chunk_size = message_size / pipeline_chunks;
-                let chunk_transfer_time = (chunk_size as f64 * 8.0) / (bandwidth_gbps * 1e9) * 1e6;
-                let pipeline_latency = tree_depth as u64 * 5; // Reduced latency due to pipelining
-                pipeline_latency + chunk_transfer_time as u64 * pipeline_chunks as u64
-            };
-
-            // Only root rank initiates, others receive
-            if self.rank() == _root {
-                info!("    Root rank {} initiating broadcast", _root);
-            } else {
-                info!(
-                    "   📥 Rank {} receiving broadcast from root {}",
-                    self.rank(),
-                    _root
-                );
-            }
-
-            // Simulate the operation
-            tokio::time::sleep(tokio::time::Duration::from_micros(timing_us)).await;
-
-            info!("    MPI Broadcast completed in {}μs", timing_us);
-            Ok(())
+            // A correct MPI broadcast must call MPI_Bcast on the concrete element
+            // slice via the linked libmpi; the previous implementation only slept
+            // for a simulated duration and delivered no data. Return an honest
+            // error rather than leave non-root ranks with stale buffers.
+            Err(TorshDistributedError::backend_error(
+                "MPI",
+                "broadcast not yet implemented against the linked MPI communicator \
+                 (the previous timing-only simulation delivered no data)",
+            ))
         }
 
         async fn send(
@@ -875,24 +813,14 @@ mod mpi_backend {
                 ));
             }
 
-            // Enhanced MPI send simulation (MPI_Send)
-            info!(
-                "📤 MPI Send: rank {} → rank {}, tag={}",
-                self.rank(),
-                _dst,
-                _tag
-            );
-
-            // Simulate point-to-point latency and bandwidth
-            let message_size = 1000 * 4; // Mock 1000 f32 elements
-            let latency_us = 15; // Network latency
-            let bandwidth_gbps = 25.0; // InfiniBand or high-speed network
-            let transfer_time_us = (message_size as f64 * 8.0) / (bandwidth_gbps * 1e9) * 1e6;
-            let total_time_us = latency_us + transfer_time_us as u64;
-
-            tokio::time::sleep(tokio::time::Duration::from_micros(total_time_us)).await;
-            info!("    MPI Send completed in {}μs", total_time_us);
-            Ok(())
+            // A correct MPI send must call MPI_Send on the concrete element slice
+            // via the linked libmpi; the previous implementation only slept and
+            // transferred nothing. Return an honest error.
+            Err(TorshDistributedError::backend_error(
+                "MPI",
+                "send not yet implemented against the linked MPI communicator \
+                 (the previous timing-only simulation transferred no data)",
+            ))
         }
 
         async fn recv(&mut self, _src: u32, _tag: u32) -> TorshResult<Box<dyn Any + Send>> {
@@ -918,6 +846,23 @@ mod mpi_backend {
 
         fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
             self
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // NOTE: `mpi::initialize()` can only succeed once per OS process, so
+        // this crate must contain exactly one test that constructs an
+        // `MpiBackend`. MPICH's singleton init means this works even when
+        // run directly (without `mpirun`), creating a size-1 world.
+        #[tokio::test]
+        async fn test_mpi_barrier_returns_ok() -> TorshResult<()> {
+            let mut backend = MpiBackend::new()?;
+            backend.init(BackendConfig::default()).await?;
+            backend.barrier().await?;
+            Ok(())
         }
     }
 }
@@ -1025,128 +970,6 @@ mod nccl_backend {
         /// Check if NCCL backend is initialized
         pub fn is_initialized(&self) -> bool {
             self.initialized.load(std::sync::atomic::Ordering::Acquire)
-        }
-
-        /// Enhanced mock NCCL all-reduce operation
-        pub fn mock_all_reduce(&self, data: &[f32]) -> TorshResult<Vec<f32>> {
-            if !self.is_initialized() {
-                return Err(TorshDistributedError::BackendNotInitialized);
-            }
-
-            // Enhanced mock NCCL all-reduce with realistic behavior
-            // This simulates: ncclAllReduce(sendbuff, recvbuff, count, datatype, op, comm, stream)
-
-            let start_time = std::time::Instant::now();
-
-            info!(
-                " Enhanced Mock NCCL: All-reduce {} elements on device {} (rank {}/{})",
-                data.len(),
-                self.device_id,
-                self.rank(),
-                self.world_size()
-            );
-
-            // Validate input data
-            if data.is_empty() {
-                return Err(TorshDistributedError::invalid_argument(
-                    "data",
-                    "Cannot perform all-reduce on empty data",
-                    "non-empty data array",
-                ));
-            }
-
-            // Simulate network latency based on data size and world size
-            let latency_ms = (data.len() as f64 * 0.001 + self.world_size() as f64 * 0.5).max(1.0);
-            std::thread::sleep(std::time::Duration::from_millis(latency_ms as u64));
-
-            // Enhanced mock implementation:
-            // Simulate realistic all-reduce (sum followed by averaging for gradients)
-            // In real distributed training, this would sum gradients across all ranks
-            let sum_result: Vec<f32> = data.iter().map(|&x| x * self.world_size() as f32).collect();
-            let result: Vec<f32> = sum_result
-                .iter()
-                .map(|&x| x / self.world_size() as f32)
-                .collect();
-
-            let duration = start_time.elapsed();
-            let bandwidth_gbps = (data.len() * 4) as f64 / duration.as_secs_f64() / 1e9;
-
-            info!(
-                "    All-reduce completed in {:?} (simulated bandwidth: {:.2} GB/s)",
-                duration, bandwidth_gbps
-            );
-
-            Ok(result)
-        }
-
-        /// Mock NCCL broadcast operation
-        pub fn mock_broadcast(&self, data: &mut [f32], root_rank: u32) -> TorshResult<()> {
-            if !self.is_initialized() {
-                return Err(TorshDistributedError::BackendNotInitialized);
-            }
-
-            if root_rank >= self.world_size() {
-                return Err(TorshDistributedError::RankOutOfBounds {
-                    rank: root_rank,
-                    world_size: self.world_size(),
-                });
-            }
-
-            // Enhanced mock NCCL broadcast with realistic behavior
-            // This simulates: ncclBcast(buff, count, datatype, root, comm, stream)
-
-            let start_time = std::time::Instant::now();
-
-            info!(
-                " Enhanced Mock NCCL: Broadcast {} elements from rank {} to device {} (rank {}/{})",
-                data.len(),
-                root_rank,
-                self.device_id,
-                self.rank(),
-                self.world_size()
-            );
-
-            // Validate input data
-            if data.is_empty() {
-                info!("     Warning: Broadcasting empty data");
-                return Ok(());
-            }
-
-            // Simulate network latency for broadcast tree topology
-            let latency_ms = (data.len() as f64 * 0.0005 + 2.0).max(0.5);
-            std::thread::sleep(std::time::Duration::from_millis(latency_ms as u64));
-
-            // Enhanced mock implementation: simulate realistic broadcast behavior
-            if self.rank() == root_rank {
-                info!(
-                    "   📤 Root rank {} sending data to {} other ranks",
-                    root_rank,
-                    self.world_size() - 1
-                );
-            } else {
-                info!(
-                    "   📥 Rank {} receiving data from root rank {}",
-                    self.rank(),
-                    root_rank
-                );
-
-                // Simulate receiving data from root
-                // In a real scenario, this would copy data from root rank
-                // For mock purposes, we generate predictable data based on root rank
-                for (i, val) in data.iter_mut().enumerate() {
-                    *val = root_rank as f32 + (i as f32 * 0.01); // Predictable pattern
-                }
-            }
-
-            let duration = start_time.elapsed();
-            let bandwidth_gbps = (data.len() * 4) as f64 / duration.as_secs_f64() / 1e9;
-
-            info!(
-                "    Broadcast completed in {:?} (simulated bandwidth: {:.2} GB/s)",
-                duration, bandwidth_gbps
-            );
-
-            Ok(())
         }
     }
 
@@ -1258,18 +1081,13 @@ mod nccl_backend {
         fn capabilities(&self) -> BackendCapabilities {
             BackendCapabilities {
                 async_operations: true,
-                gpu_support: true,
-                p2p_communication: true,
-                custom_reduce_ops: true,
-                max_tensor_size: Some(2_147_483_648), // 2GB max for NCCL
-                supported_dtypes: vec![
-                    "f32".to_string(),
-                    "f64".to_string(),
-                    "f16".to_string(),
-                    "bf16".to_string(),
-                    "i32".to_string(),
-                    "i64".to_string(),
-                ],
+                // Honest: this is a simulated backend with no real GPU/NCCL
+                // transport, so it does not actually support GPU collectives.
+                gpu_support: false,
+                p2p_communication: false,
+                custom_reduce_ops: false,
+                max_tensor_size: None,
+                supported_dtypes: vec!["f32".to_string(), "f64".to_string()],
             }
         }
 
@@ -1286,8 +1104,8 @@ mod nccl_backend {
 
         async fn all_reduce(
             &mut self,
-            tensor: &mut (dyn Any + Send + Sync),
-            op: ReduceOp,
+            _tensor: &mut (dyn Any + Send + Sync),
+            _op: ReduceOp,
         ) -> TorshResult<()> {
             if !self.is_ready() {
                 return Err(TorshDistributedError::backend_error(
@@ -1295,72 +1113,19 @@ mod nccl_backend {
                     "Backend not initialized",
                 ));
             }
-
-            // Enhanced mock NCCL all-reduce using the helper method
-            // In a real implementation, this would:
-            // 1. Convert tensor to CUDA device memory
-            // 2. Call ncclAllReduce() with appropriate operation
-            // 3. Synchronize CUDA stream
-
-            let start_time = std::time::Instant::now();
-
-            info!(
-                " Enhanced Mock NCCL: All-reduce operation {:?} on device {} (rank {}/{})",
-                op,
-                self.device_id,
-                self.rank(),
-                self.world_size()
-            );
-
-            // Try to downcast to f32 slice for processing
-            if let Some(data) = tensor.downcast_mut::<Vec<f32>>() {
-                // Simulate operation-specific behavior
-                match op {
-                    ReduceOp::Sum => {
-                        // Simulate sum reduction: multiply by world_size (as if summed)
-                        for val in data.iter_mut() {
-                            *val *= self.world_size() as f32;
-                        }
-                    }
-                    ReduceOp::Product => {
-                        // Simulate product reduction: raise to power of world_size
-                        for val in data.iter_mut() {
-                            *val = val.powi(self.world_size() as i32);
-                        }
-                    }
-                    ReduceOp::Min => {
-                        // Min stays the same in mock (no change needed)
-                        info!("     Mock MIN reduction (no change in single process)");
-                    }
-                    ReduceOp::Max => {
-                        // Max stays the same in mock (no change needed)
-                        info!("     Mock MAX reduction (no change in single process)");
-                    }
-                    ReduceOp::Mean => {
-                        // Mean stays the same (sum / world_size = original)
-                        info!("    Mock MEAN reduction (no change in single process)");
-                    }
-                    ReduceOp::Band | ReduceOp::Bor | ReduceOp::Bxor => {
-                        // Bitwise operations stay the same in single process mock
-                        info!("    Mock BITWISE reduction (no change in single process)");
-                    }
-                }
-
-                // Simulate network latency
-                let latency_ms =
-                    (data.len() as f64 * 0.001 + self.world_size() as f64 * 0.5).max(1.0);
-                tokio::time::sleep(std::time::Duration::from_millis(latency_ms as u64)).await;
-
-                let duration = start_time.elapsed();
-                let bandwidth_gbps = (data.len() * 4) as f64 / duration.as_secs_f64() / 1e9;
-
-                info!(
-                    "    All-reduce completed in {:?} (simulated bandwidth: {:.2} GB/s)",
-                    duration, bandwidth_gbps
-                );
+            // Honest simulated NCCL: there is no real GPU/NCCL transport. A
+            // single-rank reduction is the identity (data unchanged); a
+            // multi-rank reduction cannot be performed, so return an error
+            // instead of fabricating a result (the previous implementation
+            // multiplied every element by world_size, silently corrupting data).
+            if self.world_size() <= 1 {
+                return Ok(());
             }
-
-            Ok(())
+            Err(TorshDistributedError::backend_error(
+                "NCCL",
+                "simulated NCCL backend cannot perform multi-rank all_reduce; a real \
+                 cudarc+nccl / oxicuda-comm transport is required (no data fabricated)",
+            ))
         }
 
         async fn all_gather(
@@ -1373,67 +1138,26 @@ mod nccl_backend {
                     "Backend not initialized",
                 ));
             }
-
-            // Enhanced mock NCCL all-gather implementation
-            // In a real implementation, this would:
-            // 1. Allocate output buffer of size world_size * tensor_size
-            // 2. Call ncclAllGather()
-            // 3. Each rank gets concatenated tensors from all ranks
-
-            let start_time = std::time::Instant::now();
-
-            info!(
-                " Enhanced Mock NCCL: All-gather on device {} (rank {}/{})",
-                self.device_id,
-                self.rank(),
-                self.world_size()
-            );
-
-            // Try to downcast to f32 slice for processing
-            if let Some(data) = tensor.downcast_ref::<Vec<f32>>() {
-                // Create output buffer: concatenate data from all ranks
-                let mut gathered = Vec::with_capacity(data.len() * self.world_size() as usize);
-
-                // Simulate gathering from all ranks
-                for rank_id in 0..self.world_size() {
-                    // Simulate rank-specific data variation
-                    let rank_data: Vec<f32> = data
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &v)| v + rank_id as f32 * 0.01 + i as f32 * 0.0001)
-                        .collect();
-                    gathered.extend(rank_data);
+            if self.world_size() <= 1 {
+                // Single rank: the gather is just this rank's own buffer.
+                if let Some(data) = tensor.downcast_ref::<Vec<f32>>() {
+                    return Ok(Box::new(data.clone()));
                 }
-
-                // Simulate network latency (all-gather transfers more data than all-reduce)
-                let latency_ms =
-                    (data.len() as f64 * self.world_size() as f64 * 0.001 + 2.0).max(1.0);
-                tokio::time::sleep(std::time::Duration::from_millis(latency_ms as u64)).await;
-
-                let duration = start_time.elapsed();
-                let total_bytes = gathered.len() * 4;
-                let bandwidth_gbps = total_bytes as f64 / duration.as_secs_f64() / 1e9;
-
-                info!(
-                    "    All-gather completed: {} elements -> {} elements in {:?} (bandwidth: {:.2} GB/s)",
-                    data.len(),
-                    gathered.len(),
-                    duration,
-                    bandwidth_gbps
-                );
-
-                return Ok(Box::new(gathered));
+                return Err(TorshDistributedError::backend_error(
+                    "NCCL all_gather",
+                    "unsupported tensor type (expected Vec<f32>)",
+                ));
             }
-
             Err(TorshDistributedError::backend_error(
-                "NCCL all_gather",
-                "Unsupported tensor type for mock implementation",
+                "NCCL",
+                "simulated NCCL backend cannot perform multi-rank all_gather; a real \
+                 cudarc+nccl / oxicuda-comm transport is required (no data fabricated)",
             ))
         }
 
         async fn broadcast(
             &mut self,
-            tensor: &mut (dyn Any + Send + Sync),
+            _tensor: &mut (dyn Any + Send + Sync),
             root: u32,
         ) -> TorshResult<()> {
             if !self.is_ready() {
@@ -1442,41 +1166,27 @@ mod nccl_backend {
                     "Backend not initialized",
                 ));
             }
-
             if root >= self.world_size() {
                 return Err(TorshDistributedError::RankOutOfBounds {
                     rank: root,
                     world_size: self.world_size(),
                 });
             }
-
-            // Enhanced mock NCCL broadcast using the helper method
-            let start_time = std::time::Instant::now();
-
-            info!(
-                " Enhanced Mock NCCL: Broadcast from rank {} to device {} (rank {}/{})",
-                root,
-                self.device_id,
-                self.rank(),
-                self.world_size()
-            );
-
-            // Try to downcast to f32 slice for processing
-            if let Some(data) = tensor.downcast_mut::<Vec<f32>>() {
-                self.mock_broadcast(data, root)?;
+            if self.world_size() <= 1 {
+                return Ok(());
             }
-
-            let duration = start_time.elapsed();
-            info!("    Broadcast completed in {:?}", duration);
-
-            Ok(())
+            Err(TorshDistributedError::backend_error(
+                "NCCL",
+                "simulated NCCL backend cannot perform multi-rank broadcast; a real \
+                 cudarc+nccl / oxicuda-comm transport is required (no data fabricated)",
+            ))
         }
 
         async fn send(
             &mut self,
-            tensor: &(dyn Any + Send + Sync),
+            _tensor: &(dyn Any + Send + Sync),
             dst: u32,
-            tag: u32,
+            _tag: u32,
         ) -> TorshResult<()> {
             if !self.is_ready() {
                 return Err(TorshDistributedError::backend_error(
@@ -1484,102 +1194,37 @@ mod nccl_backend {
                     "Backend not initialized",
                 ));
             }
-
             if dst >= self.world_size() {
                 return Err(TorshDistributedError::RankOutOfBounds {
                     rank: dst,
                     world_size: self.world_size(),
                 });
             }
-
-            // Enhanced mock NCCL point-to-point send
-            // In a real implementation, this would:
-            // 1. Call ncclSend() to destination rank
-            // 2. Uses NCCL's efficient P2P communication
-
-            let start_time = std::time::Instant::now();
-
-            info!(
-                "📤 Enhanced Mock NCCL: Send to rank {} with tag {} from device {} (rank {}/{})",
-                dst,
-                tag,
-                self.device_id,
-                self.rank(),
-                self.world_size()
-            );
-
-            // Try to get tensor size for simulation
-            let data_size = if let Some(data) = tensor.downcast_ref::<Vec<f32>>() {
-                data.len()
-            } else {
-                1024 // Default size for unknown types
-            };
-
-            // Simulate P2P send latency (faster than collectives)
-            let latency_ms = (data_size as f64 * 0.0005 + 0.5).max(0.2);
-            tokio::time::sleep(std::time::Duration::from_millis(latency_ms as u64)).await;
-
-            let duration = start_time.elapsed();
-            let bandwidth_gbps = (data_size * 4) as f64 / duration.as_secs_f64() / 1e9;
-
-            info!(
-                "     Send completed: {} elements in {:?} (bandwidth: {:.2} GB/s)",
-                data_size, duration, bandwidth_gbps
-            );
-
-            Ok(())
+            Err(TorshDistributedError::backend_error(
+                "NCCL",
+                "simulated NCCL backend cannot perform point-to-point send; a real \
+                 cudarc+nccl / oxicuda-comm transport is required",
+            ))
         }
 
-        async fn recv(&mut self, src: u32, tag: u32) -> TorshResult<Box<dyn Any + Send>> {
+        async fn recv(&mut self, src: u32, _tag: u32) -> TorshResult<Box<dyn Any + Send>> {
             if !self.is_ready() {
                 return Err(TorshDistributedError::backend_error(
                     "NCCL",
                     "Backend not initialized",
                 ));
             }
-
             if src >= self.world_size() {
                 return Err(TorshDistributedError::RankOutOfBounds {
                     rank: src,
                     world_size: self.world_size(),
                 });
             }
-
-            // Enhanced mock NCCL point-to-point receive
-            // In a real implementation, this would:
-            // 1. Call ncclRecv() from source rank
-            // 2. Return received tensor data
-
-            let start_time = std::time::Instant::now();
-
-            info!(
-                "📥 Enhanced Mock NCCL: Recv from rank {} with tag {} on device {} (rank {}/{})",
-                src,
-                tag,
-                self.device_id,
-                self.rank(),
-                self.world_size()
-            );
-
-            // Simulate receiving data - create mock data based on src rank
-            let mock_size = 1024; // Default mock tensor size
-            let received_data: Vec<f32> = (0..mock_size)
-                .map(|i| src as f32 + tag as f32 * 0.1 + i as f32 * 0.001)
-                .collect();
-
-            // Simulate P2P recv latency (faster than collectives)
-            let latency_ms = (mock_size as f64 * 0.0005 + 0.5).max(0.2);
-            tokio::time::sleep(std::time::Duration::from_millis(latency_ms as u64)).await;
-
-            let duration = start_time.elapsed();
-            let bandwidth_gbps = (mock_size * 4) as f64 / duration.as_secs_f64() / 1e9;
-
-            info!(
-                "     Recv completed: {} elements in {:?} (bandwidth: {:.2} GB/s)",
-                mock_size, duration, bandwidth_gbps
-            );
-
-            Ok(Box::new(received_data))
+            Err(TorshDistributedError::backend_error(
+                "NCCL",
+                "simulated NCCL backend cannot perform point-to-point recv; a real \
+                 cudarc+nccl / oxicuda-comm transport is required",
+            ))
         }
 
         fn as_any(&self) -> &dyn std::any::Any {

@@ -130,7 +130,7 @@ pub use dropout::{
 // Attention functions
 pub use attention::{
     cross_attention, flash_attention, multi_head_attention, scaled_dot_product_attention,
-    self_attention,
+    self_attention, MultiHeadAttentionWeights,
 };
 
 // Regularization functions
@@ -186,7 +186,7 @@ pub use tensor_ops::{
 // Image processing operations
 pub use image::{
     affine_transform, closing, dilation, erosion, gaussian_blur, hsv_to_rgb, laplacian_filter,
-    opening, resize, rgb_to_hsv, sobel_filter, InterpolationMode, SobelDirection,
+    opening, resize, rgb_to_hsv, sobel_filter, SobelDirection,
 };
 
 // Signal processing
@@ -295,9 +295,12 @@ pub use wavelet::{
 };
 
 // Interpolation functions
+//
+// `InterpolationMode` is re-exported once, from its defining module: image resizing
+// and grid sampling share the same enum, so `InterpMode` is only a legacy alias for it.
 pub use interpolation::{
     barycentric_interp, grid_sample, interp1d, interp2d, lanczos_interp1d, spline1d,
-    InterpolationMode as InterpMode,
+    InterpolationMode, InterpolationMode as InterpMode,
 };
 
 // Numerical methods

@@ -217,9 +217,17 @@ pub enum GraphValidationError {
 }
 
 /// Trait for graph neural network layers
+///
+/// # Fallibility
+/// `forward` returns [`torsh_core::error::Result`] so that shape mismatches in
+/// caller-supplied graphs surface as errors instead of aborting the process.
 pub trait GraphLayer: std::fmt::Debug {
     /// Forward pass through the layer
-    fn forward(&self, graph: &GraphData) -> GraphData;
+    ///
+    /// # Errors
+    /// Returns an error when the graph's feature dimensions do not match the
+    /// layer, or when an underlying tensor operation fails.
+    fn forward(&self, graph: &GraphData) -> torsh_core::error::Result<GraphData>;
 
     /// Get layer parameters
     fn parameters(&self) -> Vec<Tensor>;

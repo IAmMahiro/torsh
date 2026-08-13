@@ -196,7 +196,7 @@ impl ElasticAveragingSGD {
 
             // Update parameters
             let update = effective_grad.mul_scalar(self.lr)?;
-            *param = param.sub(&update)?;
+            crate::param_update::sub_assign(&mut param, &update)?;
         }
 
         Ok(())

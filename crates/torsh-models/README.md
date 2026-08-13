@@ -14,42 +14,39 @@ This crate provides ready-to-use model architectures for various domains:
 
 ## Usage
 
+> **Note.** Several code samples below (EfficientNet, object detection,
+> segmentation, and the NLP/audio/multimodal families) illustrate the *intended*
+> API for models that are still on the roadmap and are **not constructible in
+> this release** — see [Available Models](#available-models) for what actually
+> compiles today (ResNet and Vision Transformer). Pretrained factories return an
+> error when asked for pretrained weights; they never fabricate random weights.
+
 ### Vision Models
 
 ```rust
-use torsh_models::vision::*;
+// What actually compiles today: ResNet and Vision Transformer, constructed
+// from randomly-initialized weights (pretrained factories return an error
+// rather than fabricating weights).
+use torsh_models::vision::resnet::ResNet;
+use torsh_models::vision::vit::{VisionTransformer, ViTConfig};
 
-// ResNet variants
-let resnet18 = resnet::resnet18(pretrained=true, num_classes=1000)?;
-let resnet50 = resnet::resnet50(pretrained=true, num_classes=1000)?;
-let resnet101 = resnet::resnet101(pretrained=true, num_classes=1000)?;
+// ResNet variants — each takes the number of output classes.
+let resnet18 = ResNet::resnet18(1000)?;
+let resnet50 = ResNet::resnet50(1000)?;
 
-// Custom configuration
-let custom_resnet = resnet::ResNet::new(
-    resnet::ResNetConfig {
-        layers: vec![3, 4, 6, 3],
-        num_classes: 100,
-        groups: 1,
-        width_per_group: 64,
-        norm_layer: Some(BatchNorm2d),
-    }
-)?;
+// Vision Transformer — built from a named configuration.
+let vit_b_16 = VisionTransformer::new(ViTConfig::vit_base_patch16_224())?;
+```
 
-// EfficientNet family
-let efficientnet_b0 = efficientnet::efficientnet_b0(pretrained=true)?;
-let efficientnet_b7 = efficientnet::efficientnet_b7(pretrained=true)?;
+The following families illustrate the *intended* API and are **on the roadmap**,
+not constructible in this release (Python-style keyword arguments below are
+pseudocode, not valid Rust):
 
-// Vision Transformer
-let vit_b_16 = vit::vit_base_patch16_224(pretrained=true)?;
-let vit_l_32 = vit::vit_large_patch32_384(pretrained=true)?;
-
-// Object Detection
-let faster_rcnn = detection::fasterrcnn_resnet50_fpn(pretrained=true)?;
-let mask_rcnn = detection::maskrcnn_resnet50_fpn(pretrained=true)?;
-
-// Segmentation
-let deeplabv3 = segmentation::deeplabv3_resnet101(pretrained=true)?;
-let fcn = segmentation::fcn_resnet50(pretrained=true)?;
+```text
+// Roadmap (not yet available):
+efficientnet::efficientnet_b0(pretrained=true)
+detection::fasterrcnn_resnet50_fpn(pretrained=true)
+segmentation::deeplabv3_resnet101(pretrained=true)
 ```
 
 ### NLP Models
@@ -722,40 +719,34 @@ let model = ModelType::load("model.safetensors")?;
 
 ## Available Models
 
-### Vision
-- ResNet (18, 34, 50, 101, 152)
-- ResNeXt (50, 101)
-- Wide ResNet
-- EfficientNet (B0-B7)
-- MobileNet (V2, V3)
-- VGG (11, 13, 16, 19)
-- DenseNet (121, 161, 169, 201)
-- Vision Transformer (ViT)
-- Swin Transformer
-- ConvNeXt
+> **Implementation status (v0.2.0).** Only the models listed under
+> **"Wired into the model zoo"** below are compiled, constructible through the
+> `ModelType` entry point, and covered by tests. Every model under
+> **"Roadmap"** has source present in the crate but is **not** yet wired into
+> the build graph (it needs updates to the current `torsh-nn` API) and cannot be
+> constructed today. **No pretrained weights ship with this crate**: pretrained
+> factory functions return an error when asked for pretrained weights rather than
+> silently returning randomly-initialized ones.
 
-### NLP
-- BERT (Base, Large)
-- RoBERTa
-- GPT-2 (Small, Medium, Large, XL)
-- T5 (Small, Base, Large)
-- BART
-- XLNet
-- ELECTRA
+### Wired into the model zoo (compiled, constructible, tested)
 
-### Audio
-- Wav2Vec2
-- Whisper
-- HuBERT
-- WavLM
+- **Vision**: ResNet (18, 34, 50, 101, 152), Vision Transformer (ViT)
 
-### Detection & Segmentation
-- Faster R-CNN
-- Mask R-CNN
-- YOLO (v5, v8)
-- DETR
-- DeepLabV3
-- U-Net
+### Roadmap (source present, not yet wired to the current torsh-nn API)
+
+These architectures exist in the source tree but are not reachable through
+`ModelType` and do not compile into the crate yet:
+
+- **Vision**: EfficientNet (B0–B7), MobileNet (V2, V3), DenseNet (121/161/169/201),
+  Swin Transformer, ConvNeXt, ResNeXt, Wide ResNet
+- **Detection & Segmentation**: Mask R-CNN, YOLO, DETR, U-Net (2D/3D)
+- **NLP**: BERT, RoBERTa, GPT-2, T5, BART, XLNet, ELECTRA, DeBERTa, Longformer, BigBird
+- **Audio**: Wav2Vec2, Whisper, HuBERT, WavLM
+- **Multimodal**: CLIP, ALIGN, BLIP / InstructBLIP, Flamingo, LLaVA, DALL-E
+
+## Testing
+
+This crate has 319 passing tests, 6 skipped (`cargo nextest run -p torsh-models --all-features`).
 
 ## License
 

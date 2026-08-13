@@ -14,6 +14,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use torsh_core::sync::MutexExt;
 
 /// Backend capabilities that can be supported
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -855,10 +856,7 @@ impl AutogradBackend for ReferenceBackend {
     }
 
     fn get_performance_stats(&self) -> PerformanceStats {
-        self.performance_stats
-            .lock()
-            .expect("lock should not be poisoned")
-            .clone()
+        self.performance_stats.lock_or_recover().clone()
     }
 }
 

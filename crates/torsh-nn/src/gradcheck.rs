@@ -86,12 +86,26 @@ impl GradCheckResult {
     }
 
     /// Get the worst parameter (highest error)
+    ///
+    /// A `NaN` difference is the most severe possible outcome — it is exactly
+    /// the broken-gradient case gradcheck exists to surface — so it sorts above
+    /// every finite difference instead of aborting the comparison.
+    /// [`f64::total_cmp`] orders `NaN` last, which is the ordering we want.
     pub fn worst_parameter(&self) -> Option<&ParameterGradCheckResult> {
-        self.parameter_results.iter().max_by(|a, b| {
-            a.max_abs_diff
-                .partial_cmp(&b.max_abs_diff)
-                .expect("max_abs_diff comparison should not involve NaN")
-        })
+        self.parameter_results
+            .iter()
+            .max_by(|a, b| a.max_abs_diff.total_cmp(&b.max_abs_diff))
+    }
+
+    /// Parameters whose gradient difference is `NaN`.
+    ///
+    /// These are the most severe failures: the analytical or numerical gradient
+    /// itself is not a number, so no tolerance comparison is meaningful.
+    pub fn nan_parameters(&self) -> Vec<&ParameterGradCheckResult> {
+        self.parameter_results
+            .iter()
+            .filter(|result| result.max_abs_diff.is_nan() || result.max_rel_diff.is_nan())
+            .collect()
     }
 }
 
@@ -156,11 +170,24 @@ impl GradChecker {
             )
         } else {
             let failed_count = parameter_results.iter().filter(|r| !r.passed).count();
-            format!(
-                "{} out of {} parameters failed gradient check",
-                failed_count,
-                parameter_results.len()
-            )
+            let nan_count = parameter_results
+                .iter()
+                .filter(|r| r.max_abs_diff.is_nan() || r.max_rel_diff.is_nan())
+                .count();
+            if nan_count > 0 {
+                format!(
+                    "{} out of {} parameters failed gradient check ({} produced NaN differences)",
+                    failed_count,
+                    parameter_results.len(),
+                    nan_count
+                )
+            } else {
+                format!(
+                    "{} out of {} parameters failed gradient check",
+                    failed_count,
+                    parameter_results.len()
+                )
+            }
         };
 
         Ok(GradCheckResult {
@@ -476,6 +503,10 @@ impl GradChecker {
         let mut max_abs_diff: f64 = 0.0;
         let mut max_rel_diff: f64 = 0.0;
         let mut all_within_tolerance = true;
+        // A NaN difference can never satisfy a tolerance comparison, and
+        // `f64::max` would quietly discard it (it returns the non-NaN operand).
+        // Track it explicitly so the reported difference stays NaN.
+        let mut saw_nan = false;
 
         for (_i, (&a, &n)) in anal_data.iter().zip(num_data.iter()).enumerate() {
             let abs_diff = (a as f64 - n as f64).abs();
@@ -485,12 +516,23 @@ impl GradChecker {
                 abs_diff
             };
 
+            if abs_diff.is_nan() || rel_diff.is_nan() {
+                saw_nan = true;
+                all_within_tolerance = false;
+                continue;
+            }
+
             max_abs_diff = max_abs_diff.max(abs_diff);
             max_rel_diff = max_rel_diff.max(rel_diff);
 
             if abs_diff > self.config.atol && rel_diff > self.config.rtol {
                 all_within_tolerance = false;
             }
+        }
+
+        if saw_nan {
+            max_abs_diff = f64::NAN;
+            max_rel_diff = f64::NAN;
         }
 
         Ok((

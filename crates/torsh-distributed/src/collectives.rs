@@ -4,12 +4,65 @@
 #![allow(dead_code)]
 use crate::backend::ReduceOp;
 use crate::process_group::ProcessGroup;
+use crate::tcp_backend::{encode_any, Payload, TcpBackend, TcpEngine};
 use crate::TorshResult;
 use log::info;
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use torsh_core::dtype::FloatElement;
 use torsh_tensor::Tensor;
+
+/// Obtain the real TCP collective engine for `group`, or an honest error if the
+/// active backend cannot perform cross-rank collectives.
+///
+/// The backend read-guard is released before returning, so the returned
+/// `Arc<TcpEngine>` can be awaited without holding any lock across `.await`
+/// (required by the DDP background-sync path, which `tokio::spawn`s gradient
+/// all-reduces and therefore needs a `Send` future).
+fn tcp_engine(group: &ProcessGroup) -> TorshResult<Arc<TcpEngine>> {
+    let backend = group.backend();
+    let guard = backend.read();
+    if !guard.is_ready() {
+        return Err(crate::TorshDistributedError::BackendNotInitialized);
+    }
+    guard
+        .as_any()
+        .downcast_ref::<TcpBackend>()
+        .map(|b| b.engine())
+        .ok_or_else(|| {
+            crate::TorshDistributedError::feature_not_available(
+                "cross-rank collective communication",
+                "the Gloo (TCP) backend; the active backend cannot perform real \
+                 collectives for world_size > 1",
+            )
+        })
+}
+
+/// Validate that the backend is initialised, backend-agnostically.
+///
+/// Used on the trivial `world_size <= 1` paths so a single-rank collective is
+/// correct for ANY backend type (not just the TCP backend), while still
+/// rejecting an uninitialised process group.
+fn check_ready(group: &ProcessGroup) -> TorshResult<()> {
+    let guard = group.backend().read();
+    crate::communication::validate_backend_initialized(&**guard)
+}
+
+/// Decode a received payload into a `Vec<T>`, erroring on a dtype mismatch.
+fn payload_into_vec<T: FloatElement>(payload: Payload) -> TorshResult<Vec<T>> {
+    payload
+        .into_box()
+        .downcast::<Vec<T>>()
+        .map(|b| *b)
+        .map_err(|_| {
+            crate::TorshDistributedError::invalid_argument(
+                "dtype",
+                "received payload element type does not match the local tensor",
+                "matching f32/f64 element type across ranks",
+            )
+        })
+}
 
 /// Communication group for selective collective operations
 #[derive(Debug, Clone)]
@@ -228,9 +281,14 @@ impl GroupManager {
     }
 }
 
-/// All-reduce: reduce tensor across all processes and distribute result
+/// All-reduce: reduce `tensor` across all processes and distribute the result.
+///
+/// Performs a real cross-rank reduction over the TCP backend. For
+/// `world_size == 1` the operation is the identity (correct for every op) and
+/// no network I/O occurs. For `world_size > 1` an honest error is returned if
+/// the active backend cannot communicate.
 pub async fn all_reduce<T>(
-    _tensor: &mut Tensor<T>,
+    tensor: &mut Tensor<T>,
     op: ReduceOp,
     group: &ProcessGroup,
 ) -> TorshResult<()>
@@ -243,70 +301,105 @@ where
         + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>,
 {
-    use crate::communication::with_backend_read;
+    let world_size = group.world_size();
+    if world_size <= 1 {
+        check_ready(group)?;
+        return Ok(());
+    }
+    let engine = tcp_engine(group)?;
+    let participants: Vec<u32> = (0..world_size).collect();
 
-    // For now, implement a mock version
-    // In a real implementation, this would use the backend's communication primitives
-    with_backend_read(group, |backend_guard| {
-        // Mock implementation: for sum, divide by world size to simulate averaging
-        if let ReduceOp::Sum = op {
-            let world_size = backend_guard.world_size();
-            // Create a scalar of type T from world_size
-            // For mock implementation, we'll use a simple approach
-            if world_size > 1 {
-                // This is a mock implementation - in practice, we'd need proper type conversion
-                // For now, we'll skip the averaging to avoid type issues
-                // *tensor = tensor.div_scalar(T::from(world_size as f32))?;
-            }
-        }
-        Ok(())
-    })
+    let shape = tensor.shape().dims().to_vec();
+    let device = tensor.device();
+    let mut data: Vec<T> = tensor.to_vec()?;
+    engine
+        .all_reduce_any(
+            &mut data as &mut (dyn Any + Send + Sync),
+            op,
+            &participants,
+            "",
+        )
+        .await?;
+    *tensor = Tensor::from_data(data, shape, device)?;
+    Ok(())
 }
 
-/// All-gather: gather tensors from all processes
+/// All-gather: gather tensors from all processes.
+///
+/// Each rank's `input` is transferred to every other rank; `output` ends up with
+/// one tensor per rank (in rank order). For `world_size == 1` this is a single
+/// clone of `input`.
 pub async fn all_gather<T: FloatElement>(
     output: &mut Vec<Tensor<T>>,
     input: &Tensor<T>,
     group: &ProcessGroup,
 ) -> TorshResult<()> {
-    use crate::communication::validate_backend_initialized;
-
-    let backend = group.backend();
-    let backend_guard = backend.read();
-
-    validate_backend_initialized(&**backend_guard)?;
-    let world_size = backend_guard.world_size();
-
-    // Mock implementation: duplicate input for each rank
-    // In real implementation, this would call backend.all_gather with type conversion
+    let world_size = group.world_size();
     output.clear();
-    for _ in 0..world_size {
+
+    if world_size <= 1 {
+        // Validate the backend is initialised even on the trivial path.
+        check_ready(group)?;
         output.push(input.clone());
+        return Ok(());
     }
 
+    let engine = tcp_engine(group)?;
+    let participants: Vec<u32> = (0..world_size).collect();
+
+    let shape = input.shape().dims().to_vec();
+    let device = input.device();
+    let input_data: Vec<T> = input.to_vec()?;
+    let payloads = engine
+        .all_gather_payloads(&input_data as &(dyn Any + Send + Sync), &participants, "")
+        .await?;
+    for payload in payloads {
+        let data = payload_into_vec::<T>(payload)?;
+        output.push(Tensor::from_data(data, shape.clone(), device)?);
+    }
     Ok(())
 }
 
-/// Broadcast: broadcast tensor from source rank to all processes
+/// Broadcast: send `tensor` from `src_rank` to all processes.
+///
+/// Non-root ranks receive the root's buffer; the root's tensor is unchanged.
 pub async fn broadcast<T: FloatElement>(
-    _tensor: &mut Tensor<T>,
+    tensor: &mut Tensor<T>,
     src_rank: u32,
     group: &ProcessGroup,
 ) -> TorshResult<()> {
-    use crate::communication::{validate_rank, with_backend_read};
+    use crate::communication::validate_rank;
 
-    with_backend_read(group, |backend_guard| {
-        validate_rank(src_rank, backend_guard.world_size())?;
+    let world_size = group.world_size();
+    validate_rank(src_rank, world_size)?;
+    if world_size <= 1 {
+        check_ready(group)?;
+        return Ok(());
+    }
+    let engine = tcp_engine(group)?;
+    let participants: Vec<u32> = (0..world_size).collect();
 
-        // Mock implementation: tensor remains unchanged
-        // In real implementation, would receive from src_rank if we're not the source
-        Ok(())
-    })
+    let shape = tensor.shape().dims().to_vec();
+    let device = tensor.device();
+    let mut data: Vec<T> = tensor.to_vec()?;
+    engine
+        .broadcast_any(
+            &mut data as &mut (dyn Any + Send + Sync),
+            src_rank,
+            &participants,
+            "",
+        )
+        .await?;
+    *tensor = Tensor::from_data(data, shape, device)?;
+    Ok(())
 }
 
-/// Reduce: reduce tensor to destination rank
+/// Reduce: reduce `tensor` across all processes to `dst_rank`.
+///
+/// Only the destination rank's tensor is updated with the reduced result; other
+/// ranks' tensors are left unchanged.
 pub async fn reduce<T>(
-    _tensor: &mut Tensor<T>,
+    tensor: &mut Tensor<T>,
     dst_rank: u32,
     op: ReduceOp,
     group: &ProcessGroup,
@@ -320,60 +413,116 @@ where
         + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>,
 {
-    use crate::communication::{validate_rank, with_backend_read};
+    use crate::communication::validate_rank;
 
-    with_backend_read(group, |backend_guard| {
-        validate_rank(dst_rank, backend_guard.world_size())?;
+    let world_size = group.world_size();
+    validate_rank(dst_rank, world_size)?;
+    if world_size <= 1 {
+        // Single rank already holds the reduced result (identity).
+        check_ready(group)?;
+        return Ok(());
+    }
+    let engine = tcp_engine(group)?;
+    let participants: Vec<u32> = (0..world_size).collect();
 
-        // Mock implementation
-        if backend_guard.rank() == dst_rank && matches!(op, ReduceOp::Sum) {
-            let world_size = backend_guard.world_size();
-            // For mock implementation, skip the scaling to avoid type issues
-            if world_size > 1 {
-                // *tensor = tensor.mul_scalar(T::from(world_size as f32))?;
-            }
-        }
-        Ok(())
-    })
+    let shape = tensor.shape().dims().to_vec();
+    let device = tensor.device();
+    let mut data: Vec<T> = tensor.to_vec()?;
+    engine
+        .reduce_any(
+            &mut data as &mut (dyn Any + Send + Sync),
+            dst_rank,
+            op,
+            &participants,
+            "",
+        )
+        .await?;
+    // Only the destination rank's tensor is updated with the reduced result.
+    if group.rank() == dst_rank {
+        *tensor = Tensor::from_data(data, shape, device)?;
+    }
+    Ok(())
 }
 
-/// Scatter: scatter tensor chunks from source rank to all processes
+/// Scatter: distribute `input` chunks from `src_rank`, one chunk per process.
+///
+/// `input` must be `Some` on the source rank with exactly `world_size` tensors;
+/// each rank receives `input[rank]`.
 pub async fn scatter<T: FloatElement>(
     output: &mut Tensor<T>,
     input: Option<&[Tensor<T>]>,
     src_rank: u32,
     group: &ProcessGroup,
 ) -> TorshResult<()> {
-    use crate::communication::{validate_rank, with_backend_read};
+    use crate::communication::validate_rank;
 
-    with_backend_read(group, |backend_guard| {
-        validate_rank(src_rank, backend_guard.world_size())?;
+    let world_size = group.world_size();
+    let rank = group.rank();
+    validate_rank(src_rank, world_size)?;
 
-        if backend_guard.rank() == src_rank {
-            let tensors = input.ok_or_else(|| {
-                crate::TorshDistributedError::invalid_argument(
-                    "input_tensors",
-                    "Input tensors required for source rank",
-                    "non-empty vector of tensors for scatter operation",
-                )
-            })?;
-
-            if tensors.len() != backend_guard.world_size() as usize {
-                return Err(crate::TorshDistributedError::invalid_argument(
-                    "tensors",
-                    format!(
-                        "Expected {} tensors, got {}",
-                        backend_guard.world_size(),
-                        tensors.len()
-                    ),
-                    format!("{} tensors (one per rank)", backend_guard.world_size()),
-                ));
-            }
-
-            *output = tensors[backend_guard.rank() as usize].clone();
+    let require_chunks = |input: Option<&[Tensor<T>]>| -> TorshResult<()> {
+        let tensors = input.ok_or_else(|| {
+            crate::TorshDistributedError::invalid_argument(
+                "input_tensors",
+                "Input tensors required for source rank",
+                "non-empty vector of tensors for scatter operation",
+            )
+        })?;
+        if tensors.len() != world_size as usize {
+            return Err(crate::TorshDistributedError::invalid_argument(
+                "tensors",
+                format!("Expected {} tensors, got {}", world_size, tensors.len()),
+                format!("{} tensors (one per rank)", world_size),
+            ));
         }
         Ok(())
-    })
+    };
+
+    if world_size <= 1 {
+        check_ready(group)?;
+        if rank == src_rank {
+            require_chunks(input)?;
+            if let Some(tensors) = input {
+                *output = tensors[rank as usize].clone();
+            }
+        }
+        return Ok(());
+    }
+
+    let engine = tcp_engine(group)?;
+    let participants: Vec<u32> = (0..world_size).collect();
+
+    // The source serialises one chunk per participant.
+    let chunks: Option<Vec<Vec<u8>>> = if rank == src_rank {
+        require_chunks(input)?;
+        let tensors = input.unwrap_or(&[]);
+        let mut encoded = Vec::with_capacity(tensors.len());
+        for t in tensors {
+            let v: Vec<T> = t.to_vec()?;
+            encoded.push(encode_any(&v as &(dyn Any + Send + Sync))?);
+        }
+        Some(encoded)
+    } else {
+        None
+    };
+
+    let my_bytes = engine
+        .scatter_bytes(chunks.as_deref(), src_rank, &participants, "")
+        .await?;
+    let payload = Payload::decode(&my_bytes)?;
+    let data = payload_into_vec::<T>(payload)?;
+
+    let expected = output.numel();
+    if data.len() != expected {
+        return Err(crate::TorshDistributedError::tensor_shape_mismatch(
+            vec![expected],
+            vec![data.len()],
+        ));
+    }
+    let shape = output.shape().dims().to_vec();
+    let device = output.device();
+    *output = Tensor::from_data(data, shape, device)?;
+    Ok(())
 }
 
 /// Barrier synchronization across all processes
@@ -389,52 +538,61 @@ pub async fn barrier(group: &ProcessGroup) -> TorshResult<()> {
     backend_guard.barrier().await
 }
 
-/// Send tensor to specified rank (point-to-point communication)
+/// Send `tensor` to `dst_rank` (point-to-point communication).
+///
+/// The buffer is posted to the store keyed by `(src, dst, tag)`; the matching
+/// [`recv`] consumes (and deletes) it.
+///
+/// # Constraint
+///
+/// At most **one in-flight message per `(src, dst, tag)` triple** is supported:
+/// issuing a second `send` with the same triple before the matching [`recv`]
+/// overwrites the first message. Use distinct `tag`s for concurrent messages
+/// between the same pair of ranks.
 pub async fn send<T: FloatElement>(
-    _tensor: &Tensor<T>,
+    tensor: &Tensor<T>,
     dst_rank: u32,
     tag: u32,
     group: &ProcessGroup,
 ) -> TorshResult<()> {
-    use crate::communication::{validate_rank, with_backend_read};
+    use crate::communication::validate_rank;
 
-    with_backend_read(group, |backend_guard| {
-        validate_rank(dst_rank, backend_guard.world_size())?;
-
-        // Mock implementation: store tensor in a global message queue
-        // In a real implementation, this would use the backend's send primitives
-        info!(
-            "📤 Rank {} sending tensor with tag {} to rank {}",
-            backend_guard.rank(),
-            tag,
-            dst_rank
-        );
-        Ok(())
-    })
+    validate_rank(dst_rank, group.world_size())?;
+    let engine = tcp_engine(group)?;
+    let data: Vec<T> = tensor.to_vec()?;
+    engine
+        .send_any(&data as &(dyn Any + Send + Sync), dst_rank, tag)
+        .await
 }
 
-/// Receive tensor from specified rank (point-to-point communication)
+/// Receive a tensor from `src_rank` (point-to-point communication).
+///
+/// Blocks until the matching [`send`] posts its buffer, then writes it into
+/// `tensor` (preserving `tensor`'s shape/device).
 pub async fn recv<T: FloatElement>(
-    _tensor: &mut Tensor<T>,
+    tensor: &mut Tensor<T>,
     src_rank: u32,
     tag: u32,
     group: &ProcessGroup,
 ) -> TorshResult<()> {
-    use crate::communication::{validate_rank, with_backend_read};
+    use crate::communication::validate_rank;
 
-    with_backend_read(group, |backend_guard| {
-        validate_rank(src_rank, backend_guard.world_size())?;
+    validate_rank(src_rank, group.world_size())?;
+    let engine = tcp_engine(group)?;
+    let payload = engine.recv_bytes(src_rank, tag).await?;
+    let data = payload_into_vec::<T>(payload)?;
 
-        // Mock implementation: tensor remains unchanged
-        // In a real implementation, this would use the backend's recv primitives
-        info!(
-            "📥 Rank {} receiving tensor with tag {} from rank {}",
-            backend_guard.rank(),
-            tag,
-            src_rank
-        );
-        Ok(())
-    })
+    let expected = tensor.numel();
+    if data.len() != expected {
+        return Err(crate::TorshDistributedError::tensor_shape_mismatch(
+            vec![expected],
+            vec![data.len()],
+        ));
+    }
+    let shape = tensor.shape().dims().to_vec();
+    let device = tensor.device();
+    *tensor = Tensor::from_data(data, shape, device)?;
+    Ok(())
 }
 
 /// Non-blocking send (isend) - returns immediately without waiting for completion
@@ -444,7 +602,9 @@ pub async fn isend<T: FloatElement>(
     tag: u32,
     group: &ProcessGroup,
 ) -> TorshResult<()> {
-    // For simplicity, use blocking send in mock implementation
+    // Data transfer is real (delegates to the blocking `send` over the TCP
+    // engine); the "non-blocking" contract is not yet honored — the future only
+    // resolves once the send completes. Genuine async progress is a follow-up.
     send(tensor, dst_rank, tag, group).await
 }
 
@@ -455,7 +615,9 @@ pub async fn irecv<T: FloatElement>(
     tag: u32,
     group: &ProcessGroup,
 ) -> TorshResult<()> {
-    // For simplicity, use blocking recv in mock implementation
+    // Data transfer is real (delegates to the blocking `recv` over the TCP
+    // engine); the future resolves only once the receive completes. Genuine
+    // non-blocking progress is a follow-up.
     recv(tensor, src_rank, tag, group).await
 }
 
@@ -465,7 +627,7 @@ pub async fn irecv<T: FloatElement>(
 
 /// All-reduce within a communication group
 pub async fn all_reduce_group<T>(
-    _tensor: &mut Tensor<T>,
+    tensor: &mut Tensor<T>,
     op: ReduceOp,
     comm_group: &CommunicationGroup,
     process_group: &ProcessGroup,
@@ -479,75 +641,86 @@ where
         + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>,
 {
-    let backend = process_group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let current_global_rank = backend_guard.rank();
-
-    // Check if current rank is part of this group
+    let current_global_rank = process_group.rank();
     if !comm_group.contains_rank(current_global_rank) {
         return Ok(()); // Not part of this group, skip operation
     }
-
-    // Mock implementation: for sum, divide by group size to simulate averaging
-    if let ReduceOp::Sum = op {
-        let group_size = comm_group.group_size;
-        // For mock implementation, skip the scaling to avoid type issues
-        if group_size > 1 {
-            // *tensor = tensor.div_scalar(T::from(group_size as f32))?;
-        }
+    if comm_group.group_size <= 1 {
+        return Ok(());
     }
+
+    let engine = tcp_engine(process_group)?;
+    let participants = comm_group.ranks.clone();
+    let shape = tensor.shape().dims().to_vec();
+    let device = tensor.device();
+    let mut data: Vec<T> = tensor.to_vec()?;
+    engine
+        .all_reduce_any(
+            &mut data as &mut (dyn Any + Send + Sync),
+            op,
+            &participants,
+            &comm_group.group_id,
+        )
+        .await?;
+    *tensor = Tensor::from_data(data, shape, device)?;
 
     info!(
         " All-reduce in group '{}': rank {} (local: {}) with {} participants",
         comm_group.group_id, current_global_rank, comm_group.local_rank, comm_group.group_size
     );
-
     Ok(())
 }
 
 /// Broadcast within a communication group
 pub async fn broadcast_group<T: FloatElement>(
-    _tensor: &mut Tensor<T>,
+    tensor: &mut Tensor<T>,
     src_local_rank: u32,
     comm_group: &CommunicationGroup,
     process_group: &ProcessGroup,
 ) -> TorshResult<()> {
-    use crate::communication::{validate_rank, with_backend_read};
+    use crate::communication::validate_rank;
 
-    with_backend_read(process_group, |backend_guard| {
-        let current_global_rank = backend_guard.rank();
+    let current_global_rank = process_group.rank();
+    if !comm_group.contains_rank(current_global_rank) {
+        return Ok(()); // Not part of this group, skip operation
+    }
+    validate_rank(src_local_rank, comm_group.group_size)?;
+    let src_global_rank = comm_group
+        .local_to_global_rank(src_local_rank)
+        .ok_or_else(|| {
+            crate::TorshDistributedError::invalid_argument(
+                "src_local_rank",
+                format!(
+                    "Invalid local rank {} in group '{}'",
+                    src_local_rank, comm_group.group_id
+                ),
+                format!("valid local rank in range 0..{}", comm_group.group_size),
+            )
+        })?;
+    if comm_group.group_size <= 1 {
+        return Ok(());
+    }
 
-        // Check if current rank is part of this group
-        if !comm_group.contains_rank(current_global_rank) {
-            return Ok(()); // Not part of this group, skip operation
-        }
+    let engine = tcp_engine(process_group)?;
+    let participants = comm_group.ranks.clone();
+    let shape = tensor.shape().dims().to_vec();
+    let device = tensor.device();
+    let mut data: Vec<T> = tensor.to_vec()?;
+    engine
+        .broadcast_any(
+            &mut data as &mut (dyn Any + Send + Sync),
+            src_global_rank,
+            &participants,
+            &comm_group.group_id,
+        )
+        .await?;
+    *tensor = Tensor::from_data(data, shape, device)?;
 
-        validate_rank(src_local_rank, comm_group.group_size)?;
-
-        let src_global_rank = comm_group
-            .local_to_global_rank(src_local_rank)
-            .ok_or_else(|| {
-                crate::TorshDistributedError::invalid_argument(
-                    "src_local_rank",
-                    format!(
-                        "Invalid local rank {} in group '{}'",
-                        src_local_rank, comm_group.group_id
-                    ),
-                    format!("valid local rank in range 0..{}", comm_group.group_size),
-                )
-            })?;
-
-        info!(
-            " Broadcast in group '{}': from local rank {} (global: {}) to {} participants",
-            comm_group.group_id, src_local_rank, src_global_rank, comm_group.group_size
-        );
-        Ok(())
-    })
+    info!(
+        " Broadcast in group '{}': from local rank {} (global: {}) to {} participants",
+        comm_group.group_id, src_local_rank, src_global_rank, comm_group.group_size
+    );
+    Ok(())
 }
 
 /// All-gather within a communication group
@@ -557,33 +730,44 @@ pub async fn all_gather_group<T: FloatElement>(
     comm_group: &CommunicationGroup,
     process_group: &ProcessGroup,
 ) -> TorshResult<()> {
-    use crate::communication::with_backend_read;
+    let current_global_rank = process_group.rank();
+    if !comm_group.contains_rank(current_global_rank) {
+        return Ok(()); // Not part of this group, skip operation
+    }
+    output.clear();
+    if comm_group.group_size <= 1 {
+        let _ = tcp_engine(process_group)?;
+        output.push(input.clone());
+        return Ok(());
+    }
 
-    with_backend_read(process_group, |backend_guard| {
-        let current_global_rank = backend_guard.rank();
+    let engine = tcp_engine(process_group)?;
+    let participants = comm_group.ranks.clone();
+    let shape = input.shape().dims().to_vec();
+    let device = input.device();
+    let input_data: Vec<T> = input.to_vec()?;
+    let payloads = engine
+        .all_gather_payloads(
+            &input_data as &(dyn Any + Send + Sync),
+            &participants,
+            &comm_group.group_id,
+        )
+        .await?;
+    for payload in payloads {
+        let data = payload_into_vec::<T>(payload)?;
+        output.push(Tensor::from_data(data, shape.clone(), device)?);
+    }
 
-        // Check if current rank is part of this group
-        if !comm_group.contains_rank(current_global_rank) {
-            return Ok(()); // Not part of this group, skip operation
-        }
-
-        // Mock implementation: duplicate input for each rank in the group
-        output.clear();
-        for _ in 0..comm_group.group_size {
-            output.push(input.clone());
-        }
-
-        info!(
-            "🔗 All-gather in group '{}': rank {} collecting from {} participants",
-            comm_group.group_id, current_global_rank, comm_group.group_size
-        );
-        Ok(())
-    })
+    info!(
+        "🔗 All-gather in group '{}': rank {} collecting from {} participants",
+        comm_group.group_id, current_global_rank, comm_group.group_size
+    );
+    Ok(())
 }
 
 /// Reduce within a communication group
 pub async fn reduce_group<T>(
-    _tensor: &mut Tensor<T>,
+    tensor: &mut Tensor<T>,
     dst_local_rank: u32,
     op: ReduceOp,
     comm_group: &CommunicationGroup,
@@ -598,16 +782,7 @@ where
         + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>,
 {
-    let backend = process_group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let current_global_rank = backend_guard.rank();
-
-    // Check if current rank is part of this group
+    let current_global_rank = process_group.rank();
     if !comm_group.contains_rank(current_global_rank) {
         return Ok(()); // Not part of this group, skip operation
     }
@@ -629,21 +804,32 @@ where
             ),
             expected: "valid local rank within the communication group".to_string(),
         })?;
+    if comm_group.group_size <= 1 {
+        return Ok(());
+    }
 
-    // Mock implementation
-    if current_global_rank == dst_global_rank && matches!(op, ReduceOp::Sum) {
-        let group_size = comm_group.group_size;
-        // For mock implementation, skip the scaling to avoid type issues
-        if group_size > 1 {
-            // *tensor = tensor.mul_scalar(T::from(group_size as f32))?;
-        }
+    let engine = tcp_engine(process_group)?;
+    let participants = comm_group.ranks.clone();
+    let shape = tensor.shape().dims().to_vec();
+    let device = tensor.device();
+    let mut data: Vec<T> = tensor.to_vec()?;
+    engine
+        .reduce_any(
+            &mut data as &mut (dyn Any + Send + Sync),
+            dst_global_rank,
+            op,
+            &participants,
+            &comm_group.group_id,
+        )
+        .await?;
+    if current_global_rank == dst_global_rank {
+        *tensor = Tensor::from_data(data, shape, device)?;
     }
 
     info!(
         "⬇️  Reduce in group '{}': to local rank {} (global: {}) from {} participants",
         comm_group.group_id, dst_local_rank, dst_global_rank, comm_group.group_size
     );
-
     Ok(())
 }
 
@@ -652,46 +838,34 @@ pub async fn barrier_group(
     comm_group: &CommunicationGroup,
     process_group: &ProcessGroup,
 ) -> TorshResult<()> {
-    let backend = process_group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let current_global_rank = backend_guard.rank();
-
-    // Check if current rank is part of this group
+    let current_global_rank = process_group.rank();
     if !comm_group.contains_rank(current_global_rank) {
         return Ok(()); // Not part of this group, skip operation
     }
+    if comm_group.group_size <= 1 {
+        return Ok(());
+    }
+
+    let engine = tcp_engine(process_group)?;
+    let participants = comm_group.ranks.clone();
+    engine.barrier(&participants, &comm_group.group_id).await?;
 
     info!(
-        "🚧 Barrier in group '{}': rank {} waiting for {} participants",
+        "🚧 Barrier in group '{}': rank {} synchronised with {} participants",
         comm_group.group_id, current_global_rank, comm_group.group_size
     );
-
-    // Mock implementation: immediate return
-    // In real implementation, would only synchronize with ranks in the group
     Ok(())
 }
 
 /// Point-to-point send within a communication group (using local ranks)
 pub async fn send_group<T: FloatElement>(
-    _tensor: &Tensor<T>,
+    tensor: &Tensor<T>,
     dst_local_rank: u32,
     tag: u32,
     comm_group: &CommunicationGroup,
     process_group: &ProcessGroup,
 ) -> TorshResult<()> {
-    let backend = process_group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let current_global_rank = backend_guard.rank();
+    let current_global_rank = process_group.rank();
 
     // Check if current rank is part of this group
     if !comm_group.contains_rank(current_global_rank) {
@@ -723,30 +897,28 @@ pub async fn send_group<T: FloatElement>(
             expected: "valid local rank within the communication group".to_string(),
         })?;
 
+    let engine = tcp_engine(process_group)?;
+    let data: Vec<T> = tensor.to_vec()?;
+    engine
+        .send_any(&data as &(dyn Any + Send + Sync), dst_global_rank, tag)
+        .await?;
+
     info!(
         "📤 Group send in '{}': from rank {} to local rank {} (global: {}) with tag {}",
         comm_group.group_id, current_global_rank, dst_local_rank, dst_global_rank, tag
     );
-
     Ok(())
 }
 
 /// Point-to-point receive within a communication group (using local ranks)
 pub async fn recv_group<T: FloatElement>(
-    _tensor: &mut Tensor<T>,
+    tensor: &mut Tensor<T>,
     src_local_rank: u32,
     tag: u32,
     comm_group: &CommunicationGroup,
     process_group: &ProcessGroup,
 ) -> TorshResult<()> {
-    let backend = process_group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let current_global_rank = backend_guard.rank();
+    let current_global_rank = process_group.rank();
 
     // Check if current rank is part of this group
     if !comm_group.contains_rank(current_global_rank) {
@@ -780,11 +952,24 @@ pub async fn recv_group<T: FloatElement>(
             )
         })?;
 
+    let engine = tcp_engine(process_group)?;
+    let payload = engine.recv_bytes(src_global_rank, tag).await?;
+    let data = payload_into_vec::<T>(payload)?;
+    let expected = tensor.numel();
+    if data.len() != expected {
+        return Err(crate::TorshDistributedError::tensor_shape_mismatch(
+            vec![expected],
+            vec![data.len()],
+        ));
+    }
+    let shape = tensor.shape().dims().to_vec();
+    let device = tensor.device();
+    *tensor = Tensor::from_data(data, shape, device)?;
+
     info!(
         "📥 Group recv in '{}': from local rank {} (global: {}) to rank {} with tag {}",
         comm_group.group_id, src_local_rank, src_global_rank, current_global_rank, tag
     );
-
     Ok(())
 }
 
@@ -809,38 +994,37 @@ where
         + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>,
 {
-    let backend = group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
+    let world_size = group.world_size();
+    let rank = group.rank();
+    if world_size <= 1 {
+        check_ready(group)?;
+        *output = input.clone();
+        return Ok(());
     }
 
-    let rank = backend_guard.rank();
-    let world_size = backend_guard.world_size();
+    // Real reduce-scatter: all-reduce the full tensor, then keep this rank's
+    // contiguous chunk of the reduced result.
+    let mut reduced = input.clone();
+    all_reduce(&mut reduced, op, group).await?;
 
-    // Mock implementation: simulate reduce-scatter by copying a portion of input
-    // In real implementation, would:
-    // 1. All-reduce the full tensor
-    // 2. Split result into world_size chunks
-    // 3. Each rank gets its corresponding chunk
-
-    // For simplicity, just copy the input and apply operation
-    *output = input.clone();
-
-    if let ReduceOp::Sum = op {
-        let factor = world_size;
-        // For mock implementation, skip the scaling to avoid type issues
-        if factor > 1 {
-            // *output = output.div_scalar(T::from(factor as f32))?;
-        }
-    }
+    let data = reduced.to_vec()?;
+    let total = data.len();
+    let base = total / world_size as usize;
+    let start = (rank as usize * base).min(total);
+    let end = if rank as usize + 1 == world_size as usize {
+        total
+    } else {
+        (start + base).min(total)
+    };
+    let chunk: Vec<T> = data[start..end].to_vec();
+    let device = input.device();
+    let chunk_len = chunk.len();
+    *output = Tensor::from_data(chunk, vec![chunk_len], device)?;
 
     info!(
-        " Reduce-scatter: rank {} processing chunk of reduced tensor",
-        rank
+        " Reduce-scatter: rank {} kept {} of {} reduced elements",
+        rank, chunk_len, total
     );
-
     Ok(())
 }
 
@@ -851,15 +1035,7 @@ pub async fn all_to_all<T: FloatElement>(
     input: &[Tensor<T>],
     group: &ProcessGroup,
 ) -> TorshResult<()> {
-    let backend = group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let rank = backend_guard.rank();
-    let world_size = backend_guard.world_size() as usize;
+    let world_size = group.world_size() as usize;
 
     if input.len() != world_size {
         return Err(crate::TorshDistributedError::InvalidArgument {
@@ -873,30 +1049,51 @@ pub async fn all_to_all<T: FloatElement>(
         });
     }
 
-    // Mock implementation: simulate all-to-all by copying appropriate input tensors
-    // In real implementation, each rank would send input[i] to rank i
-    // and receive from rank j into output[j]
     output.clear();
+    if world_size <= 1 {
+        check_ready(group)?;
+        output.push(input[0].clone());
+        return Ok(());
+    }
 
-    for i in 0..world_size {
-        // Simulate receiving from rank i
-        if i < input.len() {
-            output.push(input[i].clone());
-        }
+    let engine = tcp_engine(group)?;
+    let participants: Vec<u32> = (0..group.world_size()).collect();
+
+    // Serialise the chunk destined for each rank.
+    let mut sends = Vec::with_capacity(world_size);
+    for t in input {
+        let v: Vec<T> = t.to_vec()?;
+        sends.push(encode_any(&v as &(dyn Any + Send + Sync))?);
+    }
+    let received = engine.all_to_all_bytes(&sends, &participants, "").await?;
+
+    for (i, bytes) in received.into_iter().enumerate() {
+        let payload = Payload::decode(&bytes)?;
+        let data = payload_into_vec::<T>(payload)?;
+        // Reconstruct with input[i]'s shape when sizes match (symmetric case),
+        // otherwise fall back to a flat 1-D tensor.
+        let shape = input[i].shape().dims().to_vec();
+        let target_numel: usize = shape.iter().product();
+        let out_shape = if data.len() == target_numel {
+            shape
+        } else {
+            vec![data.len()]
+        };
+        output.push(Tensor::from_data(data, out_shape, input[i].device())?);
     }
 
     info!(
-        " All-to-all: rank {} exchanging data with {} ranks",
-        rank, world_size
+        " All-to-all: rank {} exchanged data with {} ranks",
+        group.rank(),
+        world_size
     );
-
     Ok(())
 }
 
 /// Ring all-reduce: more bandwidth-efficient all-reduce for large tensors
 /// Reduces communication volume by using ring topology
 pub async fn ring_all_reduce<T>(
-    _tensor: &mut Tensor<T>,
+    tensor: &mut Tensor<T>,
     op: ReduceOp,
     group: &ProcessGroup,
 ) -> TorshResult<()>
@@ -909,42 +1106,16 @@ where
         + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>,
 {
-    let backend = group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let rank = backend_guard.rank();
-    let world_size = backend_guard.world_size();
-
-    // Mock implementation: simulate ring all-reduce
-    // In real implementation, would:
-    // 1. Divide tensor into world_size chunks
-    // 2. In reduce-scatter phase, reduce chunks in ring order
-    // 3. In all-gather phase, gather reduced chunks in ring order
-
-    if let ReduceOp::Sum = op {
-        let world_size_f = world_size;
-        // For mock implementation, skip the scaling to avoid type issues
-        if world_size_f > 1 {
-            // *tensor = tensor.div_scalar(T::from(world_size_f as f32))?;
-        }
-    }
-
-    info!(
-        " Ring all-reduce: rank {} in {}-node ring topology",
-        rank, world_size
-    );
-
-    Ok(())
+    // The store-based engine already performs a correct all-reduce. The ring
+    // topology is a bandwidth optimization; the numerical result is identical,
+    // so delegate to the standard path rather than fabricate a ring.
+    all_reduce(tensor, op, group).await
 }
 
 /// Hierarchical all-reduce: two-level all-reduce for multi-node scenarios
 /// More efficient when there are multiple nodes with fast intra-node communication
 pub async fn hierarchical_all_reduce<T>(
-    _tensor: &mut Tensor<T>,
+    tensor: &mut Tensor<T>,
     op: ReduceOp,
     group: &ProcessGroup,
     ranks_per_node: u32,
@@ -958,20 +1129,11 @@ where
         + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>,
 {
-    let backend = group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let rank = backend_guard.rank();
-    let world_size = backend_guard.world_size();
-
-    if world_size % ranks_per_node != 0 {
+    let world_size = group.world_size();
+    if ranks_per_node == 0 || world_size % ranks_per_node != 0 {
         return Err(crate::TorshDistributedError::InvalidArgument {
-            arg: "rank".to_string(),
-            reason: "World size must be divisible by ranks_per_node for hierarchical all-reduce"
+            arg: "ranks_per_node".to_string(),
+            reason: "World size must be divisible by a non-zero ranks_per_node for hierarchical all-reduce"
                 .to_string(),
             expected: format!(
                 "world_size divisible by ranks_per_node ({})",
@@ -980,30 +1142,9 @@ where
         });
     }
 
-    let node_id = rank / ranks_per_node;
-    let local_rank = rank % ranks_per_node;
-    let num_nodes = world_size / ranks_per_node;
-
-    // Mock implementation: simulate hierarchical all-reduce
-    // In real implementation, would:
-    // 1. Intra-node all-reduce (within each node)
-    // 2. Inter-node all-reduce (between node representatives)
-    // 3. Intra-node broadcast (from representatives to all ranks in node)
-
-    if let ReduceOp::Sum = op {
-        let world_size_f = world_size;
-        // For mock implementation, skip the scaling to avoid type issues
-        if world_size_f > 1 {
-            // *tensor = tensor.div_scalar(T::from(world_size_f as f32))?;
-        }
-    }
-
-    info!(
-        " Hierarchical all-reduce: rank {} (node {}, local rank {}) with {} nodes × {} ranks/node",
-        rank, node_id, local_rank, num_nodes, ranks_per_node
-    );
-
-    Ok(())
+    // The two-level (intra-node then inter-node) schedule is a communication
+    // optimization; the numerical result equals a flat all-reduce, so delegate.
+    all_reduce(tensor, op, group).await
 }
 
 /// Bucket all-reduce: reduce multiple tensors efficiently by combining them
@@ -1023,63 +1164,23 @@ where
         + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>,
 {
-    let backend = group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let rank = backend_guard.rank();
-    let world_size = backend_guard.world_size();
-
     if tensors.is_empty() {
         return Ok(());
     }
 
-    // Mock implementation: simulate bucketed all-reduce
-    // In real implementation, would:
-    // 1. Group tensors into buckets based on size limit
-    // 2. Flatten each bucket into a single contiguous tensor
-    // 3. Perform all-reduce on each flattened bucket
-    // 4. Unflatten and distribute results back to original tensors
-
-    let max_bucket_size_bytes = (max_bucket_size_mb * 1024.0 * 1024.0) as usize;
-    let mut current_bucket_size = 0;
-    let mut bucket_count = 0;
-
+    // Bucketing (`max_bucket_size_mb`) is a communication-efficiency
+    // optimization; correctness only requires a real all-reduce per tensor, in
+    // the same order on every rank (SPMD).
+    let _ = max_bucket_size_mb;
     for tensor in tensors.iter_mut() {
-        let tensor_size = tensor.numel() * std::mem::size_of::<T>();
-
-        if current_bucket_size + tensor_size > max_bucket_size_bytes && current_bucket_size > 0 {
-            bucket_count += 1;
-            current_bucket_size = tensor_size;
-        } else {
-            current_bucket_size += tensor_size;
-        }
-
-        // Apply operation to each tensor (simulate all-reduce)
-        if let ReduceOp::Sum = op {
-            let world_size_f = world_size;
-            // For mock implementation, skip the scaling to avoid type issues
-            if world_size_f > 1 {
-                // *tensor = tensor.div_scalar(T::from(world_size_f as f32))?;
-            }
-        }
-    }
-
-    if current_bucket_size > 0 {
-        bucket_count += 1;
+        all_reduce(tensor, op, group).await?;
     }
 
     info!(
-        " Bucket all-reduce: rank {} processed {} tensors in {} buckets (max {:.1} MB/bucket)",
-        rank,
-        tensors.len(),
-        bucket_count,
-        max_bucket_size_mb
+        " Bucket all-reduce: rank {} reduced {} tensors",
+        group.rank(),
+        tensors.len()
     );
-
     Ok(())
 }
 
@@ -1104,74 +1205,23 @@ where
         + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>,
 {
-    let backend = group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let rank = backend_guard.rank();
-    let world_size = backend_guard.world_size();
-
     if tensors.is_empty() {
         return Ok(());
     }
 
-    // Group tensors into fusion groups based on size threshold
-    let mut fusion_groups = Vec::new();
-    let mut current_group = Vec::new();
-    let mut current_size = 0;
-
-    for (idx, tensor) in tensors.iter().enumerate() {
-        let tensor_size = tensor.numel() * std::mem::size_of::<T>();
-
-        if current_size + tensor_size > fusion_threshold_bytes && !current_group.is_empty() {
-            fusion_groups.push(std::mem::take(&mut current_group));
-            current_size = tensor_size;
-            current_group.push(idx);
-        } else {
-            current_size += tensor_size;
-            current_group.push(idx);
-        }
-    }
-
-    if !current_group.is_empty() {
-        fusion_groups.push(current_group);
-    }
-
-    // Process each fusion group
-    for (group_idx, tensor_indices) in fusion_groups.iter().enumerate() {
-        // In real implementation, would:
-        // 1. Flatten tensors in group into contiguous buffer
-        // 2. Perform single all-reduce on fused buffer
-        // 3. Unflatten and distribute back to original tensors
-
-        for &_tensor_idx in tensor_indices {
-            if let ReduceOp::Sum = op {
-                let world_size_f = world_size;
-                // For mock implementation, skip the scaling to avoid type issues
-                if world_size_f > 1 {
-                    // tensors[tensor_idx] = tensors[tensor_idx].div_scalar(T::from(world_size_f as f32))?;
-                }
-            }
-        }
-
-        info!(
-            "🔗 Fused all-reduce group {}: rank {} processed {} tensors",
-            group_idx,
-            rank,
-            tensor_indices.len()
-        );
+    // Fusion (`fusion_threshold_bytes`) is a communication-efficiency
+    // optimization; correctness only requires a real all-reduce per tensor, in
+    // the same order on every rank (SPMD).
+    let _ = fusion_threshold_bytes;
+    for tensor in tensors.iter_mut() {
+        all_reduce(tensor, op, group).await?;
     }
 
     info!(
-        " Fused all-reduce complete: rank {} processed {} tensors in {} fusion groups",
-        rank,
-        tensors.len(),
-        fusion_groups.len()
+        " Fused all-reduce complete: rank {} reduced {} tensors",
+        group.rank(),
+        tensors.len()
     );
-
     Ok(())
 }
 
@@ -1182,85 +1232,22 @@ pub async fn all_gather_varsize<T: FloatElement>(
     input: &Tensor<T>,
     group: &ProcessGroup,
 ) -> TorshResult<()> {
-    let backend = group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let rank = backend_guard.rank();
-    let world_size = backend_guard.world_size();
-
-    // In real implementation, would:
-    // 1. Exchange tensor sizes via all-gather of sizes
-    // 2. Allocate output buffers based on received sizes
-    // 3. Perform all-gather with appropriate offsets for each rank
-
-    output.clear();
-
-    // Mock implementation: simulate variable sizes
-    for i in 0..world_size {
-        // Simulate different tensor sizes from different ranks
-        let _scale_factor = 1.0 + (i as f32 * 0.1);
-        // For mock implementation, skip the scaling to avoid type issues
-        // let scaled_tensor = input.mul_scalar(T::from(scale_factor))?;
-        let scaled_tensor = input.clone();
-        output.push(scaled_tensor);
-    }
-
-    info!(
-        " Variable-size all-gather: rank {} collected from {} ranks with varying sizes",
-        rank, world_size
-    );
-
-    Ok(())
+    // The store-based all-gather already transfers each rank's exact buffer
+    // (every payload carries its own length), so variable per-rank sizes are
+    // handled correctly by the standard path.
+    all_gather(output, input, group).await
 }
 
 /// Tree-based broadcast: more efficient for large world sizes
 /// Uses binary tree topology to reduce latency compared to linear broadcast
 pub async fn tree_broadcast<T: FloatElement>(
-    _tensor: &mut Tensor<T>,
+    tensor: &mut Tensor<T>,
     src_rank: u32,
     group: &ProcessGroup,
 ) -> TorshResult<()> {
-    let backend = group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let rank = backend_guard.rank();
-    let world_size = backend_guard.world_size();
-
-    if src_rank >= world_size {
-        return Err(crate::TorshDistributedError::RankOutOfBounds {
-            rank: src_rank,
-            world_size,
-        });
-    }
-
-    // In real implementation, would use binary tree topology:
-    // - Root (src_rank) sends to its children
-    // - Each receiving rank forwards to its children
-    // - Continue until all ranks have received the data
-
-    // Calculate tree position for logging
-    let tree_depth = (world_size as f32).log2().ceil() as u32;
-    let is_root = rank == src_rank;
-    let parent_rank = if rank == src_rank {
-        None
-    } else {
-        Some((rank - 1) / 2)
-    };
-
-    info!(
-        "🌳 Tree broadcast: rank {} (root: {}, parent: {:?}) in {}-deep tree from root {}",
-        rank, is_root, parent_rank, tree_depth, src_rank
-    );
-
-    Ok(())
+    // The tree topology is a latency optimization; the delivered data is
+    // identical to a flat broadcast, so delegate to the correct path.
+    broadcast(tensor, src_rank, group).await
 }
 
 /// Pipelined all-reduce: overlaps computation and communication
@@ -1280,53 +1267,24 @@ where
         + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>,
 {
-    let backend = group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let rank = backend_guard.rank();
-    let world_size = backend_guard.world_size();
-
     if pipeline_chunks == 0 {
         return Err(crate::TorshDistributedError::InvalidArgument {
-            arg: "rank".to_string(),
+            arg: "pipeline_chunks".to_string(),
             reason: "Pipeline chunks must be greater than 0".to_string(),
             expected: "pipeline_chunks > 0".to_string(),
         });
     }
 
-    // In real implementation, would:
-    // 1. Split tensor into pipeline_chunks
-    // 2. Start all-reduce on chunk 0 while chunks 1+ are still being computed
-    // 3. Pipeline the communication and computation for optimal overlap
-
-    let chunk_size = tensor.numel().div_ceil(pipeline_chunks);
-
-    // Mock implementation: apply operation to simulate pipelined processing
-    if let ReduceOp::Sum = op {
-        let world_size_f = world_size;
-        // For mock implementation, skip the scaling to avoid type issues
-        if world_size_f > 1 {
-            // *tensor = tensor.div_scalar(T::from(world_size_f as f32))?;
-        }
-    }
-
-    info!(
-        "⚡ Pipelined all-reduce: rank {} processed tensor in {} chunks ({} elements/chunk)",
-        rank, pipeline_chunks, chunk_size
-    );
-
-    Ok(())
+    // Chunked pipelining overlaps communication with computation; the reduced
+    // result is identical to a single all-reduce, so delegate to it.
+    all_reduce(tensor, op, group).await
 }
 
 /// Double-buffered all-reduce: uses double buffering to hide latency
 /// Critical for overlapping gradient computation with communication
 pub async fn double_buffered_all_reduce<T>(
-    _current_buffer: &mut Tensor<T>,
-    _next_buffer: &mut Tensor<T>,
+    current_buffer: &mut Tensor<T>,
+    next_buffer: &mut Tensor<T>,
     op: ReduceOp,
     group: &ProcessGroup,
 ) -> TorshResult<()>
@@ -1339,36 +1297,10 @@ where
         + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>,
 {
-    let backend = group.backend();
-    let backend_guard = backend.read();
-
-    if !backend_guard.is_ready() {
-        return Err(crate::TorshDistributedError::BackendNotInitialized);
-    }
-
-    let rank = backend_guard.rank();
-    let world_size = backend_guard.world_size();
-
-    // In real implementation, would:
-    // 1. Start all-reduce on current_buffer
-    // 2. While current_buffer is being reduced, fill next_buffer with new data
-    // 3. Swap buffers when current reduction completes
-    // 4. Repeat for continuous pipelined operation
-
-    // Mock implementation: process both buffers
-    if let ReduceOp::Sum = op {
-        let world_size_f = world_size;
-        // For mock implementation, skip the scaling to avoid type issues
-        if world_size_f > 1 {
-            // *current_buffer = current_buffer.div_scalar(T::from(world_size_f as f32))?;
-            // *next_buffer = next_buffer.div_scalar(T::from(world_size_f as f32))?;
-        }
-    }
-
-    info!(
-        " Double-buffered all-reduce: rank {} processed buffers with overlap",
-        rank
-    );
-
+    // Double buffering hides latency by overlapping; the reduced results are
+    // identical to two sequential all-reduces. All ranks must issue both in the
+    // same order (SPMD).
+    all_reduce(current_buffer, op, group).await?;
+    all_reduce(next_buffer, op, group).await?;
     Ok(())
 }

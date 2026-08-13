@@ -2,9 +2,12 @@
 //!
 //! This module implements neuromorphic computing principles for graph neural networks,
 //! including spike-based communication, temporal dynamics, and event-driven processing.
-
 // Framework infrastructure - components designed for future use
 #![allow(dead_code)]
+/// Crate-local result alias: the error type defaults to [`TorshError`],
+/// so both `Result<T>` and `Result<T, OtherError>` stay valid.
+type Result<T, E = torsh_core::error::TorshError> = std::result::Result<T, E>;
+
 use crate::{GraphData, GraphLayer};
 use std::collections::{HashMap, VecDeque};
 use torsh_tensor::{
@@ -885,10 +888,10 @@ impl NeuromorphicGraphLayer {
 }
 
 impl GraphLayer for NeuromorphicGraphLayer {
-    fn forward(&self, graph: &GraphData) -> GraphData {
+    fn forward(&self, graph: &GraphData) -> Result<GraphData> {
         // Simplified neuromorphic forward pass
         // In practice, would implement sophisticated bio-inspired processing
-        graph.clone()
+        Ok(graph.clone())
     }
 
     fn parameters(&self) -> Vec<Tensor> {

@@ -3,6 +3,7 @@
 use crate::buffer::{generate_buffer_id, BufferHandle};
 use crate::error::{BackendError, BackendResult};
 use crate::{Buffer, BufferDescriptor, BufferUsage, Device};
+use torsh_core::sync::RwLockExt;
 
 #[cfg(feature = "std")]
 use std::sync::{Arc, RwLock};
@@ -62,7 +63,7 @@ impl CpuBuffer {
         // Store the CpuBuffer in the BufferHandle using Generic variant
         // This avoids the dangling pointer issue
         let handle = BufferHandle::Generic {
-            handle: Box::new(cpu_buffer),
+            handle: std::sync::Arc::new(cpu_buffer),
             size: descriptor.size,
         };
 
@@ -267,7 +268,7 @@ impl CpuBuffer {
     /// - No mutable references to the buffer exist when using this pointer
     /// - The buffer is not resized while using this pointer
     pub unsafe fn as_ptr(&self) -> *const u8 {
-        let data = self.data.read().expect("lock should not be poisoned");
+        let data = self.data.read_or_recover();
         data.as_ptr()
     }
 
@@ -280,7 +281,7 @@ impl CpuBuffer {
     /// - No other references to the buffer exist when using this pointer
     /// - The buffer is not resized while using this pointer
     pub unsafe fn as_mut_ptr(&self) -> *mut u8 {
-        let mut data = self.data.write().expect("lock should not be poisoned");
+        let mut data = self.data.write_or_recover();
         data.as_mut_ptr()
     }
 }

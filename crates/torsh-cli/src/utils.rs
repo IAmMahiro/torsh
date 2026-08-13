@@ -53,7 +53,7 @@ pub mod output {
             "json" => {
                 serde_json::to_string_pretty(data).with_context(|| "Failed to serialize to JSON")
             }
-            "yaml" => serde_yaml::to_string(data).with_context(|| "Failed to serialize to YAML"),
+            "yaml" => serde_norway::to_string(data).with_context(|| "Failed to serialize to YAML"),
             "table" => {
                 // For table format, we'll need to implement custom formatting
                 // This is a simplified version
@@ -313,9 +313,12 @@ pub mod system {
         }
     }
 
-    /// Format memory size
-    fn format_memory(memory_kb: u64) -> String {
-        let memory_bytes = memory_kb * 1024;
+    /// Format memory size.
+    ///
+    /// `memory_bytes` must already be in bytes: `sysinfo::System::total_memory` and
+    /// `available_memory` both return bytes directly (see sysinfo 0.39 docs), so no
+    /// unit conversion is needed here.
+    fn format_memory(memory_bytes: u64) -> String {
         Byte::from_u128(memory_bytes as u128)
             .unwrap_or_else(|| Byte::from_u128(0).expect("zero bytes should always be valid"))
             .get_appropriate_unit(byte_unit::UnitType::Binary)
@@ -637,6 +640,28 @@ pub mod system {
 
         serde_json::json!({ "error": "Failed to query OpenCL devices" })
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_format_memory_treats_input_as_bytes() {
+            // sysinfo::System::total_memory()/available_memory() return bytes directly
+            // (sysinfo 0.39+), so format_memory must NOT multiply by 1024 again.
+            let eight_gib_in_bytes: u64 = 8 * 1024 * 1024 * 1024;
+            let formatted = format_memory(eight_gib_in_bytes);
+
+            assert!(
+                formatted.contains("GiB"),
+                "expected GiB-scale output for 8 GiB of bytes, got: {formatted}"
+            );
+            assert!(
+                !formatted.contains("TiB"),
+                "format_memory inflated bytes by 1024x (regression), got: {formatted}"
+            );
+        }
+    }
 }
 
 /// Time and duration utilities
@@ -689,7 +714,7 @@ pub mod network {
         output_path: &Path,
         show_progress: bool,
     ) -> Result<()> {
-        let client = reqwest::Client::new();
+        let client = crate::tls::client_builder()?.build()?;
         let response = client.get(url).send().await?;
 
         let total_size = response.content_length().unwrap_or(0);
@@ -735,7 +760,11 @@ pub mod network {
 
     /// Check if URL is accessible
     pub async fn check_url_accessible(url: &str) -> bool {
-        let client = reqwest::Client::new();
+        let client = match crate::tls::client_builder().and_then(|b| b.build().map_err(Into::into))
+        {
+            Ok(client) => client,
+            Err(_) => return false,
+        };
         client.head(url).send().await.is_ok()
     }
 }

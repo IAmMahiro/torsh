@@ -74,16 +74,22 @@
 //!
 //! ### Basic Self-Attention
 //! ```rust
-//! use torsh_functional::attention::self_attention;
+//! use torsh_functional::attention::{self_attention, MultiHeadAttentionWeights};
 //! use torsh_functional::random_ops::randn;
 //!
 //! fn example() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Input sequence: [batch=2, seq_len=10, dim=512]
 //!     let input = randn(&[2, 10, 512], None, None, None)?;
 //!
+//!     // The functional API is stateless: projections are supplied by the caller
+//!     let (wq, wk) = (randn(&[512, 512], None, None, None)?, randn(&[512, 512], None, None, None)?);
+//!     let (wv, wo) = (randn(&[512, 512], None, None, None)?, randn(&[512, 512], None, None, None)?);
+//!     let weights = MultiHeadAttentionWeights::new(&wq, &wk, &wv, &wo);
+//!
 //!     // Self-attention with 8 heads, dimension 64 per head
 //!     let output = self_attention(
 //!         &input,
+//!         &weights,
 //!         512,      // embed_dim
 //!         8,        // num_heads
 //!         0.1,      // dropout
@@ -211,8 +217,34 @@ pub fn scaled_dot_product_attention(
             "scaled_dot_product_attention",
         ));
     }
+    if key_shape.len() != query_shape.len() || value_shape.len() != query_shape.len() {
+        return Err(TorshError::invalid_argument_with_context(
+            "Query, key, and value must have the same rank",
+            "scaled_dot_product_attention",
+        ));
+    }
 
-    let d_k = query_shape[query_shape.len() - 1] as f64;
+    // Query and key/value sequence lengths are independent: they differ for every
+    // cross-attention (a decoder attending to encoder memory), so the score matrix
+    // is [.., q_len, kv_len] rather than square.
+    let q_len = query_shape[query_shape.len() - 2];
+    let kv_len = key_shape[key_shape.len() - 2];
+    let head_dim = query_shape[query_shape.len() - 1];
+    if key_shape[key_shape.len() - 1] != head_dim {
+        return Err(TorshError::invalid_argument_with_context(
+            "Query and key must share the same head dimension",
+            "scaled_dot_product_attention",
+        ));
+    }
+    if value_shape[value_shape.len() - 2] != kv_len {
+        return Err(TorshError::invalid_argument_with_context(
+            "Key and value must have the same sequence length",
+            "scaled_dot_product_attention",
+        ));
+    }
+    let value_dim = value_shape[value_shape.len() - 1];
+
+    let d_k = head_dim as f64;
     let scale = 1.0 / d_k.sqrt();
 
     // Compute Q @ K^T / sqrt(d_k)
@@ -222,30 +254,34 @@ pub fn scaled_dot_product_attention(
     let mut scores = if query_shape.len() == 4 {
         let batch_size = query_shape[0];
         let num_heads = query_shape[1];
-        let seq_len = query_shape[2];
-        let head_dim = query_shape[3];
+        if key_shape[0] != batch_size || key_shape[1] != num_heads {
+            return Err(TorshError::invalid_argument_with_context(
+                "Query and key must share the same batch and head counts",
+                "scaled_dot_product_attention",
+            ));
+        }
 
         // Reshape to [batch*heads, seq, dim]
         let q_reshaped = query.view(&[
             (batch_size * num_heads) as i32,
-            seq_len as i32,
+            q_len as i32,
             head_dim as i32,
         ])?;
         let k_reshaped = key_transposed.view(&[
             (batch_size * num_heads) as i32,
             head_dim as i32,
-            seq_len as i32,
+            kv_len as i32,
         ])?;
 
         // Perform bmm
         let scores_3d = crate::linalg::bmm(&q_reshaped, &k_reshaped)?;
 
-        // Reshape back to [batch, heads, seq, seq]
+        // Reshape back to [batch, heads, q_len, kv_len]
         scores_3d.view(&[
             batch_size as i32,
             num_heads as i32,
-            seq_len as i32,
-            seq_len as i32,
+            q_len as i32,
+            kv_len as i32,
         ])?
     } else {
         // For 3D tensors, use bmm directly
@@ -256,8 +292,7 @@ pub fn scaled_dot_product_attention(
 
     // Apply causal mask if needed
     if is_causal {
-        let seq_len = scores.shape().dims()[scores.shape().ndim() - 1];
-        let causal_mask = create_causal_mask(seq_len)?;
+        let causal_mask = create_causal_mask(q_len, kv_len)?;
         // Apply mask by adding large negative value where mask is 1
         let large_neg = causal_mask.mul_scalar(-1e9)?;
         scores = scores.add_op(&large_neg)?;
@@ -285,30 +320,25 @@ pub fn scaled_dot_product_attention(
     let output = if query_shape.len() == 4 {
         let batch_size = query_shape[0];
         let num_heads = query_shape[1];
-        let seq_len = query_shape[2];
-        let head_dim = query_shape[3];
 
         // Reshape attention weights and value for bmm
-        let attn_reshaped = attn_weights.view(&[
-            (batch_size * num_heads) as i32,
-            seq_len as i32,
-            seq_len as i32,
-        ])?;
+        let attn_reshaped =
+            attn_weights.view(&[(batch_size * num_heads) as i32, q_len as i32, kv_len as i32])?;
         let value_reshaped = value.view(&[
             (batch_size * num_heads) as i32,
-            seq_len as i32,
-            head_dim as i32,
+            kv_len as i32,
+            value_dim as i32,
         ])?;
 
         // Perform bmm
         let output_3d = crate::linalg::bmm(&attn_reshaped, &value_reshaped)?;
 
-        // Reshape back to [batch, heads, seq, dim]
+        // Reshape back to [batch, heads, q_len, value_dim]
         output_3d.view(&[
             batch_size as i32,
             num_heads as i32,
-            seq_len as i32,
-            head_dim as i32,
+            q_len as i32,
+            value_dim as i32,
         ])?
     } else {
         // For 3D tensors, use bmm directly
@@ -318,20 +348,129 @@ pub fn scaled_dot_product_attention(
     Ok((output, attn_weights))
 }
 
+/// Projection parameters of a multi-head attention call.
+///
+/// The functional interface owns no state, so the caller supplies the four
+/// projection matrices (and their optional biases) exactly as
+/// `torch.nn.functional.multi_head_attention_forward` does with
+/// `use_separate_proj_weight=True`. Every weight has shape
+/// `[embed_dim, embed_dim]` and is applied as `input @ weight`, so entry
+/// `(i, j)` maps input feature `i` onto output feature `j`. Biases have shape
+/// `[embed_dim]`.
+#[derive(Debug, Clone, Copy)]
+pub struct MultiHeadAttentionWeights<'a> {
+    /// Query projection matrix `[embed_dim, embed_dim]`
+    pub q_proj_weight: &'a Tensor,
+    /// Key projection matrix `[embed_dim, embed_dim]`
+    pub k_proj_weight: &'a Tensor,
+    /// Value projection matrix `[embed_dim, embed_dim]`
+    pub v_proj_weight: &'a Tensor,
+    /// Output projection matrix `[embed_dim, embed_dim]`
+    pub out_proj_weight: &'a Tensor,
+    /// Optional query projection bias `[embed_dim]`
+    pub q_proj_bias: Option<&'a Tensor>,
+    /// Optional key projection bias `[embed_dim]`
+    pub k_proj_bias: Option<&'a Tensor>,
+    /// Optional value projection bias `[embed_dim]`
+    pub v_proj_bias: Option<&'a Tensor>,
+    /// Optional output projection bias `[embed_dim]`
+    pub out_proj_bias: Option<&'a Tensor>,
+}
+
+impl<'a> MultiHeadAttentionWeights<'a> {
+    /// Create a weight set without biases.
+    pub fn new(
+        q_proj_weight: &'a Tensor,
+        k_proj_weight: &'a Tensor,
+        v_proj_weight: &'a Tensor,
+        out_proj_weight: &'a Tensor,
+    ) -> Self {
+        Self {
+            q_proj_weight,
+            k_proj_weight,
+            v_proj_weight,
+            out_proj_weight,
+            q_proj_bias: None,
+            k_proj_bias: None,
+            v_proj_bias: None,
+            out_proj_bias: None,
+        }
+    }
+
+    /// Validate every matrix and bias against `embed_dim`.
+    fn validate(&self, embed_dim: usize) -> TorshResult<()> {
+        validate_projection(self.q_proj_weight, embed_dim, "q_proj_weight")?;
+        validate_projection(self.k_proj_weight, embed_dim, "k_proj_weight")?;
+        validate_projection(self.v_proj_weight, embed_dim, "v_proj_weight")?;
+        validate_projection(self.out_proj_weight, embed_dim, "out_proj_weight")?;
+        validate_projection_bias(self.q_proj_bias, embed_dim, "q_proj_bias")?;
+        validate_projection_bias(self.k_proj_bias, embed_dim, "k_proj_bias")?;
+        validate_projection_bias(self.v_proj_bias, embed_dim, "v_proj_bias")?;
+        validate_projection_bias(self.out_proj_bias, embed_dim, "out_proj_bias")?;
+        Ok(())
+    }
+}
+
+/// Apply one projection with an optional bias.
+fn project(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> TorshResult<Tensor> {
+    let projected = matmul_3d_2d(input, weight)?;
+    match bias {
+        Some(bias) => projected.add_op(bias),
+        None => Ok(projected),
+    }
+}
+
+/// Split a projected `[batch, seq, embed]` (or `[seq, batch, embed]`) tensor into
+/// `[batch, heads, seq, head_dim]`.
+fn split_heads(
+    projected: &Tensor,
+    batch_size: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    batch_first: bool,
+) -> TorshResult<Tensor> {
+    if batch_first {
+        projected
+            .view(&[
+                batch_size as i32,
+                seq_len as i32,
+                num_heads as i32,
+                head_dim as i32,
+            ])?
+            .transpose(1, 2)
+    } else {
+        projected
+            .view(&[
+                seq_len as i32,
+                batch_size as i32,
+                num_heads as i32,
+                head_dim as i32,
+            ])?
+            .transpose(0, 1)?
+            .transpose(1, 2)
+    }
+}
+
 /// Multi-Head Attention functional interface
 ///
-/// Applies multi-head attention to query, key, and value tensors.
+/// Applies multi-head attention to query, key, and value tensors using the
+/// projection parameters supplied by the caller. The function is stateless: the
+/// same inputs and weights always produce the same output, and the result stays
+/// connected to the weights so they can be trained.
+///
+/// Key and value may be shorter or longer than the query (cross-attention).
 ///
 /// # Arguments
-/// * `query` - Query tensor [batch_size, seq_len, embed_dim] or [seq_len, batch_size, embed_dim]
-/// * `key` - Key tensor (same shape as query)
-/// * `value` - Value tensor (same shape as query)
+/// * `query` - Query tensor `[batch, q_len, embed_dim]` or `[q_len, batch, embed_dim]`
+/// * `key` - Key tensor `[batch, kv_len, embed_dim]` or `[kv_len, batch, embed_dim]`
+/// * `value` - Value tensor, same shape as `key`
+/// * `weights` - Projection matrices and biases
 /// * `embed_dim` - Embedding dimension
 /// * `num_heads` - Number of attention heads
-/// * `dropout_p` - Dropout probability
-/// * `bias` - Whether to use bias in projections
-/// * `batch_first` - Whether batch dimension is first
-/// * `attn_mask` - Optional attention mask
+/// * `dropout_p` - Dropout probability applied to the attention weights
+/// * `batch_first` - Whether the batch dimension comes first
+/// * `attn_mask` - Optional additive attention mask, broadcast over `[.., q_len, kv_len]`
 ///
 /// # Returns
 /// Tuple of (attention_output, attention_weights)
@@ -340,109 +479,74 @@ pub fn multi_head_attention(
     query: &Tensor,
     key: &Tensor,
     value: &Tensor,
+    weights: &MultiHeadAttentionWeights<'_>,
     embed_dim: usize,
     num_heads: usize,
     dropout_p: f64,
-    bias: bool,
     batch_first: bool,
     attn_mask: Option<&Tensor>,
 ) -> TorshResult<(Tensor, Option<Tensor>)> {
-    if embed_dim % num_heads != 0 {
+    if num_heads == 0 || embed_dim % num_heads != 0 {
         return Err(TorshError::invalid_argument_with_context(
-            "embed_dim must be divisible by num_heads",
+            "embed_dim must be divisible by a non-zero num_heads",
             "multi_head_attention",
         ));
     }
+    weights.validate(embed_dim)?;
 
     let head_dim = embed_dim / num_heads;
     let query_shape_binding = query.shape();
     let query_shape = query_shape_binding.dims();
+    let key_shape_binding = key.shape();
+    let key_shape = key_shape_binding.dims();
+    let value_shape_binding = value.shape();
+    let value_shape = value_shape_binding.dims();
+    if query_shape.len() != 3 || key_shape.len() != 3 || value_shape.len() != 3 {
+        return Err(TorshError::invalid_argument_with_context(
+            "query, key and value must be 3-D",
+            "multi_head_attention",
+        ));
+    }
+    if key_shape != value_shape {
+        return Err(TorshError::invalid_argument_with_context(
+            "key and value must have the same shape",
+            "multi_head_attention",
+        ));
+    }
 
-    // Determine batch size and sequence length
-    let (batch_size, seq_len) = if batch_first {
-        (query_shape[0], query_shape[1])
+    // Determine batch size and the (independent) query / key sequence lengths
+    let (batch_size, q_len, kv_len) = if batch_first {
+        (query_shape[0], query_shape[1], key_shape[1])
     } else {
-        (query_shape[1], query_shape[0])
+        (query_shape[1], query_shape[0], key_shape[0])
     };
-
-    // Create projection weights (simplified - in practice these would be learnable parameters)
-    let w_q = create_projection_weight(embed_dim, embed_dim)?;
-    let w_k = create_projection_weight(embed_dim, embed_dim)?;
-    let w_v = create_projection_weight(embed_dim, embed_dim)?;
-    let w_o = create_projection_weight(embed_dim, embed_dim)?;
-
-    // Project query, key, value
-    let q = matmul_3d_2d(query, &w_q)?;
-    let k = matmul_3d_2d(key, &w_k)?;
-    let v = matmul_3d_2d(value, &w_v)?;
-
-    // Handle bias if needed
-    let (q, k, v) = if bias {
-        let bias_q = create_bias(embed_dim)?;
-        let bias_k = create_bias(embed_dim)?;
-        let bias_v = create_bias(embed_dim)?;
-        (q.add_op(&bias_q)?, k.add_op(&bias_k)?, v.add_op(&bias_v)?)
+    let key_batch = if batch_first {
+        key_shape[0]
     } else {
-        (q, k, v)
+        key_shape[1]
     };
+    if key_batch != batch_size {
+        return Err(TorshError::invalid_argument_with_context(
+            "query and key must share the same batch size",
+            "multi_head_attention",
+        ));
+    }
+    if query_shape[2] != embed_dim || key_shape[2] != embed_dim {
+        return Err(TorshError::invalid_argument_with_context(
+            "query, key and value must have embed_dim as their last dimension",
+            "multi_head_attention",
+        ));
+    }
+
+    // Project query, key, value with the caller's parameters
+    let q = project(query, weights.q_proj_weight, weights.q_proj_bias)?;
+    let k = project(key, weights.k_proj_weight, weights.k_proj_bias)?;
+    let v = project(value, weights.v_proj_weight, weights.v_proj_bias)?;
 
     // Reshape for multi-head attention
-    let q = if batch_first {
-        q.view(&[
-            batch_size as i32,
-            seq_len as i32,
-            num_heads as i32,
-            head_dim as i32,
-        ])?
-        .transpose(1, 2)?
-    } else {
-        q.view(&[
-            seq_len as i32,
-            batch_size as i32,
-            num_heads as i32,
-            head_dim as i32,
-        ])?
-        .transpose(0, 1)?
-        .transpose(1, 2)?
-    };
-
-    let k = if batch_first {
-        k.view(&[
-            batch_size as i32,
-            seq_len as i32,
-            num_heads as i32,
-            head_dim as i32,
-        ])?
-        .transpose(1, 2)?
-    } else {
-        k.view(&[
-            seq_len as i32,
-            batch_size as i32,
-            num_heads as i32,
-            head_dim as i32,
-        ])?
-        .transpose(0, 1)?
-        .transpose(1, 2)?
-    };
-
-    let v = if batch_first {
-        v.view(&[
-            batch_size as i32,
-            seq_len as i32,
-            num_heads as i32,
-            head_dim as i32,
-        ])?
-        .transpose(1, 2)?
-    } else {
-        v.view(&[
-            seq_len as i32,
-            batch_size as i32,
-            num_heads as i32,
-            head_dim as i32,
-        ])?
-        .transpose(0, 1)?
-        .transpose(1, 2)?
-    };
+    let q = split_heads(&q, batch_size, q_len, num_heads, head_dim, batch_first)?;
+    let k = split_heads(&k, batch_size, kv_len, num_heads, head_dim, batch_first)?;
+    let v = split_heads(&v, batch_size, kv_len, num_heads, head_dim, batch_first)?;
 
     // Apply scaled dot-product attention
     let (attn_output, attn_weights) =
@@ -451,20 +555,12 @@ pub fn multi_head_attention(
     // Reshape back to original format
     let attn_output = attn_output.transpose(1, 2)?.contiguous()?.view(&[
         batch_size as i32,
-        seq_len as i32,
+        q_len as i32,
         embed_dim as i32,
     ])?;
 
     // Apply output projection
-    let output = matmul_3d_2d(&attn_output, &w_o)?;
-
-    // Handle bias for output projection
-    let output = if bias {
-        let bias_o = create_bias(embed_dim)?;
-        output.add_op(&bias_o)?
-    } else {
-        output
-    };
+    let output = project(&attn_output, weights.out_proj_weight, weights.out_proj_bias)?;
 
     // Convert to expected format if not batch_first
     let output = if !batch_first {
@@ -636,7 +732,8 @@ pub fn flash_attention(
 /// # Arguments
 /// * `query` - Query tensor from target sequence
 /// * `key` - Key tensor from source sequence
-/// * `value` - Value tensor from source sequence  
+/// * `value` - Value tensor from source sequence
+/// * `weights` - Projection matrices and biases
 /// * `embed_dim` - Embedding dimension
 /// * `num_heads` - Number of attention heads
 /// * `dropout_p` - Dropout probability
@@ -647,13 +744,14 @@ pub fn cross_attention(
     query: &Tensor,
     key: &Tensor,
     value: &Tensor,
+    weights: &MultiHeadAttentionWeights<'_>,
     embed_dim: usize,
     num_heads: usize,
     dropout_p: f64,
 ) -> TorshResult<Tensor> {
     // Cross-attention is essentially multi-head attention with different key/value
     let (output, _) = multi_head_attention(
-        query, key, value, embed_dim, num_heads, dropout_p, true, true, None,
+        query, key, value, weights, embed_dim, num_heads, dropout_p, true, None,
     )?;
     Ok(output)
 }
@@ -663,7 +761,8 @@ pub fn cross_attention(
 /// Applies self-attention where query, key, and value all come from the same sequence.
 ///
 /// # Arguments
-/// * `input` - Input tensor
+/// * `input` - Input tensor `[batch, seq_len, embed_dim]`
+/// * `weights` - Projection matrices and biases
 /// * `embed_dim` - Embedding dimension
 /// * `num_heads` - Number of attention heads
 /// * `dropout_p` - Dropout probability
@@ -673,6 +772,7 @@ pub fn cross_attention(
 /// Self-attention output
 pub fn self_attention(
     input: &Tensor,
+    weights: &MultiHeadAttentionWeights<'_>,
     embed_dim: usize,
     num_heads: usize,
     dropout_p: f64,
@@ -680,7 +780,9 @@ pub fn self_attention(
 ) -> TorshResult<Tensor> {
     let attn_mask = if is_causal {
         let seq_len = input.shape().dims()[1]; // Assuming batch_first=true
-        Some(create_causal_mask(seq_len)?)
+                                               // The mask marks forbidden positions with 1.0 and is turned into a large
+                                               // negative additive bias by `scaled_dot_product_attention`.
+        Some(create_causal_mask(seq_len, seq_len)?)
     } else {
         None
     };
@@ -689,10 +791,10 @@ pub fn self_attention(
         input,
         input,
         input,
+        weights,
         embed_dim,
         num_heads,
         dropout_p,
-        true,
         true,
         attn_mask.as_ref(),
     )?;
@@ -727,34 +829,59 @@ fn matmul_3d_2d(input: &Tensor, weight: &Tensor) -> TorshResult<Tensor> {
     }
 }
 
-/// Create a causal mask for autoregressive attention
-fn create_causal_mask(seq_len: usize) -> TorshResult<Tensor> {
-    let mut mask_data = vec![0.0f32; seq_len * seq_len];
-    for i in 0..seq_len {
-        for j in (i + 1)..seq_len {
-            mask_data[i * seq_len + j] = 1.0;
+/// Create a causal mask for autoregressive attention.
+///
+/// Returns a `[q_len, kv_len]` tensor that is `1.0` on the positions a query must
+/// not attend to and `0.0` elsewhere. Query `i` may attend to key `j` when
+/// `j <= i`, which is the top-left aligned `tril(diagonal = 0)` convention used by
+/// the reference implementation of `torch.nn.functional.scaled_dot_product_attention`.
+fn create_causal_mask(q_len: usize, kv_len: usize) -> TorshResult<Tensor> {
+    let mut mask_data = vec![0.0f32; q_len * kv_len];
+    for i in 0..q_len {
+        for j in (i + 1)..kv_len {
+            mask_data[i * kv_len + j] = 1.0;
         }
     }
     Tensor::from_data(
         mask_data,
-        vec![seq_len, seq_len],
+        vec![q_len, kv_len],
         torsh_core::device::DeviceType::Cpu,
     )
 }
 
-/// Create projection weight matrix (placeholder implementation)
-fn create_projection_weight(input_dim: usize, output_dim: usize) -> TorshResult<Tensor> {
-    // In practice, these would be initialized with Xavier/Kaiming initialization
-    use crate::random_ops::randn;
-    let weight = randn(&[input_dim, output_dim], None, None, None)?;
-    let scale = (2.0 / (input_dim + output_dim) as f32).sqrt();
-    weight.mul_scalar(scale)
+/// Validate one projection matrix of a multi-head attention call.
+fn validate_projection(weight: &Tensor, embed_dim: usize, name: &str) -> TorshResult<()> {
+    let dims_binding = weight.shape();
+    let dims = dims_binding.dims();
+    if dims.len() != 2 || dims[0] != embed_dim || dims[1] != embed_dim {
+        return Err(TorshError::invalid_argument_with_context(
+            &format!(
+                "{name} must have shape [{embed_dim}, {embed_dim}], got {:?}",
+                dims
+            ),
+            "multi_head_attention",
+        ));
+    }
+    Ok(())
 }
 
-/// Create bias vector (placeholder implementation)
-fn create_bias(size: usize) -> TorshResult<Tensor> {
-    use torsh_tensor::creation::zeros;
-    zeros(&[size])
+/// Validate one projection bias of a multi-head attention call.
+fn validate_projection_bias(
+    bias: Option<&Tensor>,
+    embed_dim: usize,
+    name: &str,
+) -> TorshResult<()> {
+    if let Some(bias) = bias {
+        let dims_binding = bias.shape();
+        let dims = dims_binding.dims();
+        if dims.len() != 1 || dims[0] != embed_dim {
+            return Err(TorshError::invalid_argument_with_context(
+                &format!("{name} must have shape [{embed_dim}], got {:?}", dims),
+                "multi_head_attention",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -809,10 +936,21 @@ mod tests {
         }
     }
 
+    /// Build a deterministic weight set for the tests.
+    fn test_projections(embed_dim: usize) -> TorshResult<[Tensor; 4]> {
+        let identity = torsh_tensor::creation::eye::<f32>(embed_dim)?;
+        Ok([
+            identity.clone(),
+            identity.clone(),
+            identity.clone(),
+            identity,
+        ])
+    }
+
     #[test]
     fn test_causal_mask_creation() -> TorshResult<()> {
         let seq_len = 4;
-        let mask = create_causal_mask(seq_len)?;
+        let mask = create_causal_mask(seq_len, seq_len)?;
         assert_eq!(mask.shape().dims(), &[seq_len, seq_len]);
 
         // Verify causal structure (lower triangular should be 0, upper triangular should be 1)
@@ -838,13 +976,15 @@ mod tests {
         let num_heads = 8;
 
         let input = randn(&[batch_size, seq_len, embed_dim], None, None, None)?;
+        let [wq, wk, wv, wo] = test_projections(embed_dim)?;
+        let weights = MultiHeadAttentionWeights::new(&wq, &wk, &wv, &wo);
 
         let result = multi_head_attention(
-            &input, &input, &input, embed_dim, num_heads, 0.0, true, true, None,
+            &input, &input, &input, &weights, embed_dim, num_heads, 0.0, true, None,
         );
 
         assert!(result.is_ok());
-        let (output, _) = result.unwrap();
+        let (output, _) = result.expect("multi_head_attention should succeed");
         assert_eq!(output.shape().dims(), &[batch_size, seq_len, embed_dim]);
         Ok(())
     }
@@ -857,11 +997,13 @@ mod tests {
         let num_heads = 4;
 
         let input = randn(&[batch_size, seq_len, embed_dim], None, None, None)?;
+        let [wq, wk, wv, wo] = test_projections(embed_dim)?;
+        let weights = MultiHeadAttentionWeights::new(&wq, &wk, &wv, &wo);
 
-        let result = self_attention(&input, embed_dim, num_heads, 0.1, true);
+        let result = self_attention(&input, &weights, embed_dim, num_heads, 0.1, true);
         assert!(result.is_ok());
 
-        let output = result.unwrap();
+        let output = result.expect("self_attention should succeed");
         assert_eq!(output.shape().dims(), &[batch_size, seq_len, embed_dim]);
         Ok(())
     }

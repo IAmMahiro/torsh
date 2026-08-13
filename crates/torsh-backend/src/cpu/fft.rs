@@ -11,6 +11,7 @@ use crate::{BackendResult, Buffer, Device};
 use oxifft::{Complex, Direction, Flags, Plan};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use torsh_core::sync::MutexExt;
 
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, string::String, vec::Vec};
@@ -40,10 +41,7 @@ impl CpuFftOps {
 
     /// Get or create an FFT executor for the given plan
     fn get_or_create_executor(&self, plan: &FftPlan) -> BackendResult<Arc<CpuFftExecutor>> {
-        let mut cache = self
-            .executor_cache
-            .lock()
-            .expect("lock should not be poisoned");
+        let mut cache = self.executor_cache.lock_or_recover();
 
         if let Some(executor) = cache.get(&plan.id) {
             return Ok(executor.clone());

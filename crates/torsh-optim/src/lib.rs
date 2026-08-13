@@ -95,6 +95,7 @@ pub mod newton_cg;
 pub mod numerical_stability_tests;
 pub mod online_learning;
 pub mod optimizer;
+pub mod param_update;
 pub mod prodigy;
 pub mod quantum_inspired;
 pub mod radam;
@@ -201,8 +202,28 @@ pub trait Optimizer {
     /// Get the current learning rate
     fn get_lr(&self) -> Vec<f32>;
 
-    /// Set the learning rate
+    /// Set one learning rate for every parameter group (broadcast).
     fn set_lr(&mut self, lr: f32);
+
+    /// Set the learning rate of each parameter group individually.
+    ///
+    /// `lrs[i]` is applied to parameter group `i`; extra entries are ignored and
+    /// groups beyond `lrs.len()` keep their current rate. This is what learning
+    /// rate schedulers call, so that the differential-LR recipe (e.g. a lower
+    /// rate for a pretrained backbone than for a freshly initialised head,
+    /// configured through [`Optimizer::add_param_group`]) survives a scheduler
+    /// step instead of being collapsed onto a single rate.
+    ///
+    /// # Default Implementation
+    ///
+    /// The default broadcasts `lrs[0]` through [`Optimizer::set_lr`], which is
+    /// correct for optimizers that expose exactly one parameter group. Any
+    /// optimizer that can hold several groups must override this.
+    fn set_lrs(&mut self, lrs: &[f32]) {
+        if let Some(&lr) = lrs.first() {
+            self.set_lr(lr);
+        }
+    }
 
     /// Add a parameter group
     fn add_param_group(&mut self, params: Vec<Arc<RwLock<Tensor>>>, options: HashMap<String, f32>);

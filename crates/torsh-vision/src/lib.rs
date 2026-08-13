@@ -16,9 +16,11 @@
 //! use torsh_vision::transforms::*;
 //!
 //! // Create a standard image transformation pipeline
+//! // `ToTensor` comes first: it converts the decoded HWC image (0..=255) into
+//! // the planar CHW tensor (0.0..=1.0) that every other vision op expects.
 //! let transform = Compose::new(vec![
-//!     Box::new(Resize::new((224, 224))),
 //!     Box::new(ToTensor::new()),
+//!     Box::new(Resize::new((224, 224))),
 //!     Box::new(Normalize::new(vec![0.485, 0.456, 0.406], vec![0.229, 0.224, 0.225])),
 //! ]);
 //! ```
@@ -165,6 +167,9 @@ pub enum VisionError {
     #[cfg(feature = "pretrained")]
     #[error("Request error: {0}")]
     RequestError(#[from] reqwest::Error),
+
+    #[error("Unsupported operation: {0}")]
+    UnsupportedOperation(String),
 
     #[error("Other error: {0}")]
     Other(#[from] anyhow::Error),
