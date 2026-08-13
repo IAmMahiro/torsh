@@ -456,16 +456,37 @@ impl TcpEngine {
     }
 
     /// Poll `key` until it is present (or the deadline elapses).
+    ///
+    /// A transient store error is not fatal (peers may start in any order and
+    /// the master may briefly refuse connections), so the poll keeps retrying.
+    /// The *last* such error is carried into the timeout message: a store that
+    /// is unreachable for the whole deadline would otherwise be reported as an
+    /// absent key, hiding an I/O fault behind an SPMD-desync diagnosis.
     async fn poll_get(&self, store: &TcpStore, key: &str) -> TorshResult<Vec<u8>> {
         let start = Instant::now();
         let mut interval = Duration::from_millis(2);
+        let mut attempts = 0usize;
+        let mut last_error: Option<String> = None;
         loop {
-            if let Ok(Some(v)) = store.get(key).await {
-                return Ok(v);
+            attempts += 1;
+            match store.get(key).await {
+                Ok(Some(v)) => return Ok(v),
+                Ok(None) => {}
+                Err(e) => last_error = Some(e.to_string()),
             }
             if start.elapsed() > self.timeout {
+                let detail = match last_error {
+                    Some(e) => format!(
+                        "rendezvous waiting for key '{}' ({} store queries, last error: {})",
+                        key, attempts, e
+                    ),
+                    None => format!(
+                        "rendezvous waiting for key '{}' ({} store queries, key never appeared)",
+                        key, attempts
+                    ),
+                };
                 return Err(TorshDistributedError::operation_timeout(
-                    format!("rendezvous waiting for key '{}'", key),
+                    detail,
                     self.timeout.as_secs(),
                 ));
             }

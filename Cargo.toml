@@ -307,10 +307,10 @@ oxifft = "0.4.2"
 # The lean leaf crates below back ToRSh's own thin `CudaBackend` (torsh-tensor/src/
 # cuda_backend) so we avoid the heavyweight `oxicuda` umbrella facade. No CUDA SDK is
 # needed at build time (the driver is loaded at runtime via libloading).
-oxicuda-backend = "0.5.4"
-oxicuda-driver = "0.5.4"
-oxicuda-launch = "0.5.4"
-oxicuda-ptx = "0.5.4"
+oxicuda-backend = "0.5.5"
+oxicuda-driver = "0.5.5"
+oxicuda-launch = "0.5.5"
+oxicuda-ptx = "0.5.5"
 cranelift-native = "0.133"
 cranelift-object = "0.133"
 
