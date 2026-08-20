@@ -114,6 +114,19 @@ full-advanced = ["full", "sparse", "quantization", "special", "linalg", "profile
 research = ["full-advanced", "jit", "fx", "hub", "distributed", "dev", "cuda"]
 minimal = ["std"]
 
+[[example]]
+name = "01_tensor_basics"
+path = "../../examples/01_tensor_basics.rs"
+
+[[example]]
+name = "02_autograd_basics"
+path = "../../examples/02_autograd_basics.rs"
+
+[[example]]
+name = "03_neural_networks"
+path = "../../examples/03_neural_networks.rs"
+required-features = ["nn"]
+
 # [[example]]
 # name = "simple_cnn"
 # path = "../../examples/simple_cnn.rs"

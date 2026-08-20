@@ -1,3 +1,5 @@
+//! Updated for ToRSh 0.2.0
+//! 
 //! # Tutorial 03: Neural Networks
 //! 
 //! This is the third tutorial in the ToRSh learning series.
@@ -16,13 +18,18 @@
 //! - Understanding of basic machine learning concepts
 //! 
 //! Run with: `cargo run --example 03_neural_networks`
+ 
 
+use std::result::Result as StdResult;
+use std::error::Error;
+
+use torsh::F::CustomLoss;
 use torsh::prelude::*;
-use torsh::{Tensor, Device};
-use torsh::nn::{Module, Linear, ReLU, MSELoss};
-use std::f32::consts::PI;
+use torsh::{Tensor};
+use torsh::nn::{Module, layers::{Linear, ReLU}, functional::MSELoss};
+use torsh_optim::adam::AdamBuilder;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> StdResult<(), Box<dyn Error>> {
     println!("=== ToRSh Tutorial 03: Neural Networks ===\n");
     
     // 1. Understanding neural network layers
@@ -30,14 +37,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("========================");
     
     // Create a simple linear layer: y = Wx + b
-    let mut linear_layer = Linear::new(3, 2)?; // 3 inputs, 2 outputs
+    let linear_layer = Linear::new(3, 2, true); // 3 inputs, 2 outputs
     
     println!("Linear layer: 3 inputs → 2 outputs");
-    if let Some(weight) = linear_layer.weight() {
-        println!("Weight shape: {:?}", weight.shape());
+    if let Some(weight) = linear_layer.all_named_parameters().get("weight") {
+        println!("Weight shape: {:?}", weight.shape()?);
     }
-    if let Some(bias) = linear_layer.bias() {
-        println!("Bias shape: {:?}", bias.shape());
+    if let Some(bias) = linear_layer.all_named_parameters().get("bias")  {
+        println!("Bias shape: {:?}", bias.shape()?);
     }
     
     // Forward pass through the layer
@@ -46,8 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     println!("Input shape: {:?}", input.shape());
     println!("Output shape: {:?}", output.shape());
-    println!("Input: {:?}", input);
-    println!("Output: {:?}\n", output);
+    println!("Input: {:?}", input.data()?);
+    println!("Output: {:?}\n", output.data()?);
     
     // 2. Activation functions
     println!("2. Activation Functions");
@@ -58,17 +65,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let relu_output = relu.forward(&test_input)?;
     
     println!("ReLU activation function:");
-    println!("Input:  {:?}", test_input);
-    println!("Output: {:?}", relu_output);
+    println!("Input:  {:?}", test_input.data()?);
+    println!("Output: {:?}", relu_output.data()?);
     println!("ReLU sets negative values to 0, keeps positive values unchanged\n");
     
     // Manual activation functions
     let sigmoid_input = Tensor::from_vec(vec![-2.0, -1.0, 0.0, 1.0, 2.0], &[5])?;
-    let sigmoid_output = sigmoid_input.sigmoid();
+    let sigmoid_output = sigmoid_input.sigmoid()?;
     
     println!("Sigmoid activation function:");
-    println!("Input:  {:?}", sigmoid_input);
-    println!("Output: {:?}", sigmoid_output);
+    println!("Input:  {:?}", sigmoid_input.data()?);
+    println!("Output: {:?}", sigmoid_output.data()?);
     println!("Sigmoid maps values to (0, 1) range\n");
     
     // 3. Building a multi-layer network
@@ -81,40 +88,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         relu: ReLU,
         layer2: Linear,
     }
-    
+
     impl SimpleNet {
-        fn new() -> Result<Self, TorshError> {
-            Ok(Self {
-                layer1: Linear::new(2, 4)?, // 2 inputs, 4 hidden units
+        fn new() -> Self {
+            Self {
+                layer1: Linear::new(2, 4, true), // 2 inputs, 4 hidden units
                 relu: ReLU::new(),
-                layer2: Linear::new(4, 1)?, // 4 hidden units, 1 output
-            })
-        }
-        
-        fn forward(&mut self, x: &Tensor) -> Result<Tensor, TorshError> {
+                layer2: Linear::new(4, 1, true), // 4 hidden units, 1 output
+            }
+        }        
+    }
+    
+    impl Module for  SimpleNet {
+        fn forward(&self, x: &Tensor) -> Result<Tensor> {
             let h1 = self.layer1.forward(x)?;
             let h1_activated = self.relu.forward(&h1)?;
             let output = self.layer2.forward(&h1_activated)?;
             Ok(output)
         }
         
-        fn parameters(&mut self) -> Vec<&mut Tensor> {
-            let mut params = Vec::new();
-            params.extend(self.layer1.parameters());
-            params.extend(self.layer2.parameters());
-            params
+        fn named_children(&self) -> Vec<(String, &dyn Module)> {
+            vec![
+                ("layer1".to_string(), &self.layer1),
+                ("layer2".to_string(), &self.layer2),
+            ]
         }
+        
     }
     
-    let mut network = SimpleNet::new()?;
+    let network = SimpleNet::new();
     
     // Test forward pass
     let test_input = Tensor::from_vec(vec![0.5, -0.3], &[1, 2])?;
     let prediction = network.forward(&test_input)?;
     
     println!("Network architecture: 2 → 4 → 1");
-    println!("Test input: {:?}", test_input);
-    println!("Network output: {:?}\n", prediction);
+    println!("Test input: {:?}", test_input.data()?);
+    println!("Network output: {:?}\n", prediction.data()?);
     
     // 4. Training data generation (XOR problem)
     println!("4. Training Data: XOR Problem");
@@ -137,31 +147,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     
     println!("XOR Training Data:");
-    println!("Inputs:  {:?}", training_inputs);
-    println!("Targets: {:?}", training_targets);
+    println!("Inputs:  {:?}", training_inputs.data()?);
+    println!("Targets: {:?}", training_targets.data()?);
     println!("This is a classic non-linearly separable problem\n");
     
     // 5. Loss function
     println!("5. Loss Function");
     println!("================");
     
-    let loss_fn = MSELoss::new();
+    // Note: F::Reduction::Mean divides by numel (PyTorch "mean")
+    // Use F::Reduction::BatchMean to divide by batch_size instead
+    let loss_fn = MSELoss::new(F::Reduction::Mean);
     
     // Example loss calculation
     let example_predictions = Tensor::from_vec(vec![0.2, 0.8, 0.7, 0.1], &[4, 1])?;
-    let example_loss = loss_fn.forward(&example_predictions, &training_targets)?;
+    let example_loss = loss_fn.compute_loss(&example_predictions, &training_targets)?;
     
     println!("Mean Squared Error (MSE) Loss Function:");
-    println!("Predictions: {:?}", example_predictions);
-    println!("Targets:     {:?}", training_targets);
-    println!("Loss:        {:?}", example_loss);
+    println!("Predictions: {:?}", example_predictions.data()?);
+    println!("Targets:     {:?}", training_targets.data()?);
+    println!("Loss:        {:?}", example_loss.data()?);
     println!("Lower loss = better predictions\n");
     
     // 6. Training loop
     println!("6. Training the Neural Network");
     println!("==============================");
+
+    // The best way to update parameters is to use an optimizer
+    // If you are not sure which one? just use AdamW. It's good for almost everything
+
+    // First thing you need is to extract parameters for the optimizer
+    let params = network.all_named_parameters().values().map(|p| {p.tensor()}).collect(); // In current version there is a bit of boilerplate you need to remember
+
+    let mut optimizer = AdamBuilder::new().build_adamw(params); // Building an optimizer with default settings
     
-    let learning_rate = 0.1;
+    let learning_rate = 0.01;
+    optimizer.set_lr(learning_rate);
+
     let epochs = 1000;
     
     println!("Training XOR neural network...");
@@ -170,34 +192,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     for epoch in 0..epochs {
         // Zero gradients
-        for param in network.parameters() {
-            param.zero_grad();
-        }
+        optimizer.zero_grad(); // Optimizer will manage it itself
         
         // Forward pass
         let predictions = network.forward(&training_inputs)?;
         
         // Compute loss
-        let loss = loss_fn.forward(&predictions, &training_targets)?;
+        let loss = loss_fn.compute_loss(&predictions, &training_targets)?;
         
         // Backward pass
         loss.backward()?;
         
-        // Update parameters using gradient descent
-        for param in network.parameters() {
-            if let Some(grad) = param.grad() {
-                let param_data = param.to_vec()?;
-                let grad_data = grad.to_vec()?;
-                
-                let updated_data: Vec<f32> = param_data.iter()
-                    .zip(grad_data.iter())
-                    .map(|(&p, &g)| p - learning_rate * g)
-                    .collect();
-                
-                *param = Tensor::from_vec(updated_data, param.shape().dims())?;
-                param.set_requires_grad(true);
-            }
-        }
+        optimizer.step()?; // Optimizer will update params automatically
         
         // Print progress
         if epoch % 200 == 0 || epoch == epochs - 1 {
@@ -207,8 +213,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Show current predictions
             if epoch == epochs - 1 {
                 let final_predictions = network.forward(&training_inputs)?;
-                println!("Final predictions: {:?}", final_predictions);
-                println!("Targets:          {:?}", training_targets);
+                println!("Final predictions: {:?}", final_predictions.data()?);
+                println!("Targets:           {:?}", training_targets.data()?);
             }
         }
     }
@@ -216,6 +222,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 7. Testing the trained network
     println!("\n7. Testing the Trained Network");
     println!("==============================");
+
+    let _no_grad = no_grad(); // To be sure gradients are not getting accumulated. (Best practice)
     
     // Test each XOR combination
     let test_cases = vec![
@@ -235,6 +243,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}: Input {:?} → Prediction {:.3} → Rounded {}",
                  description, input_vals, pred_val, rounded);
     }
+
+    drop(_no_grad);
     
     // 8. Understanding what the network learned
     println!("\n8. Understanding the Network");
@@ -276,7 +286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Helper function for creating synthetic classification data
-fn create_spiral_data(n_samples: usize, n_classes: usize) -> Result<(Tensor, Tensor), TorshError> {
+fn create_spiral_data(n_samples: usize, n_classes: usize) -> Result<(Tensor, Tensor)> {
     let mut inputs = Vec::new();
     let mut targets = Vec::new();
     
@@ -306,34 +316,127 @@ mod tests {
     
     #[test]
     fn test_linear_layer() {
-        let mut layer = Linear::new(3, 2).unwrap();
-        let input = Tensor::ones(&[1, 3]).unwrap();
+        let layer = Linear::new(3, 2, true); // 3 inputs, 2 outputs, with bias
+        let input = Tensor::ones(&[1, 3], DeviceType::Cpu).unwrap();
         let output = layer.forward(&input).unwrap();
         
         assert_eq!(output.shape().dims(), &[1, 2]);
     }
     
     #[test]
+    fn test_linear_layer_no_bias() {
+        let layer = Linear::new(3, 2, false); // without bias
+        let input = Tensor::ones(&[1, 3], DeviceType::Cpu).unwrap();
+        let output = layer.forward(&input).unwrap();
+        
+        assert_eq!(output.shape().dims(), &[1, 2]);
+        
+        // Check that bias is not in parameters
+        assert!(layer.all_named_parameters().get("bias").is_none());
+    }
+    
+    #[test]
     fn test_relu_activation() {
         let relu = ReLU::new();
-        let input = Tensor::from_vec(vec![-1.0, 0.0, 1.0], &[3]).unwrap();
+        let input = Tensor::from_vec(vec![-1.0, 0.0, 1.0, -0.5, 2.0], &[5]).unwrap();
         let output = relu.forward(&input).unwrap();
         
         let output_data = output.to_vec().unwrap();
         assert_eq!(output_data[0], 0.0); // -1.0 → 0.0
         assert_eq!(output_data[1], 0.0); // 0.0 → 0.0
         assert_eq!(output_data[2], 1.0); // 1.0 → 1.0
+        assert_eq!(output_data[3], 0.0); // -0.5 → 0.0
+        assert_eq!(output_data[4], 2.0); // 2.0 → 2.0
     }
     
     #[test]
-    fn test_mse_loss() {
-        let loss_fn = MSELoss::new();
-        let predictions = Tensor::from_vec(vec![1.0, 2.0], &[2]).unwrap();
-        let targets = Tensor::from_vec(vec![1.0, 2.0], &[2]).unwrap();
-        let loss = loss_fn.forward(&predictions, &targets).unwrap();
+    fn test_mse_loss_none_reduction() {
+        let loss_fn = MSELoss::new(F::Reduction::None);
+        let predictions = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[3]).unwrap();
+        let targets = Tensor::from_vec(vec![1.5, 2.5, 3.5], &[3]).unwrap();
+        let loss = loss_fn.compute_loss(&predictions, &targets).unwrap();
+        
+        // Each element: (pred - target)^2 = 0.25
+        let loss_data = loss.to_vec().unwrap();
+        assert_eq!(loss_data.len(), 3);
+        for val in loss_data {
+            assert!((val - 0.25).abs() < 1e-6);
+        }
+    }
+    
+    #[test]
+    fn test_mse_loss_mean_reduction() {
+        let loss_fn = MSELoss::new(F::Reduction::Mean);
+        let predictions = Tensor::from_vec(vec![0.0, 2.0], &[2]).unwrap();
+        let targets = Tensor::from_vec(vec![1.0, 1.0], &[2]).unwrap();
+        let loss = loss_fn.compute_loss(&predictions, &targets).unwrap();
+        
+        // ((0-1)^2 + (2-1)^2) / 2 = (1 + 1) / 2 = 1.0
+        let loss_val = loss.to_vec().unwrap()[0];
+        assert!((loss_val - 1.0).abs() < 1e-6);
+    }
+    
+    #[test]
+    fn test_mse_loss_sum_reduction() {
+        let loss_fn = MSELoss::new(F::Reduction::Sum);
+        let predictions = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[3]).unwrap();
+        let targets = Tensor::from_vec(vec![2.0, 3.0, 4.0], &[3]).unwrap();
+        let loss = loss_fn.compute_loss(&predictions, &targets).unwrap();
+        
+        // Each element: (pred - target)^2 = 1.0, sum = 3.0
+        let loss_val = loss.to_vec().unwrap()[0];
+        assert!((loss_val - 3.0).abs() < 1e-6);
+    }
+    
+    #[test]
+    fn test_mse_loss_perfect_prediction() {
+        let loss_fn = MSELoss::new(F::Reduction::Mean);
+        let predictions = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[3]).unwrap();
+        let targets = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[3]).unwrap();
+        let loss = loss_fn.compute_loss(&predictions, &targets).unwrap();
         
         // Perfect predictions should have zero loss
         let loss_val = loss.to_vec().unwrap()[0];
         assert!(loss_val < 1e-6);
+    }
+    
+    #[test]
+    fn test_simple_network_forward() {
+        struct TestNet {
+            layer1: Linear,
+            relu: ReLU,
+            layer2: Linear,
+        }
+        
+        impl TestNet {
+            fn new() -> Self {
+                Self {
+                    layer1: Linear::new(2, 3, true),
+                    relu: ReLU::new(),
+                    layer2: Linear::new(3, 1, true),
+                }
+            }
+        }
+        
+        impl Module for TestNet {
+            fn forward(&self, x: &Tensor) -> Result<Tensor> {
+                let h = self.layer1.forward(x)?;
+                let h = self.relu.forward(&h)?;
+                self.layer2.forward(&h)
+            }
+            
+            fn named_children(&self) -> Vec<(String, &dyn Module)> {
+                vec![
+                    ("layer1".to_string(), &self.layer1),
+                    ("layer2".to_string(), &self.layer2),
+                ]
+            }
+        }
+        
+        let network = TestNet::new();
+        let input = Tensor::from_vec(vec![1.0, 2.0], &[1, 2]).unwrap();
+        let output = network.forward(&input).unwrap();
+        
+        assert_eq!(output.shape().dims(), &[1, 1]);
     }
 }

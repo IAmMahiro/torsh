@@ -1,3 +1,5 @@
+//! Updated for ToRSh 0.2.0
+//! 
 //! # Tutorial 02: Automatic Differentiation (Autograd) Basics
 //! 
 //! This is the second tutorial in the ToRSh learning series.
@@ -16,10 +18,13 @@
 //! 
 //! Run with: `cargo run --example 02_autograd_basics`
 
-use torsh::prelude::*;
-use torsh::{Tensor, Device};
+use std::result::Result as StdResult;
+use std::error::Error;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+use torsh::prelude::*;
+
+
+fn main() -> StdResult<(), Box<dyn Error>> {
     println!("=== ToRSh Tutorial 02: Automatic Differentiation Basics ===\n");
     
     // 1. Enabling gradient computation
@@ -27,23 +32,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("================================");
     
     // Create a tensor that requires gradients
-    let mut x = Tensor::from_vec(vec![2.0], &[1])?;
-    x.set_requires_grad(true);
-    
-    println!("Input tensor x = {:?}", x);
+    // Note: requires_grad_() returns a new Tensor, so we reassign rather than mutate
+    let x = Tensor::from_vec(vec![2.0], &[1])?.requires_grad_(true);
+
+    println!("Input tensor x = {:?}", x.data()?);
     println!("Requires gradient: {}\n", x.requires_grad());
     
     // Simple function: y = x^2
     let y = &x * &x;
     println!("Function: y = x^2");
-    println!("y = {:?}", y);
-    println!("y requires gradient: {}\n", y.requires_grad());
+    println!("y = {:?}", y.data()?);  // use .data()? to see tensor values
+    println!("y requires gradient: {}\n", y.requires_grad()); // it does!
     
     // Compute gradient dy/dx = 2x
     y.backward()?;
     
     if let Some(grad) = x.grad() {
-        println!("Gradient dy/dx = {:?}", grad);
+        println!("Gradient dy/dx = {:?}", grad.data()?);
         println!("Expected: 2 * x = 2 * 2 = 4 ✓\n");
     }
     
@@ -52,31 +57,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=========================");
     
     // Reset gradients for new computation
-    let mut a = Tensor::from_vec(vec![3.0], &[1])?;
-    let mut b = Tensor::from_vec(vec![4.0], &[1])?;
-    a.set_requires_grad(true);
-    b.set_requires_grad(true);
+    let a = Tensor::from_vec(vec![3.0], &[1])?.requires_grad_(true);
+    let b = Tensor::from_vec(vec![4.0], &[1])?.requires_grad_(true);
     
-    println!("a = {:?}, b = {:?}", a, b);
+    println!("a = {:?}\nb = {:?}", a.data()?, b.data()?);
     
     // Function: z = a^2 + 2*a*b + b^2 = (a + b)^2
     let a_squared = &a * &a;
     let b_squared = &b * &b;
-    let ab_term = &(&a * &b) * 2.0;
+    let ab_term = (&a * &b).mul_scalar(2.0)?;
     let z = &(&a_squared + &ab_term) + &b_squared;
     
     println!("Function: z = a^2 + 2*a*b + b^2");
-    println!("z = {:?}\n", z);
+    println!("z = {:?}\n", z.data()?);
     
     z.backward()?;
     
     if let Some(grad_a) = a.grad() {
-        println!("∂z/∂a = {:?}", grad_a);
+        println!("∂z/∂a = {:?}", grad_a.data()?);
         println!("Expected: 2a + 2b = 2*3 + 2*4 = 14 ✓");
     }
     
     if let Some(grad_b) = b.grad() {
-        println!("∂z/∂b = {:?}", grad_b);
+        println!("∂z/∂b = {:?}", grad_b.data()?);
         println!("Expected: 2a + 2b = 2*3 + 2*4 = 14 ✓\n");
     }
     
@@ -84,25 +87,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("3. Vector Functions");
     println!("===================");
     
-    let mut vec_x = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[3])?;
-    vec_x.set_requires_grad(true);
+    let vec_x = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[3])?.requires_grad_(true);
     
-    println!("Input vector x = {:?}", vec_x);
+    println!("Input vector x = {:?}", vec_x.data()?);
     
     // Function: f(x) = x^2 (element-wise)
     let f_x = &vec_x * &vec_x;
     println!("Function: f(x) = x^2 (element-wise)");
-    println!("f(x) = {:?}", f_x);
+    println!("f(x) = {:?}", f_x.data()?);
     
     // To compute gradients for vector functions, we need to specify which output
     // element we want to differentiate. Let's sum all outputs first.
     let scalar_output = f_x.sum()?;
-    println!("Sum of f(x) = {:?}\n", scalar_output);
+    println!("Sum of f(x) = {:?}\n", scalar_output.data()?);
     
     scalar_output.backward()?;
     
     if let Some(grad) = vec_x.grad() {
-        println!("Gradient: {:?}", grad);
+        println!("Gradient: {:?}", grad.data()?);
         println!("Expected: [2*1, 2*2, 2*3] = [2, 4, 6] ✓\n");
     }
     
@@ -110,10 +112,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("4. Gradient Accumulation");
     println!("========================");
     
-    let mut param = Tensor::from_vec(vec![1.0], &[1])?;
-    param.set_requires_grad(true);
+    let mut param = Tensor::from_vec(vec![1.0], &[1])?.requires_grad_(true);
     
-    println!("Parameter = {:?}\n", param);
+    println!("Parameter = {:?}\n", param.data()?);
     
     // First computation: y1 = param^2
     let y1 = &param * &param;
@@ -121,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     if let Some(grad) = param.grad() {
         println!("After first backward (y1 = param^2):");
-        println!("Gradient = {:?} (should be 2*1 = 2)", grad);
+        println!("Gradient = {:?} (should be 2*1 = 2)", grad.data()?);
     }
     
     // Second computation without zeroing gradients: y2 = param^3
@@ -130,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     if let Some(grad) = param.grad() {
         println!("After second backward (y2 = param^3, accumulated):");
-        println!("Gradient = {:?} (should be 2 + 3*1^2 = 5)", grad);
+        println!("Gradient = {:?} (should be 2 + 3*1^2 = 5)", grad.data()?);
     }
     
     // Zero gradients and compute again
@@ -140,35 +141,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     if let Some(grad) = param.grad() {
         println!("After zeroing gradients and computing y3 = param^3:");
-        println!("Gradient = {:?} (should be 3*1^2 = 3)\n", grad);
+        println!("Gradient = {:?} (should be 3*1^2 = 3)\n", grad.data()?);
     }
     
     // 5. Chain rule in action
     println!("5. Chain Rule in Action");
     println!("=======================");
     
-    let mut input = Tensor::from_vec(vec![0.5], &[1])?;
-    input.set_requires_grad(true);
+    let input = Tensor::from_vec(vec![0.5], &[1])?.requires_grad_(true);
     
-    println!("Input = {:?}", input);
+    println!("Input = {:?}", input.data()?);
     
     // Multi-step computation: final = sin(x^2 + 1)
-    let step1 = &input * &input;        // x^2
-    let step2 = &step1 + 1.0;           // x^2 + 1
-    let final_result = step2.sin();     // sin(x^2 + 1)
+    let step1 = &input * &input;                            // x^2
+    let step2 = step1.add_scalar(1.0)?;                     // x^2 + 1
+    let final_result = step2.sin()?;                        // sin(x^2 + 1)
     
-    println!("Step 1: x^2 = {:?}", step1);
-    println!("Step 2: x^2 + 1 = {:?}", step2);
-    println!("Final: sin(x^2 + 1) = {:?}\n", final_result);
+    println!("Step 1: x^2 = {:?}", step1.data()?);
+    println!("Step 2: x^2 + 1 = {:?}", step2.data()?);
+    println!("Final: sin(x^2 + 1) = {:?}\n", final_result.data()?);
     
     final_result.backward()?;
     
     if let Some(grad) = input.grad() {
-        println!("Gradient d/dx[sin(x^2 + 1)] = {:?}", grad);
+        println!("Gradient d/dx[sin(x^2 + 1)] = {:?}", grad.data()?);
         // Chain rule: d/dx[sin(x^2 + 1)] = cos(x^2 + 1) * 2x
-        let x_val = 0.5;
+        let x_val: f64 = 0.5;
         let expected = (x_val * x_val + 1.0).cos() * 2.0 * x_val;
-        println!("Expected: cos(x^2 + 1) * 2x = cos({:.3}) * {} = {:.6}", 
+        println!("Expected: cos(x² + 1) * 2x = cos({:.3}) * {:.1} = {:.6}", 
                  x_val * x_val + 1.0, 2.0 * x_val, expected);
     }
     
@@ -181,21 +181,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let y_data = Tensor::from_vec(vec![3.1, 4.9, 7.2, 9.1, 10.8], &[5])?;
     
     // Parameters to learn
-    let mut weight = Tensor::from_vec(vec![0.0], &[1])?; // Start with w = 0
-    let mut bias = Tensor::from_vec(vec![0.0], &[1])?;   // Start with b = 0
-    weight.set_requires_grad(true);
-    bias.set_requires_grad(true);
+    let mut weight = Tensor::from_vec(vec![0.0], &[1])?.requires_grad_(true);
+    let mut bias = Tensor::from_vec(vec![0.0], &[1])?.requires_grad_(true);
     
     println!("Training data:");
-    println!("X: {:?}", x_data);
-    println!("Y: {:?}\n", y_data);
+    println!("X: {:?}", x_data.data()?);
+    println!("Y: {:?}\n", y_data.data()?);
     
     let learning_rate = 0.01;
     let epochs = 100;
     
     println!("Training simple linear regression (y = wx + b):");
     println!("Initial parameters: w = {:.3}, b = {:.3}", 
-             weight.to_vec()?[0], bias.to_vec()?[0]);
+             weight.item()?, bias.item()?);
     
     for epoch in 0..epochs {
         // Zero gradients
@@ -208,7 +206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Compute loss: Mean Squared Error
         let diff = &predictions - &y_data;
         let squared_diff = &diff * &diff;
-        let loss = squared_diff.mean()?;
+        let loss = squared_diff.mean(None, false)?;
         
         // Backward pass
         loss.backward()?;
@@ -216,47 +214,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Update parameters using gradients
         if let (Some(w_grad), Some(b_grad)) = (weight.grad(), bias.grad()) {
             // w = w - learning_rate * gradient
-            let w_data = weight.to_vec()?;
-            let b_data = bias.to_vec()?;
-            let w_grad_data = w_grad.to_vec()?;
-            let b_grad_data = b_grad.to_vec()?;
+            // For single-element tensors, .item() is cleaner than .to_vec()?[0]
+            let w_val = weight.item()?;
+            let b_val = bias.item()?;
+            let w_grad_val = w_grad.item()?;
+            let b_grad_val = b_grad.item()?;
             
-            let new_w = w_data[0] - learning_rate * w_grad_data[0];
-            let new_b = b_data[0] - learning_rate * b_grad_data[0];
-            
-            weight = Tensor::from_vec(vec![new_w], &[1])?;
-            bias = Tensor::from_vec(vec![new_b], &[1])?;
-            weight.set_requires_grad(true);
-            bias.set_requires_grad(true);
+            let new_w = w_val - learning_rate * w_grad_val;
+            let new_b = b_val - learning_rate * b_grad_val;
+
+            // Note that here we create new tensors for clarity.
+            // In production we do optimizer.step(), which we'll see in action in the next tutorial
+
+            weight = Tensor::from_vec(vec![new_w], &[1])?.requires_grad_(true);
+            bias = Tensor::from_vec(vec![new_b], &[1])?.requires_grad_(true);
         }
         
         // Print progress
         if epoch % 20 == 0 || epoch == epochs - 1 {
             println!("Epoch {}: Loss = {:.6}, w = {:.3}, b = {:.3}", 
-                     epoch, loss.to_vec()?[0], weight.to_vec()?[0], bias.to_vec()?[0]);
+                     epoch, loss.item()?, weight.item()?, bias.item()?);
         }
     }
     
     println!("\n✅ Training completed!");
     println!("Final parameters: w = {:.3}, b = {:.3}", 
-             weight.to_vec()?[0], bias.to_vec()?[0]);
+             weight.item()?, bias.item()?);
     println!("Target parameters: w = 2.0, b = 1.0");
     println!("(Difference due to noise in training data)\n");
     
     // 7. Key concepts summary
     println!("7. Key Concepts Summary");
     println!("=======================");
-    println!("✓ requires_grad(true): Enables gradient computation for a tensor");
+    println!("✓ requires_grad_(true): Enables gradient computation for a tensor");
     println!("✓ backward(): Computes gradients via backpropagation");
     println!("✓ grad(): Access computed gradients");
     println!("✓ zero_grad(): Reset gradients to zero (important for training loops)");
     println!("✓ Chain rule: Automatic differentiation handles complex function compositions");
     println!("✓ Gradient accumulation: Gradients add up across multiple backward() calls");
-    println!("✓ Optimization: Use gradients to update parameters (gradient descent)\n");
+    println!("✓ Optimization: Use gradients to update parameters (gradient descent)");
+    println!("✓ item(): Extract scalar value from single-element tensor\n");
+    
     
     println!("🎉 Congratulations! You've completed Tutorial 02: Autograd Basics");
     println!("📚 Next: Run `cargo run --example 03_neural_networks` to learn about neural networks");
     
+
     Ok(())
 }
 
@@ -266,33 +269,31 @@ mod tests {
     
     #[test]
     fn test_simple_gradient() {
-        let mut x = Tensor::from_vec(vec![2.0], &[1]).unwrap();
-        x.set_requires_grad(true);
+        let x = Tensor::from_vec(vec![2.0], &[1]).unwrap().requires_grad_(true);
         
         let y = &x * &x; // y = x^2
         y.backward().unwrap();
         
         if let Some(grad) = x.grad() {
-            let grad_val = grad.to_vec().unwrap()[0];
+            let grad_val = grad.item::<f32>().unwrap();
             assert!((grad_val - 4.0).abs() < 1e-6); // dy/dx = 2x = 2*2 = 4
         }
     }
     
     #[test]
     fn test_gradient_accumulation() {
-        let mut x = Tensor::from_vec(vec![1.0], &[1]).unwrap();
-        x.set_requires_grad(true);
+        let x = Tensor::from_vec(vec![1.0], &[1]).unwrap().requires_grad_(true);
         
         // First computation
         let y1 = &x * &x;
         y1.backward().unwrap();
         
         // Second computation (gradients should accumulate)
-        let y2 = &x * 3.0;
+        let y2 = x.mul_scalar(3.0).unwrap();
         y2.backward().unwrap();
         
         if let Some(grad) = x.grad() {
-            let grad_val = grad.to_vec().unwrap()[0];
+            let grad_val = grad.item::<f32>().unwrap();
             // Should be 2*1 (from x^2) + 3 (from 3*x) = 5
             assert!((grad_val - 5.0).abs() < 1e-6);
         }
@@ -300,8 +301,7 @@ mod tests {
     
     #[test]
     fn test_zero_grad() {
-        let mut x = Tensor::from_vec(vec![1.0], &[1]).unwrap();
-        x.set_requires_grad(true);
+        let x = Tensor::from_vec(vec![1.0], &[1]).unwrap().requires_grad_(true);
         
         // First computation
         let y1 = &x * &x;
@@ -311,13 +311,33 @@ mod tests {
         x.zero_grad();
         
         // Second computation
-        let y2 = &x * 3.0;
+        let y2 = x.mul_scalar(3.0).unwrap();
         y2.backward().unwrap();
         
         if let Some(grad) = x.grad() {
-            let grad_val = grad.to_vec().unwrap()[0];
+            let grad_val = grad.item::<f32>().unwrap();
             // Should be only 3 (from 3*x), not accumulated
             assert!((grad_val - 3.0).abs() < 1e-6);
+        }
+    }
+    
+    #[test]
+    fn test_chain_rule() {
+        let x = Tensor::from_vec(vec![0.5], &[1]).unwrap().requires_grad_(true);
+        
+        // sin(x^2 + 1)
+        let step1 = &x * &x;
+        let step2 = step1.add_scalar(1.0).unwrap();
+        let result = step2.sin().unwrap();
+        
+        result.backward().unwrap();
+        
+        if let Some(grad) = x.grad() {
+            let grad_val = grad.item::<f32>().unwrap();
+            // Expected: cos(x^2 + 1) * 2x
+            let x_val: f32 = 0.5;
+            let expected = (x_val * x_val + 1.0).cos() * 2.0 * x_val;
+            assert!((grad_val - expected).abs() < 1e-5);
         }
     }
 }
