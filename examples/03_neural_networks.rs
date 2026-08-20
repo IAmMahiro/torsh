@@ -285,30 +285,6 @@ fn main() -> StdResult<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Helper function for creating synthetic classification data
-fn create_spiral_data(n_samples: usize, n_classes: usize) -> Result<(Tensor, Tensor)> {
-    let mut inputs = Vec::new();
-    let mut targets = Vec::new();
-    
-    for class_id in 0..n_classes {
-        for i in 0..n_samples {
-            let r = i as f32 / n_samples as f32;
-            let t = (class_id as f32 * 4.0) + (r * 4.0) + 
-                    (rand::random::<f32>() - 0.5) * 0.2;
-            
-            let x = r * t.cos();
-            let y = r * t.sin();
-            
-            inputs.extend_from_slice(&[x, y]);
-            targets.push(class_id as f32);
-        }
-    }
-    
-    let input_tensor = Tensor::from_vec(inputs, &[n_samples * n_classes, 2])?;
-    let target_tensor = Tensor::from_vec(targets, &[n_samples * n_classes])?;
-    
-    Ok((input_tensor, target_tensor))
-}
 
 #[cfg(test)]
 mod tests {
